@@ -1,6 +1,6 @@
 # Interactive and oneshot runner modes
 
-Status: Draft, awaiting owner approval
+Status: Approved
 
 ## Problem
 

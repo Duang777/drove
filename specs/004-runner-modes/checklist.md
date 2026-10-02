@@ -82,4 +82,4 @@
 
 ## Approval gate
 
-- [ ] The owner approves the scope and design before implementation starts.
+- [x] The owner approves the scope and design before implementation starts.
