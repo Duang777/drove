@@ -2,7 +2,7 @@
 
 - 状态：Draft
 - 日期：2026-10-03
-- 作者：DD（AI 助手起草，待段佳灵评审）
+- 作者：DD（AI 助手起草，待 Duang777 评审）
 - 相关 Issue：[#1](https://github.com/Duang777/drove/issues/1)（runner 交互模式）、[#2](https://github.com/Duang777/drove/issues/2)（hooks 状态权威）、[#3](https://github.com/Duang777/drove/issues/3)（Blocked 恢复）、[#4](https://github.com/Duang777/drove/issues/4)（输入注入）
 
 ## 1. 背景与动机
