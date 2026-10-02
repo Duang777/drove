@@ -1,0 +1,33 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Local data
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Env
+.env
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Go
+vendor/
+
+# Coverage
+coverage.out
+coverage.html
+
+# Frontend
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
