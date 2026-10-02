@@ -1,6 +1,6 @@
 package adapter
 
-import "github.com/drovehq/drove/internal/agent"
+import "github.com/Duang777/drove/internal/agent"
 
 // claudeRunner 适配 Anthropic Claude Code CLI。
 type claudeRunner struct{}

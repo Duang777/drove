@@ -13,13 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/drovehq/drove/internal/adapter"
-	"github.com/drovehq/drove/internal/api"
-	"github.com/drovehq/drove/internal/config"
-	"github.com/drovehq/drove/internal/event"
-	"github.com/drovehq/drove/internal/session"
-	"github.com/drovehq/drove/internal/store"
-	"github.com/drovehq/drove/internal/version"
+	"github.com/Duang777/drove/internal/adapter"
+	"github.com/Duang777/drove/internal/api"
+	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/version"
 )
 
 // Daemon 是常驻服务。

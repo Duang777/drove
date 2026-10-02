@@ -14,8 +14,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/drovehq/drove/internal/session"
-	"github.com/drovehq/drove/internal/store"
+	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/store"
 )
 
 // ErrDaemonUnreachable 表示 daemon 无法连接且无法自动拉起。

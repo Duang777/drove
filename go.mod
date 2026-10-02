@@ -1,4 +1,4 @@
-module github.com/drovehq/drove
+module github.com/Duang777/drove
 
 go 1.23.0
 

@@ -11,11 +11,11 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/drovehq/drove/internal/adapter"
-	"github.com/drovehq/drove/internal/agent"
-	"github.com/drovehq/drove/internal/event"
-	"github.com/drovehq/drove/internal/pty"
-	"github.com/drovehq/drove/internal/store"
+	"github.com/Duang777/drove/internal/adapter"
+	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/pty"
+	"github.com/Duang777/drove/internal/store"
 )
 
 // Status 是对外暴露的会话视图（供 daemon/api/CLI 使用）。

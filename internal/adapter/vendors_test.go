@@ -3,7 +3,7 @@ package adapter
 import (
 	"testing"
 
-	"github.com/drovehq/drove/internal/agent"
+	"github.com/Duang777/drove/internal/agent"
 )
 
 func TestRegistryDefaults(t *testing.T) {

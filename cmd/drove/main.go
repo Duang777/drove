@@ -11,11 +11,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/drovehq/drove/internal/client"
-	"github.com/drovehq/drove/internal/config"
-	"github.com/drovehq/drove/internal/event"
-	"github.com/drovehq/drove/internal/session"
-	"github.com/drovehq/drove/internal/version"
+	"github.com/Duang777/drove/internal/client"
+	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/version"
 )
 
 // exitCodes 语义化退出码。

@@ -1,6 +1,6 @@
 GO ?= go
 BIN := bin
-MODULE := github.com/drovehq/drove
+MODULE := github.com/Duang777/drove
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 
 .PHONY: all build build-cli build-daemon test vet lint fmt clean install help

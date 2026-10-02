@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/drovehq/drove/internal/agent"
+	"github.com/Duang777/drove/internal/agent"
 )
 
 // StateHint 是适配器对某行输出给出的状态提示。

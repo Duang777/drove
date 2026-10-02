@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/drovehq/drove/internal/config"
-	"github.com/drovehq/drove/internal/daemon"
+	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/daemon"
 )
 
 func main() {
