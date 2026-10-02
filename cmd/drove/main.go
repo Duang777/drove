@@ -4,10 +4,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -51,6 +54,7 @@ func newRootCmd() *cobra.Command {
 		newUpCmd(),
 		newPSCmd(),
 		newLogCmd(),
+		newSendCmd(),
 		newStopCmd(),
 		newVersionCmd(),
 	)
@@ -197,6 +201,74 @@ func newStopCmd() *cobra.Command {
 			fmt.Println("stopped", args[0])
 			return nil
 		},
+	}
+}
+
+func newSendCmd() *cobra.Command {
+	var fromStdin bool
+	cmd := &cobra.Command{
+		Use:   "send <agent-id> [text]",
+		Short: "向运行中的 Agent 发送输入",
+		Args: func(_ *cobra.Command, args []string) error {
+			if fromStdin {
+				if len(args) != 1 {
+					return errors.New("send with --stdin requires exactly one agent ID")
+				}
+				return nil
+			}
+			if len(args) != 2 {
+				return errors.New("send requires an agent ID and text, or --stdin")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			data, err := readSendInput(args, fromStdin, cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			c, err := newClient(ctx)
+			if err != nil {
+				return err
+			}
+			if err := c.SendInput(ctx, args[0], data); err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "sent %d bytes to %s\n", len(data), args[0])
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "从标准输入读取内容，不自动添加换行")
+	return cmd
+}
+
+func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, error) {
+	var data []byte
+	if fromStdin {
+		if len(args) != 1 {
+			return nil, errors.New("send with --stdin requires exactly one agent ID")
+		}
+		var err error
+		data, err = io.ReadAll(io.LimitReader(stdin, session.MaxInputBytes+1))
+		if err != nil {
+			return nil, fmt.Errorf("read input: %w", err)
+		}
+	} else {
+		if len(args) != 2 {
+			return nil, errors.New("send requires an agent ID and text, or --stdin")
+		}
+		data = []byte(args[1] + "\n")
+	}
+
+	switch {
+	case len(data) == 0:
+		return nil, session.ErrInputEmpty
+	case len(data) > session.MaxInputBytes:
+		return nil, fmt.Errorf("%w: %d bytes", session.ErrInputTooLarge, len(data))
+	case !utf8.Valid(data):
+		return nil, session.ErrInputNotUTF8
+	default:
+		return data, nil
 	}
 }
 

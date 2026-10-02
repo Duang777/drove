@@ -9,6 +9,7 @@
 - 命令树用 `spf13/cobra`；`root` 只挂子命令，不做业务。
 - `drove init` 生成默认配置到 `~/.drove/config.json`。
 - `drove up <vendor|command>` 启动一个 agent：默认 `interactive`，`--oneshot` 切换为单次执行；未知厂商名仍视为 generic 命令。
+- `drove send <id> <text>` 向运行中的 agent 发送一行输入；`--stdin` 保留标准输入的原始换行。
 - `drove ps` 列出全部会话；`drove log <id>` 回放事件流；`drove stop <id>` 停止（幂等）。
 - 每次命令先 `client.EnsureDaemon`：探测不可达时后台拉起 `droved`（日志 `~/.drove/drove.log`）并等待就绪。
 - `version` 子命令输出 `internal/version` 注入信息。

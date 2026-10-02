@@ -32,6 +32,7 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - 新会话会先持久化名称、厂商和运行模式，再进入状态机。
 - runner 支持 `interactive` 和 `oneshot`；新请求默认 interactive，旧事件缺少模式时按 oneshot 恢复。
 - Claude 与 Codex 的交互命令和单次执行命令由 adapter 统一选择。
+- REST 和 CLI 支持向已连接 PTY 发送受限 UTF-8 输入，输入正文不会写入审计事件。
 - oneshot 自然成功退出为 `done`；interactive、失败退出和主动停止为 `stopped`。
 - PTY 输出与退出回调在 goroutine 启动前固定，短进程不会越过 `starting -> working`。
 - daemon 按 API、会话、Hub、store 的依赖顺序关闭，并等待 PTY 回调结束。
@@ -42,7 +43,7 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 ### 尚未形成完整产品闭环
 
 - 没有可用的交互式 TUI。代码使用 Cobra，不包含 Bubble Tea 依赖。
-- API 没有输入注入或终端 resize 端点，Blocked agent 无法通过 Drove 恢复。
+- WebSocket 没有输入控制协议，API 也没有终端 resize 端点。
 - Web 控制台没有接入样式系统，现有 Tailwind 类不会生成 CSS。
 - Web 控制台没有可达的回放入口。
 - ACP 仍是文档中的预留项。
@@ -247,11 +248,15 @@ daemon 现在会在创建 API server 和监听端口前完成以下步骤：
 
 因此用户修改 `api_bind`、`event_buffer` 或 `db_path` 后，默认启动路径不会读取这些值。当前真正生效的默认覆盖只有 `DROVE_DATA_DIR`。
 
-### P0：交互闭环缺失
+### 已修复：REST 和 CLI 输入链路
 
-`session.Manager.Write` 和 `pty.Session.Resize` 已经存在，但 API、client、CLI 和 Web 都没有暴露对应操作。
+`POST /api/v1/agents/{id}/input` 和 `drove send` 现在调用
+`session.Manager.SendInput`，把完整 UTF-8 文本写入当前 daemon 持有的 PTY。
+普通命令参数会追加一个换行，`--stdin` 保留输入中的换行。
 
-adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 PTY 输入内容。此时只能绕过 Drove 操作原终端，而 daemon 模式没有暴露原终端。
+单次输入上限是 65536 字节。PTY 会完成整段写入或报告已经写入的字节数，同一会话的并发输入不会交错。成功写入后追加 `agent.input` 审计事件，payload 只包含版本和字节数，不保存输入正文。
+
+输入本身不改变 Agent 状态。`blocked -> working` 仍由后续 Detector 和 hook 信号负责。WebSocket 输入、resize 和 attach 也不在本阶段。
 
 ### 已修复：进程回调启动竞态
 
@@ -356,13 +361,13 @@ interactive，`drove up --oneshot` 保留旧的单次执行方式。adapter 负�
 
 ### 第二阶段：接通交互闭环
 
-增加输入与 resize 的 API、client 和 CLI/Web 调用。状态机还需要定义用户输入后从 `blocked` 回到 `working` 的触发规则。
+先完成 REST 和 CLI 输入，再为 WebSocket 输入与 resize 定义独立协议。状态机还需要由 Detector 定义用户输入后从 `blocked` 回到 `working` 的触发规则。
 
 验收条件：
 
-- 用户能启动一个等待 stdin 的 generic 命令。
-- 用户能通过 API 或 CLI 写入一行输入。
-- 输出进入事件日志。
+- [x] 用户能启动一个等待 stdin 的 generic 命令。
+- [x] 用户能通过 API 或 CLI 写入一行输入。
+- [x] 输出进入事件日志。
 - 状态从 `blocked` 回到 `working`，最后进入 `stopped`。
 
 ### 第三阶段：修复生命周期和并发

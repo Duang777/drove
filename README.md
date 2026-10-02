@@ -15,8 +15,17 @@ make build
 ./bin/drove init          # 初始化工作区与配置
 ./bin/drove up claude     # 起一个 Claude Code agent
 ./bin/drove ps            # 查看全部 agent 状态
+./bin/drove send <id> "继续" # 向运行中的 agent 发送一行输入
 ./bin/drove log <id>      # 回放某 agent 的事件流
 ```
+
+需要精确保留换行时，可从标准输入发送：
+
+```bash
+printf '继续\n' | ./bin/drove send <id> --stdin
+```
+
+输入审计只记录字节数，不保存输入正文。daemon 尚无认证，不要将监听地址暴露到不可信网络。
 
 ## 架构一览
 
