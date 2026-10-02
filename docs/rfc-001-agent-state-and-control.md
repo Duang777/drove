@@ -2,20 +2,22 @@
 
 - 状态：Draft
 - 日期：2026-10-03
+- 实现基线：`88d3148`
 - 作者：DD（AI 助手起草，待 Duang777 评审）
 - 相关 Issue：[#1](https://github.com/Duang777/drove/issues/1)（runner 交互模式）、[#2](https://github.com/Duang777/drove/issues/2)（hooks 状态权威）、[#3](https://github.com/Duang777/drove/issues/3)（Blocked 恢复）、[#4](https://github.com/Duang777/drove/issues/4)（输入注入）
+- 调研依据：[Phase 1 hooks 与 Detector 资料调研](next-phase-research.md)
 
 ## 1. 背景与动机
 
 Drove 的定位是"跨厂商 Agent 指挥台"：同时运行、观察、回放多个 AI coding agent，并实时识别每个 agent 的状态（Working / Blocked / Done / Idle），最终让人能"把它们往对的方向赶"。
 
-当前实现（v0.1）有三块是实的：状态机（transition 表）、事件 Hub、SQLite 事件溯源。但"识别"与"指挥"两块是虚的：
+当前实现有三块基础能力：状态机（transition 表）、事件 Hub、SQLite 事件溯源。Phase 0 和输入链路已经补齐了部分控制能力，但状态识别仍不可靠：
 
 1. 状态识别 = 英文子串匹配（`Classify`），`Error` 出现在普通输出里就误判 Blocked；进了 Blocked 永远出不来；Confidence 被忽略。
-2. runner 用的是 `claude --print` / `codex exec` 一次性模式，agent 跑一次就退出——状态机设计的 Working / Blocked / Idle 前提（agent 常驻）根本不存在。
-3. `Manager.Write` 写了但没有任何入口调用——只能看，不能指挥。
+2. runner 已支持 `interactive` 和 `oneshot`，新会话默认使用交互模式。
+3. REST 和 CLI 输入已经接通，WebSocket 输入尚未定义双向消息协议。
 
-本 RFC 提出一套统一架构，一次性解决 #1–#4。
+本 RFC 给出 #1 至 #4 的统一方向。后续实现继续按可独立验证的阶段交付。
 
 ## 2. 目标 / 非目标
 
@@ -46,16 +48,22 @@ Drove 照搬这套：hooks > 启发式，且同一时刻只有一个写入者（
 
 ### 3.2 Claude Code hooks：可直接用的权威信号
 
-- 配置位置（按优先级）：`managed-settings.json` → `~/.claude/settings.json` → `.claude/settings.json` → `.claude/settings.local.json` → plugin `hooks/hooks.json`。
-- 事件：`SessionStart`（matcher: startup / resume / clear / compact）、`SessionEnd`、`UserPromptSubmit`、`PreToolUse`（可阻断）、`PostToolUse`、`PermissionRequest`、`Notification`、`Stop`（可阻断）、`PreCompact` / `PostCompact`、`SubagentStart` / `SubagentStop`。
+- 官方文档在 2026-10-03 列出 33 个事件。Phase 1A 只订阅根会话状态需要的最小集合，不复制完整列表。
+- Claude Code 支持 `command`、`http`、`mcp_tool`、`prompt` 和 `agent` 五类 handler。Phase 1A 只使用两家都支持的 `command`。
+- user、project、local、managed、plugin、skill 和 subagent 都可以提供 hooks。不同 settings 层的 hooks 会合并，不是简单覆盖。
 - hook 以子进程运行，stdin 收到 JSON：`session_id`、`prompt_id`、`transcript_path`、`cwd`、`permission_mode`、`hook_event_name` 等；退出码 0 = 放行、2 = 阻断。
-- 对 drove 有用的映射：`UserPromptSubmit` → 新 turn 开始；`PreToolUse` / `PostToolUse` → 活跃心跳；`PermissionRequest` / `Notification` → 等待用户（Blocked）；`Stop` → turn 结束（Idle）；`SessionEnd` → 进程结束。
+- 所有 matching hooks 并行运行。Drove 收到 `Stop` 时，另一个 hook 仍可能阻止该次 Stop，因此 `Stop` 只能先生成可取消的 Idle 候选。
+- workspace trust 和 `allowManagedHooksOnly` 都可能让已配置的 hook 不执行。Drove 必须以收到当前会话的合法 signal 作为 hook 已激活的证据。
+- `Notification` 不能统一映射为 Blocked。只有 `permission_prompt`、`elicitation_dialog`、`elicitation_url_dialog`、`agent_needs_input` 和 `quota_auto_resume_stale` 等明确等待人工的类型才是 Blocked 候选；`idle_prompt` 是 Idle 候选。
 
 ### 3.3 Codex hooks：已对齐 Claude 模型
 
-- 11 个事件，与 Claude Code 基本对齐：`SessionStart`、`SessionEnd`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PermissionRequest`、`PreCompact`、`PostCompact`、`SubagentStart`、`SubagentStop`、`Stop`。
-- 配置：项目 `.codex/hooks.json` 或全局 `~/.codex/hooks.json`（`CODEX_HOME` 可覆盖）；同样是 matcher + JSON stdin 机制（codex-cli 0.149.0 已验证）。
-- 注意：非托管 hook 在全新安装上首次运行需要用户信任确认——`drove up` 时要把这一步暴露给用户，不能静默失败。
+- OpenAI 官方源码快照 `44dd77b` 定义 12 个事件：`PreToolUse`、`PermissionRequest`、`PostToolUse`、`PreCompact`、`PostCompact`、`SessionStart`、`SessionEnd`、`UserPromptSubmit`、`SubagentStart`、`SubagentStop`、`Stop` 和 `Interrupt`。
+- Codex 解析 `command`、`mcp_tool`、`prompt` 和 `agent`。当前官方文档与源码都支持执行 `command` 和 `mcp_tool`，并跳过 `prompt` 和 `agent`。
+- 配置来自活动配置层旁的 `hooks.json` 或 `config.toml` 内联 `[hooks]`。常用位置包括全局 `~/.codex/` 和项目 `<repo>/.codex/`。
+- hooks 默认启用。正式 feature key 是 `hooks`，`codex_hooks` 只作为弃用别名保留。
+- 项目配置受 project trust 约束。非 managed hook 还要按定义 hash 单独确认；定义变化后会停止执行，直到用户重新确认。
+- Drove 不得自动使用 `--dangerously-bypass-hook-trust`，也不能把没有 signal 解释为 Idle。
 
 ### 3.4 ACP：方向正确，但现在不做
 
@@ -73,16 +81,19 @@ Drove 照搬这套：hooks > 启发式，且同一时刻只有一个写入者（
 ### 4.2 信号分层（Signal hierarchy）
 
 ```
-L0  hooks 生命周期事件      （权威，immediate）
-L1  进程/协议事件            （权威，immediate：进程退出、PTY EOF）
-L2  启发式 Classify         （fallback，需去抖 + 置信度阈值）
-L3  超时推断                （最低优先级，仅用于 Idle 推断）
+L0  进程事实                 （终态权威：用户停止、daemon 关闭、进程退出）
+L1  已确认激活的 hooks       （turn 与人工等待权威）
+L2  启发式 Classify          （fallback，需去抖 + 置信度阈值）
+L3  超时推断                 （最低优先级，仅生成 Idle 候选）
 ```
 
 原则：
 
-- L0 / L1 信号直接驱动状态机；L2 信号必须经过去抖（连续 N 次一致 hint 或 M 秒窗口）且 confidence ≥ 阈值；
-- 同一会话的状态机只有一个写入者：Detector。hooks 回调、PTY 回调都只向 Detector 投递信号，不直接改状态。
+- 进程事实决定终态。hooks 不得把仍存活的 interactive 进程标记为 Done 或 Stopped。
+- hook 必须由当前会话收到合法 signal 后才算激活。配置存在不代表 hook 可执行。
+- hook 激活后，启发式只保留证据，不再写状态。hook 不可用时，启发式信号必须经过去抖并达到置信度阈值。
+- 同一会话只有一个 Detector 提出状态迁移。hooks、PTY 和 timer 回调都只向 Detector 投递信号。
+- 全局事件日志另有一个提交器，统一分配序号、落库和发布，避免不同会话写出乱序事件。
 
 ### 4.3 Detector：信号融合
 
@@ -90,88 +101,112 @@ L3  超时推断                （最低优先级，仅用于 Idle 推断）
 
 ```go
 type Signal struct {
-    Source     string    // "hook" | "process" | "heuristic" | "timeout"
-    Event      string    // "Stop" | "UserPromptSubmit" | ...
-    Confidence float64   // 0..1
-    Evidence   string    // 触发证据（hook payload 摘要 / 匹配到的行）
-    At         time.Time
+    Version         int
+    Vendor          string
+    VendorEvent     string
+    Scope           string    // "root" | "subagent"
+    VendorSessionID string
+    VendorTurnID    string
+    Notification    string
+    Confidence      float64   // 0..1
+    OccurredAt      time.Time // 仅作证据
+    ReceivedAt      time.Time // 排序依据
+    DeliveryID      string    // 幂等键
 }
 ```
 
 - Detector 维护每个 session 的信号流，按分层规则输出状态迁移建议；
 - 状态机（`internal/agent`）保持为唯一的状态权威，只接受 Detector 的迁移指令；
-- 每次迁移写入事件日志时携带 `source` / `evidence` / `confidence`，状态页可解释"为什么是 Blocked"。
+- adapter 负责把厂商 JSON 压缩成 `Signal`，Detector 不解析 Claude 或 Codex 字段；
+- prompt、tool input、transcript、assistant message 和原始厂商 JSON 不得进入事件日志；
+- signal 和派生的状态事件必须在同一 SQLite batch 中提交。提交成功后才能更新内存状态并按序发布到 Hub；
+- 状态页只展示脱敏后的 source、event、confidence 和枚举证据。
 
 状态语义（精确定义）：
 
 | 状态 | 定义 | 进入条件 |
 |---|---|---|
-| Working | 有活跃 turn | UserPromptSubmit / PreToolUse / 启发式高置信 |
-| Blocked | 等待用户决策 / 输入 | PermissionRequest / Notification / 启发式（去抖后） |
-| Idle | 进程存活，无活跃 turn | Stop hook / turn 结束 |
-| Done | 任务完成 | 见 §7 开放问题（默认：oneshot 正常退出；interactive 需显式信号） |
+| Working | 有活跃 turn | 根会话 UserPromptSubmit、工具活动或启发式高置信 |
+| Blocked | 等待用户决策或输入 | PermissionRequest、人工等待 Notification、Elicitation 或启发式去抖 |
+| Idle | 进程存活，无活跃 turn | Stop、Interrupt 或 idle_prompt 的确认窗口结束 |
+| Done | oneshot 任务正常退出 | interactive 不自动进入 Done |
 | Stopped | 进程已退出 | 进程退出事件 |
 
-Blocked 恢复（对应 #3）：Blocked 后收到 Working 类信号（UserPromptSubmit、新一轮 PreToolUse、或持续新输出）→ 迁回 Working。
+Blocked 恢复（对应 #3）：Blocked 后收到根会话 `UserPromptSubmit`、后续工具活动或已去抖的持续输出时，迁回 Working。
 
 ### 4.4 Hook 安装与会话关联
 
-关键问题：hook 收到的是 agent 自己的 `session_id`，不是 drove 的 session id。解法是环境变量——drove spawn agent 进程时注入：
+hook 收到的是厂商 session ID，不是 Drove agent ID。Drove 启动进程时注入：
 
 ```
-DROVE_SESSION_ID=<drove session id>
-DROVE_CALLBACK_URL=http://127.0.0.1:<port>/api/v1/agents/<id>/signal
+DROVE_AGENT_ID=<drove agent id>
+DROVE_SIGNAL_URL=http://127.0.0.1:<port>/api/v1/agents/<id>/signal
+DROVE_SIGNAL_TOKEN=<per-session random token>
 ```
 
-- drove 提供 `drove hook` 子命令：从 stdin 读 hook JSON，附上 env 里的会话信息，POST 到 daemon。hook 配置里只需写 `"command": "drove hook"`——单二进制，无外部脚本依赖。
-- `drove up` 时把 drove 的 hooks **合并**写入用户 / 项目配置（claude：`~/.claude/settings.json` 或项目 `.claude/settings.json`；codex：`~/.codex/hooks.json`），用可识别的 command 标记以便清理；绝不覆盖用户已有配置。
-- 会话结束时提供清理（`drove up --no-hooks` 可跳过安装）。
+- `drove hook --vendor <vendor>` 从 stdin 读取厂商 JSON，附上环境变量中的关联信息和 `delivery_id`，再 POST 到 daemon。
+- Phase 1A 只提供手工配置样例或隔离测试配置，不修改用户或项目配置。
+- hook 策略分为 `off`、`auto` 和 `required`。`auto` 允许在 hook 不可用时降级，`required` 在未观察到合法 signal 时明确报错。
+- Phase 1B 再提供显式的 `drove hooks install` 与 `uninstall`。安装器必须结构化合并 JSON 或 TOML、原子写入、记录所有权，并且只删除 Drove 拥有的节点。
+- Drove 不代替用户接受 workspace、project 或 hook trust。
 
 ### 4.5 输入注入（对应 #4）
 
-- API：`POST /api/v1/agents/{id}/input`，body `{"data": "..."}`，写入 PTY stdin；事件日志记 `agent.input`。
-- CLI：`drove send <id> "prompt..."`，支持 `--stdin` 管道。
-- WebSocket：双向消息 `{"type":"input","data":"..."}`。
-- 语义：经 PTY stdin 注入的输入对 agent 而言就是用户输入，会正常触发 `UserPromptSubmit` hook → 状态机自动回到 Working，链路自洽。
-- 后续：`drove attach <id>`（全交互接管）另开 RFC / issue。
+- REST `POST /api/v1/agents/{id}/input` 和 CLI `drove send` 已在 `88d3148` 完成。
+- `agent.input` 只记录版本和字节数，不保存输入正文。
+- 输入本身不改变状态。Phase 1 的 `UserPromptSubmit` signal 负责把 Blocked 或 Idle 恢复为 Working。
+- WebSocket 双向输入仍未实现，Issue #4 继续保持打开。消息 schema、错误响应、背压和连接关闭语义必须先进入独立 spec。
+- `drove attach <id>` 的全交互接管另开 RFC 或 issue。
 
 ### 4.6 事件模型扩展
 
-新增事件类型（都进 SQLite，照常回放）：
+事件类型都进入 SQLite 并支持回放：
 
-- `agent.signal`：收到的原始信号（含 source / event / confidence / evidence）
-- `agent.input`：注入的输入（可节选，避免日志爆炸）
-- 状态迁移事件 payload 增加 `source`、`evidence`、`confidence` 字段。
+- `agent.input` 已实现，payload 只包含版本和字节数。
+- `agent.signal` 待实现，只保存 adapter 白名单中的枚举、ID、布尔值和长度摘要，不保存厂商原始 JSON。
+- 状态迁移事件 payload 增加 `source`、`event`、`confidence` 和脱敏证据。
+
+所有事件生产者必须经过一个全局提交器。提交器按接收顺序分配序号，使用
+`Store.AppendEvents` 写入连续 batch，提交成功后更新内存投影，最后按序发布到
+Hub。持久化失败时不得更新内存或发布未持久化事件。
 
 ## 5. 分阶段实施
 
-- **Phase 0**（#1）：runner `mode` 字段 + `--oneshot`；interactive 为默认。验收：`drove up claude` 常驻。
-- **Phase 1**（#2、#3）：`internal/detect` 包 + 信号分层 + `drove hook` 子命令 + `drove up` 自动安装 hooks（claude / codex）；Blocked 恢复逻辑。验收：Stop / UserPromptSubmit 驱动状态准确；误判可恢复。
-- **Phase 2**（#4）：input API + `drove send` + WS 双向。验收：send 后 agent 响应且状态机回到 Working。
-- **Phase 3**：ANSI 剥离（#5）、daemon 重启恢复（#6）。
+- **Phase 0，已完成**（#1）：runner `mode` 字段、`--oneshot` 和 interactive 默认值。
+- **Phase 1A，待实施**（#2、#3）：事件 reader-first 兼容、全局提交器、`internal/detect`、signal endpoint、`drove hook`、adapter 规范化、手工 hook 配置和 Blocked 恢复。
+- **Phase 1B，待实施**：显式 hook 安装、幂等更新、精确卸载和 trust 状态展示。
+- **Phase 2，部分完成**（#4）：REST 和 CLI 输入已完成；WebSocket 双向输入待独立 spec。
+- **Phase 3，部分完成**：ANSI 处理（#5）待实施；daemon 会话投影恢复（#6 短期目标）已完成。
 
 ## 6. 安全考虑
 
-- `/signal` 回调端点只接受 localhost，且校验 `DROVE_SESSION_ID` 与 token（daemon 启动时生成的随机 token，经 env 传给 agent 进程，hook 继承）。
+- `/signal` 回调端点只接受 loopback，并校验 agent ID 和每会话随机 token。hook 通过继承的环境变量取得这些值。
+- token 只防止会话误串和偶然调用，不抵御 agent 本身或同一 OS 用户下的恶意进程。
+- signal endpoint 限制 body 大小，严格解析 JSON，并拒绝无效 UTF-8、未知字段、错误 vendor、已 detach 会话和过期 token。
 - input 注入在开放远程访问前必须加认证；本 RFC 范围内 daemon 仍只绑 `127.0.0.1`。
-- hook 安装必须显式合并用户配置；Codex 的首次信任提示要透出给用户。
+- hook 安装由显式命令触发，不能静默覆盖用户配置或绕过 Claude、Codex 的 trust 流程。
+- signal 持久化必须脱敏，不保存 prompt、tool input、transcript 或 assistant message。
 
 ## 7. 开放问题
 
-1. **Done 的权威判定**：turn 结束（Stop）≠ 任务完成。Phase 1 暂定：oneshot 正常退出 → Done；interactive 下 Done 需显式信号（`drove done <id>` 或未来 ACP `state_update`）。是否需要在 Stop hook 里做 transcript 语义判断？（倾向不做，保持 hook 轻量。）
-2. **hook 配置的生命周期**：会话结束时是否移除 drove 安装的 hooks？倾向：默认保留（幂等合并），`drove hooks uninstall` 提供清理。
-3. **无 hook 环境的 Idle 推断**：纯启发式下，输出静默多久算 Idle？阈值可配置，默认 5 分钟，且仅在无 L0 / L1 信号时生效。
-4. **Windows PTY**：`creack/pty` 不支持 Windows；本 RFC 不覆盖，interactive 模式暂只支持 unix。
+1. **Stop 确认窗口**：同一事件的 matching hooks 并行运行。spec 必须确定 Idle 候选的等待时间、取消信号和可注入时钟。
+2. **无 hook 环境的 Idle 推断**：纯启发式下，输出静默多久才生成 Idle 候选，以及哪些活动取消候选。
+3. **厂商版本探测**：Codex hooks 仍在快速变化。spec 必须定义最低版本、能力探测失败和不支持事件的降级行为。
+4. **Windows PTY**：`creack/pty` 不支持 Windows；本 RFC 不覆盖，interactive 模式暂只支持 Unix。
 
 ## 附录 A：hook 事件 → drove 状态映射（初版）
 
 | Hook 事件 | 信号等级 | 目标状态 | 备注 |
 |---|---|---|---|
-| SessionStart | L0 | —（确认 Starting→Working） | 仅确认，不迁移 |
-| UserPromptSubmit | L0 | Working | 新 turn 开始 |
-| PreToolUse / PostToolUse | L0 | Working | 活跃心跳 |
-| PermissionRequest | L0 | Blocked | 等待用户决策 |
-| Notification | L0 | Blocked | 需要用户注意 |
-| Stop | L0 | Idle | turn 结束 |
-| SessionEnd | L1 | Stopped | 进程结束 |
-| SubagentStart / Stop | L0 | Working | 视为活跃 |
+| SessionStart | L1 | 不迁移 | 证明当前会话的 hook 已激活 |
+| UserPromptSubmit | L1 | Working | 新 turn 开始，也可解除 Blocked |
+| PreToolUse、PostToolUse | L1 | Working | 根会话活跃，也可解除 Blocked |
+| PermissionRequest | L1 | Blocked 候选 | 只在确实等待人工时采用 |
+| 人工等待 Notification | L1 | Blocked 候选 | 只接受明确的 matcher allowlist |
+| idle_prompt | L1 | Idle 候选 | 不是 Blocked |
+| Stop | L1 | Idle 候选 | 等待确认窗口，后续活动可取消 |
+| Interrupt | L1 | Idle 候选 | Codex turn 中断，不是进程退出 |
+| SessionEnd | L1 | 不迁移 | 记录 signal，终态由进程事实决定 |
+| SubagentStart、SubagentStop | L1 | 根会话保持 Working | 子代理停止不代表根会话 Idle |
+| 进程正常退出 | L0 | Done 或 Stopped | oneshot 为 Done，interactive 为 Stopped |
+| 用户停止、daemon 关闭、异常退出 | L0 | Stopped | 终态权威 |
