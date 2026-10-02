@@ -7,6 +7,7 @@ const KIND_STYLE: Record<string, string> = {
   output: 'text-gray-700',
   error: 'text-red-600',
   session_lifecycle: 'text-blue-600',
+  'agent.input': 'text-cyan-600',
 }
 
 interface Props {

@@ -22,6 +22,22 @@ func TestNewSessionLifecycleCarriesEncodedPayload(t *testing.T) {
 	}
 }
 
+func TestNewAgentInputCarriesRedactedPayload(t *testing.T) {
+	ev := NewAgentInput(8, "session-1", "agent-1", `{"version":1,"bytes":9}`)
+
+	if ev.Seq != 8 ||
+		ev.Type != TypeAgentInput ||
+		ev.SessionID != "session-1" ||
+		ev.AgentID != "agent-1" ||
+		ev.Reason != "accepted" ||
+		ev.Payload != `{"version":1,"bytes":9}` {
+		t.Fatalf("agent input event = %+v", ev)
+	}
+	if ev.Timestamp.IsZero() {
+		t.Fatal("agent input timestamp is zero")
+	}
+}
+
 func TestHubFanOut(t *testing.T) {
 	h := NewHub(0)
 	s1 := h.Subscribe(16)

@@ -200,6 +200,33 @@ func TestRecoveryProjectorIgnoresOutputAndErrorOnlySessions(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorIgnoresInputOnlySessions(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	if err := projector.Apply(store.EventRow{
+		Seq:       1,
+		Timestamp: base,
+		Type:      string(event.TypeAgentInput),
+		SessionID: "orphan",
+		AgentID:   "orphan",
+		Reason:    "accepted",
+		Payload:   `{"version":1,"bytes":9}`,
+	}); err != nil {
+		t.Fatalf("apply input: %v", err)
+	}
+
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if len(plan.Snapshots) != 0 || len(plan.Reconciliation) != 0 {
+		t.Fatalf("plan = %+v, want no sessions", plan)
+	}
+	if plan.Report.ScannedEvents != 1 || plan.Report.Sessions != 0 || plan.Report.LastSeq != 1 {
+		t.Fatalf("report = %+v", plan.Report)
+	}
+}
+
 func TestRecoveryProjectorStateChainCompatibility(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -364,8 +391,18 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "empty session ID",
 		},
 		{
+			name:    "empty input session",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentInput)}},
+			wantErr: "empty session ID",
+		},
+		{
 			name:    "mismatched agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeOutput), SessionID: "s1", AgentID: "a2"}},
+			wantErr: "does not match",
+		},
+		{
+			name:    "mismatched input agent",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentInput), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
 		},
 		{

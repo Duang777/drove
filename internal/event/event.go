@@ -21,6 +21,8 @@ const (
 	TypeError Type = "error"
 	// TypeSessionLifecycle 表示会话创建/销毁。
 	TypeSessionLifecycle Type = "session_lifecycle"
+	// TypeAgentInput 表示已写入 Agent PTY 的脱敏输入审计。
+	TypeAgentInput Type = "agent.input"
 )
 
 // Event 是不可变事件。所有字段导出供序列化，但外部不得修改。
@@ -85,6 +87,19 @@ func NewSessionLifecycle(seq uint64, sessionID, agentID, reason, payload string)
 		SessionID: sessionID,
 		AgentID:   agentID,
 		Reason:    reason,
+		Payload:   payload,
+	}
+}
+
+// NewAgentInput 构造已写入 Agent PTY 的脱敏输入审计事件。
+func NewAgentInput(seq uint64, sessionID, agentID, payload string) Event {
+	return Event{
+		Seq:       seq,
+		Timestamp: time.Now().UTC(),
+		Type:      TypeAgentInput,
+		SessionID: sessionID,
+		AgentID:   agentID,
+		Reason:    "accepted",
 		Payload:   payload,
 	}
 }

@@ -47,6 +47,7 @@ export type EventType =
   | 'output'
   | 'error'
   | 'session_lifecycle'
+  | 'agent.input'
 
 /** 实时事件（Go: event.Event）。 */
 export interface Event {

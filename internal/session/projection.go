@@ -81,6 +81,11 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 		return p.applyState(row)
 	case event.TypeError:
 		return p.applyError(row)
+	case event.TypeAgentInput:
+		if row.SessionID == "" {
+			return projectionError(row, "input event has empty session ID")
+		}
+		return validateAgentID(row)
 	case event.TypeOutput:
 		if row.SessionID == "" {
 			return nil
