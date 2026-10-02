@@ -5,7 +5,6 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -30,21 +29,27 @@ type Config struct {
 	Env []string
 	// Dir 是工作目录；空则继承当前目录。
 	Dir string
+	// OnOutput 在每行输出可用时被调用。回调必须保持非阻塞。
+	OnOutput func(line string)
+	// OnExit 在进程退出后被调用一次。
+	OnExit func(info ExitInfo)
 }
 
 // Session 是一个运行中的 PTY 会话。
-// 用法：Start -> Write（注入输入）；OnOutput（读取回调）；Close / Wait。
+// 用法：Start -> Write（注入输入）-> Close / Wait。
 type Session struct {
-	mu sync.Mutex
+	mu        sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
 
 	cmd    *exec.Cmd
 	ptmx   *os.File
 	closed bool
 
-	// OnOutput 在每行输出可用时被调用（非阻塞约定：回调内不得阻塞）。
-	OnOutput func(line string)
-	// OnExit 在进程退出后被调用。
-	OnExit func(info ExitInfo)
+	onOutput func(line string)
+	onExit   func(info ExitInfo)
+	readDone chan struct{}
+	done     chan struct{}
 
 	// WaitCh 返回进程退出信息（Close 后仍可读取一次）。
 	WaitCh chan ExitInfo
@@ -71,9 +76,13 @@ func Start(cfg Config) (*Session, error) {
 	}
 
 	s := &Session{
-		cmd:    cmd,
-		ptmx:   ptmx,
-		WaitCh: make(chan ExitInfo, 1),
+		cmd:      cmd,
+		ptmx:     ptmx,
+		onOutput: cfg.OnOutput,
+		onExit:   cfg.OnExit,
+		readDone: make(chan struct{}),
+		done:     make(chan struct{}),
+		WaitCh:   make(chan ExitInfo, 1),
 	}
 
 	// 设置终端行数/列数（默认 120x40，可被上层调整）。
@@ -86,21 +95,15 @@ func Start(cfg Config) (*Session, error) {
 
 // readLoop 持续读取 PTY 输出并按行回调。Close 关闭 ptmx 后可中断。
 func (s *Session) readLoop() {
+	defer close(s.readDone)
+
 	r := bufio.NewReader(s.ptmx)
 	for {
 		line, err := r.ReadString('\n')
-		if line != "" {
-			if s.OnOutput != nil {
-				s.OnOutput(line)
-			}
+		if line != "" && s.onOutput != nil {
+			s.onOutput(line)
 		}
 		if err != nil {
-			if err != io.EOF && !errors.Is(err, os.ErrClosed) {
-				// 读取异常：仍尝试将残余行上抛后退出。
-				if line != "" && s.OnOutput != nil {
-					s.OnOutput(line)
-				}
-			}
 			return
 		}
 	}
@@ -119,13 +122,15 @@ func (s *Session) waitLoop() {
 	} else {
 		info.Code = 0
 	}
+	if s.onExit != nil {
+		s.onExit(info)
+	}
 	select {
 	case s.WaitCh <- info:
 	default:
 	}
-	if s.OnExit != nil {
-		s.OnExit(info)
-	}
+	<-s.readDone
+	close(s.done)
 }
 
 // Write 向 agent 注入输入。
@@ -162,22 +167,24 @@ func (s *Session) PID() int {
 
 // Close 关闭 PTY，中断读取，并终止子进程（若仍存活）。
 func (s *Session) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrClosed
-	}
-	s.closed = true
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		closeErr := s.ptmx.Close()
+		var killErr error
+		if s.cmd.Process != nil {
+			killErr = s.cmd.Process.Kill()
+		}
+		s.mu.Unlock()
 
-	// 关闭主从端，触发 readLoop 退出。
-	err := s.ptmx.Close()
+		<-s.done
 
-	// 若进程仍在运行则终止。
-	if s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	if err != nil && !errors.Is(err, os.ErrClosed) {
-		return fmt.Errorf("pty: close: %w", err)
-	}
-	return nil
+		if closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
+			s.closeErr = errors.Join(s.closeErr, fmt.Errorf("pty: close master: %w", closeErr))
+		}
+		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			s.closeErr = errors.Join(s.closeErr, fmt.Errorf("pty: kill process: %w", killErr))
+		}
+	})
+	return s.closeErr
 }

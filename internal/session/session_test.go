@@ -455,6 +455,97 @@ func TestStartRejectsInvalidGenericRequestWithoutHistory(t *testing.T) {
 	}
 }
 
+func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
+	manager, _ := newTestManager(t)
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Name:    "immediate-agent",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "printf fast"},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	t.Cleanup(func() {
+		if stopErr := manager.Stop(id); stopErr != nil {
+			t.Errorf("stop immediate agent: %v", stopErr)
+		}
+	})
+
+	var rows []store.EventRow
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rows, err = manager.Replay(status.AgentID)
+		if err != nil {
+			t.Fatalf("replay: %v", err)
+		}
+		hasWorking := false
+		hasOutput := false
+		hasStopped := false
+		for _, row := range rows {
+			hasWorking = hasWorking ||
+				(row.Type == string(event.TypeStateChanged) &&
+					row.From == string(agent.StateStarting) &&
+					row.To == string(agent.StateWorking))
+			hasOutput = hasOutput ||
+				(row.Type == string(event.TypeOutput) && row.Payload == "fast")
+			hasStopped = hasStopped ||
+				(row.Type == string(event.TypeStateChanged) &&
+					row.To == string(agent.StateStopped))
+		}
+		if hasWorking && hasOutput && hasStopped {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"timed out waiting for working, output, and stopped events: %+v",
+				rows,
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	workingIndex := -1
+	outputIndex := -1
+	stoppedIndex := -1
+	outputCount := 0
+	for i, row := range rows {
+		switch {
+		case row.Type == string(event.TypeStateChanged) &&
+			row.From == string(agent.StateStarting) &&
+			row.To == string(agent.StateWorking):
+			workingIndex = i
+		case row.Type == string(event.TypeOutput) && row.Payload == "fast":
+			outputIndex = i
+			outputCount++
+		case row.Type == string(event.TypeStateChanged) &&
+			row.To == string(agent.StateStopped):
+			stoppedIndex = i
+		}
+	}
+	if workingIndex < 0 || outputIndex < 0 || stoppedIndex < 0 {
+		t.Fatalf(
+			"event indexes: working=%d output=%d stopped=%d rows=%+v",
+			workingIndex,
+			outputIndex,
+			stoppedIndex,
+			rows,
+		)
+	}
+	if outputCount != 1 {
+		t.Fatalf("output event count = %d, want 1", outputCount)
+	}
+	if workingIndex >= outputIndex || workingIndex >= stoppedIndex {
+		t.Fatalf(
+			"working event index %d must precede output %d and stopped %d",
+			workingIndex,
+			outputIndex,
+			stoppedIndex,
+		)
+	}
+}
+
 func newTestManager(t *testing.T) (*Manager, *store.Store) {
 	t.Helper()
 

@@ -171,11 +171,20 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, err
 	}
 
-	// 3. 创建 PTY 会话。
+	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
+	callbacksReady := make(chan struct{})
 	sess, err := pty.Start(pty.Config{
 		Command: cmdName,
 		Args:    cmdArgs,
 		Dir:     req.Dir,
+		OnOutput: func(line string) {
+			<-callbacksReady
+			m.onOutput(id, line, entry)
+		},
+		OnExit: func(info pty.ExitInfo) {
+			<-callbacksReady
+			m.onExit(id, info)
+		},
 	})
 	if err != nil {
 		startErr := fmt.Errorf("session: start pty: %w", err)
@@ -185,19 +194,18 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, startErr
 	}
 
-	sess.OnOutput = func(line string) { m.onOutput(id, line, entry) }
-	sess.OnExit = func(info pty.ExitInfo) { m.onExit(id, info) }
-
 	m.mu.Lock()
 	m.sessions[id] = sess
 	m.mu.Unlock()
 
 	// 4. 状态推进：进程活着 -> Working。
 	if err := a.Transition(agent.StateWorking, "process started"); err != nil {
+		close(callbacksReady)
 		_ = sess.Close()
 		m.cleanup(id)
 		return nil, err
 	}
+	close(callbacksReady)
 
 	return m.Status(id)
 }

@@ -7,7 +7,8 @@
 ## 关键设计
 
 - `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→*Session）、event Hub、store、adapter Registry。
-- `Start(ctx, req)`：按 vendor 取适配器 → 构造 agent → 创建 PTY → 启动命令 → 注册状态变更钩子（把迁移落库 + 发布事件）→ 输出按行切分后发布 Output 事件 → 进程退出时迁移 Stopped。
+- `Start(ctx, req)`：按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
+- PTY 回调在启动前注册，但通过单次 ready channel 等待会话登记完成，防止短进程的输出或退出越过 `starting -> working`。
 - `Replay(sessionID)`：从 store 读取事件流供回放（CLI `log` 命令 / API）。
 - 状态决策：优先采纳适配器 hint；结合"进程是否存活"（存活→Working，退出→Stopped/Done）兜底，防止误判。
 
