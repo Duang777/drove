@@ -3,6 +3,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -44,6 +45,12 @@ type StartRequest struct {
 	Dir string
 }
 
+type createdPayload struct {
+	Version int    `json:"version"`
+	Name    string `json:"name"`
+	Vendor  string `json:"vendor"`
+}
+
 // Manager 是会话编排入口。
 type Manager struct {
 	reg   *adapter.Registry
@@ -73,7 +80,17 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	}
 	entry := m.reg.For(req.Vendor)
 
-	// 1. 构造 agent（Starting 态）。
+	// 1. 在创建持久化会话前解析并校验命令。
+	cmdName, cmdArgs := entry.Runner.Command()
+	if req.Command != "" {
+		cmdName = req.Command
+		cmdArgs = req.Args
+	}
+	if cmdName == "" {
+		return nil, errors.New("session: generic vendor requires explicit command")
+	}
+
+	// 2. 构造 agent 并先持久化会话元数据。
 	id := agent.ID(uuid.NewString())
 	if req.Name == "" {
 		req.Name = req.Vendor + "-" + string(id)[:8]
@@ -83,23 +100,29 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		agent.WithVendor(req.Vendor),
 		agent.WithStateChangeHook(m.onStateChange),
 	)
-	if err := a.Transition(agent.StateStarting, "session start"); err != nil {
-		return nil, err
+	payload, err := json.Marshal(createdPayload{
+		Version: 1,
+		Name:    req.Name,
+		Vendor:  req.Vendor,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("session: encode creation metadata: %w", err)
 	}
+	if err := m.persistAndPublish(event.NewSessionLifecycle(
+		0,
+		string(id),
+		string(id),
+		"created",
+		string(payload),
+	)); err != nil {
+		return nil, fmt.Errorf("session: persist creation: %w", err)
+	}
+
 	m.mu.Lock()
 	m.agents[id] = a
 	m.mu.Unlock()
-
-	// 2. 决定命令。
-	cmdName, cmdArgs := entry.Runner.Command()
-	if req.Command != "" {
-		cmdName = req.Command
-		cmdArgs = req.Args
-	}
-	if cmdName == "" {
-		// generic 且未提供命令：回滚并报错。
-		m.cleanup(id)
-		return nil, errors.New("session: generic vendor requires explicit command")
+	if err := a.Transition(agent.StateStarting, "session start"); err != nil {
+		return nil, err
 	}
 
 	// 3. 创建 PTY 会话。
@@ -109,8 +132,11 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		Dir:     req.Dir,
 	})
 	if err != nil {
-		m.cleanup(id)
-		return nil, fmt.Errorf("session: start pty: %w", err)
+		startErr := fmt.Errorf("session: start pty: %w", err)
+		a.SetError(startErr.Error())
+		m.persistAndPublish(event.NewError(0, string(id), string(id), startErr.Error()))
+		_ = a.Transition(agent.StateStopped, "startup failed")
+		return nil, startErr
 	}
 
 	sess.OnOutput = func(line string) { m.onOutput(id, line, entry) }
@@ -265,7 +291,7 @@ func (m *Manager) onExit(id agent.ID, info pty.ExitInfo) {
 }
 
 // persistAndPublish 先分配全局序号、落库（保证回放一致），再发布到 Hub。
-func (m *Manager) persistAndPublish(ev event.Event) {
+func (m *Manager) persistAndPublish(ev event.Event) error {
 	ev.Seq = m.hub.NextSeq()
 	if err := m.store.AppendEvent(store.EventRow{
 		Seq:       ev.Seq,
@@ -280,9 +306,10 @@ func (m *Manager) persistAndPublish(ev event.Event) {
 	}); err != nil {
 		// 落库失败仍发布，但记录错误事件便于审计。
 		m.hub.Publish(event.NewError(0, ev.SessionID, ev.AgentID, "persist failed: "+err.Error()))
-		return
+		return fmt.Errorf("persist event seq %d: %w", ev.Seq, err)
 	}
 	m.hub.Publish(ev)
+	return nil
 }
 
 // agent 返回 agent 实例。

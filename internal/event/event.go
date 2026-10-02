@@ -34,7 +34,7 @@ type Event struct {
 	From   string `json:"from,omitempty"`
 	To     string `json:"to,omitempty"`
 	Reason string `json:"reason,omitempty"`
-	// Payload 承载 TypeOutput / TypeError 的具体内容。
+	// Payload 承载具体事件类型定义的内容。
 	Payload string `json:"payload,omitempty"`
 }
 
@@ -77,7 +77,7 @@ func NewError(seq uint64, sessionID, agentID, message string) Event {
 }
 
 // NewSessionLifecycle 构造会话生命周期事件。
-func NewSessionLifecycle(seq uint64, sessionID, agentID, reason string) Event {
+func NewSessionLifecycle(seq uint64, sessionID, agentID, reason, payload string) Event {
 	return Event{
 		Seq:       seq,
 		Timestamp: time.Now().UTC(),
@@ -85,6 +85,7 @@ func NewSessionLifecycle(seq uint64, sessionID, agentID, reason string) Event {
 		SessionID: sessionID,
 		AgentID:   agentID,
 		Reason:    reason,
+		Payload:   payload,
 	}
 }
 

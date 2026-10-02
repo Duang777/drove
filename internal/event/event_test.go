@@ -5,6 +5,22 @@ import (
 	"time"
 )
 
+func TestNewSessionLifecycleCarriesEncodedPayload(t *testing.T) {
+	ev := NewSessionLifecycle(7, "session-1", "agent-1", "created", `{"version":1}`)
+
+	if ev.Seq != 7 ||
+		ev.Type != TypeSessionLifecycle ||
+		ev.SessionID != "session-1" ||
+		ev.AgentID != "agent-1" ||
+		ev.Reason != "created" ||
+		ev.Payload != `{"version":1}` {
+		t.Fatalf("session lifecycle event = %+v", ev)
+	}
+	if ev.Timestamp.IsZero() {
+		t.Fatal("session lifecycle timestamp is zero")
+	}
+}
+
 func TestHubFanOut(t *testing.T) {
 	h := NewHub(0)
 	s1 := h.Subscribe(16)
