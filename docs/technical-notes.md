@@ -1,6 +1,6 @@
 # Drove 技术笔记
 
-本文记录以提交 `50214ba` 为基线的代码阅读和本地验证结果，并补充重启安全事件序号修复的验证证据。它描述当前实现，不把 `README.md` 或 `AGENTS.md` 中的规划当成已经完成的功能。
+本文记录以提交 `50214ba` 为基线的代码阅读和本地验证结果，并补充重启安全事件序号与会话投影恢复的验证证据。它描述当前实现，不把 `README.md` 或 `AGENTS.md` 中的规划当成已经完成的功能。
 
 ## 1. 痛点与目标
 
@@ -27,7 +27,9 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - Claude、Codex 和 generic 三类 adapter。
 - PTY 子进程启动、按行读取、写入和关闭。
 - SQLite 追加式事件日志及按 session 回放。
-- daemon 启动时从 SQLite 最大事件序号继续分配。
+- daemon 启动时从 SQLite 事件流恢复历史会话，并从提交后的最大序号继续分配。
+- 无法重连 PTY 的历史会话会追加恢复事件并收口为 `stopped`。
+- 新会话会先持久化名称和厂商元数据，再进入状态机。
 - REST 管理接口和 WebSocket 实时事件流。
 - CLI 的 `init`、`up`、`ps`、`log`、`stop`、`version` 命令。
 - React 控制台骨架、REST 客户端和 WebSocket 自动重连。
@@ -35,7 +37,6 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 ### 尚未形成完整产品闭环
 
 - 没有可用的交互式 TUI。代码使用 Cobra，不包含 Bubble Tea 依赖。
-- daemon 重启后不会恢复会话投影。
 - API 没有输入注入或终端 resize 端点，Blocked agent 无法通过 Drove 恢复。
 - Web 控制台没有接入样式系统，现有 Tailwind 类不会生成 CSS。
 - Web 控制台没有可达的回放入口。
@@ -76,13 +77,14 @@ internal/session.Manager -------------------+
 `POST /api/v1/agents` 最终调用 `Manager.Start`：
 
 1. 根据 `vendor` 查找 adapter。
-2. 创建 `agent.Agent`，初始状态为 `pending`。
-3. 迁移到 `starting`，状态事件写入 SQLite。
-4. 根据 adapter 或请求参数确定命令。
-5. 启动 PTY 和子进程。
-6. 注册输出与退出回调。
-7. 迁移到 `working`。
-8. 返回 `session.Status`。
+2. 根据 adapter 或请求参数解析并校验命令。
+3. 创建 `agent.Agent`，初始状态为 `pending`。
+4. 写入包含名称和厂商的 `session_lifecycle(created)` 事件。
+5. 迁移到 `starting`，状态事件写入 SQLite。
+6. 启动 PTY 和子进程。
+7. 注册输出与退出回调。
+8. 迁移到 `working`。
+9. 返回 `session.Status`。
 
 关键代码：
 
@@ -206,6 +208,34 @@ Go 覆盖率集中在 `agent`、`event`、`adapter` 和 `store`。以下主链�
 | `make build` | 通过，生成 `bin/drove` 与 `bin/droved` |
 | 隔离数据目录两次启动回归 | 通过，重启前最大序号 3，重启后新会话序号为 4 到 6 |
 
+### 已修复：daemon 重启后会话投影丢失
+
+daemon 现在会在创建 API server 和监听端口前完成以下步骤：
+
+1. 按全局序号流式扫描 SQLite 事件。
+2. 重建每个 session 的名称、厂商、状态、错误和时间。
+3. 将当前 daemon 无法控制的历史非 stopped 会话追加为 stopped。
+4. 在一个事务中提交全部 reconciliation 事件。
+5. 用提交后的最大序号创建 Hub，再构造对外 API。
+
+旧数据库没有 `created` 事件时，恢复结果使用完整 Agent ID 作为名称，并将厂商标记为 `unknown`。只有 output 或 error、没有生命周期或状态事实的 session 不会出现在状态列表中。坏状态链、坏元数据和未知事件类型会阻止 daemon 监听端口。
+
+三次启动回归使用隔离数据目录 `/tmp/drove-three-start.6H6Kar`：
+
+1. 第一次启动创建一个 1 秒短任务和一个仍在运行的任务。短任务正常 stopped，长任务保持 working，SQLite 序号为 1 到 7。
+2. 第二次启动扫描 7 条事件，恢复 2 个会话，将长任务追加 error 和 `working -> stopped`，最大序号变为 9。两个恢复状态都没有 PID。
+3. 第二次启动后创建的新任务从序号 10 开始，正常结束于序号 13。
+4. 第三次启动扫描 13 条事件，恢复 3 个 stopped 会话，`interrupted=0`，没有重复追加 reconciliation，SQLite 仍为 13 条事件。
+
+验证结果：
+
+| 命令或场景 | 结果 |
+| --- | --- |
+| `go test ./internal/session ./internal/store ./internal/agent ./internal/event ./internal/daemon -race` | 通过 |
+| `go vet ./...` | 通过 |
+| `make build` | 通过 |
+| 隔离数据目录三次启动回归 | 通过，恢复序号 8 到 9，新会话从 10 开始，第三次启动最大序号保持 13 |
+
 ### P0：配置初始化与配置加载没有接通
 
 `drove init` 写入 `~/.drove/config.json`。但是 CLI 和 daemon 都调用 `config.Load("")`，而 `Load` 只有在 `path != ""` 时才读取文件。
@@ -222,7 +252,7 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 
 `pty.Start` 先启动 `readLoop` 和 `waitLoop`，`Manager.Start` 返回后才设置 `OnOutput` 和 `OnExit`。短命令可能在回调注册前输出或退出。
 
-本次短命令测试没有触发丢失，但代码顺序允许该竞态存在。`session` 和 `pty` 没有测试覆盖这一点。
+本次开发在给成功启动路径增加 race 测试时复现了该竞态。恢复功能没有修改 PTY 生命周期，因此该问题仍需独立修复；`pty` 目前也没有自己的测试。
 
 ### P1：daemon 关闭没有按文档清理会话
 
@@ -239,15 +269,8 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 - 选择 `generic` 后只发送 `{vendor: "generic"}`，后端会拒绝，因为 generic 必须提供 command。
 - `EventLog` 支持 `replayID`，但 `App` 从不传入该属性，因此界面无法进入回放模式。
 
-### P1：状态列表实现与约定不一致
-
-`Manager.List` 注释声称按创建时间排序，实际遍历 map，顺序不稳定。
-
-它还在持有 `Manager.mu.RLock` 时调用 `Status`，而 `Status` 再次获取同一个读锁。当写锁已经排队时，嵌套读锁存在死锁风险。
-
 ### P2：其他实现缺口
 
-- `session_lifecycle` 事件有类型和构造函数，但没有生产者。
 - `StateIdle` 有迁移规则，但没有任何运行时信号会进入该状态。
 - `StateHint.Confidence` 被记录，但没有使用。
 - WebSocket 没有文档所说的定时 ping。客户端断开且没有新事件时，服务端订阅可能继续存活。
@@ -263,10 +286,10 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 
 验收条件：
 
-- [x] daemon 启动时从 `Store.LastSeq()` 初始化 Hub 序号。
+- [x] daemon 启动时从 Bootstrap 提交后的最大序号初始化 Hub。
 - [x] 重启后的第一条事件序号严格大于已有最大序号。
-- daemon 从历史事件重建 session 状态列表。
-- 无法恢复的运行中进程明确标记为 `stopped` 或新的 `interrupted` 语义。
+- [x] daemon 从历史事件重建 session 状态列表。
+- [x] 无法恢复的运行中进程追加恢复事实并标记为 `stopped`。
 - [x] 完成隔离数据目录的跨重启回归验证。
 
 这里需要先做产品决策：Drove 是否承诺 daemon 重启后重新连接原进程。普通子进程加 PTY 无法提供该能力。如果要保留进程，需要 tmux、独立 supervisor 或可重连的终端后端。事件溯源只能恢复历史和投影，不能恢复已经丢失的进程句柄。
@@ -287,8 +310,7 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 - 在启动 goroutine 前注册 PTY 回调。
 - 为 `Manager` 增加统一的 `Close`。
 - 明确 API、Hub、PTY 和 store 的关闭顺序。
-- 修复 `Manager.List` 的锁范围并稳定排序。
-- 为 `session`、`pty`、`api`、`client` 和 `daemon` 增加测试。
+- 为 `pty`、`api` 和 `client` 增加测试。
 
 ### 第四阶段：补齐 Web MVP
 
@@ -298,18 +320,20 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 - 为 REST 和 WebSocket 消息增加运行时解析。
 - 把 `npm run typecheck` 和 `npm run build` 加入 CI。
 
-## 7. 已完成的第一个开发任务
+## 7. 已完成的持久化开发任务
 
-已实现“重启安全的事件序号”。
+已实现“重启安全的事件序号”和“重启安全的会话投影恢复”。
 
 本次修改：
 
 - `event.NewHub` 要求调用方传入初始序号。
-- `daemon.Run` 在创建 Hub 前调用 `Store.LastSeq()`。
-- 测试覆盖空库、有历史事件和序号读取失败。
-- 真实重启回归确认新会话事件继续追加并可回放。
+- `session.Bootstrap` 在 daemon 监听前扫描、投影、校验并追加恢复事件。
+- `daemon.Run` 使用 Bootstrap 返回的 Manager 和 Hub。
+- 新会话持久化 version 1 名称与厂商元数据。
+- 测试覆盖空库、legacy 历史、状态链缺口、坏事件、幂等恢复和失败启动。
+- 真实三次启动回归确认状态可查询、PID 不恢复、reconciliation 不重复且新事件序号继续增长。
 
-历史会话投影恢复和持久化失败传播仍是后续任务。不要把“序号续接”和“进程重连”混成一个改动。
+进程重连和运行期持久化失败传播仍是后续任务。事件投影恢复不会重新连接或控制旧进程。
 
 ## 8. 面试口述版
 
@@ -319,4 +343,4 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 
 同类工具中，tmux 更关注终端持久化，Temporal 更关注可恢复工作流，LangGraph、CrewAI 和 AutoGen 更关注 agent 编排。Drove 当前选择的是本地进程控制与观察，暂时没有工作流调度、模型 SDK 编排或真正的终端重连能力。
 
-设计取舍上，PTY 和 adapter 隔离降低了厂商锁定，追加式事件日志也适合审计和回放。当前代价是启发式状态识别不稳定，而且事件持久化、运行进程和会话投影还没有形成一致的恢复协议。后续开发应先补齐这个协议，再扩展 UI 和厂商能力。
+设计取舍上，PTY 和 adapter 隔离降低了厂商锁定，追加式事件日志也适合审计和回放。daemon 现在能从事件重建会话投影，但不能重连旧 PTY，运行期持久化失败也仍可能造成有界序号缺口。后续开发应先修复 PTY 回调注册和关闭顺序，再扩展 UI 和厂商能力。

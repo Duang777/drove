@@ -16,7 +16,6 @@ import (
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/api"
 	"github.com/Duang777/drove/internal/config"
-	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
@@ -47,13 +46,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	defer st.Close()
 
-	// 2. 事件 Hub + 适配器注册表 + 会话管理器。
-	hub, err := newHubFromStore(st)
+	// 2. 在 API 对外可见前恢复会话投影。
+	recovered, err := bootstrapSessions(ctx, st)
 	if err != nil {
 		return err
 	}
-	reg := adapter.NewRegistry()
-	mgr := session.NewManager(reg, hub, st)
+	hub := recovered.Hub
+	mgr := recovered.Manager
+	report := recovered.Recovery
+	log.Info(
+		"session projection recovered",
+		"scanned_events", report.ScannedEvents,
+		"sessions", report.Sessions,
+		"interrupted", report.Interrupted,
+		"legacy_metadata", report.LegacyMetadata,
+		"partial_history", report.PartialHistory,
+		"last_seq", report.LastSeq,
+	)
 
 	// 3. API server。
 	srv := api.NewServer(api.ServerOptions{
@@ -96,11 +105,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return nil
 }
 
-func newHubFromStore(st *store.Store) (*event.Hub, error) {
-	// 启动时读取与内存分配依赖单个 daemon 独占该数据库。
-	lastSeq, err := st.LastSeq()
+func bootstrapSessions(ctx context.Context, st *store.Store) (*session.BootstrapResult, error) {
+	recovered, err := session.Bootstrap(ctx, adapter.NewRegistry(), st)
 	if err != nil {
-		return nil, fmt.Errorf("daemon: restore event sequence: %w", err)
+		return nil, fmt.Errorf("daemon: bootstrap sessions: %w", err)
 	}
-	return event.NewHub(lastSeq), nil
+	return recovered, nil
 }

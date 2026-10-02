@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,9 @@ type createdPayload struct {
 	Vendor  string `json:"vendor"`
 }
 
+// ErrNotAttached 表示会话存在，但当前 daemon 没有它的 PTY。
+var ErrNotAttached = errors.New("session: agent is not attached to a PTY")
+
 // Manager 是会话编排入口。
 type Manager struct {
 	reg   *adapter.Registry
@@ -62,6 +66,13 @@ type Manager struct {
 	sessions map[agent.ID]*pty.Session
 }
 
+// BootstrapResult 包含恢复后的运行时组件和启动报告。
+type BootstrapResult struct {
+	Manager  *Manager
+	Hub      *event.Hub
+	Recovery RecoveryReport
+}
+
 // NewManager 创建 Manager。
 func NewManager(reg *adapter.Registry, hub *event.Hub, st *store.Store) *Manager {
 	return &Manager{
@@ -71,6 +82,41 @@ func NewManager(reg *adapter.Registry, hub *event.Hub, st *store.Store) *Manager
 		agents:   make(map[agent.ID]*agent.Agent),
 		sessions: make(map[agent.ID]*pty.Session),
 	}
+}
+
+// Bootstrap 重建会话投影，并收口当前 daemon 没有 PTY 的历史会话。
+func Bootstrap(ctx context.Context, reg *adapter.Registry, st *store.Store) (*BootstrapResult, error) {
+	projector := newRecoveryProjector()
+	lastSeq, err := st.ScanEvents(ctx, projector.Apply)
+	if err != nil {
+		return nil, fmt.Errorf("session: bootstrap scan: %w", err)
+	}
+	plan, err := projector.Finish(time.Now().UTC())
+	if err != nil {
+		return nil, fmt.Errorf("session: bootstrap projection: %w", err)
+	}
+
+	manager := NewManager(reg, nil, st)
+	for _, snapshot := range plan.Snapshots {
+		restored, err := agent.Restore(snapshot, agent.WithStateChangeHook(manager.onStateChange))
+		if err != nil {
+			return nil, fmt.Errorf("session: bootstrap restore agent %q: %w", snapshot.ID, err)
+		}
+		manager.agents[snapshot.ID] = restored
+	}
+
+	committedLastSeq, err := st.AppendEvents(ctx, lastSeq, plan.Reconciliation)
+	if err != nil {
+		return nil, fmt.Errorf("session: bootstrap reconciliation: %w", err)
+	}
+	hub := event.NewHub(committedLastSeq)
+	manager.hub = hub
+	plan.Report.LastSeq = committedLastSeq
+	return &BootstrapResult{
+		Manager:  manager,
+		Hub:      hub,
+		Recovery: plan.Report,
+	}, nil
 }
 
 // Start 启动一个 agent 会话。
@@ -158,17 +204,24 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 
 // Stop 停止一个 agent 会话（幂等）。
 func (m *Manager) Stop(id agent.ID) error {
-	m.mu.RLock()
-	sess, ok := m.sessions[id]
-	m.mu.RUnlock()
+	a, ok := m.agent(id)
 	if !ok {
 		return fmt.Errorf("session: unknown agent %q", id)
 	}
-	if err := sess.Close(); err != nil && !errors.Is(err, pty.ErrClosed) {
-		return err
+
+	m.mu.RLock()
+	sess, attached := m.sessions[id]
+	m.mu.RUnlock()
+	if !attached {
+		if a.State() == agent.StateStopped {
+			return nil
+		}
+		return fmt.Errorf("session: agent %q is %s without a PTY", id, a.State())
 	}
-	a, ok := m.agent(id)
-	if ok && a.State() != agent.StateStopped {
+	if err := sess.Close(); err != nil && !errors.Is(err, pty.ErrClosed) {
+		return fmt.Errorf("session: stop agent %q: %w", id, err)
+	}
+	if a.State() != agent.StateStopped {
 		// 进程退出回调可能已迁移到 Stopped，这里仅在未停止时迁移，保证幂等。
 		_ = a.Transition(agent.StateStopped, "user stop")
 	}
@@ -203,15 +256,25 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 // List 返回全部会话状态（按创建时间排序）。
 func (m *Manager) List() []*Status {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	agents := make([]*agent.Agent, 0, len(m.agents))
+	for _, a := range m.agents {
+		agents = append(agents, a)
+	}
+	m.mu.RUnlock()
 
-	out := make([]*Status, 0, len(m.agents))
-	for id := range m.agents {
-		st, err := m.Status(id)
+	out := make([]*Status, 0, len(agents))
+	for _, a := range agents {
+		st, err := m.Status(a.ID())
 		if err == nil {
 			out = append(out, st)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].AgentID < out[j].AgentID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
 	return out
 }
 
@@ -222,14 +285,17 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 
 // Write 向某 agent 注入输入。
 func (m *Manager) Write(id agent.ID, data []byte) error {
-	m.mu.RLock()
-	sess, ok := m.sessions[id]
-	m.mu.RUnlock()
-	if !ok {
+	if _, ok := m.agent(id); !ok {
 		return fmt.Errorf("session: unknown agent %q", id)
 	}
+	m.mu.RLock()
+	sess, attached := m.sessions[id]
+	m.mu.RUnlock()
+	if !attached {
+		return fmt.Errorf("%w: %q", ErrNotAttached, id)
+	}
 	if _, err := sess.Write(data); err != nil {
-		return err
+		return fmt.Errorf("session: write agent %q: %w", id, err)
 	}
 	return nil
 }
