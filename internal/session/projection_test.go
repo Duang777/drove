@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +96,9 @@ func TestRecoveryProjectorReconcilesEveryState(t *testing.T) {
 			if len(plan.Snapshots) != 1 || plan.Snapshots[0].State != agent.StateStopped {
 				t.Fatalf("snapshots = %+v, want one stopped session", plan.Snapshots)
 			}
+			if plan.Snapshots[0].RunMode != agent.RunModeOneshot {
+				t.Fatalf("run mode = %q, want %q", plan.Snapshots[0].RunMode, agent.RunModeOneshot)
+			}
 			if plan.Snapshots[0].LastError != test.wantError {
 				t.Fatalf("last error = %q, want %q", plan.Snapshots[0].LastError, test.wantError)
 			}
@@ -162,6 +166,7 @@ func TestRecoveryProjectorUsesLegacyMetadataAndFactTimestamps(t *testing.T) {
 	snapshot := plan.Snapshots[0]
 	if snapshot.Name != "legacy-agent" ||
 		snapshot.Vendor != "unknown" ||
+		snapshot.RunMode != agent.RunModeOneshot ||
 		snapshot.LastError != "persisted failure" ||
 		!snapshot.CreatedAt.Equal(createdAt) ||
 		!snapshot.UpdatedAt.Equal(createdAt) {
@@ -403,6 +408,20 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "vendor is empty",
 		},
 		{
+			name: "empty metadata mode",
+			rows: []store.EventRow{
+				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":1,"name":"agent","vendor":"generic","mode":""}`},
+			},
+			wantErr: "mode",
+		},
+		{
+			name: "invalid metadata mode",
+			rows: []store.EventRow{
+				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":1,"name":"agent","vendor":"generic","mode":"batch"}`},
+			},
+			wantErr: "mode",
+		},
+		{
 			name: "invalid from state",
 			rows: []store.EventRow{
 				{Seq: 1, Timestamp: base, Type: string(event.TypeStateChanged), SessionID: "s1", From: "bad", To: "working"},
@@ -510,6 +529,7 @@ func TestRecoveryProjectorBuildsSnapshotAndReconciliation(t *testing.T) {
 	if snapshot.ID != agent.ID("agent-1") ||
 		snapshot.Name != "build-api" ||
 		snapshot.Vendor != "generic" ||
+		snapshot.RunMode != agent.RunModeOneshot ||
 		snapshot.State != agent.StateStopped ||
 		snapshot.LastError != restartInterruptionError ||
 		!snapshot.CreatedAt.Equal(createdAt) ||
@@ -532,5 +552,58 @@ func TestRecoveryProjectorBuildsSnapshotAndReconciliation(t *testing.T) {
 		got.Reason != restartStopReason ||
 		!got.Timestamp.Equal(recoveryTime) {
 		t.Fatalf("reconciliation state = %+v", got)
+	}
+}
+
+func TestRecoveryProjectorRestoresPersistedRunMode(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 4, 5, 6, 7, time.UTC)
+	for _, mode := range []agent.RunMode{agent.RunModeInteractive, agent.RunModeOneshot} {
+		t.Run(string(mode), func(t *testing.T) {
+			projector := newRecoveryProjector()
+			if err := projector.Apply(store.EventRow{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeSessionLifecycle),
+				SessionID: "agent-1",
+				AgentID:   "agent-1",
+				Reason:    "created",
+				Payload:   `{"version":1,"name":"agent","vendor":"generic","mode":"` + string(mode) + `"}`,
+			}); err != nil {
+				t.Fatalf("apply creation: %v", err)
+			}
+
+			plan, err := projector.Finish(base.Add(time.Hour))
+			if err != nil {
+				t.Fatalf("finish projection: %v", err)
+			}
+			if len(plan.Snapshots) != 1 || plan.Snapshots[0].RunMode != mode {
+				t.Fatalf("snapshots = %+v, want mode %q", plan.Snapshots, mode)
+			}
+		})
+	}
+}
+
+func TestCreationMetadataRemainsReadableByOldVersionOneDecoder(t *testing.T) {
+	mode := agent.RunModeInteractive
+	raw, err := json.Marshal(createdPayload{
+		Version: 1,
+		Name:    "agent",
+		Vendor:  "generic",
+		Mode:    &mode,
+	})
+	if err != nil {
+		t.Fatalf("marshal creation metadata: %v", err)
+	}
+
+	var oldMetadata struct {
+		Version int    `json:"version"`
+		Name    string `json:"name"`
+		Vendor  string `json:"vendor"`
+	}
+	if err := json.Unmarshal(raw, &oldMetadata); err != nil {
+		t.Fatalf("old decoder rejected new metadata: %v", err)
+	}
+	if oldMetadata.Version != 1 || oldMetadata.Name != "agent" || oldMetadata.Vendor != "generic" {
+		t.Fatalf("old metadata = %+v", oldMetadata)
 	}
 }

@@ -15,11 +15,15 @@ export type AgentState =
   | 'idle'
   | 'stopped'
 
+/** agent 运行模式（与 internal/agent.RunMode 对齐）。 */
+export type RunMode = 'interactive' | 'oneshot'
+
 /** 会话状态视图（Go: session.Status）。 */
 export interface AgentStatus {
   agent_id: string
   name: string
   vendor: string
+  mode: RunMode
   state: AgentState
   pid?: number
   created_at: string
@@ -34,6 +38,7 @@ export interface StartRequest {
   command?: string
   args?: string[]
   dir?: string
+  mode?: RunMode
 }
 
 /** 事件类型（Go: event.Type）。 */

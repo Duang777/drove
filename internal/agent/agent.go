@@ -18,7 +18,15 @@ type ID string
 // State 表示一个 agent 的运行时状态。
 type State string
 
+// RunMode 控制 agent 进程的启动方式和自然退出语义。
+type RunMode string
+
 const (
+	// RunModeInteractive 启动常驻交互进程。
+	RunModeInteractive RunMode = "interactive"
+	// RunModeOneshot 启动执行一次后退出的进程。
+	RunModeOneshot RunMode = "oneshot"
+
 	// StatePending 已创建、尚未启动（初始态）。
 	StatePending State = "pending"
 	// StateStarting 进程已拉起、尚未就绪（生命周期边界态）。
@@ -74,6 +82,11 @@ func Valid(s State) bool {
 	return ok
 }
 
+// ValidRunMode 报告 mode 是否为合法运行模式。
+func ValidRunMode(mode RunMode) bool {
+	return mode == RunModeInteractive || mode == RunModeOneshot
+}
+
 // CanTransition 报告 from -> to 是否合法。
 func CanTransition(from, to State) bool {
 	m, ok := transitions[from]
@@ -94,6 +107,7 @@ type Agent struct {
 	id        ID
 	name      string
 	vendor    string // 适配器厂商标识，如 "claude" / "codex" / "generic"
+	runMode   RunMode
 	state     State
 	lastError string
 
@@ -111,6 +125,7 @@ type RestoreSnapshot struct {
 	ID        ID
 	Name      string
 	Vendor    string
+	RunMode   RunMode
 	State     State
 	LastError string
 	CreatedAt time.Time
@@ -127,6 +142,11 @@ func WithVendor(vendor string) Option {
 	return func(a *Agent) { a.vendor = vendor }
 }
 
+// WithRunMode 设置 agent 运行模式。
+func WithRunMode(mode RunMode) Option {
+	return func(a *Agent) { a.runMode = mode }
+}
+
 // WithStateChangeHook 注册状态变更回调。
 func WithStateChangeHook(fn func(id ID, from, to State, reason string)) Option {
 	return func(a *Agent) { a.onStateChange = fn }
@@ -136,6 +156,7 @@ func WithStateChangeHook(fn func(id ID, from, to State, reason string)) Option {
 func New(id ID, opts ...Option) *Agent {
 	a := &Agent{
 		id:        id,
+		runMode:   RunModeInteractive,
 		state:     StatePending,
 		createdAt: time.Now().UTC(),
 		updatedAt: time.Now().UTC(),
@@ -152,6 +173,7 @@ func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
 		id:        snapshot.ID,
 		name:      snapshot.Name,
 		vendor:    snapshot.Vendor,
+		runMode:   snapshot.RunMode,
 		state:     snapshot.State,
 		lastError: snapshot.LastError,
 		createdAt: snapshot.CreatedAt,
@@ -175,6 +197,9 @@ func validateRestoredAgent(a *Agent) error {
 	}
 	if strings.TrimSpace(a.vendor) == "" {
 		return errors.New("agent: restore: vendor is required")
+	}
+	if !ValidRunMode(a.runMode) {
+		return fmt.Errorf("agent: restore: invalid run mode %q", a.runMode)
 	}
 	if !Valid(a.state) {
 		return fmt.Errorf("agent: restore: invalid state %q", a.state)
@@ -206,6 +231,13 @@ func (a *Agent) Vendor() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.vendor
+}
+
+// RunMode 返回 agent 的运行模式。
+func (a *Agent) RunMode() RunMode {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.runMode
 }
 
 // State 返回当前状态（读取权威入口）。

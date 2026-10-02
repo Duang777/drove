@@ -12,6 +12,7 @@ func TestRestoreRejectsInvalidSnapshot(t *testing.T) {
 		ID:        "agent-1",
 		Name:      "build-api",
 		Vendor:    "generic",
+		RunMode:   RunModeOneshot,
 		State:     StateStopped,
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt.Add(time.Minute),
@@ -26,6 +27,8 @@ func TestRestoreRejectsInvalidSnapshot(t *testing.T) {
 		{name: "blank ID", change: func(s *RestoreSnapshot) { s.ID = "   " }, wantErr: "ID"},
 		{name: "missing name", change: func(s *RestoreSnapshot) { s.Name = "" }, wantErr: "name"},
 		{name: "missing vendor", change: func(s *RestoreSnapshot) { s.Vendor = "" }, wantErr: "vendor"},
+		{name: "missing run mode", change: func(s *RestoreSnapshot) { s.RunMode = "" }, wantErr: "run mode"},
+		{name: "invalid run mode", change: func(s *RestoreSnapshot) { s.RunMode = "batch" }, wantErr: "run mode"},
 		{name: "invalid state", change: func(s *RestoreSnapshot) { s.State = "unknown" }, wantErr: "state"},
 		{name: "missing creation time", change: func(s *RestoreSnapshot) { s.CreatedAt = time.Time{} }, wantErr: "creation time"},
 		{name: "missing update time", change: func(s *RestoreSnapshot) { s.UpdatedAt = time.Time{} }, wantErr: "update time"},
@@ -64,6 +67,7 @@ func TestRestoreBuildsSnapshotWithoutCallingStateHook(t *testing.T) {
 		ID:        "agent-1",
 		Name:      "build-api",
 		Vendor:    "generic",
+		RunMode:   RunModeOneshot,
 		State:     StateWorking,
 		LastError: "previous warning",
 		CreatedAt: createdAt,
@@ -80,6 +84,7 @@ func TestRestoreBuildsSnapshotWithoutCallingStateHook(t *testing.T) {
 	if a.ID() != "agent-1" ||
 		a.Name() != "build-api" ||
 		a.Vendor() != "generic" ||
+		a.RunMode() != RunModeOneshot ||
 		a.State() != StateWorking ||
 		a.LastError() != "previous warning" ||
 		!a.CreatedAt().Equal(createdAt) ||
@@ -101,6 +106,7 @@ func TestRestoreRejectsOptionsThatInvalidateSnapshot(t *testing.T) {
 		ID:        "agent-1",
 		Name:      "build-api",
 		Vendor:    "generic",
+		RunMode:   RunModeOneshot,
 		State:     StateStopped,
 		CreatedAt: createdAt,
 		UpdatedAt: createdAt,
@@ -112,6 +118,7 @@ func TestRestoreRejectsOptionsThatInvalidateSnapshot(t *testing.T) {
 	}{
 		{name: "blank name", option: WithName(" ")},
 		{name: "blank vendor", option: WithVendor(" ")},
+		{name: "invalid run mode", option: WithRunMode("batch")},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -123,6 +130,26 @@ func TestRestoreRejectsOptionsThatInvalidateSnapshot(t *testing.T) {
 				t.Fatalf("restore returned agent %v with error %v", a.ID(), err)
 			}
 		})
+	}
+}
+
+func TestRunMode(t *testing.T) {
+	for _, mode := range []RunMode{RunModeInteractive, RunModeOneshot} {
+		if !ValidRunMode(mode) {
+			t.Errorf("expected %q to be valid", mode)
+		}
+	}
+	for _, mode := range []RunMode{"", "batch", "Interactive"} {
+		if ValidRunMode(mode) {
+			t.Errorf("expected %q to be invalid", mode)
+		}
+	}
+
+	if got := New("default").RunMode(); got != RunModeInteractive {
+		t.Fatalf("default run mode = %q, want %q", got, RunModeInteractive)
+	}
+	if got := New("oneshot", WithRunMode(RunModeOneshot)).RunMode(); got != RunModeOneshot {
+		t.Fatalf("configured run mode = %q, want %q", got, RunModeOneshot)
 	}
 }
 

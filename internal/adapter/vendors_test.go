@@ -63,10 +63,36 @@ func TestCodexHeuristic(t *testing.T) {
 	}
 }
 
-func TestGenericCommand(t *testing.T) {
-	r := genericRunner{}
-	name, _ := r.Command()
-	if name != "" {
-		t.Fatalf("generic command = %q, want empty", name)
+func TestRunnerCommands(t *testing.T) {
+	tests := []struct {
+		name     string
+		runner   Runner
+		mode     agent.RunMode
+		wantName string
+		wantArgs []string
+	}{
+		{name: "claude interactive", runner: claudeRunner{}, mode: agent.RunModeInteractive, wantName: "claude"},
+		{name: "claude oneshot", runner: claudeRunner{}, mode: agent.RunModeOneshot, wantName: "claude", wantArgs: []string{"--print"}},
+		{name: "codex interactive", runner: codexRunner{}, mode: agent.RunModeInteractive, wantName: "codex"},
+		{name: "codex oneshot", runner: codexRunner{}, mode: agent.RunModeOneshot, wantName: "codex", wantArgs: []string{"exec"}},
+		{name: "generic interactive", runner: genericRunner{}, mode: agent.RunModeInteractive},
+		{name: "generic oneshot", runner: genericRunner{}, mode: agent.RunModeOneshot},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			name, args := test.runner.Command(test.mode)
+			if name != test.wantName {
+				t.Fatalf("command name = %q, want %q", name, test.wantName)
+			}
+			if len(args) != len(test.wantArgs) {
+				t.Fatalf("command args = %v, want %v", args, test.wantArgs)
+			}
+			for i := range test.wantArgs {
+				if args[i] != test.wantArgs[i] {
+					t.Fatalf("command args = %v, want %v", args, test.wantArgs)
+				}
+			}
+		})
 	}
 }

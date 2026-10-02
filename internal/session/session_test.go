@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -65,6 +66,7 @@ func TestBootstrapRestoresLegacySessionIdempotently(t *testing.T) {
 	}
 	if firstStatus.Name != "legacy-agent" ||
 		firstStatus.Vendor != "unknown" ||
+		firstStatus.Mode != agent.RunModeOneshot ||
 		firstStatus.State != agent.StateStopped ||
 		firstStatus.PID != 0 ||
 		firstStatus.LastError != restartInterruptionError ||
@@ -143,6 +145,7 @@ func TestBootstrapRestoresVersionedDoneSession(t *testing.T) {
 	}
 	if status.Name != "build-api" ||
 		status.Vendor != "codex" ||
+		status.Mode != agent.RunModeOneshot ||
 		status.State != agent.StateStopped ||
 		status.LastError != "" {
 		t.Fatalf("restored status = %+v", status)
@@ -270,6 +273,7 @@ func TestStopRejectsLiveAgentWithoutPTY(t *testing.T) {
 		ID:        "agent-1",
 		Name:      "agent",
 		Vendor:    "generic",
+		RunMode:   agent.RunModeOneshot,
 		State:     agent.StateWorking,
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -401,7 +405,7 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
 		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":1,"name":"broken-agent","vendor":"generic"}` {
+		rows[0].Payload != `{"version":1,"name":"broken-agent","vendor":"generic","mode":"interactive"}` {
 		t.Fatalf("creation event = %+v", rows[0])
 	}
 	if rows[1].Seq != 2 ||
@@ -429,6 +433,98 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	}
 	if failedStatus.LastError == "" || failedStatus.LastError != rows[2].Payload {
 		t.Fatalf("failed session error = %q, event payload = %q", failedStatus.LastError, rows[2].Payload)
+	}
+}
+
+func TestNormalizeRunMode(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   agent.RunMode
+		want    agent.RunMode
+		wantErr bool
+	}{
+		{name: "omitted", want: agent.RunModeInteractive},
+		{name: "interactive", input: agent.RunModeInteractive, want: agent.RunModeInteractive},
+		{name: "oneshot", input: agent.RunModeOneshot, want: agent.RunModeOneshot},
+		{name: "unknown", input: "batch", wantErr: true},
+		{name: "whitespace", input: " interactive ", wantErr: true},
+		{name: "case sensitive", input: "Interactive", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := normalizeRunMode(test.input)
+			if test.wantErr {
+				if !errors.Is(err, ErrInvalidMode) {
+					t.Fatalf("normalize error = %v, want ErrInvalidMode", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalize: %v", err)
+			}
+			if got != test.want {
+				t.Fatalf("normalized mode = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestStartRejectsInvalidModeWithoutHistory(t *testing.T) {
+	manager, st := newTestManager(t)
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Command: "/bin/true",
+		Mode:    "batch",
+	})
+	if !errors.Is(err, ErrInvalidMode) {
+		t.Fatalf("start error = %v, want ErrInvalidMode", err)
+	}
+	if status != nil {
+		t.Fatalf("start status = %+v, want nil", status)
+	}
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestStartPersistsAndReportsRunMode(t *testing.T) {
+	manager, _ := newTestManager(t)
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+	})
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Name:    "mode-agent",
+		Command: "/bin/cat",
+		Mode:    agent.RunModeOneshot,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if status.Mode != agent.RunModeOneshot {
+		t.Fatalf("status mode = %q, want %q", status.Mode, agent.RunModeOneshot)
+	}
+
+	rows, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("replay contains no creation event")
+	}
+	var metadata createdPayload
+	if err := json.Unmarshal([]byte(rows[0].Payload), &metadata); err != nil {
+		t.Fatalf("decode creation metadata: %v", err)
+	}
+	if metadata.Mode == nil || *metadata.Mode != agent.RunModeOneshot {
+		t.Fatalf("creation mode = %v, want %q", metadata.Mode, agent.RunModeOneshot)
 	}
 }
 
@@ -465,6 +561,9 @@ func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
+	}
+	if status.Mode != agent.RunModeInteractive {
+		t.Fatalf("status mode = %q, want %q", status.Mode, agent.RunModeInteractive)
 	}
 	id := agent.ID(status.AgentID)
 	t.Cleanup(func() {

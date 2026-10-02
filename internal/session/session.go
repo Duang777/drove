@@ -22,34 +22,38 @@ import (
 
 // Status 是对外暴露的会话视图（供 daemon/api/CLI 使用）。
 type Status struct {
-	AgentID   string      `json:"agent_id"`
-	Name      string      `json:"name"`
-	Vendor    string      `json:"vendor"`
-	State     agent.State `json:"state"`
-	PID       int         `json:"pid,omitempty"`
-	CreatedAt time.Time   `json:"created_at"`
-	UpdatedAt time.Time   `json:"updated_at"`
-	LastError string      `json:"last_error,omitempty"`
+	AgentID   string        `json:"agent_id"`
+	Name      string        `json:"name"`
+	Vendor    string        `json:"vendor"`
+	Mode      agent.RunMode `json:"mode"`
+	State     agent.State   `json:"state"`
+	PID       int           `json:"pid,omitempty"`
+	CreatedAt time.Time     `json:"created_at"`
+	UpdatedAt time.Time     `json:"updated_at"`
+	LastError string        `json:"last_error,omitempty"`
 }
 
 // StartRequest 描述启动一个新 agent 会话的参数。
 type StartRequest struct {
 	// Vendor 是厂商标识（"claude"/"codex"/"generic"）；空则 generic。
-	Vendor string
+	Vendor string `json:"vendor"`
 	// Name 是显示名；空则自动生成。
-	Name string
+	Name string `json:"name,omitempty"`
 	// Command 覆盖默认命令（generic 时必填）。
-	Command string
+	Command string `json:"command,omitempty"`
 	// Args 附加参数。
-	Args []string
+	Args []string `json:"args,omitempty"`
 	// Dir 工作目录；空则继承 daemon 目录。
-	Dir string
+	Dir string `json:"dir,omitempty"`
+	// Mode 是运行模式；空则 interactive。
+	Mode agent.RunMode `json:"mode,omitempty"`
 }
 
 type createdPayload struct {
-	Version int    `json:"version"`
-	Name    string `json:"name"`
-	Vendor  string `json:"vendor"`
+	Version int            `json:"version"`
+	Name    string         `json:"name"`
+	Vendor  string         `json:"vendor"`
+	Mode    *agent.RunMode `json:"mode,omitempty"`
 }
 
 var (
@@ -57,6 +61,8 @@ var (
 	ErrNotAttached = errors.New("session: agent is not attached to a PTY")
 	// ErrManagerClosed 表示 Manager 已开始关闭，不再接受新会话。
 	ErrManagerClosed = errors.New("session: manager closed")
+	// ErrInvalidMode 表示启动请求包含不支持的运行模式。
+	ErrInvalidMode = errors.New("session: invalid mode")
 )
 
 // Manager 是会话编排入口。
@@ -138,10 +144,15 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if req.Vendor == "" {
 		req.Vendor = "generic"
 	}
+	mode, err := normalizeRunMode(req.Mode)
+	if err != nil {
+		return nil, err
+	}
+	req.Mode = mode
 	entry := m.reg.For(req.Vendor)
 
 	// 1. 在创建持久化会话前解析并校验命令。
-	cmdName, cmdArgs := entry.Runner.Command()
+	cmdName, cmdArgs := entry.Runner.Command(req.Mode)
 	if req.Command != "" {
 		cmdName = req.Command
 		cmdArgs = req.Args
@@ -158,12 +169,15 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	a := agent.New(id,
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
+		agent.WithRunMode(req.Mode),
 		agent.WithStateChangeHook(m.onStateChange),
 	)
+	persistedMode := req.Mode
 	payload, err := json.Marshal(createdPayload{
 		Version: 1,
 		Name:    req.Name,
 		Vendor:  req.Vendor,
+		Mode:    &persistedMode,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("session: encode creation metadata: %w", err)
@@ -309,6 +323,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		AgentID:   string(a.ID()),
 		Name:      a.Name(),
 		Vendor:    a.Vendor(),
+		Mode:      a.RunMode(),
 		State:     a.State(),
 		CreatedAt: a.CreatedAt(),
 		UpdatedAt: a.UpdatedAt(),
@@ -465,6 +480,16 @@ func (m *Manager) beginStart() error {
 
 func (m *Manager) endStart() {
 	m.starts.Done()
+}
+
+func normalizeRunMode(mode agent.RunMode) (agent.RunMode, error) {
+	if mode == "" {
+		return agent.RunModeInteractive, nil
+	}
+	if !agent.ValidRunMode(mode) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidMode, mode)
+	}
+	return mode, nil
 }
 
 // cleanup 移除未完全启动的会话残留。

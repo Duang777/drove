@@ -38,6 +38,7 @@ type sessionDraft struct {
 	id                     string
 	name                   string
 	vendor                 string
+	runMode                agent.RunMode
 	state                  agent.State
 	lastError              string
 	createdAt              time.Time
@@ -125,6 +126,13 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	}
 	if strings.TrimSpace(metadata.Vendor) == "" {
 		return projectionError(row, "creation metadata vendor is empty")
+	}
+	if metadata.Mode == nil {
+		draft.runMode = agent.RunModeOneshot
+	} else if !agent.ValidRunMode(*metadata.Mode) {
+		return projectionError(row, "creation metadata mode %q is invalid", *metadata.Mode)
+	} else {
+		draft.runMode = *metadata.Mode
 	}
 
 	draft.name = metadata.Name
@@ -229,6 +237,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		if !draft.hasCreated {
 			draft.name = draft.id
 			draft.vendor = "unknown"
+			draft.runMode = agent.RunModeOneshot
 			plan.Report.LegacyMetadata++
 		}
 
@@ -270,6 +279,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			ID:        agent.ID(draft.id),
 			Name:      draft.name,
 			Vendor:    draft.vendor,
+			RunMode:   draft.runMode,
 			State:     state,
 			LastError: lastError,
 			CreatedAt: draft.createdAt,

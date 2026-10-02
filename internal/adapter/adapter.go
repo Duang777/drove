@@ -24,8 +24,8 @@ type StateHint struct {
 type Runner interface {
 	// Vendor 返回厂商标识（如 "claude"）。
 	Vendor() string
-	// Command 返回可执行文件与参数（不含环境变量透传）。
-	Command() (name string, args []string)
+	// Command 返回指定运行模式的可执行文件与参数（不含环境变量透传）。
+	Command(mode agent.RunMode) (name string, args []string)
 }
 
 // Heuristic 从输出行推断状态信号。

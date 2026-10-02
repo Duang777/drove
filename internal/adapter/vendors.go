@@ -6,8 +6,11 @@ import "github.com/Duang777/drove/internal/agent"
 type claudeRunner struct{}
 
 func (claudeRunner) Vendor() string { return "claude" }
-func (claudeRunner) Command() (string, []string) {
-	return "claude", []string{"--print"}
+func (claudeRunner) Command(mode agent.RunMode) (string, []string) {
+	if mode == agent.RunModeOneshot {
+		return "claude", []string{"--print"}
+	}
+	return "claude", nil
 }
 
 // claudeHeuristic 从 claude 输出中识别状态信号。
@@ -30,8 +33,11 @@ func (claudeHeuristic) Classify(line string) (StateHint, bool) {
 type codexRunner struct{}
 
 func (codexRunner) Vendor() string { return "codex" }
-func (codexRunner) Command() (string, []string) {
-	return "codex", []string{"exec"}
+func (codexRunner) Command(mode agent.RunMode) (string, []string) {
+	if mode == agent.RunModeOneshot {
+		return "codex", []string{"exec"}
+	}
+	return "codex", nil
 }
 
 // codexHeuristic 从 codex 输出中识别状态信号。
@@ -51,8 +57,10 @@ func (codexHeuristic) Classify(line string) (StateHint, bool) {
 // genericRunner 兜底：直接运行用户命令，无启发式。
 type genericRunner struct{}
 
-func (genericRunner) Vendor() string              { return "generic" }
-func (genericRunner) Command() (string, []string) { return "", nil }
+func (genericRunner) Vendor() string { return "generic" }
+func (genericRunner) Command(agent.RunMode) (string, []string) {
+	return "", nil
+}
 
 // containsAny 报告 s 是否包含 patterns 中的任意子串。
 func containsAny(s string, patterns ...string) bool {

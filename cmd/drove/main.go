@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
@@ -97,6 +98,7 @@ func newInitCmd() *cobra.Command {
 func newUpCmd() *cobra.Command {
 	var name string
 	var dir string
+	var oneshot bool
 	cmd := &cobra.Command{
 		Use:   "up <vendor|command>",
 		Short: "启动一个 Agent 会话（自动拉起 daemon）",
@@ -107,17 +109,18 @@ func newUpCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			st, err := c.Start(ctx, sessionStartRequest(args[0], name, dir))
+			st, err := c.Start(ctx, sessionStartRequest(args[0], name, dir, oneshot))
 			if err != nil {
 				return err
 			}
-			fmt.Printf("started agent %s (vendor=%s, state=%s, pid=%d)\n",
-				st.AgentID, st.Vendor, st.State, st.PID)
+			fmt.Printf("started agent %s (vendor=%s, mode=%s, state=%s, pid=%d)\n",
+				st.AgentID, st.Vendor, st.Mode, st.State, st.PID)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "agent 显示名")
 	cmd.Flags().StringVar(&dir, "dir", "", "agent 工作目录")
+	cmd.Flags().BoolVar(&oneshot, "oneshot", false, "以单次执行模式启动 agent")
 	return cmd
 }
 
@@ -139,10 +142,10 @@ func newPSCmd() *cobra.Command {
 				fmt.Println("no agents running")
 				return nil
 			}
-			fmt.Printf("%-38s %-16s %-10s %-10s %-6s\n", "AGENT ID", "NAME", "VENDOR", "STATE", "PID")
+			fmt.Printf("%-38s %-16s %-10s %-12s %-10s %-6s\n", "AGENT ID", "NAME", "VENDOR", "MODE", "STATE", "PID")
 			for _, st := range list {
-				fmt.Printf("%-38s %-16s %-10s %-10s %-6d\n",
-					st.AgentID, truncate(st.Name, 16), st.Vendor, st.State, st.PID)
+				fmt.Printf("%-38s %-16s %-10s %-12s %-10s %-6d\n",
+					st.AgentID, truncate(st.Name, 16), st.Vendor, st.Mode, st.State, st.PID)
 			}
 			return nil
 		},
@@ -209,13 +212,23 @@ func newVersionCmd() *cobra.Command {
 
 // sessionStartRequest 把 CLI 参数映射为 daemon 的 StartRequest。
 // 若第一个参数不是内置厂商名，则视为 generic 命令。
-func sessionStartRequest(arg, name, dir string) session.StartRequest {
+func sessionStartRequest(arg, name, dir string, oneshot bool) session.StartRequest {
 	vendor := arg
 	cmdName := ""
 	if !isKnownVendor(arg) {
 		cmdName, vendor = arg, "generic"
 	}
-	return session.StartRequest{Vendor: vendor, Name: name, Command: cmdName, Dir: dir}
+	mode := agent.RunModeInteractive
+	if oneshot {
+		mode = agent.RunModeOneshot
+	}
+	return session.StartRequest{
+		Vendor:  vendor,
+		Name:    name,
+		Command: cmdName,
+		Dir:     dir,
+		Mode:    mode,
+	}
 }
 
 func isKnownVendor(s string) bool {
