@@ -1,6 +1,6 @@
 # Restart-safe session projection recovery
 
-Status: Draft, awaiting owner approval
+Status: Approved
 
 ## Problem
 
