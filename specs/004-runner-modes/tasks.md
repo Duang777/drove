@@ -179,6 +179,9 @@ Files:
 
 - `internal/agent/agent.go`
 - `internal/agent/agent_test.go`
+- `internal/pty/pty.go`
+- `internal/pty/pty_test.go`
+- `internal/pty/AGENTS.md`
 - `internal/session/session.go`
 - `internal/session/session_test.go`
 
@@ -193,12 +196,13 @@ Work:
 - Ignore heuristic Done hints for interactive Agents.
 - Persist the terminal state before detaching the matching PTY.
 - Remove stale PIDs after natural exit.
+- Close the PTY master after natural process and read completion.
 - Test the full decision matrix and real process behavior.
 
 Verification:
 
 ```bash
-go test ./internal/agent ./internal/session -race -count=20
+go test ./internal/agent ./internal/pty ./internal/session -race -count=20
 ```
 
 ### T8: Update technical documentation
@@ -232,8 +236,8 @@ Work:
 Verification:
 
 ```bash
-gofmt -w internal/agent internal/session
-go test ./internal/agent ./internal/session -race -count=20
+gofmt -w internal/agent internal/pty internal/session
+go test ./internal/agent ./internal/pty ./internal/session -race -count=20
 go test ./... -race -count=1
 go vet ./...
 npm --prefix web run typecheck

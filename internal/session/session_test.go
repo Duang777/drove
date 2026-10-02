@@ -13,6 +13,7 @@ import (
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
 )
 
@@ -643,6 +644,9 @@ func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
 			stoppedIndex,
 		)
 	}
+	if final := waitForDetachedState(t, manager, id, agent.StateStopped); final.PID != 0 {
+		t.Fatalf("final status = %+v, want no PID", final)
+	}
 }
 
 func TestManagerCloseWaitsForInFlightStart(t *testing.T) {
@@ -700,6 +704,7 @@ func TestManagerCloseStopsSessionsAndRejectsNewStarts(t *testing.T) {
 	started, err := manager.Start(context.Background(), StartRequest{
 		Name:    "close-agent",
 		Command: "/bin/cat",
+		Mode:    agent.RunModeOneshot,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -724,6 +729,9 @@ func TestManagerCloseStopsSessionsAndRejectsNewStarts(t *testing.T) {
 	}
 	if status.State != agent.StateStopped || status.PID != 0 {
 		t.Fatalf("status after close = %+v, want stopped without PID", status)
+	}
+	if status.LastError != "" {
+		t.Fatalf("last error after requested stop = %q, want empty", status.LastError)
 	}
 	if err := manager.Stop(id); err != nil {
 		t.Fatalf("stop after close: %v", err)
@@ -768,6 +776,303 @@ func TestManagerCloseStopsSessionsAndRejectsNewStarts(t *testing.T) {
 	}
 	if afterSeq != lastSeq {
 		t.Fatalf("last seq after rejected start = %d, want %d", afterSeq, lastSeq)
+	}
+}
+
+func TestDecideExit(t *testing.T) {
+	exitErr := errors.New("exit status 7")
+	tests := []struct {
+		name      string
+		mode      agent.RunMode
+		cause     stopCause
+		info      pty.ExitInfo
+		wantState agent.State
+		wantError string
+	}{
+		{
+			name:      "natural interactive success",
+			mode:      agent.RunModeInteractive,
+			info:      pty.ExitInfo{Code: 0},
+			wantState: agent.StateStopped,
+		},
+		{
+			name:      "natural oneshot success",
+			mode:      agent.RunModeOneshot,
+			info:      pty.ExitInfo{Code: 0},
+			wantState: agent.StateDone,
+		},
+		{
+			name:      "natural interactive failure",
+			mode:      agent.RunModeInteractive,
+			info:      pty.ExitInfo{Code: 7, Err: exitErr},
+			wantState: agent.StateStopped,
+			wantError: exitErr.Error(),
+		},
+		{
+			name:      "natural oneshot failure",
+			mode:      agent.RunModeOneshot,
+			info:      pty.ExitInfo{Code: 7, Err: exitErr},
+			wantState: agent.StateStopped,
+			wantError: exitErr.Error(),
+		},
+		{
+			name:      "user stop suppresses process error",
+			mode:      agent.RunModeOneshot,
+			cause:     stopCauseUser,
+			info:      pty.ExitInfo{Code: -1, Err: errors.New("signal: killed")},
+			wantState: agent.StateStopped,
+		},
+		{
+			name:      "shutdown suppresses process error",
+			mode:      agent.RunModeOneshot,
+			cause:     stopCauseShutdown,
+			info:      pty.ExitInfo{Code: -1, Err: errors.New("signal: killed")},
+			wantState: agent.StateStopped,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := decideExit(test.mode, test.cause, test.info)
+			if got.target != test.wantState || got.errorMessage != test.wantError {
+				t.Fatalf("decision = %+v, want state=%s error=%q", got, test.wantState, test.wantError)
+			}
+		})
+	}
+}
+
+func TestOneshotNaturalSuccessEndsDoneAndDetaches(t *testing.T) {
+	manager, _ := newTestManager(t)
+
+	started, err := manager.Start(context.Background(), StartRequest{
+		Name:    "oneshot-success",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "exit 0"},
+		Mode:    agent.RunModeOneshot,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	status := waitForDetachedState(t, manager, agent.ID(started.AgentID), agent.StateDone)
+	if status.PID != 0 {
+		t.Fatalf("status after natural exit = %+v, want no PID", status)
+	}
+	if err := manager.Stop(agent.ID(started.AgentID)); err != nil {
+		t.Fatalf("stop completed oneshot: %v", err)
+	}
+}
+
+func TestNaturalFailurePersistsErrorAndDetaches(t *testing.T) {
+	manager, _ := newTestManager(t)
+
+	started, err := manager.Start(context.Background(), StartRequest{
+		Name:    "oneshot-failure",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "exit 7"},
+		Mode:    agent.RunModeOneshot,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	status := waitForDetachedState(t, manager, agent.ID(started.AgentID), agent.StateStopped)
+	if status.PID != 0 || status.LastError == "" {
+		t.Fatalf("status after failed exit = %+v, want error without PID", status)
+	}
+
+	rows, err := manager.Replay(started.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	errorIndex := -1
+	stoppedIndex := -1
+	for i, row := range rows {
+		if row.Type == string(event.TypeError) && row.Payload == status.LastError {
+			errorIndex = i
+		}
+		if row.Type == string(event.TypeStateChanged) && row.To == string(agent.StateStopped) {
+			stoppedIndex = i
+		}
+	}
+	if errorIndex < 0 || stoppedIndex < 0 || errorIndex >= stoppedIndex {
+		t.Fatalf("error index = %d, stopped index = %d, rows = %+v", errorIndex, stoppedIndex, rows)
+	}
+}
+
+func TestUserStopOneshotEndsStoppedWithoutProcessError(t *testing.T) {
+	manager, _ := newTestManager(t)
+
+	started, err := manager.Start(context.Background(), StartRequest{
+		Name:    "oneshot-stop",
+		Command: "/bin/cat",
+		Mode:    agent.RunModeOneshot,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(started.AgentID)
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop again: %v", err)
+	}
+
+	status, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.State != agent.StateStopped || status.PID != 0 || status.LastError != "" {
+		t.Fatalf("status after stop = %+v, want stopped without PID or error", status)
+	}
+
+	rows, err := manager.Replay(started.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type == string(event.TypeError) {
+			t.Fatalf("requested stop persisted unexpected error: %+v", row)
+		}
+	}
+}
+
+func TestInteractiveIgnoresDoneHint(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("interactive-agent")
+	a := agent.New(
+		id,
+		agent.WithName("interactive-agent"),
+		agent.WithVendor("claude"),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithStateChangeHook(manager.onStateChange),
+	)
+	if err := a.Transition(agent.StateStarting, "test start"); err != nil {
+		t.Fatalf("transition starting: %v", err)
+	}
+	if err := a.Transition(agent.StateWorking, "test working"); err != nil {
+		t.Fatalf("transition working: %v", err)
+	}
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.mu.Unlock()
+
+	manager.onOutput(id, "Task complete!", manager.reg.For("claude"))
+
+	if got := a.State(); got != agent.StateWorking {
+		t.Fatalf("interactive state = %s, want working", got)
+	}
+}
+
+func TestStopCauseAndExitClaimHaveOneWinner(t *testing.T) {
+	t.Run("stop first", func(t *testing.T) {
+		manager, _ := newTestManager(t)
+		id := agent.ID("agent-1")
+		running := &runningSession{}
+		manager.sessions[id] = running
+
+		manager.requestStop(id, running, stopCauseUser)
+		cause, ok := manager.claimExit(id, running)
+		if !ok || cause != stopCauseUser {
+			t.Fatalf("claim = (%d, %v), want user stop", cause, ok)
+		}
+		if _, ok := manager.claimExit(id, running); ok {
+			t.Fatal("second exit claim succeeded")
+		}
+	})
+
+	t.Run("exit first", func(t *testing.T) {
+		manager, _ := newTestManager(t)
+		id := agent.ID("agent-1")
+		running := &runningSession{}
+		manager.sessions[id] = running
+
+		cause, ok := manager.claimExit(id, running)
+		if !ok || cause != stopCauseNone {
+			t.Fatalf("claim = (%d, %v), want natural exit", cause, ok)
+		}
+		manager.requestStop(id, running, stopCauseUser)
+		if running.stopCause != stopCauseNone {
+			t.Fatalf("stop cause = %d, want unchanged", running.stopCause)
+		}
+	})
+}
+
+func TestNaturalExitRacingStopRecordsOneTerminalTransition(t *testing.T) {
+	for i := range 10 {
+		manager, _ := newTestManager(t)
+		started, err := manager.Start(context.Background(), StartRequest{
+			Name:    "racing-agent",
+			Command: "/bin/sh",
+			Args:    []string{"-c", "exit 0"},
+			Mode:    agent.RunModeOneshot,
+		})
+		if err != nil {
+			t.Fatalf("iteration %d start: %v", i, err)
+		}
+		id := agent.ID(started.AgentID)
+
+		stopResult := make(chan error, 1)
+		go func() {
+			stopResult <- manager.Stop(id)
+		}()
+		select {
+		case stopErr := <-stopResult:
+			if stopErr != nil {
+				t.Fatalf("iteration %d stop: %v", i, stopErr)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("iteration %d stop timed out", i)
+		}
+
+		status, err := manager.Status(id)
+		if err != nil {
+			t.Fatalf("iteration %d status: %v", i, err)
+		}
+		if status.PID != 0 ||
+			(status.State != agent.StateDone && status.State != agent.StateStopped) {
+			t.Fatalf("iteration %d final status = %+v", i, status)
+		}
+
+		rows, err := manager.Replay(started.AgentID)
+		if err != nil {
+			t.Fatalf("iteration %d replay: %v", i, err)
+		}
+		terminalTransitions := 0
+		for _, row := range rows {
+			if row.Type == string(event.TypeStateChanged) &&
+				(row.To == string(agent.StateDone) || row.To == string(agent.StateStopped)) {
+				terminalTransitions++
+			}
+		}
+		if terminalTransitions != 1 {
+			t.Fatalf(
+				"iteration %d terminal transitions = %d, want 1; rows=%+v",
+				i,
+				terminalTransitions,
+				rows,
+			)
+		}
+	}
+}
+
+func waitForDetachedState(t *testing.T, manager *Manager, id agent.ID, want agent.State) *Status {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, err := manager.Status(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if status.State == want && status.PID == 0 {
+			return status
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status = %+v, want state %s without PID", status, want)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

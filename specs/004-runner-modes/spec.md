@@ -302,6 +302,11 @@ The PTY exit callback captures the exact `runningSession` pointer created for
 that start. An exit claim succeeds only when the map still contains that
 pointer and no previous callback has claimed it.
 
+`onExit` runs inside the PTY wait loop, so it cannot call synchronous
+`Session.Close` without waiting on itself. After `onExit` and the read loop
+return, the PTY wait loop closes the master file and marks the Session closed.
+A later `Session.Close` remains idempotent.
+
 ### Stop ordering
 
 `Manager.Stop` records `stopCauseUser` under the Manager mutex before it calls
@@ -581,6 +586,9 @@ Implementation is expected to touch these existing files:
 - `internal/session/projection.go`
 - `internal/session/projection_test.go`
 - `internal/session/AGENTS.md`
+- `internal/pty/pty.go`
+- `internal/pty/pty_test.go`
+- `internal/pty/AGENTS.md`
 - `internal/api/server.go`
 - `cmd/drove/main.go`
 - `cmd/drove/AGENTS.md`
@@ -653,6 +661,8 @@ Use real short commands through PTY:
 - Repeated Stop after done or stopped succeeds.
 - Interactive output that matches the Claude Done heuristic does not mark a
   live process done.
+- Natural PTY completion closes the master and makes later writes and resizes
+  return `pty.ErrClosed`.
 - Focused tests pass repeatedly under the race detector.
 
 ### API, CLI, and Web tests
@@ -789,6 +799,7 @@ git diff --check
   either mode.
 - Concurrent Stop and natural exit have one lock-defined winner.
 - Natural exit removes the PID from Status.
+- Natural exit releases the PTY master without waiting for garbage collection.
 - Interactive Done hints do not mark a live process done.
 - Restart still reconciles historical done to stopped.
 - PTY does not import or inspect mode.

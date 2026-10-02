@@ -65,6 +65,20 @@ var (
 	ErrInvalidMode = errors.New("session: invalid mode")
 )
 
+type stopCause uint8
+
+const (
+	stopCauseNone stopCause = iota
+	stopCauseUser
+	stopCauseShutdown
+)
+
+type runningSession struct {
+	process     *pty.Session
+	stopCause   stopCause
+	exitClaimed bool
+}
+
 // Manager 是会话编排入口。
 type Manager struct {
 	reg   *adapter.Registry
@@ -73,7 +87,7 @@ type Manager struct {
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
-	sessions map[agent.ID]*pty.Session
+	sessions map[agent.ID]*runningSession
 	closed   bool
 
 	starts    sync.WaitGroup
@@ -95,7 +109,7 @@ func NewManager(reg *adapter.Registry, hub *event.Hub, st *store.Store) *Manager
 		hub:      hub,
 		store:    st,
 		agents:   make(map[agent.ID]*agent.Agent),
-		sessions: make(map[agent.ID]*pty.Session),
+		sessions: make(map[agent.ID]*runningSession),
 	}
 }
 
@@ -201,6 +215,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 
 	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
 	callbacksReady := make(chan struct{})
+	running := &runningSession{}
 	sess, err := pty.Start(pty.Config{
 		Command: cmdName,
 		Args:    cmdArgs,
@@ -211,7 +226,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		},
 		OnExit: func(info pty.ExitInfo) {
 			<-callbacksReady
-			m.onExit(id, info)
+			m.onExit(id, running, info)
 		},
 	})
 	if err != nil {
@@ -222,12 +237,14 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, startErr
 	}
 
+	running.process = sess
 	m.mu.Lock()
-	m.sessions[id] = sess
+	m.sessions[id] = running
 	m.mu.Unlock()
 
 	// 4. 状态推进：进程活着 -> Working。
 	if err := a.Transition(agent.StateWorking, "process started"); err != nil {
+		m.requestStop(id, running, stopCauseShutdown)
 		close(callbacksReady)
 		_ = sess.Close()
 		m.cleanup(id)
@@ -249,21 +266,24 @@ func (m *Manager) Close() error {
 
 		type attachedSession struct {
 			id      agent.ID
-			session *pty.Session
+			session *runningSession
 		}
-		m.mu.RLock()
+		m.mu.Lock()
 		attached := make([]attachedSession, 0, len(m.sessions))
 		for id, sess := range m.sessions {
+			if !sess.exitClaimed && sess.stopCause == stopCauseNone {
+				sess.stopCause = stopCauseShutdown
+			}
 			attached = append(attached, attachedSession{id: id, session: sess})
 		}
-		m.mu.RUnlock()
+		m.mu.Unlock()
 		sort.Slice(attached, func(i, j int) bool {
 			return attached[i].id < attached[j].id
 		})
 
 		var closeErrors []error
 		for _, item := range attached {
-			if err := item.session.Close(); err != nil {
+			if err := item.session.process.Close(); err != nil {
 				closeErrors = append(
 					closeErrors,
 					fmt.Errorf("session: close agent %q: %w", item.id, err),
@@ -294,17 +314,14 @@ func (m *Manager) Stop(id agent.ID) error {
 	sess, attached := m.sessions[id]
 	m.mu.RUnlock()
 	if !attached {
-		if a.State() == agent.StateStopped {
+		if state := a.State(); state == agent.StateDone || state == agent.StateStopped {
 			return nil
 		}
 		return fmt.Errorf("session: agent %q is %s without a PTY", id, a.State())
 	}
-	if err := sess.Close(); err != nil && !errors.Is(err, pty.ErrClosed) {
+	m.requestStop(id, sess, stopCauseUser)
+	if err := sess.process.Close(); err != nil && !errors.Is(err, pty.ErrClosed) {
 		return fmt.Errorf("session: stop agent %q: %w", id, err)
-	}
-	if a.State() != agent.StateStopped {
-		// 进程退出回调可能已迁移到 Stopped，这里仅在未停止时迁移，保证幂等。
-		_ = a.Transition(agent.StateStopped, "user stop")
 	}
 	return nil
 }
@@ -330,7 +347,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		LastError: a.LastError(),
 	}
 	if sess != nil {
-		st.PID = sess.PID()
+		st.PID = sess.process.PID()
 	}
 	return st, nil
 }
@@ -376,7 +393,7 @@ func (m *Manager) Write(id agent.ID, data []byte) error {
 	if !attached {
 		return fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
-	if _, err := sess.Write(data); err != nil {
+	if _, err := sess.process.Write(data); err != nil {
 		return fmt.Errorf("session: write agent %q: %w", id, err)
 	}
 	return nil
@@ -416,25 +433,65 @@ func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 			_ = a.Transition(agent.StateBlocked, hint.Reason)
 		}
 	case agent.StateDone:
-		if a.State() == agent.StateWorking {
+		if a.RunMode() == agent.RunModeOneshot && a.State() == agent.StateWorking {
 			_ = a.Transition(agent.StateDone, hint.Reason)
 		}
 	}
 }
 
-// onExit 进程退出：迁移 Stopped（若仍存活状态）。
-func (m *Manager) onExit(id agent.ID, info pty.ExitInfo) {
+type exitDecision struct {
+	target       agent.State
+	reason       string
+	errorMessage string
+}
+
+func decideExit(mode agent.RunMode, cause stopCause, info pty.ExitInfo) exitDecision {
+	switch cause {
+	case stopCauseUser:
+		return exitDecision{target: agent.StateStopped, reason: "user stop"}
+	case stopCauseShutdown:
+		return exitDecision{target: agent.StateStopped, reason: "manager shutdown"}
+	}
+
+	reason := fmt.Sprintf("process exited code=%d", info.Code)
+	if mode == agent.RunModeOneshot && info.Code == 0 && info.Err == nil {
+		return exitDecision{target: agent.StateDone, reason: reason}
+	}
+
+	decision := exitDecision{target: agent.StateStopped, reason: reason}
+	if info.Err != nil {
+		decision.errorMessage = info.Err.Error()
+	} else if info.Code != 0 {
+		decision.errorMessage = reason
+	}
+	return decision
+}
+
+// onExit 根据运行模式和停止原因记录终态，再移除 PTY。
+func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo) {
+	cause, ok := m.claimExit(id, running)
+	if !ok {
+		return
+	}
+	defer m.detach(id, running)
+
 	a, ok := m.agent(id)
 	if !ok {
 		return
 	}
-	cur := a.State()
-	if cur != agent.StateStopped {
-		reason := fmt.Sprintf("process exited code=%d", info.Code)
-		if info.Err != nil {
-			a.SetError(info.Err.Error())
-		}
-		_ = a.Transition(agent.StateStopped, reason)
+
+	decision := decideExit(a.RunMode(), cause, info)
+	if decision.errorMessage != "" {
+		a.SetError(decision.errorMessage)
+		_ = m.persistAndPublish(event.NewError(
+			0,
+			string(id),
+			string(id),
+			decision.errorMessage,
+		))
+	}
+	if a.State() != decision.target {
+		_ = a.Transition(decision.target, decision.reason)
 	}
 }
 
@@ -480,6 +537,36 @@ func (m *Manager) beginStart() error {
 
 func (m *Manager) endStart() {
 	m.starts.Done()
+}
+
+func (m *Manager) requestStop(id agent.ID, running *runningSession, cause stopCause) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if current, ok := m.sessions[id]; ok &&
+		current == running &&
+		!running.exitClaimed &&
+		running.stopCause == stopCauseNone {
+		running.stopCause = cause
+	}
+}
+
+func (m *Manager) claimExit(id agent.ID, running *runningSession) (stopCause, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current, ok := m.sessions[id]
+	if !ok || current != running || running.exitClaimed {
+		return stopCauseNone, false
+	}
+	running.exitClaimed = true
+	return running.stopCause, true
+}
+
+func (m *Manager) detach(id agent.ID, running *runningSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[id] == running {
+		delete(m.sessions, id)
+	}
 }
 
 func normalizeRunMode(mode agent.RunMode) (agent.RunMode, error) {

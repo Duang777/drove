@@ -18,7 +18,7 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 
 ## 2. 当前完成度
 
-当前仓库是一个初始 MVP，共 59 个受 Git 管理的文件，只有一个提交、一个分支，没有 tag 和公开 issue。
+当前仓库仍处于初始 MVP 阶段。
 
 ### 已经实现
 
@@ -29,7 +29,10 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - SQLite 追加式事件日志及按 session 回放。
 - daemon 启动时从 SQLite 事件流恢复历史会话，并从提交后的最大序号继续分配。
 - 无法重连 PTY 的历史会话会追加恢复事件并收口为 `stopped`。
-- 新会话会先持久化名称和厂商元数据，再进入状态机。
+- 新会话会先持久化名称、厂商和运行模式，再进入状态机。
+- runner 支持 `interactive` 和 `oneshot`；新请求默认 interactive，旧事件缺少模式时按 oneshot 恢复。
+- Claude 与 Codex 的交互命令和单次执行命令由 adapter 统一选择。
+- oneshot 自然成功退出为 `done`；interactive、失败退出和主动停止为 `stopped`。
 - PTY 输出与退出回调在 goroutine 启动前固定，短进程不会越过 `starting -> working`。
 - daemon 按 API、会话、Hub、store 的依赖顺序关闭，并等待 PTY 回调结束。
 - REST 管理接口和 WebSocket 实时事件流。
@@ -78,15 +81,15 @@ internal/session.Manager -------------------+
 
 `POST /api/v1/agents` 最终调用 `Manager.Start`：
 
-1. 根据 `vendor` 查找 adapter。
-2. 根据 adapter 或请求参数解析并校验命令。
-3. 创建 `agent.Agent`，初始状态为 `pending`。
-4. 写入包含名称和厂商的 `session_lifecycle(created)` 事件。
-5. 迁移到 `starting`，状态事件写入 SQLite。
-6. 启动 PTY 和子进程。
-7. 注册输出与退出回调。
-8. 迁移到 `working`。
-9. 返回 `session.Status`。
+1. 校验 `mode`，空值默认 `interactive`。
+2. 根据 `vendor` 查找 adapter，并解析对应模式的命令。
+3. 使用请求中的自定义命令覆盖 adapter 默认命令。
+4. 创建 `agent.Agent`，初始状态为 `pending`。
+5. 写入包含名称、厂商和模式的 `session_lifecycle(created)` 事件。
+6. 迁移到 `starting`，状态事件写入 SQLite。
+7. 使用固定的输出与退出回调启动 PTY 和子进程。
+8. 登记 PTY，迁移到 `working`，再放行回调。
+9. 返回包含运行模式的 `session.Status`。
 
 关键代码：
 
@@ -122,7 +125,7 @@ pending -> starting -> working
                          |
                          +--> blocked -> working
                          +--> done
-                         +--> idle -> working
+                         +--> idle -> working / done
 
 任意运行态最终进入 stopped
 ```
@@ -284,6 +287,39 @@ API Shutdown -> Manager.Close -> Hub.Close -> Store.Close
 - 重启前后最大序号都为 4，没有追加 interruption error 或 reconciliation 事件。
 - `go test ./internal/event ./internal/daemon -race -count=10` 通过。
 
+### 已修复：runner 只能单次执行
+
+`agent.RunMode` 现在记录 `interactive` 或 `oneshot`。新请求默认
+interactive，`drove up --oneshot` 保留旧的单次执行方式。adapter 负责厂商参数：
+
+| Vendor | Interactive | Oneshot |
+| --- | --- | --- |
+| Claude | `claude` | `claude --print` |
+| Codex | `codex` | `codex exec` |
+| Generic | 使用请求命令 | 使用请求命令 |
+
+创建事件仍使用 version 1 payload，并增加可选 `mode` 字段。旧事件缺少该字段时
+恢复为 oneshot；新请求缺少 mode 时默认 interactive。两个默认值属于不同边界。
+
+退出回调根据运行模式、停止原因和进程结果决定终态：
+
+- oneshot 自然成功退出进入 `done`。
+- interactive 自然退出进入 `stopped`。
+- 自然失败退出进入 `stopped`，并在状态事件前持久化进程错误。
+- 用户停止和 daemon 关闭先记录停止原因，胜出退出认领后进入 `stopped`，且不记录预期的 kill 错误。
+
+自然退出会在终态事件持久化后移除运行中 PTY，读取循环结束后也会关闭 PTY master，
+因此 Status 不再保留已经退出的 PID 或依赖垃圾回收释放文件描述符。
+`stopCause` 和 `exitClaimed` 由 Manager 的同一把锁保护，使 Stop 与自然退出只有一个判定结果。
+
+验证结果：
+
+- `go test ./internal/agent ./internal/session -race -count=20` 通过。
+- 退出语义与 Stop 竞态测试在 race detector 下重复 50 轮通过。
+- 全仓 race、vet、Go build、Web typecheck 和 Web build 通过。
+- 隔离数据库实测中，interactive 短进程退出为 `stopped`，oneshot 短进程退出为 `done`，两者都清除了 PID。
+- 使用同一数据库重启后，两个 mode 均正确恢复，历史 `done` 按既有规则追加 `done -> stopped`，事件最大序号从 8 增至 9。
+
 ### P1：Web 控制台目前是无样式骨架
 
 组件大量使用 Tailwind class，但项目没有 Tailwind 依赖、配置或 CSS 入口。Vite 构建产物只有 HTML 和 JS，没有 CSS 文件。
@@ -299,7 +335,7 @@ API Shutdown -> Manager.Close -> Hub.Close -> Store.Close
 - `StateHint.Confidence` 被记录，但没有使用。
 - WebSocket 没有文档所说的定时 ping。客户端断开且没有新事件时，服务端订阅可能继续存活。
 - `CheckOrigin` 无条件返回 true。默认只绑定 localhost 时风险有限，但配置为外部地址后需要安全策略。
-- API 将所有启动失败都映射为 500，没有区分无效请求和运行时故障。
+- API 已将无效 runner mode 映射为 400；其他请求校验错误仍可能返回 500。
 - 前端直接断言 REST 和 WebSocket JSON 类型，没有边界校验。
 
 ## 6. 推荐的开发顺序

@@ -130,7 +130,20 @@ func (s *Session) waitLoop() {
 	default:
 	}
 	<-s.readDone
+	s.closeAfterNaturalExit()
 	close(s.done)
+}
+
+func (s *Session) closeAfterNaturalExit() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	s.closed = true
+	if err := s.ptmx.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+		s.closeErr = errors.Join(s.closeErr, fmt.Errorf("pty: close master after exit: %w", err))
+	}
 }
 
 // Write 向 agent 注入输入。
@@ -169,11 +182,15 @@ func (s *Session) PID() int {
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.mu.Lock()
+		alreadyClosed := s.closed
 		s.closed = true
-		closeErr := s.ptmx.Close()
+		var closeErr error
 		var killErr error
-		if s.cmd.Process != nil {
-			killErr = s.cmd.Process.Kill()
+		if !alreadyClosed {
+			closeErr = s.ptmx.Close()
+			if s.cmd.Process != nil {
+				killErr = s.cmd.Process.Kill()
+			}
 		}
 		s.mu.Unlock()
 

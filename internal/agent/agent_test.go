@@ -177,6 +177,7 @@ func TestLegalTransitions(t *testing.T) {
 		{StateBlocked, StateWorking, true},
 		{StateBlocked, StateDone, true},
 		{StateIdle, StateWorking, true},
+		{StateIdle, StateDone, true},
 		{StateDone, StateStopped, true},
 		// 非法迁移
 		{StateStopped, StateWorking, false},

@@ -50,6 +50,7 @@
 - [x] The first lock-protected claim determines concurrent exit behavior.
 - [x] Daemon shutdown marks all attached sessions before closing any PTY.
 - [x] Natural exit detaches the matching PTY after terminal state persistence.
+- [x] Natural PTY completion closes the master file without calling Close from its own callback.
 - [x] Stop after done or stopped is idempotent.
 - [x] `idle -> done` is added for successful oneshot exit.
 - [x] Interactive Agents ignore heuristic Done hints.

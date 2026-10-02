@@ -55,6 +55,18 @@ func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 		t.Fatalf("unexpected duplicate exit %+v", exit)
 	case <-time.After(25 * time.Millisecond):
 	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after natural exit")
+	}
+	if _, err := sess.Write([]byte("input")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("write after natural exit = %v, want ErrClosed", err)
+	}
+	if err := sess.Resize(24, 80); !errors.Is(err, ErrClosed) {
+		t.Fatalf("resize after natural exit = %v, want ErrClosed", err)
+	}
 }
 
 func TestCloseWaitsForOutputCallbackAndIsIdempotent(t *testing.T) {
