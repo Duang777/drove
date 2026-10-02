@@ -8,10 +8,11 @@
 
 ## 结论
 
-Phase 1 不能直接按 RFC-001 当前草案编码。草案中的 Claude Code 事件列表已经
-落后，Codex 事件数、handler 支持情况和信任模型也需要校正。两家当前都能稳定
-提供 `command` hook，因此 Phase 1A 应以“厂商 command hook → `drove hook`
-relay → 本地 signal endpoint → 单写者 Detector”为最小公共链路。
+本次更新前的 RFC-001 草案不能直接用于 Phase 1 编码。旧稿中的 Claude Code
+事件列表已经落后，Codex 事件数、handler 支持情况和信任模型也不准确。本次
+RFC 更新已校正这些事实。两家当前都能稳定提供 `command` hook，因此 Phase 1A
+应以“厂商 command hook → `drove hook` relay → 本地 signal endpoint →
+单写者 Detector”为最小公共链路。
 
 Phase 1A 编码前必须固定五项协议：
 
@@ -141,7 +142,7 @@ Codex 仍在快速演进。本文同时引用已发布官方文档与 2026-10-02
 
 定义和固定长度数组见
 [`hook_config.rs:L35-L150`](https://github.com/openai/codex/blob/44dd77b71e88c78295736bffd3dc3b684c13be6d/codex-rs/config/src/hook_config.rs#L35-L150)。
-RFC-001 所写“11 个事件”遗漏了 `Interrupt`，需要更正。
+RFC-001 旧稿所写“11 个事件”遗漏了 `Interrupt`，本次已更正为 12 个。
 
 ### Handler 类型
 
