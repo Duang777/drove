@@ -2,13 +2,17 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -53,6 +57,7 @@ func (s *Server) routes() {
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDelete)
+	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
 	mux.HandleFunc("GET /ws", s.handleWS)
 }
@@ -105,6 +110,67 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.opts.Manager.Stop(agent.ID(id)); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+const maxInputRequestBytes = 6*session.MaxInputBytes + 128
+
+type inputRequest struct {
+	Data string `json:"data"`
+}
+
+func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxInputRequestBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum size")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if !utf8.Valid(body) {
+		writeErr(w, http.StatusBadRequest, session.ErrInputNotUTF8.Error())
+		return
+	}
+
+	var req inputRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+
+	if _, err := s.opts.Manager.SendInput(agent.ID(r.PathValue("id")), []byte(req.Data)); err != nil {
+		switch {
+		case errors.Is(err, session.ErrInputEmpty), errors.Is(err, session.ErrInputNotUTF8):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, session.ErrInputTooLarge):
+			writeErr(w, http.StatusRequestEntityTooLarge, err.Error())
+		case errors.Is(err, session.ErrUnknownAgent):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, session.ErrNotAttached):
+			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, session.ErrManagerClosed):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

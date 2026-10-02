@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -71,6 +73,23 @@ func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.
 // Stop 停止一个会话。
 func (c *Client) Stop(ctx context.Context, id string) error {
 	return c.delete(ctx, "/api/v1/agents/"+id)
+}
+
+type inputRequest struct {
+	Data string `json:"data"`
+}
+
+// SendInput 向一个已连接的 Agent 发送 UTF-8 文本。
+func (c *Client) SendInput(ctx context.Context, id string, data []byte) error {
+	if !utf8.Valid(data) {
+		return errors.New("client: input is not valid UTF-8")
+	}
+	return c.postJSON(
+		ctx,
+		"/api/v1/agents/"+url.PathEscape(id)+"/input",
+		inputRequest{Data: string(data)},
+		nil,
+	)
 }
 
 // Replay 回放某会话事件。
@@ -163,6 +182,9 @@ func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
 	if resp.StatusCode >= 400 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("client: %s %s: %s", resp.Status, path, string(msg))
+	}
+	if out == nil {
+		return drain(resp.Body)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }

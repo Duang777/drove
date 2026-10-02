@@ -11,6 +11,7 @@
   - `POST /api/v1/agents`：启动会话（JSON body → StartRequest）
   - `GET  /api/v1/agents/{id}`：单会话状态
   - `DELETE /api/v1/agents/{id}`：停止会话
+  - `POST /api/v1/agents/{id}/input`：向已连接 PTY 写入一段受限 UTF-8 文本
   - `GET  /api/v1/agents/{id}/events`：回放事件流（REST，JSON 数组）
   - `GET  /ws`：WebSocket 实时事件流（每订阅一个连接）
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。

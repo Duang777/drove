@@ -6,7 +6,7 @@
 
 ## 关键设计
 
-- `Client` 封装 REST 调用（List / Start / Status / Stop / Replay），基址来自 Config.APIBind。
+- `Client` 封装 REST 调用（List / Start / Status / Stop / SendInput / Replay），基址来自 Config.APIBind。
 - `EnsureDaemon(ctx)`：先探测 `/api/v1/agents`（500ms 超时）；不可达则找到 `droved`（优先可执行文件同目录，其次 PATH），后台启动并写日志到 `~/.drove/drove.log`，轮询至多 3 秒等待就绪。
 - 所有错误转换为 `ErrDaemonUnreachable`（区别于业务错误），CLI 据此提示用户。
 
