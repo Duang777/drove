@@ -2,6 +2,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -97,6 +98,100 @@ func (s *Store) AppendEvent(ev EventRow) error {
 		return fmt.Errorf("store: append event: %w", err)
 	}
 	return nil
+}
+
+// AppendEvents 在一个事务内追加连续事件，并防止基于过期最大序号写入。
+func (s *Store) AppendEvents(ctx context.Context, expectedLastSeq uint64, events []EventRow) (uint64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return expectedLastSeq, fmt.Errorf("store: begin event batch: %w", err)
+	}
+	defer tx.Rollback()
+
+	var current sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM events`).Scan(&current); err != nil {
+		return expectedLastSeq, fmt.Errorf("store: read event batch boundary: %w", err)
+	}
+	if current.Valid && current.Int64 < 0 {
+		return expectedLastSeq, fmt.Errorf("store: invalid negative event seq %d", current.Int64)
+	}
+	currentLastSeq := uint64(current.Int64)
+	if currentLastSeq != expectedLastSeq {
+		return expectedLastSeq, fmt.Errorf(
+			"store: stale event batch boundary: current seq %d, expected %d",
+			currentLastSeq,
+			expectedLastSeq,
+		)
+	}
+
+	for i, event := range events {
+		expectedSeq := expectedLastSeq + uint64(i) + 1
+		if event.Seq != expectedSeq {
+			return expectedLastSeq, fmt.Errorf(
+				"store: event batch seq %d at index %d, want %d",
+				event.Seq,
+				i,
+				expectedSeq,
+			)
+		}
+	}
+	for _, event := range events {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO events (seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			event.Seq, event.Timestamp.UTC().Format(time.RFC3339Nano), event.Type, event.SessionID,
+			event.AgentID, event.From, event.To, event.Reason, event.Payload,
+		); err != nil {
+			return expectedLastSeq, fmt.Errorf("store: append event batch at seq %d: %w", event.Seq, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return expectedLastSeq, fmt.Errorf("store: commit event batch: %w", err)
+	}
+	return expectedLastSeq + uint64(len(events)), nil
+}
+
+// ScanEvents 按全局 seq 升序访问全部事件，并返回最后一个序号。
+func (s *Store) ScanEvents(ctx context.Context, visit func(EventRow) error) (uint64, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload
+		 FROM events ORDER BY seq ASC`,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store: scan events: %w", err)
+	}
+	defer rows.Close()
+
+	var lastSeq uint64
+	for rows.Next() {
+		var row EventRow
+		var rawSeq int64
+		var timestamp string
+		if err := rows.Scan(&rawSeq, &timestamp, &row.Type, &row.SessionID, &row.AgentID,
+			&row.From, &row.To, &row.Reason, &row.Payload); err != nil {
+			return lastSeq, fmt.Errorf("store: scan event row at seq %d: %w", rawSeq, err)
+		}
+		if rawSeq <= 0 {
+			return lastSeq, fmt.Errorf("store: invalid event seq %d", rawSeq)
+		}
+		row.Seq = uint64(rawSeq)
+		if lastSeq != 0 && row.Seq <= lastSeq {
+			return lastSeq, fmt.Errorf("store: event seq %d is not greater than %d", row.Seq, lastSeq)
+		}
+		parsedTimestamp, err := time.Parse(time.RFC3339Nano, timestamp)
+		if err != nil {
+			return lastSeq, fmt.Errorf("store: parse event timestamp at seq %d: %w", row.Seq, err)
+		}
+		row.Timestamp = parsedTimestamp
+		if err := visit(row); err != nil {
+			return lastSeq, fmt.Errorf("store: visit event at seq %d: %w", row.Seq, err)
+		}
+		lastSeq = row.Seq
+	}
+	if err := rows.Err(); err != nil {
+		return lastSeq, fmt.Errorf("store: iterate events: %w", err)
+	}
+	return lastSeq, nil
 }
 
 // Replay 按 seq 升序回放某会话的全部事件。

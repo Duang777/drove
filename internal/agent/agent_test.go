@@ -1,6 +1,130 @@
 package agent
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestRestoreRejectsInvalidSnapshot(t *testing.T) {
+	createdAt := time.Date(2026, time.October, 3, 3, 4, 5, 6, time.UTC)
+	valid := RestoreSnapshot{
+		ID:        "agent-1",
+		Name:      "build-api",
+		Vendor:    "generic",
+		State:     StateStopped,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt.Add(time.Minute),
+	}
+
+	tests := []struct {
+		name    string
+		change  func(*RestoreSnapshot)
+		wantErr string
+	}{
+		{name: "missing ID", change: func(s *RestoreSnapshot) { s.ID = "" }, wantErr: "ID"},
+		{name: "blank ID", change: func(s *RestoreSnapshot) { s.ID = "   " }, wantErr: "ID"},
+		{name: "missing name", change: func(s *RestoreSnapshot) { s.Name = "" }, wantErr: "name"},
+		{name: "missing vendor", change: func(s *RestoreSnapshot) { s.Vendor = "" }, wantErr: "vendor"},
+		{name: "invalid state", change: func(s *RestoreSnapshot) { s.State = "unknown" }, wantErr: "state"},
+		{name: "missing creation time", change: func(s *RestoreSnapshot) { s.CreatedAt = time.Time{} }, wantErr: "creation time"},
+		{name: "missing update time", change: func(s *RestoreSnapshot) { s.UpdatedAt = time.Time{} }, wantErr: "update time"},
+		{
+			name:    "update before creation",
+			change:  func(s *RestoreSnapshot) { s.UpdatedAt = s.CreatedAt.Add(-time.Nanosecond) },
+			wantErr: "before creation time",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := valid
+			test.change(&snapshot)
+
+			a, err := Restore(snapshot)
+			if err == nil {
+				t.Fatal("restore succeeded with invalid snapshot")
+			}
+			if a != nil {
+				t.Fatalf("restore returned agent %v with error %v", a.ID(), err)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %q, want %q context", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRestoreBuildsSnapshotWithoutCallingStateHook(t *testing.T) {
+	createdAt := time.Date(2026, time.October, 3, 3, 4, 5, 6, time.UTC)
+	updatedAt := createdAt.Add(2 * time.Minute)
+	var transitions int
+
+	a, err := Restore(RestoreSnapshot{
+		ID:        "agent-1",
+		Name:      "build-api",
+		Vendor:    "generic",
+		State:     StateWorking,
+		LastError: "previous warning",
+		CreatedAt: createdAt,
+		UpdatedAt: updatedAt,
+	}, WithStateChangeHook(func(_ ID, _, _ State, _ string) {
+		transitions++
+	}))
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if transitions != 0 {
+		t.Fatalf("restore fired %d state hooks, want 0", transitions)
+	}
+	if a.ID() != "agent-1" ||
+		a.Name() != "build-api" ||
+		a.Vendor() != "generic" ||
+		a.State() != StateWorking ||
+		a.LastError() != "previous warning" ||
+		!a.CreatedAt().Equal(createdAt) ||
+		!a.UpdatedAt().Equal(updatedAt) {
+		t.Fatalf("restored agent does not match snapshot")
+	}
+
+	if err := a.Transition(StateDone, "completed"); err != nil {
+		t.Fatalf("transition restored agent: %v", err)
+	}
+	if transitions != 1 {
+		t.Fatalf("transition fired %d state hooks, want 1", transitions)
+	}
+}
+
+func TestRestoreRejectsOptionsThatInvalidateSnapshot(t *testing.T) {
+	createdAt := time.Date(2026, time.October, 3, 3, 4, 5, 6, time.UTC)
+	snapshot := RestoreSnapshot{
+		ID:        "agent-1",
+		Name:      "build-api",
+		Vendor:    "generic",
+		State:     StateStopped,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+
+	tests := []struct {
+		name   string
+		option Option
+	}{
+		{name: "blank name", option: WithName(" ")},
+		{name: "blank vendor", option: WithVendor(" ")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			a, err := Restore(snapshot, test.option)
+			if err == nil {
+				t.Fatal("restore succeeded after an option invalidated the snapshot")
+			}
+			if a != nil {
+				t.Fatalf("restore returned agent %v with error %v", a.ID(), err)
+			}
+		})
+	}
+}
 
 func TestValidStates(t *testing.T) {
 	valid := []State{StatePending, StateStarting, StateWorking, StateBlocked, StateDone, StateIdle, StateStopped}

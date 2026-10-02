@@ -7,6 +7,7 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -105,6 +106,17 @@ type Agent struct {
 // Option 是 Agent 的构建选项。
 type Option func(*Agent)
 
+// RestoreSnapshot 是从持久化事件投影出的 Agent 状态。
+type RestoreSnapshot struct {
+	ID        ID
+	Name      string
+	Vendor    string
+	State     State
+	LastError string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 // WithName 设置 agent 显示名。
 func WithName(name string) Option {
 	return func(a *Agent) { a.name = name }
@@ -132,6 +144,51 @@ func New(id ID, opts ...Option) *Agent {
 		o(a)
 	}
 	return a
+}
+
+// Restore 从已验证的持久化快照构造 Agent，不触发状态变更回调。
+func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
+	a := &Agent{
+		id:        snapshot.ID,
+		name:      snapshot.Name,
+		vendor:    snapshot.Vendor,
+		state:     snapshot.State,
+		lastError: snapshot.LastError,
+		createdAt: snapshot.CreatedAt,
+		updatedAt: snapshot.UpdatedAt,
+	}
+	for _, option := range opts {
+		option(a)
+	}
+	if err := validateRestoredAgent(a); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+func validateRestoredAgent(a *Agent) error {
+	if strings.TrimSpace(string(a.id)) == "" {
+		return errors.New("agent: restore: ID is required")
+	}
+	if strings.TrimSpace(a.name) == "" {
+		return errors.New("agent: restore: name is required")
+	}
+	if strings.TrimSpace(a.vendor) == "" {
+		return errors.New("agent: restore: vendor is required")
+	}
+	if !Valid(a.state) {
+		return fmt.Errorf("agent: restore: invalid state %q", a.state)
+	}
+	if a.createdAt.IsZero() {
+		return errors.New("agent: restore: creation time is required")
+	}
+	if a.updatedAt.IsZero() {
+		return errors.New("agent: restore: update time is required")
+	}
+	if a.updatedAt.Before(a.createdAt) {
+		return errors.New("agent: restore: update time is before creation time")
+	}
+	return nil
 }
 
 // ID 返回 agent 标识。
