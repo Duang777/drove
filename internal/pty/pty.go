@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -146,18 +147,33 @@ func (s *Session) closeAfterNaturalExit() {
 	}
 }
 
-// Write 向 agent 注入输入。
+// Write 向 agent 注入完整输入，或返回已写入的字节数和错误。
 func (s *Session) Write(data []byte) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return 0, ErrClosed
 	}
-	n, err := s.ptmx.Write(data)
+	n, err := writeFull(s.ptmx, data)
 	if err != nil {
 		return n, fmt.Errorf("pty: write: %w", err)
 	}
 	return n, nil
+}
+
+func writeFull(w io.Writer, data []byte) (int, error) {
+	written := 0
+	for written < len(data) {
+		n, err := w.Write(data[written:])
+		written += n
+		if err != nil {
+			return written, err
+		}
+		if n == 0 {
+			return written, io.ErrShortWrite
+		}
+	}
+	return written, nil
 }
 
 // Resize 调整终端尺寸（rows x cols）。

@@ -14,6 +14,8 @@
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 → 清空运行中会话索引。
 - `Replay(sessionID)`：从 store 读取事件流供回放（CLI `log` 命令 / API）。
+- `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
+- 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input`，但该审计事件不创建会话、不改变状态或时间戳。
 - 状态决策：优先采纳适配器 hint；结合"进程是否存活"（存活→Working，退出→Stopped/Done）兜底，防止误判。
 

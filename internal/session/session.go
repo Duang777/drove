@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -56,13 +57,33 @@ type createdPayload struct {
 	Mode    *agent.RunMode `json:"mode,omitempty"`
 }
 
+type inputAuditPayload struct {
+	Version int `json:"version"`
+	Bytes   int `json:"bytes"`
+}
+
+// MaxInputBytes 是一次输入操作允许的最大 UTF-8 字节数。
+const MaxInputBytes = 64 * 1024
+
 var (
+	// ErrUnknownAgent 表示目标 Agent 不存在。
+	ErrUnknownAgent = errors.New("session: unknown agent")
 	// ErrNotAttached 表示会话存在，但当前 daemon 没有它的 PTY。
 	ErrNotAttached = errors.New("session: agent is not attached to a PTY")
 	// ErrManagerClosed 表示 Manager 已开始关闭，不再接受新会话。
 	ErrManagerClosed = errors.New("session: manager closed")
 	// ErrInvalidMode 表示启动请求包含不支持的运行模式。
 	ErrInvalidMode = errors.New("session: invalid mode")
+	// ErrInputEmpty 表示输入为空。
+	ErrInputEmpty = errors.New("session: input is empty")
+	// ErrInputTooLarge 表示输入超过单次操作上限。
+	ErrInputTooLarge = errors.New("session: input exceeds maximum size")
+	// ErrInputNotUTF8 表示输入不是合法 UTF-8 文本。
+	ErrInputNotUTF8 = errors.New("session: input is not valid UTF-8")
+	// ErrInputWrite 表示 PTY 未完整接受输入。
+	ErrInputWrite = errors.New("session: input write failed")
+	// ErrInputAudit 表示输入已送达，但审计事件持久化失败。
+	ErrInputAudit = errors.New("session: input delivered but audit failed")
 )
 
 type stopCause uint8
@@ -73,10 +94,22 @@ const (
 	stopCauseShutdown
 )
 
+type processSession interface {
+	Write([]byte) (int, error)
+	Close() error
+	PID() int
+}
+
 type runningSession struct {
-	process     *pty.Session
+	inputMu     sync.Mutex
+	process     processSession
 	stopCause   stopCause
 	exitClaimed bool
+}
+
+// InputResult 描述一次输入操作已经写入 PTY 的字节数。
+type InputResult struct {
+	BytesWritten int
 }
 
 // Manager 是会话编排入口。
@@ -382,21 +415,91 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 	return m.store.Replay(sessionID)
 }
 
-// Write 向某 agent 注入输入。
-func (m *Manager) Write(id agent.ID, data []byte) error {
-	if _, ok := m.agent(id); !ok {
-		return fmt.Errorf("session: unknown agent %q", id)
+// SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。
+func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
+	if len(data) == 0 {
+		return InputResult{}, ErrInputEmpty
 	}
+	if len(data) > MaxInputBytes {
+		return InputResult{}, fmt.Errorf("%w: %d bytes", ErrInputTooLarge, len(data))
+	}
+	if !utf8.Valid(data) {
+		return InputResult{}, ErrInputNotUTF8
+	}
+	payload, err := json.Marshal(inputAuditPayload{Version: 1, Bytes: len(data)})
+	if err != nil {
+		return InputResult{}, fmt.Errorf("session: encode input audit: %w", err)
+	}
+
 	m.mu.RLock()
-	sess, attached := m.sessions[id]
+	closed := m.closed
+	_, known := m.agents[id]
+	running, attached := m.sessions[id]
 	m.mu.RUnlock()
+	if closed {
+		return InputResult{}, ErrManagerClosed
+	}
+	if !known {
+		return InputResult{}, fmt.Errorf("%w: %q", ErrUnknownAgent, id)
+	}
 	if !attached {
-		return fmt.Errorf("%w: %q", ErrNotAttached, id)
+		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
-	if _, err := sess.process.Write(data); err != nil {
-		return fmt.Errorf("session: write agent %q: %w", id, err)
+
+	running.inputMu.Lock()
+	defer running.inputMu.Unlock()
+
+	m.mu.RLock()
+	current, stillAttached := m.sessions[id]
+	closed = m.closed
+	exitClaimed := running.exitClaimed
+	m.mu.RUnlock()
+	if closed {
+		return InputResult{}, ErrManagerClosed
 	}
-	return nil
+	if !stillAttached || current != running || exitClaimed {
+		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
+	}
+
+	written, err := running.process.Write(data)
+	result := InputResult{BytesWritten: written}
+	if err != nil {
+		if errors.Is(err, pty.ErrClosed) {
+			return result, fmt.Errorf("%w: %q", ErrNotAttached, id)
+		}
+		return result, fmt.Errorf(
+			"%w: agent %q wrote %d/%d bytes: %w",
+			ErrInputWrite,
+			id,
+			written,
+			len(data),
+			err,
+		)
+	}
+	if written != len(data) {
+		return result, fmt.Errorf(
+			"%w: agent %q wrote %d/%d bytes",
+			ErrInputWrite,
+			id,
+			written,
+			len(data),
+		)
+	}
+	if err := m.persistAndPublish(event.NewAgentInput(
+		0,
+		string(id),
+		string(id),
+		string(payload),
+	)); err != nil {
+		return result, fmt.Errorf(
+			"%w: agent %q received %d bytes; do not retry: %w",
+			ErrInputAudit,
+			id,
+			written,
+			err,
+		)
+	}
+	return result, nil
 }
 
 // -- 内部回调 --
@@ -469,6 +572,9 @@ func decideExit(mode agent.RunMode, cause stopCause, info pty.ExitInfo) exitDeci
 
 // onExit 根据运行模式和停止原因记录终态，再移除 PTY。
 func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo) {
+	running.inputMu.Lock()
+	defer running.inputMu.Unlock()
+
 	cause, ok := m.claimExit(id, running)
 	if !ok {
 		return

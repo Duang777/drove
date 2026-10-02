@@ -259,11 +259,11 @@ func TestStopRestoredStoppedAgentIsIdempotent(t *testing.T) {
 	if err := result.Manager.Stop("missing"); err == nil {
 		t.Fatal("stop unknown agent succeeded")
 	}
-	if err := result.Manager.Write("agent-1", []byte("input")); !errors.Is(err, ErrNotAttached) {
-		t.Fatalf("write restored agent error = %v, want ErrNotAttached", err)
+	if _, err := result.Manager.SendInput("agent-1", []byte("input")); !errors.Is(err, ErrNotAttached) {
+		t.Fatalf("send input to restored agent error = %v, want ErrNotAttached", err)
 	}
-	if err := result.Manager.Write("missing", []byte("input")); err == nil || errors.Is(err, ErrNotAttached) {
-		t.Fatalf("write unknown agent error = %v, want unknown-agent error", err)
+	if _, err := result.Manager.SendInput("missing", []byte("input")); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("send input to unknown agent error = %v, want ErrUnknownAgent", err)
 	}
 }
 
@@ -736,8 +736,8 @@ func TestManagerCloseStopsSessionsAndRejectsNewStarts(t *testing.T) {
 	if err := manager.Stop(id); err != nil {
 		t.Fatalf("stop after close: %v", err)
 	}
-	if err := manager.Write(id, []byte("input")); !errors.Is(err, ErrNotAttached) {
-		t.Fatalf("write after close error = %v, want ErrNotAttached", err)
+	if _, err := manager.SendInput(id, []byte("input")); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("send input after close error = %v, want ErrManagerClosed", err)
 	}
 
 	rows, err := manager.Replay(started.AgentID)
@@ -776,6 +776,142 @@ func TestManagerCloseStopsSessionsAndRejectsNewStarts(t *testing.T) {
 	}
 	if afterSeq != lastSeq {
 		t.Fatalf("last seq after rejected start = %d, want %d", afterSeq, lastSeq)
+	}
+}
+
+func TestSendInputValidatesBeforeLookingUpAgent(t *testing.T) {
+	manager, _ := newTestManager(t)
+
+	tests := []struct {
+		name string
+		data []byte
+		want error
+	}{
+		{name: "empty", want: ErrInputEmpty},
+		{name: "too large", data: []byte(strings.Repeat("x", MaxInputBytes+1)), want: ErrInputTooLarge},
+		{name: "invalid UTF-8", data: []byte{0xff}, want: ErrInputNotUTF8},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := manager.SendInput("missing", test.data)
+			if !errors.Is(err, test.want) {
+				t.Fatalf("send input error = %v, want %v", err, test.want)
+			}
+			if result.BytesWritten != 0 {
+				t.Fatalf("bytes written = %d, want 0", result.BytesWritten)
+			}
+		})
+	}
+}
+
+func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("agent-1")
+	a := agent.New(
+		id,
+		agent.WithName("agent"),
+		agent.WithVendor("generic"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	process := &fakeProcessSession{writeN: 2, writeErr: errors.New("broken pipe")}
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.sessions[id] = &runningSession{process: process}
+	manager.mu.Unlock()
+
+	result, err := manager.SendInput(id, []byte("input"))
+	if !errors.Is(err, ErrInputWrite) {
+		t.Fatalf("send input error = %v, want ErrInputWrite", err)
+	}
+	if result.BytesWritten != 2 {
+		t.Fatalf("bytes written = %d, want 2", result.BytesWritten)
+	}
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("events = %+v, want no successful input audit", rows)
+	}
+}
+
+func TestSendInputAuditsWithoutPersistingContentBeforeExit(t *testing.T) {
+	manager, _ := newTestManager(t)
+	started, err := manager.Start(context.Background(), StartRequest{
+		Name:    "input-agent",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "IFS= read -r line"},
+		Mode:    agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(started.AgentID)
+	t.Cleanup(func() {
+		if closeErr := manager.Close(); closeErr != nil {
+			t.Errorf("close manager: %v", closeErr)
+		}
+	})
+
+	input := []byte("secret prompt\n")
+	result, err := manager.SendInput(id, input)
+	if err != nil {
+		t.Fatalf("send input: %v", err)
+	}
+	if result.BytesWritten != len(input) {
+		t.Fatalf("bytes written = %d, want %d", result.BytesWritten, len(input))
+	}
+	waitForDetachedState(t, manager, id, agent.StateStopped)
+
+	rows, err := manager.Replay(started.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	inputIndex := -1
+	stoppedIndex := -1
+	for i, row := range rows {
+		if row.Type == string(event.TypeAgentInput) {
+			inputIndex = i
+			if row.Reason != "accepted" || row.Payload != `{"version":1,"bytes":14}` {
+				t.Fatalf("input audit = %+v", row)
+			}
+			if strings.Contains(row.Payload, "secret") {
+				t.Fatalf("input audit leaked content: %+v", row)
+			}
+		}
+		if row.Type == string(event.TypeStateChanged) && row.To == string(agent.StateStopped) {
+			stoppedIndex = i
+		}
+	}
+	if inputIndex < 0 || stoppedIndex < 0 || inputIndex >= stoppedIndex {
+		t.Fatalf("input index = %d, stopped index = %d; rows=%+v", inputIndex, stoppedIndex, rows)
+	}
+}
+
+func TestSendInputReportsDeliveredButUnaudited(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("agent-1")
+	a := agent.New(
+		id,
+		agent.WithName("agent"),
+		agent.WithVendor("generic"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	process := &fakeProcessSession{writeN: 5}
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.sessions[id] = &runningSession{process: process}
+	manager.mu.Unlock()
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	result, err := manager.SendInput(id, []byte("input"))
+	if !errors.Is(err, ErrInputAudit) {
+		t.Fatalf("send input error = %v, want ErrInputAudit", err)
+	}
+	if result.BytesWritten != 5 || !strings.Contains(err.Error(), "do not retry") {
+		t.Fatalf("send input result = %+v, error = %v", result, err)
 	}
 }
 
@@ -1096,4 +1232,21 @@ func newTestStore(t *testing.T) *store.Store {
 		}
 	})
 	return st
+}
+
+type fakeProcessSession struct {
+	writeN   int
+	writeErr error
+}
+
+func (s *fakeProcessSession) Write([]byte) (int, error) {
+	return s.writeN, s.writeErr
+}
+
+func (s *fakeProcessSession) Close() error {
+	return nil
+}
+
+func (s *fakeProcessSession) PID() int {
+	return 1
 }

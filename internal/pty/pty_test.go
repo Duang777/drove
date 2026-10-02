@@ -1,13 +1,65 @@
 package pty
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+type chunkWriter struct {
+	bytes.Buffer
+	max int
+	err error
+}
+
+func (w *chunkWriter) Write(data []byte) (int, error) {
+	if w.max == 0 {
+		return 0, w.err
+	}
+	if len(data) > w.max {
+		data = data[:w.max]
+	}
+	n, _ := w.Buffer.Write(data)
+	return n, w.err
+}
+
+func TestWriteFullCompletesShortWrites(t *testing.T) {
+	writer := &chunkWriter{max: 2}
+	data := []byte("abcdef")
+
+	n, err := writeFull(writer, data)
+	if err != nil {
+		t.Fatalf("write full: %v", err)
+	}
+	if n != len(data) || !bytes.Equal(writer.Bytes(), data) {
+		t.Fatalf("write result = (%d, %q), want (%d, %q)", n, writer.Bytes(), len(data), data)
+	}
+}
+
+func TestWriteFullRejectsZeroProgress(t *testing.T) {
+	n, err := writeFull(&chunkWriter{}, []byte("input"))
+	if n != 0 || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("write result = (%d, %v), want (0, io.ErrShortWrite)", n, err)
+	}
+}
+
+func TestWriteFullPreservesPartialFailure(t *testing.T) {
+	writeErr := errors.New("write failed")
+	writer := &chunkWriter{max: 2, err: writeErr}
+
+	n, err := writeFull(writer, []byte("input"))
+	if n != 2 || !errors.Is(err, writeErr) {
+		t.Fatalf("write result = (%d, %v), want (2, write failed)", n, err)
+	}
+	if got := writer.String(); got != "in" {
+		t.Fatalf("written data = %q, want %q", got, "in")
+	}
+}
 
 func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 	outputs := make(chan string, 4)
