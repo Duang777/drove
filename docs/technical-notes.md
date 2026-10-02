@@ -334,13 +334,3 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 - 真实三次启动回归确认状态可查询、PID 不恢复、reconciliation 不重复且新事件序号继续增长。
 
 进程重连和运行期持久化失败传播仍是后续任务。事件投影恢复不会重新连接或控制旧进程。
-
-## 8. 面试口述版
-
-实现上，Drove 用一个 Go daemon 管理多个 PTY 子进程。CLI 和 React 控制台都通过 REST 与 WebSocket 访问 daemon。session 层负责组合状态机、adapter、PTY、事件 Hub 和 SQLite。
-
-原理上，它把 agent 输出和状态变化转换成有序事件。SQLite 保存历史，Hub 分发实时事件，前端再从事件流计算展示状态。adapter 只识别厂商输出中的状态提示，最终状态迁移仍由统一状态机决定。
-
-同类工具中，tmux 更关注终端持久化，Temporal 更关注可恢复工作流，LangGraph、CrewAI 和 AutoGen 更关注 agent 编排。Drove 当前选择的是本地进程控制与观察，暂时没有工作流调度、模型 SDK 编排或真正的终端重连能力。
-
-设计取舍上，PTY 和 adapter 隔离降低了厂商锁定，追加式事件日志也适合审计和回放。daemon 现在能从事件重建会话投影，但不能重连旧 PTY，运行期持久化失败也仍可能造成有界序号缺口。后续开发应先修复 PTY 回调注册和关闭顺序，再扩展 UI 和厂商能力。
