@@ -1,6 +1,6 @@
 # Race-free PTY lifecycle and safe daemon shutdown
 
-Status: Draft
+Status: Approved
 
 ## Problem
 
