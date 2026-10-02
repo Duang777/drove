@@ -27,6 +27,10 @@ vendor/
 coverage.out
 coverage.html
 
+# LoopX local control state
+.loopx/
+.codex/goals/
+
 # Frontend
 web/node_modules/
 web/dist/
