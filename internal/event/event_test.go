@@ -1,6 +1,7 @@
 package event
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -96,4 +97,66 @@ func TestHubContinuesAfterInitialSequence(t *testing.T) {
 	if got := h.NextSeq(); got != 43 {
 		t.Fatalf("second seq = %d, want 43", got)
 	}
+}
+
+func TestHubCloseClosesSubscriptionsAndIsIdempotent(t *testing.T) {
+	h := NewHub(0)
+	first := h.Subscribe(1)
+	second := h.Subscribe(1)
+
+	h.Close()
+	h.Close()
+	h.Unsubscribe(first)
+	h.Unsubscribe(second)
+
+	for _, sub := range []*Subscription{first, second} {
+		select {
+		case _, ok := <-sub.C():
+			if ok {
+				t.Fatal("subscription channel remained open after Hub.Close")
+			}
+		default:
+			t.Fatal("closed subscription channel was not immediately readable")
+		}
+	}
+
+	afterClose := h.Subscribe(1)
+	select {
+	case _, ok := <-afterClose.C():
+		if ok {
+			t.Fatal("subscription created after Hub.Close remained open")
+		}
+	default:
+		t.Fatal("subscription created after Hub.Close was not closed")
+	}
+	if got := h.Publish(NewOutput(0, "session", "agent", "ignored")); got != 1 {
+		t.Fatalf("publish sequence after close = %d, want 1", got)
+	}
+}
+
+func TestHubCloseIsSafeWithConcurrentPublishAndUnsubscribe(t *testing.T) {
+	h := NewHub(0)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+
+	for i := 0; i < 16; i++ {
+		sub := h.Subscribe(32)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 100; j++ {
+				h.Publish(NewOutput(0, "session", "agent", "line"))
+			}
+		}()
+		go func(sub *Subscription) {
+			defer wg.Done()
+			<-start
+			h.Unsubscribe(sub)
+		}(sub)
+	}
+
+	close(start)
+	h.Close()
+	wg.Wait()
 }

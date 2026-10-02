@@ -30,6 +30,8 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - daemon 启动时从 SQLite 事件流恢复历史会话，并从提交后的最大序号继续分配。
 - 无法重连 PTY 的历史会话会追加恢复事件并收口为 `stopped`。
 - 新会话会先持久化名称和厂商元数据，再进入状态机。
+- PTY 输出与退出回调在 goroutine 启动前固定，短进程不会越过 `starting -> working`。
+- daemon 按 API、会话、Hub、store 的依赖顺序关闭，并等待 PTY 回调结束。
 - REST 管理接口和 WebSocket 实时事件流。
 - CLI 的 `init`、`up`、`ps`、`log`、`stop`、`version` 命令。
 - React 控制台骨架、REST 客户端和 WebSocket 自动重连。
@@ -248,17 +250,39 @@ daemon 现在会在创建 API server 和监听端口前完成以下步骤：
 
 adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 PTY 输入内容。此时只能绕过 Drove 操作原终端，而 daemon 模式没有暴露原终端。
 
-### P1：进程回调存在启动竞态
+### 已修复：进程回调启动竞态
 
-`pty.Start` 先启动 `readLoop` 和 `waitLoop`，`Manager.Start` 返回后才设置 `OnOutput` 和 `OnExit`。短命令可能在回调注册前输出或退出。
+`pty.Config` 现在携带 `OnOutput` 和 `OnExit`。`pty.Start` 在启动读取和等待 goroutine 前把回调保存为 Session 私有字段，运行期间不再修改回调。
 
-本次开发在给成功启动路径增加 race 测试时复现了该竞态。恢复功能没有修改 PTY 生命周期，因此该问题仍需独立修复；`pty` 目前也没有自己的测试。
+`Manager.Start` 还使用单次 ready channel 暂停两个回调，直到 PTY 已登记且 `starting -> working` 已完成持久化。即时输出或退出的短进程因此保留完整状态前缀。
 
-### P1：daemon 关闭没有按文档清理会话
+`Session.Close` 现在幂等，并等待读循环、进程等待和全部回调完成。读取同时返回数据和错误时，残余输出只上报一次。
 
-`daemon.Run` 只关闭 HTTP server，并通过 `defer` 关闭 store。它没有停止 `Manager` 中的 PTY session，也没有关闭 Hub。
+验证结果：
 
-这与 `internal/daemon/AGENTS.md` 描述的关闭顺序不同。daemon 退出后，子进程可能成为孤儿，仍在运行的回调也可能继续访问已经关闭的 store。
+- `go test ./internal/pty ./internal/session -race -count=20` 通过。
+- 即时输出测试确认 `starting -> working` 早于 output 和 stopped 事件。
+- 阻塞回调测试确认 `Session.Close` 会等待回调返回。
+
+### 已修复：daemon 关闭会话晚于 store
+
+`Manager.Close` 先拒绝新 Start，再等待进行中的 Start，随后按 Agent ID 顺序关闭全部 PTY。每个 PTY 都会等待输出和退出回调完成。
+
+`daemon.Run` 对信号取消和 Serve 异常使用同一条关闭路径：
+
+```text
+API Shutdown -> Manager.Close -> Hub.Close -> Store.Close
+```
+
+这个顺序允许退出回调在 store 仍可用时写入 `stopped`，也允许 WebSocket 在 Hub 关闭前收到最后的状态事件。`Hub.Close` 最后关闭全部订阅 channel，使现有 WebSocket 写循环退出。
+
+隔离数据目录的真实验证启动了一个 `/bin/cat` 会话：
+
+- daemon 收到 SIGTERM 后退出，agent PID 不再存在。
+- SQLite 最大序号为 4，包含一个 `working -> stopped` 事件。
+- 使用同一个数据库重启后，会话恢复为 `stopped` 且没有 PID。
+- 重启前后最大序号都为 4，没有追加 interruption error 或 reconciliation 事件。
+- `go test ./internal/event ./internal/daemon -race -count=10` 通过。
 
 ### P1：Web 控制台目前是无样式骨架
 
@@ -307,10 +331,11 @@ adapter 可以把状态识别成 `blocked`，但用户不能通过 Drove 向该 
 
 ### 第三阶段：修复生命周期和并发
 
-- 在启动 goroutine 前注册 PTY 回调。
-- 为 `Manager` 增加统一的 `Close`。
-- 明确 API、Hub、PTY 和 store 的关闭顺序。
-- 为 `pty`、`api` 和 `client` 增加测试。
+- [x] 在启动 goroutine 前注册 PTY 回调。
+- [x] 为 `Manager` 增加统一的 `Close`。
+- [x] 按 API、会话、Hub、store 的依赖顺序关闭。
+- [x] 为 `pty` 增加短进程、输出和关闭测试。
+- [ ] 为 `api` 和 `client` 增加测试。
 
 ### 第四阶段：补齐 Web MVP
 

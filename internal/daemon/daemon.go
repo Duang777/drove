@@ -32,7 +32,7 @@ func New(cfg *config.Config) *Daemon {
 }
 
 // Run 启动 daemon 并阻塞，直到 ctx 取消或收到终止信号。
-func (d *Daemon) Run(ctx context.Context) error {
+func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	log := slog.Default()
 
 	if err := d.cfg.Validate(); err != nil {
@@ -44,7 +44,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("daemon: store: %w", err)
 	}
-	defer st.Close()
+	defer func() {
+		if closeErr := st.Close(); closeErr != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("daemon: close store: %w", closeErr))
+		}
+	}()
 
 	// 2. 在 API 对外可见前恢复会话投影。
 	recovered, err := bootstrapSessions(ctx, st)
@@ -93,16 +97,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
 	case err := <-errCh:
-		return err
+		runErr = fmt.Errorf("daemon: serve: %w", err)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("daemon: shutdown: %w", err)
+		runErr = errors.Join(runErr, fmt.Errorf("daemon: shutdown api: %w", err))
 	}
+	if err := mgr.Close(); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("daemon: shutdown sessions: %w", err))
+	}
+	hub.Close()
 	log.Info("drove daemon stopped")
-	return nil
+	return runErr
 }
 
 func bootstrapSessions(ctx context.Context, st *store.Store) (*session.BootstrapResult, error) {

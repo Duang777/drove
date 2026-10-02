@@ -7,7 +7,8 @@
 ## 关键设计
 
 - `Daemon.Run(ctx)`：打开 store → 构建 Hub/Registry/Manager → 启动 API server → 阻塞直到 ctx 取消或收到 SIGINT/SIGTERM。
-- 优雅关闭顺序：先停 API（不再接受新连接）→ 关闭 Hub 订阅 → 关闭 store → 停止会话（agent 进程随之终止）。
+- 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
+- 信号取消与 Serve 异常共用关闭路径；任一步失败都继续清理剩余资源，并汇总返回错误。
 - 本包不做业务逻辑，只做装配（composition root）。新依赖一律在此注入。
 
 ## 约束

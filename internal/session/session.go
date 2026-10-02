@@ -52,8 +52,12 @@ type createdPayload struct {
 	Vendor  string `json:"vendor"`
 }
 
-// ErrNotAttached 表示会话存在，但当前 daemon 没有它的 PTY。
-var ErrNotAttached = errors.New("session: agent is not attached to a PTY")
+var (
+	// ErrNotAttached 表示会话存在，但当前 daemon 没有它的 PTY。
+	ErrNotAttached = errors.New("session: agent is not attached to a PTY")
+	// ErrManagerClosed 表示 Manager 已开始关闭，不再接受新会话。
+	ErrManagerClosed = errors.New("session: manager closed")
+)
 
 // Manager 是会话编排入口。
 type Manager struct {
@@ -64,6 +68,11 @@ type Manager struct {
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
 	sessions map[agent.ID]*pty.Session
+	closed   bool
+
+	starts    sync.WaitGroup
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // BootstrapResult 包含恢复后的运行时组件和启动报告。
@@ -121,6 +130,11 @@ func Bootstrap(ctx context.Context, reg *adapter.Registry, st *store.Store) (*Bo
 
 // Start 启动一个 agent 会话。
 func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) {
+	if beginErr := m.beginStart(); beginErr != nil {
+		return nil, fmt.Errorf("session: start: %w", beginErr)
+	}
+	defer m.endStart()
+
 	if req.Vendor == "" {
 		req.Vendor = "generic"
 	}
@@ -208,6 +222,51 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	close(callbacksReady)
 
 	return m.Status(id)
+}
+
+// Close 停止全部已连接会话并等待 PTY 回调结束。
+func (m *Manager) Close() error {
+	m.closeOnce.Do(func() {
+		m.mu.Lock()
+		m.closed = true
+		m.mu.Unlock()
+
+		m.starts.Wait()
+
+		type attachedSession struct {
+			id      agent.ID
+			session *pty.Session
+		}
+		m.mu.RLock()
+		attached := make([]attachedSession, 0, len(m.sessions))
+		for id, sess := range m.sessions {
+			attached = append(attached, attachedSession{id: id, session: sess})
+		}
+		m.mu.RUnlock()
+		sort.Slice(attached, func(i, j int) bool {
+			return attached[i].id < attached[j].id
+		})
+
+		var closeErrors []error
+		for _, item := range attached {
+			if err := item.session.Close(); err != nil {
+				closeErrors = append(
+					closeErrors,
+					fmt.Errorf("session: close agent %q: %w", item.id, err),
+				)
+			}
+		}
+
+		m.mu.Lock()
+		for _, item := range attached {
+			if m.sessions[item.id] == item.session {
+				delete(m.sessions, item.id)
+			}
+		}
+		m.mu.Unlock()
+		m.closeErr = errors.Join(closeErrors...)
+	})
+	return m.closeErr
 }
 
 // Stop 停止一个 agent 会话（幂等）。
@@ -392,6 +451,20 @@ func (m *Manager) agent(id agent.ID) (*agent.Agent, bool) {
 	defer m.mu.RUnlock()
 	a, ok := m.agents[id]
 	return a, ok
+}
+
+func (m *Manager) beginStart() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	m.starts.Add(1)
+	return nil
+}
+
+func (m *Manager) endStart() {
+	m.starts.Done()
 }
 
 // cleanup 移除未完全启动的会话残留。

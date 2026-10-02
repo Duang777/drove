@@ -2,15 +2,20 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net"
+	"net/http"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
 
@@ -157,5 +162,146 @@ func TestBootstrapSessionsReturnsScanError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "daemon: bootstrap sessions: session: bootstrap scan: store: scan events:") {
 		t.Fatalf("error = %q, want daemon and store context", err)
+	}
+}
+
+func TestRunStopsLiveSessionBeforeClosingStore(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "drove.db")
+	addr := reserveAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- New(&config.Config{
+			DataDir:     dataDir,
+			DBPath:      dbPath,
+			APIBind:     addr,
+			EventBuffer: 16,
+		}).Run(ctx)
+	}()
+
+	started := startAgentThroughAPI(t, addr)
+	childNeedsCleanup := true
+	t.Cleanup(func() {
+		if childNeedsCleanup {
+			_ = syscall.Kill(started.PID, syscall.SIGKILL)
+		}
+	})
+
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("daemon run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not stop")
+	}
+
+	if err := syscall.Kill(started.PID, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("agent process %d still exists after daemon shutdown: %v", started.PID, err)
+	}
+	childNeedsCleanup = false
+
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+
+	lastSeqBeforeRestart, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq before restart: %v", err)
+	}
+	rows, err := st.Replay(started.AgentID)
+	if err != nil {
+		t.Fatalf("replay after shutdown: %v", err)
+	}
+	hasStopped := false
+	for _, row := range rows {
+		if row.Type == string(event.TypeStateChanged) &&
+			row.To == string(agent.StateStopped) {
+			hasStopped = true
+		}
+	}
+	if !hasStopped {
+		t.Fatalf("replay has no stopped event after shutdown: %+v", rows)
+	}
+
+	recovered, err := bootstrapSessions(context.Background(), st)
+	if err != nil {
+		t.Fatalf("bootstrap after clean shutdown: %v", err)
+	}
+	defer recovered.Hub.Close()
+	defer recovered.Manager.Close()
+
+	if recovered.Recovery.Interrupted != 0 {
+		t.Fatalf("restart interrupted sessions = %d, want 0", recovered.Recovery.Interrupted)
+	}
+	if recovered.Recovery.LastSeq != lastSeqBeforeRestart {
+		t.Fatalf(
+			"restart last seq = %d, want unchanged %d",
+			recovered.Recovery.LastSeq,
+			lastSeqBeforeRestart,
+		)
+	}
+	status, err := recovered.Manager.Status(agent.ID(started.AgentID))
+	if err != nil {
+		t.Fatalf("restored status: %v", err)
+	}
+	if status.State != agent.StateStopped || status.PID != 0 {
+		t.Fatalf("restored status = %+v, want stopped without PID", status)
+	}
+}
+
+func reserveAddress(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve address: %v", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release address: %v", err)
+	}
+	return addr
+}
+
+func startAgentThroughAPI(t *testing.T, addr string) *session.Status {
+	t.Helper()
+
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		response, err := client.Post(
+			"http://"+addr+"/api/v1/agents",
+			"application/json",
+			strings.NewReader(`{"vendor":"generic","name":"shutdown-agent","command":"/bin/cat"}`),
+		)
+		if err == nil {
+			var status session.Status
+			decodeErr := json.NewDecoder(response.Body).Decode(&status)
+			closeErr := response.Body.Close()
+			if response.StatusCode != http.StatusCreated {
+				t.Fatalf("create status = %d, body = %+v", response.StatusCode, status)
+			}
+			if decodeErr != nil {
+				t.Fatalf("decode create response: %v", decodeErr)
+			}
+			if closeErr != nil {
+				t.Fatalf("close create response: %v", closeErr)
+			}
+			if status.PID <= 0 {
+				t.Fatalf("created status = %+v, want live PID", status)
+			}
+			return &status
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon API did not become ready: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

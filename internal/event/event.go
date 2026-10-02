@@ -97,6 +97,7 @@ type Hub struct {
 	mu      sync.RWMutex
 	subs    map[uint64]*Subscription
 	nextSub uint64
+	closed  bool
 }
 
 // NewHub 创建从 initialSeq 之后继续分配序号的事件 Hub。
@@ -114,10 +115,14 @@ func (h *Hub) Subscribe(buf int) *Subscription {
 	defer h.mu.Unlock()
 
 	s := &Subscription{
-		id:  h.nextSub,
 		ch:  make(chan Event, buf),
 		hub: h,
 	}
+	if h.closed {
+		close(s.ch)
+		return s
+	}
+	s.id = h.nextSub
 	h.nextSub++
 	h.subs[s.id] = s
 	return s
@@ -148,6 +153,9 @@ func (h *Hub) Publish(ev Event) uint64 {
 
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	if h.closed {
+		return ev.Seq
+	}
 
 	for _, s := range h.subs {
 		select {
@@ -157,6 +165,20 @@ func (h *Hub) Publish(ev Event) uint64 {
 		}
 	}
 	return ev.Seq
+}
+
+// Close 关闭全部订阅并拒绝后续订阅。
+func (h *Hub) Close() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	for id, sub := range h.subs {
+		delete(h.subs, id)
+		close(sub.ch)
+	}
 }
 
 // Subscription 是一次事件订阅。

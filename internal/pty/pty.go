@@ -29,7 +29,7 @@ type Config struct {
 	Env []string
 	// Dir 是工作目录；空则继承当前目录。
 	Dir string
-	// OnOutput 在每行输出可用时被调用。回调必须保持非阻塞。
+	// OnOutput 在每行输出可用时被调用。回调不得长期阻塞。
 	OnOutput func(line string)
 	// OnExit 在进程退出后被调用一次。
 	OnExit func(info ExitInfo)

@@ -9,6 +9,7 @@
 - `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→*Session）、event Hub、store、adapter Registry。
 - `Start(ctx, req)`：按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - PTY 回调在启动前注册，但通过单次 ready channel 等待会话登记完成，防止短进程的输出或退出越过 `starting -> working`。
+- `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 → 清空运行中会话索引。
 - `Replay(sessionID)`：从 store 读取事件流供回放（CLI `log` 命令 / API）。
 - 状态决策：优先采纳适配器 hint；结合"进程是否存活"（存活→Working，退出→Stopped/Done）兜底，防止误判。
 

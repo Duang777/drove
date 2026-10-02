@@ -546,6 +546,132 @@ func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
 	}
 }
 
+func TestManagerCloseWaitsForInFlightStart(t *testing.T) {
+	manager, _ := newTestManager(t)
+
+	if err := manager.beginStart(); err != nil {
+		t.Fatalf("begin start: %v", err)
+	}
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- manager.Close()
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		manager.mu.RLock()
+		closed := manager.closed
+		manager.mu.RUnlock()
+		if closed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("manager did not enter closing state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	select {
+	case err := <-closeResult:
+		t.Fatalf("close returned before in-flight start completed: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	_, err := manager.Start(context.Background(), StartRequest{
+		Command: "/bin/cat",
+	})
+	if !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("start while closing error = %v, want ErrManagerClosed", err)
+	}
+
+	manager.endStart()
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close did not finish after in-flight start completed")
+	}
+}
+
+func TestManagerCloseStopsSessionsAndRejectsNewStarts(t *testing.T) {
+	manager, st := newTestManager(t)
+
+	started, err := manager.Start(context.Background(), StartRequest{
+		Name:    "close-agent",
+		Command: "/bin/cat",
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(started.AgentID)
+	t.Cleanup(func() {
+		if closeErr := manager.Close(); closeErr != nil {
+			t.Errorf("cleanup close: %v", closeErr)
+		}
+	})
+
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close manager: %v", err)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close manager again: %v", err)
+	}
+
+	status, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if status.State != agent.StateStopped || status.PID != 0 {
+		t.Fatalf("status after close = %+v, want stopped without PID", status)
+	}
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop after close: %v", err)
+	}
+	if err := manager.Write(id, []byte("input")); !errors.Is(err, ErrNotAttached) {
+		t.Fatalf("write after close error = %v, want ErrNotAttached", err)
+	}
+
+	rows, err := manager.Replay(started.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	hasStopped := false
+	for _, row := range rows {
+		if row.Type == string(event.TypeStateChanged) &&
+			row.From == string(agent.StateWorking) &&
+			row.To == string(agent.StateStopped) {
+			hasStopped = true
+		}
+	}
+	if !hasStopped {
+		t.Fatalf("replay has no working -> stopped event: %+v", rows)
+	}
+
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq before rejected start: %v", err)
+	}
+	rejected, err := manager.Start(context.Background(), StartRequest{
+		Name:    "rejected-agent",
+		Command: "/bin/cat",
+	})
+	if !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("start after close error = %v, want ErrManagerClosed", err)
+	}
+	if rejected != nil {
+		t.Fatalf("start after close status = %+v, want nil", rejected)
+	}
+	afterSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq after rejected start: %v", err)
+	}
+	if afterSeq != lastSeq {
+		t.Fatalf("last seq after rejected start = %d, want %d", afterSeq, lastSeq)
+	}
+}
+
 func newTestManager(t *testing.T) (*Manager, *store.Store) {
 	t.Helper()
 
