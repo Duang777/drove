@@ -98,9 +98,10 @@ type Hub struct {
 	nextSub uint64
 }
 
-// NewHub 创建事件 Hub。
-func NewHub() *Hub {
+// NewHub 创建从 initialSeq 之后继续分配序号的事件 Hub。
+func NewHub(initialSeq uint64) *Hub {
 	return &Hub{
+		seq:     initialSeq,
 		subs:    make(map[uint64]*Subscription),
 		nextSub: 1,
 	}

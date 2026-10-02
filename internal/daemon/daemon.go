@@ -48,7 +48,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer st.Close()
 
 	// 2. 事件 Hub + 适配器注册表 + 会话管理器。
-	hub := event.NewHub()
+	hub, err := newHubFromStore(st)
+	if err != nil {
+		return err
+	}
 	reg := adapter.NewRegistry()
 	mgr := session.NewManager(reg, hub, st)
 
@@ -91,4 +94,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	log.Info("drove daemon stopped")
 	return nil
+}
+
+func newHubFromStore(st *store.Store) (*event.Hub, error) {
+	// 启动时读取与内存分配依赖单个 daemon 独占该数据库。
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		return nil, fmt.Errorf("daemon: restore event sequence: %w", err)
+	}
+	return event.NewHub(lastSeq), nil
 }

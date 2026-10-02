@@ -6,7 +6,7 @@ import (
 )
 
 func TestHubFanOut(t *testing.T) {
-	h := NewHub()
+	h := NewHub(0)
 	s1 := h.Subscribe(16)
 	s2 := h.Subscribe(16)
 	defer h.Unsubscribe(s1)
@@ -32,7 +32,7 @@ func TestHubFanOut(t *testing.T) {
 }
 
 func TestHubSlowSubscriberDropped(t *testing.T) {
-	h := NewHub()
+	h := NewHub(0)
 	s := h.Subscribe(1)
 	defer h.Unsubscribe(s)
 
@@ -50,7 +50,7 @@ func TestHubSlowSubscriberDropped(t *testing.T) {
 }
 
 func TestPublishWithPresetSeq(t *testing.T) {
-	h := NewHub()
+	h := NewHub(0)
 	ev := NewStateChanged(42, "s", "a", "working", "blocked", "waiting")
 	if got := h.Publish(ev); got != 42 {
 		t.Fatalf("preset seq publish = %d, want 42", got)
@@ -58,7 +58,7 @@ func TestPublishWithPresetSeq(t *testing.T) {
 }
 
 func TestUnsubscribeClosesChannel(t *testing.T) {
-	h := NewHub()
+	h := NewHub(0)
 	s := h.Subscribe(4)
 	h.Unsubscribe(s)
 	select {
@@ -68,5 +68,16 @@ func TestUnsubscribeClosesChannel(t *testing.T) {
 		}
 	default:
 		t.Fatal("expected closed channel to be immediately readable")
+	}
+}
+
+func TestHubContinuesAfterInitialSequence(t *testing.T) {
+	h := NewHub(41)
+
+	if got := h.NextSeq(); got != 42 {
+		t.Fatalf("first seq = %d, want 42", got)
+	}
+	if got := h.NextSeq(); got != 43 {
+		t.Fatalf("second seq = %d, want 43", got)
 	}
 }
