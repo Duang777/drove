@@ -256,6 +256,10 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "unsupported signal protocol version")
 		return
 	}
+	if len(req.Payload) > session.MaxSignalPayloadBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge, "signal payload exceeds maximum size")
+		return
+	}
 
 	err = s.opts.Manager.AcceptSignal(
 		r.Context(),

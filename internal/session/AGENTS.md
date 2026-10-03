@@ -6,20 +6,22 @@
 
 ## 关键设计
 
-- `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
+- `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、
+  `signals`（ID→可接收 hook 的启动中/运行中会话）、event Hub、store、adapter Registry。
 - 每个运行中会话持有一个 Detector 和一个内存 signal token；token 只授权该
   Agent 的 signal endpoint，并随会话 detach 失效。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。
-- PTY 回调在启动前注册，但通过单次 ready channel 等待会话登记完成，防止短进程的输出或退出越过 `starting -> working`。
+- PTY 回调在启动前注册；signal 与输出/退出使用独立 readiness gate，使启动期 hook
+  可等待 `starting -> working`，同时防止短进程先提交错误终态。
 - 运行中会话记录停止原因和退出认领状态；`Stop`、`Close` 与自然退出通过同一个锁确定唯一终态。
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 → 清空运行中会话索引。
 - `Replay(sessionID)`：从 store 读取事件流供回放（CLI `log` 命令 / API）。
 - `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
-- `onOutput` 先持久化并发布原始文本，再把 adapter 的独立清洗分类视图交给
-  Detector；回放和订阅 payload 不受 ANSI 清洗影响。
+- `onOutput` 仅替换当前会话 signal token 后持久化并发布文本，再把 adapter 的独立
+  清洗分类视图交给 Detector；回放和订阅 payload 不受 ANSI 清洗影响。
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input`，但该审计事件不创建会话、不改变状态或时间戳。
 - 状态决策：进程退出决定终态；激活后的 hook 决定 turn 状态；未激活 hook

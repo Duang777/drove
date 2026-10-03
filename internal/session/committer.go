@@ -85,12 +85,8 @@ func (c *committer) Commit(
 		return nil, errCommitterClosed
 	}
 
-	select {
-	case result := <-request.result:
-		return result.events, result.err
-	case <-c.done:
-		return nil, errCommitterClosed
-	}
+	result := <-request.result
+	return result.events, result.err
 }
 
 func (c *committer) Fatal() <-chan error {

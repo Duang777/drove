@@ -47,6 +47,46 @@ func TestRelaySignalPostsVersionedEnvelopeWithSessionToken(t *testing.T) {
 	}
 }
 
+func TestRelaySignalPreservesInLimitPayloadSize(t *testing.T) {
+	prefix := `{"hook_event_name":"SessionStart","session_id":"vendor-session","padding":"`
+	suffix := `"}`
+	payload := []byte(prefix + strings.Repeat(
+		"<",
+		MaxHookPayloadBytes-len(prefix)-len(suffix),
+	) + suffix)
+	if len(payload) != MaxHookPayloadBytes {
+		t.Fatalf("payload size = %d, want %d", len(payload), MaxHookPayloadBytes)
+	}
+
+	var requestBodyBytes int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestBodyBytes = r.ContentLength
+		var received signalRequest
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if len(received.Payload) != len(payload) {
+			t.Errorf("received payload size = %d, want %d", len(received.Payload), len(payload))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	if err := RelaySignal(
+		context.Background(),
+		server.URL,
+		"session-token",
+		"claude",
+		"delivery-large",
+		payload,
+	); err != nil {
+		t.Fatalf("relay signal: %v", err)
+	}
+	if requestBodyBytes > MaxHookPayloadBytes+2048 {
+		t.Fatalf("request body size = %d, exceeds endpoint envelope limit", requestBodyBytes)
+	}
+}
+
 func TestRelaySignalRejectsUnsafeURLAndInvalidPayload(t *testing.T) {
 	tests := []struct {
 		name      string

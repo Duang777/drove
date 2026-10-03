@@ -101,8 +101,9 @@ func (m *Manager) prepareRuntime(
 	}
 
 	running := &runningSession{
-		ready:  make(chan struct{}),
-		vendor: a.Vendor(),
+		ready:       make(chan struct{}),
+		signalReady: make(chan struct{}),
+		vendor:      a.Vendor(),
 	}
 	detector, err := detect.New(detect.Options{
 		Policy:  m.hookPolicy,
@@ -202,7 +203,7 @@ func (m *Manager) AcceptSignal(
 	m.mu.RLock()
 	closed := m.closed
 	_, known := m.agents[id]
-	running, attached := m.sessions[id]
+	running, provisioned := m.signals[id]
 	m.mu.RUnlock()
 	if closed {
 		return ErrManagerClosed
@@ -210,7 +211,7 @@ func (m *Manager) AcceptSignal(
 	if !known {
 		return fmt.Errorf("%w: %q", ErrUnknownAgent, id)
 	}
-	if !attached || running.detector == nil {
+	if !provisioned || running.detector == nil {
 		return fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 	if !verifySignalAuthorization(running.signalToken, authorization) {
@@ -226,20 +227,20 @@ func (m *Manager) AcceptSignal(
 	}
 
 	select {
-	case <-running.ready:
+	case <-running.signalReady:
 	case <-ctx.Done():
 		return fmt.Errorf("session: wait for signal-ready session: %w", ctx.Err())
 	}
 
 	m.mu.RLock()
-	current, stillAttached := m.sessions[id]
+	current, stillProvisioned := m.signals[id]
 	closed = m.closed
 	exitClaimed := running.exitClaimed
 	m.mu.RUnlock()
 	if closed {
 		return ErrManagerClosed
 	}
-	if !stillAttached || current != running || exitClaimed {
+	if !stillProvisioned || current != running || exitClaimed {
 		return fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
