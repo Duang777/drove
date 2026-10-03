@@ -40,7 +40,7 @@
 
 ## Metadata
 
-- [x] Creation metadata version 3 is defined.
+- [x] Creation metadata stays at version 2 with additive optional fields.
 - [x] Injection mode, status, and reason enums are fixed.
 - [x] Versions 1 and 2 retain explicit fallback values.
 - [x] Recovered sessions report detached injection.

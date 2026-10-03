@@ -296,9 +296,58 @@ func TestRecoveryProjectorReadsVersionTwoMetadataAndEvidence(t *testing.T) {
 	}
 	snapshot := plan.Snapshots[0]
 	if snapshot.HookPolicy != agent.HooksAuto ||
+		snapshot.SignalInjection != agent.SignalInjectionOff ||
+		snapshot.InjectionStatus != agent.InjectionDetached ||
+		snapshot.InjectionReason != agent.InjectionReasonRecovered ||
 		snapshot.LastTransition == nil ||
 		snapshot.LastTransition.Source != agent.EvidenceProcess ||
 		snapshot.LastTransition.Event != "process_start_failed" {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestRecoveryProjectorReadsAdditiveVersionTwoInjectionMetadata(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+				`"mode":"interactive","hook_policy":"auto",` +
+				`"signal_injection":"auto","signal_injection_status":"injected",` +
+				`"signal_injection_reason":"session_config"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+			Reason:    "startup failed",
+			Payload: `{"version":1,"source":"process","event":"process_start_failed",` +
+				`"confidence":1}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	snapshot := plan.Snapshots[0]
+	if snapshot.SignalInjection != agent.SignalInjectionAuto ||
+		snapshot.InjectionStatus != agent.InjectionDetached ||
+		snapshot.InjectionReason != agent.InjectionReasonRecovered {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
 }
@@ -637,6 +686,20 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "unsupported",
 		},
 		{
+			name: "partial injection metadata",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeSessionLifecycle),
+				SessionID: "s1",
+				Reason:    "created",
+				Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+					`"mode":"interactive","hook_policy":"auto",` +
+					`"signal_injection":"auto"}`,
+			}},
+			wantErr: "signal injection",
+		},
+		{
 			name: "empty metadata name",
 			rows: []store.EventRow{
 				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":1,"name":"","vendor":"generic"}`},
@@ -840,27 +903,41 @@ func TestRecoveryProjectorRestoresPersistedRunMode(t *testing.T) {
 	}
 }
 
-func TestCreationMetadataRemainsReadableByOldVersionOneDecoder(t *testing.T) {
+func TestCreationMetadataRemainsReadableByOldVersionTwoDecoder(t *testing.T) {
 	mode := agent.RunModeInteractive
+	policy := agent.HooksAuto
+	injection := agent.SignalInjectionAuto
+	injectionStatus := agent.InjectionInjected
+	injectionReason := agent.InjectionReasonSessionConfig
 	raw, err := json.Marshal(createdPayload{
-		Version: 1,
-		Name:    "agent",
-		Vendor:  "generic",
-		Mode:    &mode,
+		Version:               2,
+		Name:                  "agent",
+		Vendor:                "claude",
+		Mode:                  &mode,
+		HookPolicy:            &policy,
+		SignalInjection:       &injection,
+		SignalInjectionStatus: &injectionStatus,
+		SignalInjectionReason: &injectionReason,
 	})
 	if err != nil {
 		t.Fatalf("marshal creation metadata: %v", err)
 	}
 
 	var oldMetadata struct {
-		Version int    `json:"version"`
-		Name    string `json:"name"`
-		Vendor  string `json:"vendor"`
+		Version    int              `json:"version"`
+		Name       string           `json:"name"`
+		Vendor     string           `json:"vendor"`
+		Mode       agent.RunMode    `json:"mode"`
+		HookPolicy agent.HookPolicy `json:"hook_policy"`
 	}
 	if err := json.Unmarshal(raw, &oldMetadata); err != nil {
 		t.Fatalf("old decoder rejected new metadata: %v", err)
 	}
-	if oldMetadata.Version != 1 || oldMetadata.Name != "agent" || oldMetadata.Vendor != "generic" {
+	if oldMetadata.Version != 2 ||
+		oldMetadata.Name != "agent" ||
+		oldMetadata.Vendor != "claude" ||
+		oldMetadata.Mode != mode ||
+		oldMetadata.HookPolicy != policy {
 		t.Fatalf("old metadata = %+v", oldMetadata)
 	}
 }

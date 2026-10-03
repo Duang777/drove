@@ -209,8 +209,8 @@ Files:
 Work:
 
 - Add requested injection mode, status, and reason to Agent snapshots.
-- Write creation metadata version 3.
-- Read versions 1, 2, and 3.
+- Extend creation metadata version 2 with optional injection fields.
+- Read version 1, legacy version 2, and additive version 2.
 - Restore old metadata with explicit detached fallback values.
 - Add fields to `session.Status`.
 - Keep injection status separate from runtime hook status.

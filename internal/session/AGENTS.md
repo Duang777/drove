@@ -13,6 +13,8 @@
   Detector 本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
+- session signal injection 在创建事件前向 adapter 请求纯计划，并只在
+  `<data_dir>/sessions/<agent-id>/` 原子写入私有文件；退出回调完成后清理。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。
 - PTY 回调在启动前注册；signal 与输出/退出使用独立 readiness gate，使启动期 hook
   可等待 `starting -> working`，同时防止短进程先提交错误终态。
@@ -35,4 +37,5 @@
 - 禁止在 session 之外创建 agent 或 PTY 会话。
 - 事件必须经 Committer **先落库、再改投影、最后发布**；Store 失败后 Manager 通过 `Fatal()` 触发 daemon fail-stop。
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
+- 临时注入路径必须二次校验并拒绝 symlink；adapter 不得直接操作文件系统。
 - 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`。

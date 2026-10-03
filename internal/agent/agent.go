@@ -28,6 +28,15 @@ type RunMode string
 // HookPolicy controls hook activation for one immutable session.
 type HookPolicy string
 
+// SignalInjectionMode controls process-local signal configuration.
+type SignalInjectionMode string
+
+// SignalInjectionStatus records the launch-time injection result.
+type SignalInjectionStatus string
+
+// SignalInjectionReason explains one bounded injection result.
+type SignalInjectionReason string
+
 const (
 	// RunModeInteractive 启动常驻交互进程。
 	RunModeInteractive RunMode = "interactive"
@@ -40,6 +49,35 @@ const (
 	HooksAuto HookPolicy = "auto"
 	// HooksRequired requires a hook signal during startup.
 	HooksRequired HookPolicy = "required"
+
+	// SignalInjectionAuto enables a supported adapter injection plan.
+	SignalInjectionAuto SignalInjectionMode = "auto"
+	// SignalInjectionOff leaves the vendor command unchanged.
+	SignalInjectionOff SignalInjectionMode = "off"
+
+	// InjectionOff means no injection was requested.
+	InjectionOff SignalInjectionStatus = "off"
+	// InjectionInjected means the session plan was applied.
+	InjectionInjected SignalInjectionStatus = "injected"
+	// InjectionSkipped means auto injection could not be applied safely.
+	InjectionSkipped SignalInjectionStatus = "skipped"
+	// InjectionDetached means recovered metadata has no live injected process.
+	InjectionDetached SignalInjectionStatus = "detached"
+
+	// InjectionReasonHookPolicyOff means hooks disabled the relay.
+	InjectionReasonHookPolicyOff SignalInjectionReason = "hook_policy_off"
+	// InjectionReasonConfiguredOff means configuration disabled injection.
+	InjectionReasonConfiguredOff SignalInjectionReason = "configured_off"
+	// InjectionReasonUnsupported means the adapter has no injection capability.
+	InjectionReasonUnsupported SignalInjectionReason = "unsupported"
+	// InjectionReasonRelayUnavailable means no Drove relay executable was found.
+	InjectionReasonRelayUnavailable SignalInjectionReason = "relay_unavailable"
+	// InjectionReasonArgumentConflict means caller arguments own the setting.
+	InjectionReasonArgumentConflict SignalInjectionReason = "argument_conflict"
+	// InjectionReasonSessionConfig means a session plan was materialized.
+	InjectionReasonSessionConfig SignalInjectionReason = "session_config"
+	// InjectionReasonRecovered means no original runtime remains after restart.
+	InjectionReasonRecovered SignalInjectionReason = "recovered"
 
 	// StatePending 已创建、尚未启动（初始态）。
 	StatePending State = "pending"
@@ -173,6 +211,33 @@ func ValidHookPolicy(policy HookPolicy) bool {
 	return policy == HooksOff || policy == HooksAuto || policy == HooksRequired
 }
 
+// ValidSignalInjectionMode reports whether mode is supported.
+func ValidSignalInjectionMode(mode SignalInjectionMode) bool {
+	return mode == SignalInjectionAuto || mode == SignalInjectionOff
+}
+
+// ValidSignalInjectionResult reports whether a status and reason can coexist.
+func ValidSignalInjectionResult(
+	status SignalInjectionStatus,
+	reason SignalInjectionReason,
+) bool {
+	switch status {
+	case InjectionOff:
+		return reason == InjectionReasonHookPolicyOff ||
+			reason == InjectionReasonConfiguredOff
+	case InjectionInjected:
+		return reason == InjectionReasonSessionConfig
+	case InjectionSkipped:
+		return reason == InjectionReasonUnsupported ||
+			reason == InjectionReasonRelayUnavailable ||
+			reason == InjectionReasonArgumentConflict
+	case InjectionDetached:
+		return reason == InjectionReasonRecovered
+	default:
+		return false
+	}
+}
+
 // CanTransition 报告 from -> to 是否合法。
 func CanTransition(from, to State) bool {
 	m, ok := transitions[from]
@@ -268,14 +333,17 @@ func RecordError(message string, evidence Evidence) Change {
 type Agent struct {
 	mu sync.RWMutex
 
-	id             ID
-	name           string
-	vendor         string // 适配器厂商标识，如 "claude" / "codex" / "generic"
-	runMode        RunMode
-	hookPolicy     HookPolicy
-	state          State
-	lastError      string
-	lastTransition *Evidence
+	id              ID
+	name            string
+	vendor          string // 适配器厂商标识，如 "claude" / "codex" / "generic"
+	runMode         RunMode
+	hookPolicy      HookPolicy
+	signalInjection SignalInjectionMode
+	injectionStatus SignalInjectionStatus
+	injectionReason SignalInjectionReason
+	state           State
+	lastError       string
+	lastTransition  *Evidence
 
 	createdAt time.Time
 	updatedAt time.Time
@@ -287,16 +355,19 @@ type Option func(*Agent)
 
 // RestoreSnapshot 是从持久化事件投影出的 Agent 状态。
 type RestoreSnapshot struct {
-	ID             ID
-	Name           string
-	Vendor         string
-	RunMode        RunMode
-	HookPolicy     HookPolicy
-	State          State
-	LastError      string
-	LastTransition *Evidence
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	ID              ID
+	Name            string
+	Vendor          string
+	RunMode         RunMode
+	HookPolicy      HookPolicy
+	SignalInjection SignalInjectionMode
+	InjectionStatus SignalInjectionStatus
+	InjectionReason SignalInjectionReason
+	State           State
+	LastError       string
+	LastTransition  *Evidence
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 // WithName 设置 agent 显示名。
@@ -319,15 +390,31 @@ func WithHookPolicy(policy HookPolicy) Option {
 	return func(a *Agent) { a.hookPolicy = policy }
 }
 
+// WithSignalInjection sets immutable launch injection metadata.
+func WithSignalInjection(
+	mode SignalInjectionMode,
+	status SignalInjectionStatus,
+	reason SignalInjectionReason,
+) Option {
+	return func(a *Agent) {
+		a.signalInjection = mode
+		a.injectionStatus = status
+		a.injectionReason = reason
+	}
+}
+
 // New 创建处于 StatePending 的 agent。
 func New(id ID, opts ...Option) *Agent {
 	a := &Agent{
-		id:         id,
-		runMode:    RunModeInteractive,
-		hookPolicy: HooksOff,
-		state:      StatePending,
-		createdAt:  time.Now().UTC(),
-		updatedAt:  time.Now().UTC(),
+		id:              id,
+		runMode:         RunModeInteractive,
+		hookPolicy:      HooksOff,
+		signalInjection: SignalInjectionOff,
+		injectionStatus: InjectionOff,
+		injectionReason: InjectionReasonConfiguredOff,
+		state:           StatePending,
+		createdAt:       time.Now().UTC(),
+		updatedAt:       time.Now().UTC(),
 	}
 	for _, o := range opts {
 		o(a)
@@ -341,17 +428,30 @@ func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
 	if hookPolicy == "" {
 		hookPolicy = HooksOff
 	}
+	signalInjection := snapshot.SignalInjection
+	injectionStatus := snapshot.InjectionStatus
+	injectionReason := snapshot.InjectionReason
+	if signalInjection == "" {
+		signalInjection = SignalInjectionOff
+	}
+	if injectionStatus == "" && injectionReason == "" {
+		injectionStatus = InjectionOff
+		injectionReason = InjectionReasonConfiguredOff
+	}
 	a := &Agent{
-		id:             snapshot.ID,
-		name:           snapshot.Name,
-		vendor:         snapshot.Vendor,
-		runMode:        snapshot.RunMode,
-		hookPolicy:     hookPolicy,
-		state:          snapshot.State,
-		lastError:      snapshot.LastError,
-		lastTransition: cloneEvidence(snapshot.LastTransition),
-		createdAt:      snapshot.CreatedAt,
-		updatedAt:      snapshot.UpdatedAt,
+		id:              snapshot.ID,
+		name:            snapshot.Name,
+		vendor:          snapshot.Vendor,
+		runMode:         snapshot.RunMode,
+		hookPolicy:      hookPolicy,
+		signalInjection: signalInjection,
+		injectionStatus: injectionStatus,
+		injectionReason: injectionReason,
+		state:           snapshot.State,
+		lastError:       snapshot.LastError,
+		lastTransition:  cloneEvidence(snapshot.LastTransition),
+		createdAt:       snapshot.CreatedAt,
+		updatedAt:       snapshot.UpdatedAt,
 	}
 	for _, option := range opts {
 		option(a)
@@ -377,6 +477,19 @@ func validateRestoredAgent(a *Agent) error {
 	}
 	if !ValidHookPolicy(a.hookPolicy) {
 		return fmt.Errorf("agent: restore: invalid hook policy %q", a.hookPolicy)
+	}
+	if !ValidSignalInjectionMode(a.signalInjection) {
+		return fmt.Errorf(
+			"agent: restore: invalid signal injection mode %q",
+			a.signalInjection,
+		)
+	}
+	if !ValidSignalInjectionResult(a.injectionStatus, a.injectionReason) {
+		return fmt.Errorf(
+			"agent: restore: invalid signal injection result %q/%q",
+			a.injectionStatus,
+			a.injectionReason,
+		)
 	}
 	if !Valid(a.state) {
 		return fmt.Errorf("agent: restore: invalid state %q", a.state)
@@ -435,6 +548,23 @@ func (a *Agent) HookPolicy() HookPolicy {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.hookPolicy
+}
+
+// SignalInjection returns the immutable requested injection mode.
+func (a *Agent) SignalInjection() SignalInjectionMode {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.signalInjection
+}
+
+// SignalInjectionResult returns immutable launch injection metadata.
+func (a *Agent) SignalInjectionResult() (
+	SignalInjectionStatus,
+	SignalInjectionReason,
+) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.injectionStatus, a.injectionReason
 }
 
 // State 返回当前状态（读取权威入口）。

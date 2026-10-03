@@ -42,6 +42,9 @@ type sessionDraft struct {
 	vendor                 string
 	runMode                agent.RunMode
 	hookPolicy             agent.HookPolicy
+	signalInjection        agent.SignalInjectionMode
+	injectionStatus        agent.SignalInjectionStatus
+	injectionReason        agent.SignalInjectionReason
 	state                  agent.State
 	lastError              string
 	lastTransition         *agent.Evidence
@@ -138,6 +141,9 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	switch metadata.Version {
 	case 1:
 		draft.hookPolicy = agent.HooksOff
+		draft.signalInjection = agent.SignalInjectionOff
+		draft.injectionStatus = agent.InjectionDetached
+		draft.injectionReason = agent.InjectionReasonRecovered
 		if metadata.Mode == nil {
 			draft.runMode = agent.RunModeOneshot
 		} else if !agent.ValidRunMode(*metadata.Mode) {
@@ -154,6 +160,36 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 		}
 		draft.runMode = *metadata.Mode
 		draft.hookPolicy = *metadata.HookPolicy
+		hasInjectionMetadata := metadata.SignalInjection != nil ||
+			metadata.SignalInjectionStatus != nil ||
+			metadata.SignalInjectionReason != nil
+		if !hasInjectionMetadata {
+			draft.signalInjection = agent.SignalInjectionOff
+			draft.injectionStatus = agent.InjectionDetached
+			draft.injectionReason = agent.InjectionReasonRecovered
+			break
+		}
+		if metadata.SignalInjection == nil ||
+			metadata.SignalInjectionStatus == nil ||
+			metadata.SignalInjectionReason == nil ||
+			!agent.ValidSignalInjectionMode(*metadata.SignalInjection) {
+			return projectionError(
+				row,
+				"creation metadata version 2 has an invalid signal injection mode",
+			)
+		}
+		if !agent.ValidSignalInjectionResult(
+			*metadata.SignalInjectionStatus,
+			*metadata.SignalInjectionReason,
+		) {
+			return projectionError(
+				row,
+				"creation metadata version 2 has an invalid signal injection result",
+			)
+		}
+		draft.signalInjection = *metadata.SignalInjection
+		draft.injectionStatus = agent.InjectionDetached
+		draft.injectionReason = agent.InjectionReasonRecovered
 	default:
 		return projectionError(row, "unsupported creation metadata version %d", metadata.Version)
 	}
@@ -381,6 +417,9 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			draft.vendor = "unknown"
 			draft.runMode = agent.RunModeOneshot
 			draft.hookPolicy = agent.HooksOff
+			draft.signalInjection = agent.SignalInjectionOff
+			draft.injectionStatus = agent.InjectionDetached
+			draft.injectionReason = agent.InjectionReasonRecovered
 			plan.Report.LegacyMetadata++
 		}
 
@@ -425,16 +464,19 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			updatedAt = draft.createdAt
 		}
 		plan.Snapshots = append(plan.Snapshots, agent.RestoreSnapshot{
-			ID:             agent.ID(draft.id),
-			Name:           draft.name,
-			Vendor:         draft.vendor,
-			RunMode:        draft.runMode,
-			HookPolicy:     draft.hookPolicy,
-			State:          state,
-			LastError:      lastError,
-			LastTransition: draft.lastTransition,
-			CreatedAt:      draft.createdAt,
-			UpdatedAt:      updatedAt,
+			ID:              agent.ID(draft.id),
+			Name:            draft.name,
+			Vendor:          draft.vendor,
+			RunMode:         draft.runMode,
+			HookPolicy:      draft.hookPolicy,
+			SignalInjection: draft.signalInjection,
+			InjectionStatus: draft.injectionStatus,
+			InjectionReason: draft.injectionReason,
+			State:           state,
+			LastError:       lastError,
+			LastTransition:  draft.lastTransition,
+			CreatedAt:       draft.createdAt,
+			UpdatedAt:       updatedAt,
 		})
 	}
 	plan.Report.Sessions = len(plan.Snapshots)

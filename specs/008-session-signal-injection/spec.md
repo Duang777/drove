@@ -178,11 +178,11 @@ Codex notify does not satisfy `required`.
 
 ## Session metadata and status
 
-Creation metadata becomes version 3. It adds:
+Creation metadata remains version 2 and adds optional fields:
 
 ```json
 {
-  "version": 3,
+  "version": 2,
   "name": "claude-12345678",
   "vendor": "claude",
   "mode": "interactive",
@@ -218,10 +218,11 @@ signal_injection_status
 signal_injection_reason
 ```
 
-Readers continue to accept creation versions 1 and 2. They restore both as
-injection `off`, status `detached`, and reason `recovered`. A recovered version
-3 session preserves the requested mode but reports status `detached` because
-the original PTY and temporary configuration no longer exist.
+Version 1 and older version 2 events without these fields restore as injection
+`off`, status `detached`, and reason `recovered`. A recovered version 2 event
+with these fields preserves the requested mode but reports status `detached`
+because the original PTY and temporary configuration no longer exist. Keeping
+version 2 lets older readers ignore the additive fields.
 
 The status describes launch configuration. `hook_status` remains the runtime
 authority status. `injected` never implies `hook_active`.
@@ -504,7 +505,7 @@ Session startup uses this order:
 4. Create the Agent ID and prepare the session signal credential.
 5. Ask the adapter for an immutable injection plan.
 6. Materialize any temporary files under the session-private directory.
-7. Commit creation metadata version 3 and `Pending -> Starting`.
+7. Commit additive creation metadata version 2 and `Pending -> Starting`.
 8. Register the pending runtime session.
 9. Start the PTY with the final arguments and existing signal environment.
 10. Continue the approved Phase 1A readiness and required-hook sequence.
@@ -660,7 +661,7 @@ Automated tests must cover:
 - startup failure after materialization;
 - normal exit, user stop, daemon shutdown, and repeated cleanup;
 - stale startup cleanup with valid Agent IDs, unknown names, and symlinks;
-- creation metadata versions 1, 2, and 3;
+- creation metadata version 1, legacy version 2, and additive version 2;
 - status separation between injection result and runtime hook status;
 - concurrent session isolation under the race detector;
 - no change to isolated Claude or Codex user and project config hashes.

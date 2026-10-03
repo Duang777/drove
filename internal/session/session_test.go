@@ -496,7 +496,7 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
 		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"off"}` {
+		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"off","signal_injection":"off","signal_injection_status":"off","signal_injection_reason":"hook_policy_off"}` {
 		t.Fatalf("creation event = %+v", rows[0])
 	}
 	if rows[1].Seq != 2 ||

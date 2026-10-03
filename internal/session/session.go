@@ -24,18 +24,21 @@ import (
 
 // Status 是对外暴露的会话视图（供 daemon/api/CLI 使用）。
 type Status struct {
-	AgentID        string            `json:"agent_id"`
-	Name           string            `json:"name"`
-	Vendor         string            `json:"vendor"`
-	Mode           agent.RunMode     `json:"mode"`
-	State          agent.State       `json:"state"`
-	PID            int               `json:"pid,omitempty"`
-	CreatedAt      time.Time         `json:"created_at"`
-	UpdatedAt      time.Time         `json:"updated_at"`
-	LastError      string            `json:"last_error,omitempty"`
-	HookPolicy     agent.HookPolicy  `json:"hook_policy"`
-	HookStatus     detect.HookStatus `json:"hook_status"`
-	LastTransition *agent.Evidence   `json:"last_transition,omitempty"`
+	AgentID               string                      `json:"agent_id"`
+	Name                  string                      `json:"name"`
+	Vendor                string                      `json:"vendor"`
+	Mode                  agent.RunMode               `json:"mode"`
+	State                 agent.State                 `json:"state"`
+	PID                   int                         `json:"pid,omitempty"`
+	CreatedAt             time.Time                   `json:"created_at"`
+	UpdatedAt             time.Time                   `json:"updated_at"`
+	LastError             string                      `json:"last_error,omitempty"`
+	HookPolicy            agent.HookPolicy            `json:"hook_policy"`
+	HookStatus            detect.HookStatus           `json:"hook_status"`
+	SignalInjection       agent.SignalInjectionMode   `json:"signal_injection"`
+	SignalInjectionStatus agent.SignalInjectionStatus `json:"signal_injection_status"`
+	SignalInjectionReason agent.SignalInjectionReason `json:"signal_injection_reason"`
+	LastTransition        *agent.Evidence             `json:"last_transition,omitempty"`
 }
 
 // StartRequest 描述启动一个新 agent 会话的参数。
@@ -57,11 +60,14 @@ type StartRequest struct {
 }
 
 type createdPayload struct {
-	Version    int               `json:"version"`
-	Name       string            `json:"name"`
-	Vendor     string            `json:"vendor"`
-	Mode       *agent.RunMode    `json:"mode,omitempty"`
-	HookPolicy *agent.HookPolicy `json:"hook_policy,omitempty"`
+	Version               int                          `json:"version"`
+	Name                  string                       `json:"name"`
+	Vendor                string                       `json:"vendor"`
+	Mode                  *agent.RunMode               `json:"mode,omitempty"`
+	HookPolicy            *agent.HookPolicy            `json:"hook_policy,omitempty"`
+	SignalInjection       *agent.SignalInjectionMode   `json:"signal_injection,omitempty"`
+	SignalInjectionStatus *agent.SignalInjectionStatus `json:"signal_injection_status,omitempty"`
+	SignalInjectionReason *agent.SignalInjectionReason `json:"signal_injection_reason,omitempty"`
 }
 
 type inputAuditPayload struct {
@@ -116,6 +122,7 @@ type runningSession struct {
 	signalDigest   signalTokenDigest
 	hasSignalToken bool
 	vendor         string
+	injectionDir   string
 	stopCause      stopCause
 	exitClaimed    bool
 }
@@ -137,6 +144,11 @@ type Manager struct {
 	detectConfig     detect.Config
 	clock            observationClock
 	newCredential    signalCredentialSource
+	injectionEnabled bool
+	injectionDataDir string
+	injectionRelay   string
+	injectionModes   map[string]agent.SignalInjectionMode
+	injectionFS      signalInjectionFS
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
@@ -173,6 +185,7 @@ func NewManager(
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
 		newCredential: generateSignalCredential,
+		injectionFS:   defaultSignalInjectionFS(),
 	}
 	for _, option := range options {
 		option(manager)
@@ -244,42 +257,71 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	req.Hooks = hookPolicy
 
 	// 1. 在创建持久化会话前解析并校验命令。
-	cmdName, cmdArgs := entry.Runner.Command(req.Mode)
+	cmdName, baseArgs := entry.Runner.Command(req.Mode)
 	if req.Command != "" {
 		cmdName = req.Command
-		cmdArgs = req.Args
+		baseArgs = nil
 	}
 	if cmdName == "" {
 		return nil, errors.New("session: generic vendor requires explicit command")
 	}
 
-	// 2. 构造 agent 并先持久化会话元数据。
+	// 2. 生成会话专属配置，再持久化会话元数据。
 	id := agent.ID(uuid.NewString())
 	if req.Name == "" {
 		req.Name = req.Vendor + "-" + string(id)[:8]
+	}
+	injection, err := m.prepareSignalInjection(
+		id,
+		entry,
+		req.Vendor,
+		req.Hooks,
+		req.Mode,
+		baseArgs,
+		req.Args,
+	)
+	if err != nil {
+		return nil, err
 	}
 	a := agent.New(id,
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
 		agent.WithRunMode(req.Mode),
 		agent.WithHookPolicy(req.Hooks),
+		agent.WithSignalInjection(
+			injection.mode,
+			injection.status,
+			injection.reason,
+		),
 	)
 	persistedMode := req.Mode
 	persistedPolicy := req.Hooks
+	persistedInjection := injection.mode
+	persistedInjectionStatus := injection.status
+	persistedInjectionReason := injection.reason
 	payload, err := json.Marshal(createdPayload{
-		Version:    2,
-		Name:       req.Name,
-		Vendor:     req.Vendor,
-		Mode:       &persistedMode,
-		HookPolicy: &persistedPolicy,
+		Version:               2,
+		Name:                  req.Name,
+		Vendor:                req.Vendor,
+		Mode:                  &persistedMode,
+		HookPolicy:            &persistedPolicy,
+		SignalInjection:       &persistedInjection,
+		SignalInjectionStatus: &persistedInjectionStatus,
+		SignalInjectionReason: &persistedInjectionReason,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("session: encode creation metadata: %w", err)
+		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
+		return nil, errors.Join(
+			fmt.Errorf("session: encode creation metadata: %w", err),
+			cleanupErr,
+		)
 	}
 	running, processEnv, signalToken, err := m.prepareRuntime(a, entry)
 	if err != nil {
-		return nil, err
+		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
+		return nil, errors.Join(err, cleanupErr)
 	}
+	running.injectionDir = injection.dir
 	if _, err := m.committer.CommitAgent(
 		ctx,
 		a,
@@ -296,7 +338,11 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		)},
 	); err != nil {
 		running.observer.Close()
-		return nil, fmt.Errorf("session: persist creation: %w", err)
+		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
+		return nil, errors.Join(
+			fmt.Errorf("session: persist creation: %w", err),
+			cleanupErr,
+		)
 	}
 
 	m.mu.Lock()
@@ -307,7 +353,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
 	sess, err := pty.Start(pty.Config{
 		Command: cmdName,
-		Args:    cmdArgs,
+		Args:    injection.args,
 		Env:     processEnv,
 		Dir:     req.Dir,
 		OnOutput: func(line string) {
@@ -337,7 +383,8 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		close(running.signalReady)
 		close(running.callbacksReady)
 		running.observer.Close()
-		return nil, errors.Join(startErr, commitErr)
+		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
+		return nil, errors.Join(startErr, commitErr, cleanupErr)
 	}
 
 	m.mu.Lock()
@@ -487,6 +534,8 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		HookStatus:     hookStatus,
 		LastTransition: a.LastTransition(),
 	}
+	st.SignalInjection = a.SignalInjection()
+	st.SignalInjectionStatus, st.SignalInjectionReason = a.SignalInjectionResult()
 	if process != nil {
 		st.PID = process.PID()
 	}
@@ -692,6 +741,7 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 		return
 	}
 	defer m.detach(id, running)
+	defer m.finalizeSignalInjection(id, running)
 	if running.observer == nil {
 		return
 	}

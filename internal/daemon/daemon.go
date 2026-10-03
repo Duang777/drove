@@ -57,7 +57,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	}()
 
 	// 2. 在 API 对外可见前恢复会话投影。
-	recovered, err := bootstrapSessions(ctx, st)
+	recovered, err := bootstrapSessions(ctx, st, signalInjectionOption(d.cfg))
 	if err != nil {
 		return err
 	}
@@ -90,6 +90,15 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		hub.Close()
 		return errors.Join(
 			fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err),
+			closeErr,
+		)
+	}
+	if err := session.CleanupStaleSignalInjections(d.cfg.DataDir); err != nil {
+		closeErr := mgr.Close()
+		hub.Close()
+		_ = ln.Close()
+		return errors.Join(
+			fmt.Errorf("daemon: clean stale signal injection: %w", err),
 			closeErr,
 		)
 	}

@@ -186,6 +186,43 @@ func TestHookPolicyAndEvidenceValidation(t *testing.T) {
 	}
 }
 
+func TestSignalInjectionMetadataValidation(t *testing.T) {
+	if !ValidSignalInjectionMode(SignalInjectionAuto) ||
+		!ValidSignalInjectionMode(SignalInjectionOff) ||
+		ValidSignalInjectionMode("required") {
+		t.Fatal("signal injection mode validation is incorrect")
+	}
+	if !ValidSignalInjectionResult(
+		InjectionInjected,
+		InjectionReasonSessionConfig,
+	) || ValidSignalInjectionResult(
+		InjectionInjected,
+		InjectionReasonRelayUnavailable,
+	) {
+		t.Fatal("signal injection result validation is incorrect")
+	}
+
+	target := New(
+		"agent",
+		WithSignalInjection(
+			SignalInjectionAuto,
+			InjectionSkipped,
+			InjectionReasonRelayUnavailable,
+		),
+	)
+	status, reason := target.SignalInjectionResult()
+	if target.SignalInjection() != SignalInjectionAuto ||
+		status != InjectionSkipped ||
+		reason != InjectionReasonRelayUnavailable {
+		t.Fatalf(
+			"signal injection = %s/%s/%s",
+			target.SignalInjection(),
+			status,
+			reason,
+		)
+	}
+}
+
 func TestValidStates(t *testing.T) {
 	valid := []State{StatePending, StateStarting, StateWorking, StateBlocked, StateDone, StateIdle, StateStopped}
 	for _, s := range valid {
