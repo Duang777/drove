@@ -2,13 +2,13 @@
 package pty
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/creack/pty"
 )
@@ -30,8 +30,10 @@ type Config struct {
 	Env []string
 	// Dir 是工作目录；空则继承当前目录。
 	Dir string
-	// OnOutput 在每行输出可用时被调用。回调不得长期阻塞。
-	OnOutput func(line string)
+	// OnOutput 在输出字节可用时被调用。回调不得长期阻塞。
+	OnOutput func(chunk []byte, offset uint64)
+	// OnOutputEnd 在最后一次输出回调后被调用一次。
+	OnOutputEnd func(offset uint64)
 	// OnExit 在进程退出后被调用一次。
 	OnExit func(info ExitInfo)
 }
@@ -47,10 +49,11 @@ type Session struct {
 	ptmx   *os.File
 	closed bool
 
-	onOutput func(line string)
-	onExit   func(info ExitInfo)
-	readDone chan struct{}
-	done     chan struct{}
+	onOutput    func(chunk []byte, offset uint64)
+	onOutputEnd func(offset uint64)
+	onExit      func(info ExitInfo)
+	readDone    chan struct{}
+	done        chan struct{}
 
 	// WaitCh 返回进程退出信息（Close 后仍可读取一次）。
 	WaitCh chan ExitInfo
@@ -77,13 +80,14 @@ func Start(cfg Config) (*Session, error) {
 	}
 
 	s := &Session{
-		cmd:      cmd,
-		ptmx:     ptmx,
-		onOutput: cfg.OnOutput,
-		onExit:   cfg.OnExit,
-		readDone: make(chan struct{}),
-		done:     make(chan struct{}),
-		WaitCh:   make(chan ExitInfo, 1),
+		cmd:         cmd,
+		ptmx:        ptmx,
+		onOutput:    cfg.OnOutput,
+		onOutputEnd: cfg.OnOutputEnd,
+		onExit:      cfg.OnExit,
+		readDone:    make(chan struct{}),
+		done:        make(chan struct{}),
+		WaitCh:      make(chan ExitInfo, 1),
 	}
 
 	// 设置终端行数/列数（默认 120x40，可被上层调整）。
@@ -94,20 +98,80 @@ func Start(cfg Config) (*Session, error) {
 	return s, nil
 }
 
-// readLoop 持续读取 PTY 输出并按行回调。Close 关闭 ptmx 后可中断。
+const outputReadBufferSize = 32 * 1024
+
+// readLoop 持续读取 PTY 输出字节。Close 关闭 ptmx 后可中断。
 func (s *Session) readLoop() {
 	defer close(s.readDone)
+	readOutput(s.ptmx, s.onOutput, s.onOutputEnd)
+}
 
-	r := bufio.NewReader(s.ptmx)
+func readOutput(
+	reader io.Reader,
+	onOutput func([]byte, uint64),
+	onOutputEnd func(uint64),
+) {
+	buffer := make([]byte, outputReadBufferSize)
+	var pending []byte
+	var offset uint64
+	deliver := func(data []byte) {
+		if len(data) == 0 {
+			return
+		}
+		chunk := append([]byte(nil), data...)
+		if onOutput != nil {
+			onOutput(chunk, offset)
+		}
+		offset += uint64(len(chunk))
+	}
+	defer func() {
+		deliver(pending)
+		if onOutputEnd != nil {
+			onOutputEnd(offset)
+		}
+	}()
+
 	for {
-		line, err := r.ReadString('\n')
-		if line != "" && s.onOutput != nil {
-			s.onOutput(line)
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			pending = append(pending, buffer[:n]...)
+			for len(pending) > 0 {
+				prefix := completeUTF8Prefix(pending, outputReadBufferSize)
+				if prefix == 0 {
+					break
+				}
+				deliver(pending[:prefix])
+				pending = append([]byte(nil), pending[prefix:]...)
+			}
 		}
 		if err != nil {
 			return
 		}
 	}
+}
+
+func completeUTF8Prefix(data []byte, limit int) int {
+	if limit > len(data) {
+		limit = len(data)
+	}
+	lastComplete := 0
+	for index := 0; index < limit; {
+		if !utf8.FullRune(data[index:]) {
+			return lastComplete
+		}
+		r, size := utf8.DecodeRune(data[index:])
+		if r != utf8.RuneError || size != 1 {
+			if index+size > limit {
+				return lastComplete
+			}
+			index += size
+			lastComplete = index
+			continue
+		}
+		index++
+		lastComplete = index
+	}
+	return lastComplete
 }
 
 // waitLoop 等待进程退出并通知。

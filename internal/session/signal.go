@@ -179,6 +179,7 @@ func (m *Manager) prepareRuntime(
 		vendor:         a.Vendor(),
 	}
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
+		running.output = newOutputProcessor(m, a.ID(), running, entry, "")
 		return running, nil, "", nil
 	}
 
@@ -194,6 +195,7 @@ func (m *Manager) prepareRuntime(
 	}
 	running.signalDigest = digest
 	running.hasSignalToken = true
+	running.output = newOutputProcessor(m, a.ID(), running, entry, token)
 	return running, []string{
 		SignalAgentIDEnv + "=" + string(a.ID()),
 		SignalURLEnv + "=" + signalURL,

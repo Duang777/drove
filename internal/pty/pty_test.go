@@ -9,12 +9,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 type chunkWriter struct {
 	bytes.Buffer
 	max int
 	err error
+}
+
+type outputRecord struct {
+	data   []byte
+	offset uint64
 }
 
 func (w *chunkWriter) Write(data []byte) (int, error) {
@@ -62,14 +68,18 @@ func TestWriteFullPreservesPartialFailure(t *testing.T) {
 }
 
 func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
-	outputs := make(chan string, 4)
+	outputs := make(chan outputRecord, 4)
+	outputEnds := make(chan uint64, 2)
 	exits := make(chan ExitInfo, 2)
 
 	sess, err := Start(Config{
 		Command: "/bin/sh",
 		Args:    []string{"-c", "printf 'first\\nlast'"},
-		OnOutput: func(line string) {
-			outputs <- line
+		OnOutput: func(chunk []byte, offset uint64) {
+			outputs <- outputRecord{data: chunk, offset: offset}
+		},
+		OnOutputEnd: func(offset uint64) {
+			outputEnds <- offset
 		},
 		OnExit: func(info ExitInfo) {
 			exits <- info
@@ -84,15 +94,28 @@ func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 		}
 	})
 
-	gotOutputs := []string{
-		waitString(t, outputs, "first output"),
-		waitString(t, outputs, "final partial output"),
+	var got []byte
+	var nextOffset uint64
+	for {
+		select {
+		case output := <-outputs:
+			if output.offset != nextOffset {
+				t.Fatalf("output offset = %d, want %d", output.offset, nextOffset)
+			}
+			got = append(got, output.data...)
+			nextOffset += uint64(len(output.data))
+		case endOffset := <-outputEnds:
+			if endOffset != nextOffset {
+				t.Fatalf("end offset = %d, want %d", endOffset, nextOffset)
+			}
+			goto outputComplete
+		case <-time.After(2 * time.Second):
+			t.Fatal("output end timed out")
+		}
 	}
-	if gotOutputs[0] != "first\r\n" {
-		t.Fatalf("first output = %q, want %q", gotOutputs[0], "first\r\n")
-	}
-	if gotOutputs[1] != "last" {
-		t.Fatalf("final output = %q, want %q", gotOutputs[1], "last")
+outputComplete:
+	if string(got) != "first\r\nlast" {
+		t.Fatalf("output = %q, want %q", got, "first\r\nlast")
 	}
 
 	info := waitExit(t, exits)
@@ -102,7 +125,9 @@ func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 
 	select {
 	case output := <-outputs:
-		t.Fatalf("unexpected duplicate output %q", output)
+		t.Fatalf("unexpected duplicate output %q", output.data)
+	case offset := <-outputEnds:
+		t.Fatalf("unexpected duplicate output end at %d", offset)
 	case exit := <-exits:
 		t.Fatalf("unexpected duplicate exit %+v", exit)
 	case <-time.After(25 * time.Millisecond):
@@ -121,6 +146,34 @@ func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 	}
 }
 
+func TestStartDeliversPromptWithoutNewline(t *testing.T) {
+	outputs := make(chan outputRecord, 1)
+	sess, err := Start(Config{
+		Command: "/bin/sh",
+		Args:    []string{"-c", "printf 'Allow? [y/n] '; sleep 30"},
+		OnOutput: func(chunk []byte, offset uint64) {
+			outputs <- outputRecord{data: chunk, offset: offset}
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	select {
+	case output := <-outputs:
+		if output.offset != 0 || string(output.data) != "Allow? [y/n] " {
+			t.Fatalf("output = (%d, %q)", output.offset, output.data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("prompt without newline was not delivered")
+	}
+}
+
 func TestCloseWaitsForOutputCallbackAndIsIdempotent(t *testing.T) {
 	callbackStarted := make(chan struct{})
 	releaseCallback := make(chan struct{})
@@ -130,7 +183,7 @@ func TestCloseWaitsForOutputCallbackAndIsIdempotent(t *testing.T) {
 	sess, err := Start(Config{
 		Command: "/bin/sh",
 		Args:    []string{"-c", "printf 'ready\\n'; sleep 30"},
-		OnOutput: func(string) {
+		OnOutput: func([]byte, uint64) {
 			callbackOnce.Do(func() { close(callbackStarted) })
 			<-releaseCallback
 		},
@@ -192,7 +245,7 @@ func TestStartFailureInvokesNoCallback(t *testing.T) {
 
 	sess, err := Start(Config{
 		Command: filepath.Join(t.TempDir(), "missing-command"),
-		OnOutput: func(string) {
+		OnOutput: func([]byte, uint64) {
 			outputCalls.Add(1)
 		},
 		OnExit: func(ExitInfo) {
@@ -213,15 +266,113 @@ func TestStartFailureInvokesNoCallback(t *testing.T) {
 	}
 }
 
-func waitString(t *testing.T, ch <-chan string, label string) string {
-	t.Helper()
-	select {
-	case value := <-ch:
-		return value
-	case <-time.After(2 * time.Second):
-		t.Fatalf("%s timed out", label)
-		return ""
+func TestReadOutputPreservesUTF8AcrossShortReads(t *testing.T) {
+	reader := &scriptedReader{chunks: [][]byte{
+		[]byte("A\xe4"),
+		[]byte("\xb8"),
+		[]byte("\x96B"),
+	}}
+	var records []outputRecord
+	var endOffsets []uint64
+	readOutput(
+		reader,
+		func(chunk []byte, offset uint64) {
+			records = append(records, outputRecord{data: chunk, offset: offset})
+		},
+		func(offset uint64) {
+			endOffsets = append(endOffsets, offset)
+		},
+	)
+
+	var got []byte
+	var offset uint64
+	for _, record := range records {
+		if record.offset != offset {
+			t.Fatalf("record offset = %d, want %d", record.offset, offset)
+		}
+		if !utf8.Valid(record.data) {
+			t.Fatalf("normal output split UTF-8: %x", record.data)
+		}
+		got = append(got, record.data...)
+		offset += uint64(len(record.data))
 	}
+	if string(got) != "A世B" {
+		t.Fatalf("output = %q, want A世B", got)
+	}
+	if len(endOffsets) != 1 || endOffsets[0] != uint64(len(got)) {
+		t.Fatalf("end offsets = %v, want [%d]", endOffsets, len(got))
+	}
+}
+
+func TestReadOutputPreservesInvalidAndIncompleteFinalBytes(t *testing.T) {
+	input := []byte{'a', 0xff, 0xe4, 0xb8}
+	reader := &scriptedReader{chunks: [][]byte{
+		input[:2],
+		input[2:],
+	}}
+	var got []byte
+	var endOffset uint64
+	readOutput(
+		reader,
+		func(chunk []byte, _ uint64) {
+			got = append(got, chunk...)
+		},
+		func(offset uint64) {
+			endOffset = offset
+		},
+	)
+	if !bytes.Equal(got, input) {
+		t.Fatalf("output = %x, want %x", got, input)
+	}
+	if endOffset != uint64(len(input)) {
+		t.Fatalf("end offset = %d, want %d", endOffset, len(input))
+	}
+}
+
+func TestReadOutputCapsChunksAndCopiesCallbackBytes(t *testing.T) {
+	first := bytes.Repeat([]byte{'a'}, outputReadBufferSize-1)
+	first = append(first, 0xe4)
+	reader := &scriptedReader{chunks: [][]byte{
+		first,
+		{0xb8, 0x96, 'z'},
+	}}
+	var records []outputRecord
+	readOutput(reader, func(chunk []byte, offset uint64) {
+		records = append(records, outputRecord{data: chunk, offset: offset})
+	}, nil)
+
+	var got []byte
+	for _, record := range records {
+		if len(record.data) > outputReadBufferSize {
+			t.Fatalf("chunk length = %d, max %d", len(record.data), outputReadBufferSize)
+		}
+		if !utf8.Valid(record.data) {
+			t.Fatalf("chunk split UTF-8: suffix %x", record.data[len(record.data)-4:])
+		}
+		got = append(got, record.data...)
+	}
+	want := append(append([]byte(nil), first...), 0xb8, 0x96, 'z')
+	if !bytes.Equal(got, want) {
+		t.Fatalf("output length = %d, want %d", len(got), len(want))
+	}
+	reader.chunks[0][0] = 'x'
+	if records[0].data[0] != 'a' {
+		t.Fatal("callback bytes alias reader input")
+	}
+}
+
+type scriptedReader struct {
+	chunks [][]byte
+	index  int
+}
+
+func (r *scriptedReader) Read(buffer []byte) (int, error) {
+	if r.index >= len(r.chunks) {
+		return 0, io.EOF
+	}
+	chunk := r.chunks[r.index]
+	r.index++
+	return copy(buffer, chunk), nil
 }
 
 func waitExit(t *testing.T, ch <-chan ExitInfo) ExitInfo {

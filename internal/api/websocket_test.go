@@ -66,9 +66,9 @@ func TestWebSocketInputAcknowledgesAndPreservesEventEnvelope(t *testing.T) {
 			if message["request_id"] == request.RequestID {
 				ack = message
 			}
-		case string(event.TypeOutput):
+		case string(event.TypeOutputChunk):
 			if message["agent_id"] == status.AgentID &&
-				strings.Contains(message["payload"].(string), "continue") {
+				outputPayloadContains(t, message["payload"].(string), "continue") {
 				output = message
 			}
 		}

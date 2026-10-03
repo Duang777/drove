@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -430,7 +431,7 @@ func TestWriteLogRowsWritesRawChunksAndLegacyNewline(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if err := writeLogRows(&output, rows); err != nil {
+	if err := writeLogRows(&output, rows, false); err != nil {
 		t.Fatalf("write log rows: %v", err)
 	}
 	want := append([]byte("first line\n"), []byte{0x1b, '[', '2', 'J', 0, 0xff}...)
@@ -445,11 +446,62 @@ func TestWriteLogRowsRejectsMalformedOutputChunk(t *testing.T) {
 		Seq:     9,
 		Type:    string(event.TypeOutputChunk),
 		Payload: `{"version":1,"offset":0,"len":2,"data_b64":"YQ=="}`,
-	}})
+	}}, false)
 	if err == nil || !strings.Contains(err.Error(), "seq 9") {
 		t.Fatalf("write error = %v, want malformed chunk at seq 9", err)
 	}
 	if output.Len() != 0 {
 		t.Fatalf("malformed chunk wrote %q", output.Bytes())
+	}
+}
+
+func TestLogCommandExposesPlainFlag(t *testing.T) {
+	flag := newLogCmd().Flags().Lookup("plain")
+	if flag == nil || flag.DefValue != "false" {
+		t.Fatalf("--plain flag = %+v, want default false", flag)
+	}
+}
+
+func TestWriteLogRowsPlainStripsControlsAcrossChunks(t *testing.T) {
+	first, err := event.HydrateOutputChunkPayload(
+		`{"version":1,"offset":0,"len":8}`,
+		[]byte("before\x1b]"),
+	)
+	if err != nil {
+		t.Fatalf("hydrate first chunk: %v", err)
+	}
+	secondData := []byte("0;secret\x1b\\after\x1b[31")
+	second, err := event.HydrateOutputChunkPayload(
+		fmt.Sprintf(`{"version":1,"offset":8,"len":%d}`, len(secondData)),
+		secondData,
+	)
+	if err != nil {
+		t.Fatalf("hydrate second chunk: %v", err)
+	}
+	thirdData := []byte("m red\x1b[0m")
+	third, err := event.HydrateOutputChunkPayload(
+		fmt.Sprintf(
+			`{"version":1,"offset":%d,"len":%d}`,
+			8+len(secondData),
+			len(thirdData),
+		),
+		thirdData,
+	)
+	if err != nil {
+		t.Fatalf("hydrate third chunk: %v", err)
+	}
+
+	rows := []store.EventRow{
+		{Seq: 1, Type: string(event.TypeOutputChunk), Payload: first},
+		{Seq: 2, Type: string(event.TypeOutputChunk), Payload: second},
+		{Seq: 3, Type: string(event.TypeOutputChunk), Payload: third},
+		{Seq: 4, Type: string(event.TypeOutput), Payload: "legacy\r\n"},
+	}
+	var output bytes.Buffer
+	if err := writeLogRows(&output, rows, true); err != nil {
+		t.Fatalf("write plain log rows: %v", err)
+	}
+	if got, want := output.String(), "beforeafter redlegacy\n"; got != want {
+		t.Fatalf("plain output = %q, want %q", got, want)
 	}
 }

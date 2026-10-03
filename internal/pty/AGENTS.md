@@ -6,8 +6,12 @@
 
 ## 关键设计
 
-- `Session` 封装 `creack/pty`：`Start` 创建 PTY 并启动命令；`Write` 在同一临界区内完整写入一段输入或返回已写入字节数与错误；读取循环把输出**按行切分**后经 `Config.OnOutput` 回调上抛（事件化由上层负责）。
-- `Config.OnOutput` 与 `Config.OnExit` 在读取和等待 goroutine 启动前固定，运行中不得替换。
+- `Session` 封装 `creack/pty`：`Start` 创建 PTY 并启动命令；`Write` 在同一临界区内完整写入一段输入或返回已写入字节数与错误。
+- 读取循环使用 32 KiB 缓冲区，按带源字节偏移的块调用 `Config.OnOutput`；
+  正常块不拆分合法 UTF-8 码点，EOF 原样送出无效或不完整尾部字节。
+- `Config.OnOutputEnd` 在最后一个输出块后调用一次；它与 `Config.OnExit` 没有顺序保证。
+- `Config.OnOutput`、`Config.OnOutputEnd` 与 `Config.OnExit` 在读取和等待
+  goroutine 启动前固定，运行中不得替换。
 - 主动停止由 `Close` 回收资源；自然退出在读取结束后关闭 PTY master。`Close` 幂等，并等待读取、进程退出和全部回调完成。
 - 进程退出码经 `WaitCh` 返回，供状态机迁移到 `Stopped`/`Done`。
 

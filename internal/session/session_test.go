@@ -15,6 +15,7 @@ import (
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
 )
 
@@ -771,8 +772,9 @@ func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
 				(row.Type == string(event.TypeStateChanged) &&
 					row.From == string(agent.StateStarting) &&
 					row.To == string(agent.StateWorking))
-			hasOutput = hasOutput ||
-				(row.Type == string(event.TypeOutput) && row.Payload == "fast")
+			if row.Type == string(event.TypeOutputChunk) {
+				hasOutput = string(outputChunkData(t, row)) == "fast"
+			}
 			hasStopped = hasStopped ||
 				(row.Type == string(event.TypeStateChanged) &&
 					row.To == string(agent.StateStopped))
@@ -799,9 +801,11 @@ func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
 			row.From == string(agent.StateStarting) &&
 			row.To == string(agent.StateWorking):
 			workingIndex = i
-		case row.Type == string(event.TypeOutput) && row.Payload == "fast":
-			outputIndex = i
-			outputCount++
+		case row.Type == string(event.TypeOutputChunk):
+			if string(outputChunkData(t, row)) == "fast" {
+				outputIndex = i
+				outputCount++
+			}
 		case row.Type == string(event.TypeStateChanged) &&
 			row.To == string(agent.StateStopped):
 			stoppedIndex = i
@@ -1211,14 +1215,14 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
 	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
 
-	manager.onOutput(id, "Task complete!", manager.reg.For("claude"), "")
+	feedTestOutput(t, manager, id, "Task complete!")
 
 	if got := a.State(); got != agent.StateWorking {
 		t.Fatalf("interactive state = %s, want working", got)
 	}
 }
 
-func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
+func TestOutputProcessorSanitizesOnlyHeuristicView(t *testing.T) {
 	manager, _ := newTestManager(t)
 	manager.detectConfig.HeuristicConfirmation = 5 * time.Millisecond
 	id := agent.ID("ansi-agent")
@@ -1238,26 +1242,44 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	subscription := manager.hub.Subscribe(4)
 	defer manager.hub.Unsubscribe(subscription)
 	raw := "Waiting \x1b[2K\x1b[1Gfor your input"
-	manager.onOutput(id, raw, manager.reg.For("claude"), "")
+	feedTestOutput(t, manager, id, raw)
 
 	waitForState(t, manager, id, agent.StateBlocked)
 	rows, err := manager.Replay(string(id))
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	var persistedOutput string
+	var persistedOutput []byte
 	for _, row := range rows {
-		if row.Type == string(event.TypeOutput) {
-			persistedOutput = row.Payload
+		if row.Type == string(event.TypeOutputChunk) {
+			payload, decodeErr := event.DecodeOutputChunkPayload(row.Payload)
+			if decodeErr != nil {
+				t.Fatalf("decode persisted output: %v", decodeErr)
+			}
+			persistedOutput, decodeErr = payload.DecodeData()
+			if decodeErr != nil {
+				t.Fatalf("decode persisted data: %v", decodeErr)
+			}
 		}
 	}
-	if persistedOutput != raw {
-		t.Fatalf("persisted output = %q, want raw %q", persistedOutput, raw)
+	if string(persistedOutput) != raw+"\n" {
+		t.Fatalf("persisted output = %q, want raw %q", persistedOutput, raw+"\n")
 	}
 	select {
 	case streamed := <-subscription.C():
-		if streamed.Type != event.TypeOutput || streamed.Payload != raw {
-			t.Fatalf("streamed event = %+v, want raw output", streamed)
+		if streamed.Type != event.TypeOutputChunk {
+			t.Fatalf("streamed event = %+v, want output chunk", streamed)
+		}
+		payload, decodeErr := event.DecodeOutputChunkPayload(streamed.Payload)
+		if decodeErr != nil {
+			t.Fatalf("decode streamed output: %v", decodeErr)
+		}
+		data, decodeErr := payload.DecodeData()
+		if decodeErr != nil {
+			t.Fatalf("decode streamed data: %v", decodeErr)
+		}
+		if string(data) != raw+"\n" {
+			t.Fatalf("streamed data = %q, want %q", data, raw+"\n")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for streamed output")
@@ -1384,23 +1406,26 @@ func TestNaturalExitRacingStopRecordsOneTerminalTransition(t *testing.T) {
 
 func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 	manager, _ := newTestManager(t)
-	started, err := manager.Start(context.Background(), StartRequest{
-		Name:    "trailing-output",
-		Command: "/bin/cat",
-		Mode:    agent.RunModeInteractive,
-	})
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	id := agent.ID(started.AgentID)
-	if err := manager.Stop(id); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	waitForDetachedState(t, manager, id, agent.StateStopped)
+	id := agent.ID("trailing-output")
+	a := agent.New(
+		id,
+		agent.WithName("trailing-output"),
+		agent.WithVendor("generic"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.mu.Unlock()
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
+	commitTestState(t, manager, a, agent.StateWorking, "test working")
+	running := attachTestRuntime(t, manager, a, manager.reg.For("generic"))
 
-	manager.onOutput(id, "final output", adapter.NewRegistry().For("generic"), "")
+	manager.onExit(id, running, pty.ExitInfo{Code: 0})
+	if err := running.output.Feed([]byte("final output"), 0); err != nil {
+		t.Fatalf("feed trailing output: %v", err)
+	}
 
-	rows, err := manager.Replay(started.AgentID)
+	rows, err := manager.Replay(string(id))
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
@@ -1411,8 +1436,18 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 			row.To == string(agent.StateStopped) {
 			stoppedIndex = index
 		}
-		if row.Type == string(event.TypeOutput) && row.Payload == "final output" {
-			outputIndex = index
+		if row.Type == string(event.TypeOutputChunk) {
+			payload, decodeErr := event.DecodeOutputChunkPayload(row.Payload)
+			if decodeErr != nil {
+				t.Fatalf("decode output chunk: %v", decodeErr)
+			}
+			data, decodeErr := payload.DecodeData()
+			if decodeErr != nil {
+				t.Fatalf("decode output data: %v", decodeErr)
+			}
+			if string(data) == "final output" {
+				outputIndex = index
+			}
 		}
 	}
 	if stoppedIndex < 0 || outputIndex <= stoppedIndex {
@@ -1476,6 +1511,35 @@ func attachTestRuntime(
 	manager.sessions[a.ID()] = running
 	manager.mu.Unlock()
 	return running
+}
+
+func feedTestOutput(t *testing.T, manager *Manager, id agent.ID, line string) {
+	t.Helper()
+
+	manager.mu.RLock()
+	running := manager.sessions[id]
+	manager.mu.RUnlock()
+	if running == nil || running.output == nil {
+		t.Fatalf("agent %q has no output processor", id)
+	}
+	data := append([]byte(line), '\n')
+	if err := running.output.Feed(data, running.output.nextSourceOffset); err != nil {
+		t.Fatalf("feed output for agent %q: %v", id, err)
+	}
+}
+
+func outputChunkData(t *testing.T, row store.EventRow) []byte {
+	t.Helper()
+
+	payload, err := event.DecodeOutputChunkPayload(row.Payload)
+	if err != nil {
+		t.Fatalf("decode output chunk at seq %d: %v", row.Seq, err)
+	}
+	data, err := payload.DecodeData()
+	if err != nil {
+		t.Fatalf("decode output chunk data at seq %d: %v", row.Seq, err)
+	}
+	return data
 }
 
 func newTestStore(t *testing.T) *store.Store {

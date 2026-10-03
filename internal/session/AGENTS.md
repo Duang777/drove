@@ -7,8 +7,9 @@
 ## 关键设计
 
 - `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
-- 每个运行中会话持有一个 observation actor、Detector State 和 signal token 的 SHA-256 digest；
-  token 只授权该 Agent 的 signal endpoint，并在启动失败或退出认领时失效。
+- 每个运行中会话持有一个 observation actor、一个输出处理器、Detector State 和
+  signal token 的 SHA-256 digest；token 只授权该 Agent 的 signal endpoint，并在
+  启动失败或退出认领时失效。
 - observation actor 独占容量 64 的 inbox 和真实计时器，一次只提交一个 Decision；
   Detector 本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
@@ -24,8 +25,10 @@
 - `Replay(sessionID)`：从 store 读取事件流供回放；仍保留的 `output.chunk` 附件被编码进
   Base64 payload，已过期的附件只返回 offset/len metadata。
 - `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
-- `onOutput` 仅替换当前会话 signal token 后持久化并发布文本，再把 adapter 的独立
-  清洗分类视图交给 Detector；回放和订阅 payload 不受 ANSI 清洗影响。
+- 输出处理器校验 PTY 源偏移，跨回调等长替换 signal token，并把不超过 32 KiB 的
+  `output.chunk` 作为一个回调批次提交；Store 成功后才发送输出活动和派生行观察。
+- 派生行使用共享流式终端清洗器，按 LF 分行、移除一个尾随 CR，并把未完成行限制为
+  最新 64 KiB；进程终态后的尾部原始输出仍持久化，但不再进入 Detector。
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
   `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。

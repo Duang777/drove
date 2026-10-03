@@ -46,9 +46,12 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 			t.Fatalf("replay: %v", replayErr)
 		}
 		for _, row := range rows {
-			if row.Type == string(event.TypeOutput) && strings.Contains(row.Payload, "|") {
-				envLine = row.Payload
-				break
+			if row.Type == string(event.TypeOutputChunk) {
+				output := strings.TrimRight(string(outputChunkData(t, row)), "\r\n")
+				if strings.Contains(output, "|") {
+					envLine = output
+					break
+				}
 			}
 		}
 		if envLine != "" {
@@ -71,7 +74,8 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	if parts[1] != wantURL {
 		t.Fatalf("signal URL = %q, want %q", parts[1], wantURL)
 	}
-	if parts[2] != "[REDACTED]" {
+	wantMask := string(newStreamingRedactor([]byte(testSignalToken)).mask)
+	if parts[2] != wantMask {
 		t.Fatalf("persisted signal token = %q, want redaction", parts[2])
 	}
 	token := attachedSignalToken(t, manager, agent.ID(status.AgentID))
@@ -330,19 +334,18 @@ func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	id := agent.ID(status.AgentID)
-	entry := manager.reg.For("claude")
 
-	manager.onOutput(id, "Error: low confidence", entry, "")
+	feedTestOutput(t, manager, id, "Error: low confidence")
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("low-confidence hint changed state to %s", got.State)
 	}
-	manager.onOutput(id, "Waiting for your input", entry, "")
+	feedTestOutput(t, manager, id, "Waiting for your input")
 	waitForState(t, manager, id, agent.StateBlocked)
-	manager.onOutput(id, "resuming first line", entry, "")
+	feedTestOutput(t, manager, id, "resuming first line")
 	if got, _ := manager.Status(id); got.State != agent.StateBlocked {
 		t.Fatalf("one activity line changed state to %s", got.State)
 	}
-	manager.onOutput(id, "resuming second line", entry, "")
+	feedTestOutput(t, manager, id, "resuming second line")
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("sustained output left state at %s", got.State)
 	}
@@ -371,7 +374,7 @@ func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
 		t.Fatalf("activate hook: %v", err)
 	}
 
-	manager.onOutput(id, "Waiting for your input", manager.reg.For("claude"), "")
+	feedTestOutput(t, manager, id, "Waiting for your input")
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("active hook allowed heuristic state %s", got.State)
 	}

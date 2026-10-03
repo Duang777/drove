@@ -171,7 +171,8 @@ func TestHandleInputWritesAndAuditsWithoutContent(t *testing.T) {
 					t.Fatalf("input audit = %+v", row)
 				}
 			}
-			if row.Type == string(event.TypeOutput) && strings.Contains(row.Payload, "secret") {
+			if row.Type == string(event.TypeOutputChunk) &&
+				outputPayloadContains(t, row.Payload, "secret") {
 				hasOutput = true
 			}
 		}
@@ -183,6 +184,20 @@ func TestHandleInputWritesAndAuditsWithoutContent(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func outputPayloadContains(t *testing.T, payload, text string) bool {
+	t.Helper()
+
+	decoded, err := event.DecodeOutputChunkPayload(payload)
+	if err != nil {
+		t.Fatalf("decode output chunk: %v", err)
+	}
+	data, err := decoded.DecodeData()
+	if err != nil {
+		t.Fatalf("decode output data: %v", err)
+	}
+	return strings.Contains(string(data), text)
 }
 
 func TestHandleInputValidatesRequest(t *testing.T) {

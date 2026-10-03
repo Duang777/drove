@@ -22,6 +22,7 @@ import (
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/term"
 	"github.com/Duang777/drove/internal/version"
 )
 
@@ -166,7 +167,8 @@ func newPSCmd() *cobra.Command {
 }
 
 func newLogCmd() *cobra.Command {
-	return &cobra.Command{
+	var plain bool
+	cmd := &cobra.Command{
 		Use:   "log <agent-id>",
 		Short: "回放某 Agent 的事件流",
 		Args:  cobra.ExactArgs(1),
@@ -180,17 +182,30 @@ func newLogCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return writeLogRows(cmd.OutOrStdout(), rows)
+			return writeLogRows(cmd.OutOrStdout(), rows, plain)
 		},
 	}
+	cmd.Flags().BoolVar(&plain, "plain", false, "移除终端控制序列")
+	return cmd
 }
 
-func writeLogRows(w io.Writer, rows []store.EventRow) error {
+func writeLogRows(w io.Writer, rows []store.EventRow, plain bool) error {
+	var stripper term.Stripper
+	writeOutput := func(seq uint64, data []byte) error {
+		if plain {
+			data = stripper.Feed(data)
+		}
+		if _, err := w.Write(data); err != nil {
+			return fmt.Errorf("write output at seq %d: %w", seq, err)
+		}
+		return nil
+	}
 	for _, row := range rows {
 		switch event.Type(row.Type) {
 		case event.TypeOutput:
-			if _, err := io.WriteString(w, strings.TrimRight(row.Payload, "\r\n")+"\n"); err != nil {
-				return fmt.Errorf("write legacy output event at seq %d: %w", row.Seq, err)
+			data := []byte(strings.TrimRight(row.Payload, "\r\n") + "\n")
+			if err := writeOutput(row.Seq, data); err != nil {
+				return err
 			}
 		case event.TypeOutputChunk:
 			payload, err := event.DecodeOutputChunkPayload(row.Payload)
@@ -204,9 +219,14 @@ func writeLogRows(w io.Writer, rows []store.EventRow) error {
 			if err != nil {
 				return fmt.Errorf("decode output chunk data at seq %d: %w", row.Seq, err)
 			}
-			if _, err := w.Write(data); err != nil {
-				return fmt.Errorf("write output chunk at seq %d: %w", row.Seq, err)
+			if err := writeOutput(row.Seq, data); err != nil {
+				return err
 			}
+		}
+	}
+	if plain {
+		if _, err := w.Write(stripper.Flush()); err != nil {
+			return fmt.Errorf("write final plain output: %w", err)
 		}
 	}
 	return nil

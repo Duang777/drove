@@ -16,9 +16,9 @@
   `--payload-argv` 改为读取唯一位置参数，`--managed-by drove/v1` 只作受管命令标记。
   两种模式都使用三个继承的 session 环境变量静默转发到 daemon；不得自动拉起
   daemon，且投递失败只能写脱敏 stderr 并返回成功。
-- `drove ps` 列出全部会话；`drove log <id>` 只向 stdout 回放终端字节，
-  旧 `output` 事件补一个换行，已过期的 `output.chunk` 不输出占位文本；
-  `drove stop <id>` 停止（幂等）。
+- `drove ps` 列出全部会话；`drove log <id>` 默认只向 stdout 回放终端字节，
+  `--plain` 使用流式清洗器移除跨事件控制序列；旧 `output` 事件补一个换行，
+  已过期的 `output.chunk` 不输出占位文本；`drove stop <id>` 停止（幂等）。
 - 每次命令从 DataDir 读取控制令牌后调用 `client.EnsureDaemon`；仅网络不可达时后台拉起 `droved`，认证失败直接返回。
 - `version` 子命令输出 `internal/version` 注入信息。
 

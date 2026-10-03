@@ -20,6 +20,8 @@
   不接受控制面 token；请求 envelope 必须严格校验，只有已提交或重复的 delivery
   返回 204。
 - 每个 WebSocket 连接只有一个读协程和一个写协程；写协程独占事件、ack/error、ping/pong 和 close 帧。
+- REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload
+  含 Base64 正文，过期回放只含 offset/len 元数据。
 - 输入消息必须携带版本、连接内唯一 `request_id` 和 Agent ID；响应以同一 `request_id` 返回稳定 ack/error。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。

@@ -11,6 +11,7 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
+	"github.com/Duang777/drove/internal/term"
 )
 
 // OutputHint is the bounded classification of one sanitized terminal line.
@@ -62,7 +63,7 @@ func (e Entry) Classify(line string) (OutputHint, bool) {
 	if e.Heuristic == nil {
 		return OutputHint{}, false
 	}
-	return e.Heuristic.Classify(sanitizeTerminalText(line))
+	return e.Heuristic.Classify(term.StripString(line))
 }
 
 // SupportsHooks reports whether this vendor can decode command-hook payloads.

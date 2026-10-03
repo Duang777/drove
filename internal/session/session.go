@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -117,6 +116,7 @@ type runningSession struct {
 	inputMu        sync.Mutex
 	process        processSession
 	observer       *observationActor
+	output         *outputProcessor
 	callbacksReady chan struct{}
 	signalReady    chan struct{}
 	signalDigest   signalTokenDigest
@@ -316,7 +316,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			cleanupErr,
 		)
 	}
-	running, processEnv, signalToken, err := m.prepareRuntime(a, entry)
+	running, processEnv, _, err := m.prepareRuntime(a, entry)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)
@@ -356,9 +356,13 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		Args:    injection.args,
 		Env:     processEnv,
 		Dir:     req.Dir,
-		OnOutput: func(line string) {
+		OnOutput: func(chunk []byte, offset uint64) {
 			<-running.callbacksReady
-			m.onOutput(id, line, entry, signalToken)
+			_ = running.output.Feed(chunk, offset)
+		},
+		OnOutputEnd: func(offset uint64) {
+			<-running.callbacksReady
+			_ = running.output.End(offset)
 		},
 		OnExit: func(info pty.ExitInfo) {
 			<-running.callbacksReady
@@ -694,74 +698,6 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 
 // -- 内部回调 --
 
-// onOutput 脱敏后发布输出，再把独立分类视图交给 Detector。
-func (m *Manager) onOutput(
-	id agent.ID,
-	line string,
-	entry adapter.Entry,
-	signalToken string,
-) {
-	line = redactSignalToken(line, signalToken)
-	line = strings.TrimRight(line, "\r\n")
-	if line == "" {
-		return
-	}
-
-	if _, err := m.committer.CommitEvents(
-		context.Background(),
-		[]event.Draft{event.NewOutputDraft(string(id), string(id), line)},
-	); err != nil {
-		return
-	}
-
-	m.mu.RLock()
-	running := m.sessions[id]
-	exitClaimed := running != nil && running.exitClaimed
-	m.mu.RUnlock()
-	if running == nil || running.observer == nil || exitClaimed {
-		return
-	}
-
-	observedAt := m.clock.Now()
-	hint, ok := entry.Classify(line)
-	if ok {
-		a, exists := m.agent(id)
-		if !exists {
-			return
-		}
-		signal, err := detect.NewHeuristicSignal(detect.Signal{
-			Kind:        hint.Kind,
-			Vendor:      a.Vendor(),
-			VendorEvent: "terminal_hint",
-			Scope:       detect.ScopeRoot,
-			Evidence:    hint.Evidence,
-			Confidence:  hint.Confidence,
-			ReceivedAt:  observedAt,
-		})
-		if err != nil {
-			return
-		}
-		observation, err := detect.ObserveSignal(signal)
-		if err != nil {
-			return
-		}
-		_ = running.observer.Deliver(context.Background(), observation)
-		return
-	}
-	observation, err := detect.ObserveOutput(aVendor(m, id), observedAt)
-	if err != nil {
-		return
-	}
-	_ = running.observer.Deliver(context.Background(), observation)
-}
-
-func redactSignalToken(line, token string) string {
-	if token == "" {
-		return line
-	}
-	return strings.ReplaceAll(line, token, "[REDACTED]")
-}
-
 // onExit 根据运行模式和停止原因记录终态，再移除 PTY。
 func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo) {
 	running.inputMu.Lock()
@@ -830,14 +766,6 @@ func processObservation(
 		return detect.Observation{}, err
 	}
 	return detect.ObserveSignal(signal)
-}
-
-func aVendor(m *Manager, id agent.ID) string {
-	a, ok := m.agent(id)
-	if !ok {
-		return ""
-	}
-	return a.Vendor()
 }
 
 // Fatal 返回运行时持久化或投影失败通知。
