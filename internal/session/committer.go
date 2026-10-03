@@ -25,11 +25,6 @@ type commitStore interface {
 	Replay(string) ([]store.EventRow, error)
 }
 
-type projectionChange struct {
-	validate func() error
-	apply    func([]event.Event) error
-}
-
 type commitOperation interface {
 	isCommitOperation()
 }
@@ -48,21 +43,12 @@ type agentOperation struct {
 
 func (agentOperation) isCommitOperation() {}
 
-// legacyOperation exists only until every runtime writer uses sealed drafts.
-type legacyOperation struct {
-	drafts []event.Event
-	change projectionChange
-}
-
-func (legacyOperation) isCommitOperation() {}
-
 type commitRequest struct {
 	operation commitOperation
 	result    chan commitResult
 }
 
 type commitResult struct {
-	events  []event.Event
 	receipt commitReceipt
 	err     error
 }
@@ -116,23 +102,6 @@ func newCommitter(initialSeq uint64, st commitStore, hub *event.Hub) *committer 
 	}
 	go c.run(initialSeq)
 	return c
-}
-
-// Commit preserves the old event API while callers migrate to sealed
-// operations. Caller cancellation only controls queue admission.
-func (c *committer) Commit(
-	ctx context.Context,
-	drafts []event.Event,
-	change projectionChange,
-) ([]event.Event, error) {
-	if len(drafts) == 0 {
-		return nil, errors.New("session: commit requires at least one event")
-	}
-	result, err := c.submit(ctx, legacyOperation{
-		drafts: append([]event.Event(nil), drafts...),
-		change: change,
-	})
-	return result.events, err
 }
 
 func (c *committer) CommitEvents(
@@ -309,25 +278,16 @@ func (c *committer) execute(
 	lastSeq uint64,
 	operation commitOperation,
 ) (uint64, commitResult) {
-	drafts, legacyEvents, apply, at, err := prepareCommitOperation(operation)
+	drafts, apply, at, err := prepareCommitOperation(operation)
 	if err != nil {
 		return lastSeq, commitResult{err: agentPlanRejectedError{err: err}}
 	}
 
-	var committed []event.Event
-	switch {
-	case legacyEvents != nil:
-		committed = append([]event.Event(nil), legacyEvents...)
-		for i := range committed {
-			committed[i].Seq = lastSeq + uint64(i) + 1
-		}
-	default:
-		committed = make([]event.Event, len(drafts))
-		for i := range drafts {
-			committed[i], err = event.Commit(lastSeq+uint64(i)+1, at, drafts[i])
-			if err != nil {
-				return lastSeq, commitResult{err: agentPlanRejectedError{err: err}}
-			}
+	committed := make([]event.Event, len(drafts))
+	for i := range drafts {
+		committed[i], err = event.Commit(lastSeq+uint64(i)+1, at, drafts[i])
+		if err != nil {
+			return lastSeq, commitResult{err: agentPlanRejectedError{err: err}}
 		}
 	}
 
@@ -368,7 +328,6 @@ func (c *committer) execute(
 		}
 	}
 	return newLastSeq, commitResult{
-		events: committed,
 		receipt: commitReceipt{
 			FirstSeq: committed[0].Seq,
 			LastSeq:  committed[len(committed)-1].Seq,
@@ -380,7 +339,6 @@ func prepareCommitOperation(
 	operation commitOperation,
 ) (
 	drafts []event.Draft,
-	legacyEvents []event.Event,
 	apply func([]event.Event) error,
 	at time.Time,
 	err error,
@@ -388,13 +346,13 @@ func prepareCommitOperation(
 	switch typed := operation.(type) {
 	case eventsOperation:
 		if len(typed.drafts) == 0 {
-			return nil, nil, nil, time.Time{}, errors.New("session: empty events operation")
+			return nil, nil, time.Time{}, errors.New("session: empty events operation")
 		}
-		return append([]event.Draft(nil), typed.drafts...), nil, nil, time.Now().UTC(), nil
+		return append([]event.Draft(nil), typed.drafts...), nil, time.Now().UTC(), nil
 	case agentOperation:
 		prepared, prepareErr := typed.agent.Prepare(typed.change)
 		if prepareErr != nil {
-			return nil, nil, nil, time.Time{}, prepareErr
+			return nil, nil, time.Time{}, prepareErr
 		}
 		drafts = append([]event.Draft(nil), typed.drafts...)
 		if message, ok := prepared.ErrorMessage(); ok {
@@ -413,7 +371,7 @@ func prepareCommitOperation(
 				DeliveryID: evidence.DeliveryID,
 			})
 			if encodeErr != nil {
-				return nil, nil, nil, time.Time{}, fmt.Errorf(
+				return nil, nil, time.Time{}, fmt.Errorf(
 					"session: encode state evidence: %w",
 					encodeErr,
 				)
@@ -428,23 +386,13 @@ func prepareCommitOperation(
 			))
 		}
 		if len(drafts) == 0 {
-			return nil, nil, nil, time.Time{}, errors.New("session: empty agent operation")
+			return nil, nil, time.Time{}, errors.New("session: empty agent operation")
 		}
-		return drafts, nil, func([]event.Event) error {
+		return drafts, func([]event.Event) error {
 			return typed.agent.ApplyCommitted(prepared)
 		}, prepared.Timestamp(), nil
-	case legacyOperation:
-		if len(typed.drafts) == 0 {
-			return nil, nil, nil, time.Time{}, errors.New("session: empty legacy operation")
-		}
-		if typed.change.validate != nil {
-			if validateErr := typed.change.validate(); validateErr != nil {
-				return nil, nil, nil, time.Time{}, validateErr
-			}
-		}
-		return nil, append([]event.Event(nil), typed.drafts...), typed.change.apply, time.Time{}, nil
 	default:
-		return nil, nil, nil, time.Time{}, fmt.Errorf(
+		return nil, nil, time.Time{}, fmt.Errorf(
 			"session: unknown commit operation %T",
 			operation,
 		)

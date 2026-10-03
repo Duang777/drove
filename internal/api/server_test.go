@@ -281,7 +281,7 @@ func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 	body := `{
 		"version":1,
 		"vendor":"claude",
-		"delivery_id":"delivery-1",
+		"delivery_id":"550e8400-e29b-41d4-a716-446655440000",
 		"payload":{
 			"hook_event_name":"PermissionRequest",
 			"session_id":"vendor-session"

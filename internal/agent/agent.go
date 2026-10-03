@@ -1,7 +1,7 @@
 // Package agent 定义 Agent 抽象与状态机。
 //
-// 本包是全项目唯一的"状态权威"：Agent 的状态只能通过
-// Transition 变更，任何组件不得直接修改 Agent 的内部状态字段。
+// 本包是全项目唯一的"状态权威"：Agent 的状态只能通过已提交的 Change
+// 变更，任何组件不得直接修改 Agent 的内部状态字段。
 package agent
 
 import (
@@ -145,12 +145,11 @@ var transitions = map[State]map[State]bool{
 	},
 	StateIdle: {
 		StateWorking: true,
+		StateBlocked: true,
 		StateDone:    true,
 		StateStopped: true,
 	},
-	StateDone: {
-		StateStopped: true,
-	},
+	StateDone:    {},
 	StateStopped: {}, // 终态，不可再迁移
 }
 
@@ -191,15 +190,6 @@ var (
 	// ErrStaleTransitionPlan 表示计划基于的状态版本已过期或不属于目标 Agent。
 	ErrStaleTransitionPlan = errors.New("agent: stale transition plan")
 )
-
-// TransitionPlan 是持久化前生成、提交后应用的状态迁移计划。
-type TransitionPlan struct {
-	AgentID  ID
-	Revision uint64
-	From     State
-	To       State
-	Reason   string
-}
 
 // Snapshot is an immutable view used by decision code.
 type Snapshot struct {
@@ -580,83 +570,6 @@ func (p PreparedChange) ErrorMessage() (string, bool) {
 // Timestamp returns the timestamp shared by the durable events and projection.
 func (p PreparedChange) Timestamp() time.Time {
 	return p.at
-}
-
-// PlanTransition 验证并生成不会立即改变状态的迁移计划。
-func (a *Agent) PlanTransition(to State, reason string) (TransitionPlan, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	if !CanTransition(a.state, to) {
-		return TransitionPlan{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, a.state, to)
-	}
-	return TransitionPlan{
-		AgentID:  a.id,
-		Revision: a.revision,
-		From:     a.state,
-		To:       to,
-		Reason:   reason,
-	}, nil
-}
-
-// ValidateTransitionPlan 确认计划仍基于当前权威状态。
-func (a *Agent) ValidateTransitionPlan(plan TransitionPlan) error {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.validateTransitionPlan(plan)
-}
-
-// ApplyTransition 在事件已持久化后应用计划。
-func (a *Agent) ApplyTransition(plan TransitionPlan, at time.Time) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.validateTransitionPlan(plan); err != nil {
-		return err
-	}
-	if at.IsZero() {
-		return errors.New("agent: transition time is required")
-	}
-	a.state = plan.To
-	a.updatedAt = at
-	a.revision++
-	return nil
-}
-
-func (a *Agent) validateTransitionPlan(plan TransitionPlan) error {
-	if plan.AgentID != a.id || plan.Revision != a.revision || plan.From != a.state {
-		return fmt.Errorf(
-			"%w: agent=%q revision=%d state=%s",
-			ErrStaleTransitionPlan,
-			a.id,
-			a.revision,
-			a.state,
-		)
-	}
-	if !CanTransition(plan.From, plan.To) {
-		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, plan.From, plan.To)
-	}
-	return nil
-}
-
-// Transition 立即应用一个迁移，供状态机的独立使用者调用。
-func (a *Agent) Transition(to State, reason string) error {
-	plan, err := a.PlanTransition(to, reason)
-	if err != nil {
-		return err
-	}
-	return a.ApplyTransition(plan, time.Now().UTC())
-}
-
-// SetError 记录 agent 的错误信息（不改变状态）。
-func (a *Agent) SetError(errMsg string) {
-	a.SetErrorAt(errMsg, time.Now().UTC())
-}
-
-// SetErrorAt 在事件提交后使用同一时间记录错误信息。
-func (a *Agent) SetErrorAt(errMsg string, at time.Time) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.lastError = errMsg
-	a.updatedAt = at
 }
 
 // CreatedAt / UpdatedAt 返回时间戳。

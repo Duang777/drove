@@ -250,6 +250,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
 		agent.WithRunMode(req.Mode),
+		agent.WithHookPolicy(agent.HookPolicy(m.hookPolicy)),
 	)
 	persistedMode := req.Mode
 	payload, err := json.Marshal(createdPayload{
@@ -265,9 +266,21 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if err != nil {
 		return nil, err
 	}
-	if _, err := m.commitEvents(ctx, []event.Event{event.NewSessionLifecycle(
-		0, string(id), string(id), "created", string(payload),
-	)}, projectionChange{}); err != nil {
+	if _, err := m.committer.CommitAgent(
+		ctx,
+		a,
+		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "session_start",
+			Confidence: 1,
+		}),
+		[]event.Draft{event.NewSessionLifecycleDraft(
+			string(id),
+			string(id),
+			"created",
+			string(payload),
+		)},
+	); err != nil {
 		running.detector.Close()
 		return nil, fmt.Errorf("session: persist creation: %w", err)
 	}
@@ -275,11 +288,6 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.mu.Lock()
 	m.agents[id] = a
 	m.mu.Unlock()
-	if err := m.transitionAgent(ctx, a, agent.StateStarting, "session start"); err != nil {
-		running.detector.Close()
-		m.cleanup(id)
-		return nil, err
-	}
 
 	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
 	sess, err := pty.Start(pty.Config{
@@ -299,9 +307,22 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if err != nil {
 		running.detector.Close()
 		startErr := fmt.Errorf("session: start pty: %w", err)
-		errorCommitErr := m.recordAgentError(ctx, a, startErr.Error())
-		stopCommitErr := m.transitionAgent(ctx, a, agent.StateStopped, "startup failed")
-		return nil, errors.Join(startErr, errorCommitErr, stopCommitErr)
+		_, commitErr := m.committer.CommitAgent(
+			ctx,
+			a,
+			agent.FailTo(
+				agent.StateStopped,
+				"startup failed",
+				startErr.Error(),
+				agent.Evidence{
+					Source:     agent.EvidenceProcess,
+					Event:      "process_start_failed",
+					Confidence: 1,
+				},
+			),
+			nil,
+		)
+		return nil, errors.Join(startErr, commitErr)
 	}
 
 	running.process = sess
@@ -310,7 +331,16 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.mu.Unlock()
 
 	// 4. 状态推进：进程活着 -> Working。
-	if err := m.transitionAgent(ctx, a, agent.StateWorking, "process started"); err != nil {
+	if _, err := m.committer.CommitAgent(
+		ctx,
+		a,
+		agent.MoveTo(agent.StateWorking, "process started", agent.Evidence{
+			Source:     agent.EvidenceProcess,
+			Event:      "process_started",
+			Confidence: 1,
+		}),
+		nil,
+	); err != nil {
 		m.requestStop(id, running, stopCauseShutdown)
 		close(running.ready)
 		_ = sess.Close()
@@ -528,9 +558,10 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 			len(data),
 		)
 	}
-	if _, err := m.commitEvents(context.Background(), []event.Event{event.NewAgentInput(
-		0, string(id), string(id), string(payload),
-	)}, projectionChange{}); err != nil {
+	if _, err := m.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{event.NewAgentInputDraft(string(id), string(id), string(payload))},
+	); err != nil {
 		return result, fmt.Errorf(
 			"%w: agent %q received %d bytes; do not retry: %w",
 			ErrInputAudit,
@@ -550,10 +581,9 @@ func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 	if line == "" {
 		return
 	}
-	if _, err := m.commitEvents(
+	if _, err := m.committer.CommitEvents(
 		context.Background(),
-		[]event.Event{event.NewOutput(0, string(id), string(id), line)},
-		projectionChange{},
+		[]event.Draft{event.NewOutputDraft(string(id), string(id), line)},
 	); err != nil {
 		return
 	}
@@ -631,107 +661,31 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	_ = m.commitExit(context.Background(), a, decision)
 }
 
-func (m *Manager) transitionAgent(
-	ctx context.Context,
-	a *agent.Agent,
-	to agent.State,
-	reason string,
-) error {
-	plan, err := a.PlanTransition(to, reason)
-	if err != nil {
-		return err
-	}
-	draft := event.NewStateChanged(
-		0,
-		string(a.ID()),
-		string(a.ID()),
-		string(plan.From),
-		string(plan.To),
-		plan.Reason,
-	)
-	_, err = m.commitEvents(ctx, []event.Event{draft}, projectionChange{
-		validate: func() error {
-			return a.ValidateTransitionPlan(plan)
-		},
-		apply: func(committed []event.Event) error {
-			return a.ApplyTransition(plan, committed[0].Timestamp)
-		},
-	})
-	return err
-}
-
-func (m *Manager) recordAgentError(ctx context.Context, a *agent.Agent, message string) error {
-	draft := event.NewError(0, string(a.ID()), string(a.ID()), message)
-	_, err := m.commitEvents(ctx, []event.Event{draft}, projectionChange{
-		apply: func(committed []event.Event) error {
-			a.SetErrorAt(message, committed[0].Timestamp)
-			return nil
-		},
-	})
-	return err
-}
-
 func (m *Manager) commitExit(ctx context.Context, a *agent.Agent, decision exitDecision) error {
-	drafts := make([]event.Event, 0, 2)
-	errorIndex := -1
-	if decision.errorMessage != "" {
-		errorIndex = len(drafts)
-		drafts = append(drafts, event.NewError(
-			0,
-			string(a.ID()),
-			string(a.ID()),
-			decision.errorMessage,
-		))
-	}
-
-	stateIndex := -1
-	var plan agent.TransitionPlan
-	if a.State() != decision.target {
-		var err error
-		plan, err = a.PlanTransition(decision.target, decision.reason)
-		if err != nil {
-			return err
-		}
-		stateIndex = len(drafts)
-		drafts = append(drafts, event.NewStateChanged(
-			0,
-			string(a.ID()),
-			string(a.ID()),
-			string(plan.From),
-			string(plan.To),
-			plan.Reason,
-		))
-	}
-	if len(drafts) == 0 {
+	if a.State() == decision.target && decision.errorMessage == "" {
 		return nil
 	}
-
-	change := projectionChange{
-		apply: func(committed []event.Event) error {
-			if errorIndex >= 0 {
-				a.SetErrorAt(decision.errorMessage, committed[errorIndex].Timestamp)
-			}
-			if stateIndex >= 0 {
-				return a.ApplyTransition(plan, committed[stateIndex].Timestamp)
-			}
-			return nil
-		},
+	evidence := agent.Evidence{
+		Source:     agent.EvidenceProcess,
+		Event:      "process_exited",
+		Confidence: 1,
 	}
-	if stateIndex >= 0 {
-		change.validate = func() error {
-			return a.ValidateTransitionPlan(plan)
-		}
+	var change agent.Change
+	switch {
+	case a.State() == decision.target:
+		change = agent.RecordError(decision.errorMessage, evidence)
+	case decision.errorMessage != "":
+		change = agent.FailTo(
+			decision.target,
+			decision.reason,
+			decision.errorMessage,
+			evidence,
+		)
+	default:
+		change = agent.MoveTo(decision.target, decision.reason, evidence)
 	}
-	_, err := m.commitEvents(ctx, drafts, change)
+	_, err := m.committer.CommitAgent(ctx, a, change, nil)
 	return err
-}
-
-func (m *Manager) commitEvents(
-	ctx context.Context,
-	drafts []event.Event,
-	change projectionChange,
-) ([]event.Event, error) {
-	return m.committer.Commit(ctx, drafts, change)
 }
 
 // Fatal 返回运行时持久化或投影失败通知。

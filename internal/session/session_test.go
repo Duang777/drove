@@ -395,7 +395,14 @@ func TestTransitionPersistenceFailureLeavesAgentAndHubUnchanged(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
-	err := manager.transitionAgent(context.Background(), a, agent.StateStarting, "test")
+	_, err := manager.committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "test", agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
+		}),
+		nil,
+	)
 	if err == nil {
 		t.Fatal("transition succeeded with closed store")
 	}
@@ -1129,12 +1136,8 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 	manager.mu.Lock()
 	manager.agents[id] = a
 	manager.mu.Unlock()
-	if err := manager.transitionAgent(context.Background(), a, agent.StateStarting, "test start"); err != nil {
-		t.Fatalf("transition starting: %v", err)
-	}
-	if err := manager.transitionAgent(context.Background(), a, agent.StateWorking, "test working"); err != nil {
-		t.Fatalf("transition working: %v", err)
-	}
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
+	commitTestState(t, manager, a, agent.StateWorking, "test working")
 	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
 
 	manager.onOutput(id, "Task complete!", manager.reg.For("claude"))
@@ -1156,12 +1159,8 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	manager.mu.Lock()
 	manager.agents[id] = a
 	manager.mu.Unlock()
-	if err := manager.transitionAgent(context.Background(), a, agent.StateStarting, "test start"); err != nil {
-		t.Fatalf("transition starting: %v", err)
-	}
-	if err := manager.transitionAgent(context.Background(), a, agent.StateWorking, "test working"); err != nil {
-		t.Fatalf("transition working: %v", err)
-	}
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
+	commitTestState(t, manager, a, agent.StateWorking, "test working")
 	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
 
 	subscription := manager.hub.Subscribe(4)
@@ -1185,7 +1184,6 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	if persistedOutput != raw {
 		t.Fatalf("persisted output = %q, want raw %q", persistedOutput, raw)
 	}
-
 	select {
 	case streamed := <-subscription.C():
 		if streamed.Type != event.TypeOutput || streamed.Payload != raw {
@@ -1193,6 +1191,32 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for streamed output")
+	}
+}
+
+func commitTestState(
+	t *testing.T,
+	manager *Manager,
+	a *agent.Agent,
+	target agent.State,
+	reason string,
+) {
+	t.Helper()
+	source := agent.EvidenceProcess
+	eventName := "process_started"
+	if target == agent.StateStarting {
+		source = agent.EvidenceSession
+		eventName = "session_start"
+	}
+	if _, err := manager.committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(target, reason, agent.Evidence{
+			Source: source, Event: eventName, Confidence: 1,
+		}),
+		nil,
+	); err != nil {
+		t.Fatalf("transition %s: %v", target, err)
 	}
 }
 
