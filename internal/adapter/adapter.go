@@ -54,6 +54,7 @@ type Entry struct {
 	Runner         Runner
 	Heuristic      Heuristic
 	HookNormalizer HookNormalizer
+	SignalInjector SignalInjector
 }
 
 // Classify sanitizes terminal control sequences before invoking the vendor heuristic.
@@ -77,6 +78,21 @@ func (e Entry) NormalizeHook(input HookInput) (detect.Signal, error) {
 	return e.HookNormalizer.NormalizeHook(input)
 }
 
+// SupportsSignalInjection reports whether the vendor has a session-only plan.
+func (e Entry) SupportsSignalInjection() bool {
+	return e.SignalInjector != nil
+}
+
+// InjectSignals builds a copied session-only launch plan.
+func (e Entry) InjectSignals(
+	request SignalInjectionRequest,
+) (SignalInjectionPlan, error) {
+	if e.SignalInjector == nil {
+		return SignalInjectionPlan{}, ErrUnsupportedSignalInjection
+	}
+	return injectSignals(e.SignalInjector, request)
+}
+
 // Registry 按厂商标识注册与查找适配器。
 type Registry struct {
 	mu      sync.RWMutex
@@ -87,8 +103,18 @@ type Registry struct {
 // NewRegistry 创建注册表并内置 claude / codex / generic 三款适配器。
 func NewRegistry() *Registry {
 	r := &Registry{entries: make(map[string]Entry)}
-	r.register(claudeRunner{}, claudeHeuristic{}, claudeHookDecoder{})
-	r.register(codexRunner{}, codexHeuristic{}, codexHookDecoder{})
+	r.register(
+		claudeRunner{},
+		claudeHeuristic{},
+		claudeHookDecoder{},
+		claudeSignalInjector{},
+	)
+	r.register(
+		codexRunner{},
+		codexHeuristic{},
+		codexHookDecoder{},
+		codexSignalInjector{},
+	)
 	r.generic = Entry{Runner: genericRunner{}, Heuristic: nil}
 	return r
 }
@@ -98,6 +124,7 @@ func (r *Registry) register(
 	runner Runner,
 	heuristic Heuristic,
 	normalizer HookNormalizer,
+	injector SignalInjector,
 ) {
 	v := runner.Vendor()
 	if _, dup := r.entries[v]; dup {
@@ -107,6 +134,7 @@ func (r *Registry) register(
 		Runner:         runner,
 		Heuristic:      heuristic,
 		HookNormalizer: normalizer,
+		SignalInjector: injector,
 	}
 }
 

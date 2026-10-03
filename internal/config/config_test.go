@@ -159,3 +159,65 @@ func TestValidateConsoleOrigins(t *testing.T) {
 		})
 	}
 }
+
+func TestSignalInjectionForUsesCapabilityDefaultAndOverride(t *testing.T) {
+	cfg := Defaults()
+	if got := cfg.SignalInjectionFor("claude", true); got != SignalInjectionAuto {
+		t.Fatalf("supported default = %q, want auto", got)
+	}
+	if got := cfg.SignalInjectionFor("generic", false); got != SignalInjectionOff {
+		t.Fatalf("unsupported default = %q, want off", got)
+	}
+
+	cfg.Agents = map[string]AgentConfig{
+		"claude": {SignalInjection: SignalInjectionOff},
+		"custom": {SignalInjection: SignalInjectionAuto},
+	}
+	if got := cfg.SignalInjectionFor("claude", true); got != SignalInjectionOff {
+		t.Fatalf("explicit off = %q", got)
+	}
+	if got := cfg.SignalInjectionFor("custom", false); got != SignalInjectionAuto {
+		t.Fatalf("explicit auto = %q", got)
+	}
+}
+
+func TestValidateRejectsInvalidSignalInjection(t *testing.T) {
+	cfg := Defaults()
+	cfg.DataDir = t.TempDir()
+	cfg.Agents = map[string]AgentConfig{
+		"codex": {SignalInjection: "required"},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "signal_injection") {
+		t.Fatalf("validate error = %v, want signal_injection", err)
+	}
+}
+
+func TestLoadResolvedParsesAgentSignalInjection(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DROVE_DATA_DIR", "")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"data_dir": "/tmp/drove",
+		"api_bind": "127.0.0.1:7373",
+		"event_buffer": 16,
+		"console_origins": ["http://localhost:5173"],
+		"agents": {
+			"claude": {"signal_injection": "off"},
+			"codex": {"signal_injection": "auto", "future": true}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, _, err := LoadResolved(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate config: %v", err)
+	}
+	if cfg.SignalInjectionFor("claude", true) != SignalInjectionOff ||
+		cfg.SignalInjectionFor("codex", true) != SignalInjectionAuto {
+		t.Fatalf("agent settings = %+v", cfg.Agents)
+	}
+}

@@ -12,6 +12,21 @@ import (
 	"strings"
 )
 
+// SignalInjection controls process-local vendor signal configuration.
+type SignalInjection string
+
+const (
+	// SignalInjectionAuto enables an adapter's supported session mechanism.
+	SignalInjectionAuto SignalInjection = "auto"
+	// SignalInjectionOff preserves the vendor command without injection.
+	SignalInjectionOff SignalInjection = "off"
+)
+
+// AgentConfig contains vendor-keyed launch behavior.
+type AgentConfig struct {
+	SignalInjection SignalInjection `json:"signal_injection,omitempty"`
+}
+
 // Config 是 Drove 的运行时配置。
 type Config struct {
 	// DataDir 存放 SQLite 事件日志与工作区数据。
@@ -24,6 +39,8 @@ type Config struct {
 	ConsoleOrigins []string `json:"console_origins"`
 	// DBPath 是 SQLite 文件路径（由 DataDir 派生，可不配置）。
 	DBPath string `json:"db_path,omitempty"`
+	// Agents contains vendor-keyed launch behavior without vendor semantics.
+	Agents map[string]AgentConfig `json:"agents,omitempty"`
 }
 
 // Defaults 返回安全默认配置。
@@ -127,7 +144,34 @@ func (c *Config) Validate() error {
 		}
 		seenOrigins[origin] = struct{}{}
 	}
+	for vendor, settings := range c.Agents {
+		if vendor == "" || strings.TrimSpace(vendor) != vendor {
+			return fmt.Errorf("config: agent vendor %q is invalid", vendor)
+		}
+		switch settings.SignalInjection {
+		case "", SignalInjectionAuto, SignalInjectionOff:
+		default:
+			return fmt.Errorf(
+				"config: agents.%s.signal_injection must be auto or off",
+				vendor,
+			)
+		}
+	}
 	return nil
+}
+
+// SignalInjectionFor resolves one vendor setting against adapter capability.
+func (c *Config) SignalInjectionFor(
+	vendor string,
+	supported bool,
+) SignalInjection {
+	if settings, ok := c.Agents[vendor]; ok && settings.SignalInjection != "" {
+		return settings.SignalInjection
+	}
+	if supported {
+		return SignalInjectionAuto
+	}
+	return SignalInjectionOff
 }
 
 func validateConsoleOrigin(origin string) error {
