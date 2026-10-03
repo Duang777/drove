@@ -64,6 +64,7 @@ var transitions = map[State]map[State]bool{
 	StateBlocked: {
 		StateWorking: true,
 		StateDone:    true,
+		StateIdle:    true,
 		StateStopped: true,
 	},
 	StateIdle: {
@@ -97,8 +98,21 @@ func CanTransition(from, to State) bool {
 	return m[to]
 }
 
-// ErrInvalidTransition 表示状态迁移不合法。
-var ErrInvalidTransition = errors.New("agent: invalid state transition")
+var (
+	// ErrInvalidTransition 表示状态迁移不合法。
+	ErrInvalidTransition = errors.New("agent: invalid state transition")
+	// ErrStaleTransitionPlan 表示计划基于的状态版本已过期或不属于目标 Agent。
+	ErrStaleTransitionPlan = errors.New("agent: stale transition plan")
+)
+
+// TransitionPlan 是持久化前生成、提交后应用的状态迁移计划。
+type TransitionPlan struct {
+	AgentID  ID
+	Revision uint64
+	From     State
+	To       State
+	Reason   string
+}
 
 // Agent 是一个受控的 agent 实例。
 // 它只描述状态与元数据，不持有进程/PTY/事件实现。
@@ -114,8 +128,7 @@ type Agent struct {
 
 	createdAt time.Time
 	updatedAt time.Time
-
-	onStateChange func(id ID, from, to State, reason string)
+	revision  uint64
 }
 
 // Option 是 Agent 的构建选项。
@@ -146,11 +159,6 @@ func WithVendor(vendor string) Option {
 // WithRunMode 设置 agent 运行模式。
 func WithRunMode(mode RunMode) Option {
 	return func(a *Agent) { a.runMode = mode }
-}
-
-// WithStateChangeHook 注册状态变更回调。
-func WithStateChangeHook(fn func(id ID, from, to State, reason string)) Option {
-	return func(a *Agent) { a.onStateChange = fn }
 }
 
 // New 创建处于 StatePending 的 agent。
@@ -255,32 +263,81 @@ func (a *Agent) LastError() string {
 	return a.lastError
 }
 
-// Transition 将 agent 迁移到 to 状态。非法迁移返回 ErrInvalidTransition。
-// reason 用于审计与事件记录。
-func (a *Agent) Transition(to State, reason string) error {
-	a.mu.Lock()
-	from := a.state
-	if !CanTransition(from, to) {
-		a.mu.Unlock()
-		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, from, to)
+// PlanTransition 验证并生成不会立即改变状态的迁移计划。
+func (a *Agent) PlanTransition(to State, reason string) (TransitionPlan, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !CanTransition(a.state, to) {
+		return TransitionPlan{}, fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, a.state, to)
 	}
-	a.state = to
-	a.updatedAt = time.Now().UTC()
-	cb := a.onStateChange
-	a.mu.Unlock()
+	return TransitionPlan{
+		AgentID:  a.id,
+		Revision: a.revision,
+		From:     a.state,
+		To:       to,
+		Reason:   reason,
+	}, nil
+}
 
-	if cb != nil {
-		cb(a.id, from, to, reason)
+// ValidateTransitionPlan 确认计划仍基于当前权威状态。
+func (a *Agent) ValidateTransitionPlan(plan TransitionPlan) error {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.validateTransitionPlan(plan)
+}
+
+// ApplyTransition 在事件已持久化后应用计划。
+func (a *Agent) ApplyTransition(plan TransitionPlan, at time.Time) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.validateTransitionPlan(plan); err != nil {
+		return err
+	}
+	if at.IsZero() {
+		return errors.New("agent: transition time is required")
+	}
+	a.state = plan.To
+	a.updatedAt = at
+	a.revision++
+	return nil
+}
+
+func (a *Agent) validateTransitionPlan(plan TransitionPlan) error {
+	if plan.AgentID != a.id || plan.Revision != a.revision || plan.From != a.state {
+		return fmt.Errorf(
+			"%w: agent=%q revision=%d state=%s",
+			ErrStaleTransitionPlan,
+			a.id,
+			a.revision,
+			a.state,
+		)
+	}
+	if !CanTransition(plan.From, plan.To) {
+		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, plan.From, plan.To)
 	}
 	return nil
 }
 
+// Transition 立即应用一个迁移，供状态机的独立使用者调用。
+func (a *Agent) Transition(to State, reason string) error {
+	plan, err := a.PlanTransition(to, reason)
+	if err != nil {
+		return err
+	}
+	return a.ApplyTransition(plan, time.Now().UTC())
+}
+
 // SetError 记录 agent 的错误信息（不改变状态）。
 func (a *Agent) SetError(errMsg string) {
+	a.SetErrorAt(errMsg, time.Now().UTC())
+}
+
+// SetErrorAt 在事件提交后使用同一时间记录错误信息。
+func (a *Agent) SetErrorAt(errMsg string, at time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.lastError = errMsg
-	a.updatedAt = time.Now().UTC()
+	a.updatedAt = at
 }
 
 // CreatedAt / UpdatedAt 返回时间戳。

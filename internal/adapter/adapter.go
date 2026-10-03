@@ -6,6 +6,7 @@ package adapter
 import (
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/Duang777/drove/internal/agent"
 )
@@ -38,6 +39,32 @@ type Heuristic interface {
 type Entry struct {
 	Runner    Runner
 	Heuristic Heuristic
+	decoder   hookDecoder
+}
+
+// Classify sanitizes terminal control sequences before invoking the vendor heuristic.
+func (e Entry) Classify(line string) (StateHint, bool) {
+	if e.Heuristic == nil {
+		return StateHint{}, false
+	}
+	return e.Heuristic.Classify(sanitizeTerminalText(line))
+}
+
+// SupportsHooks reports whether this vendor can decode command-hook payloads.
+func (e Entry) SupportsHooks() bool {
+	return e.decoder != nil
+}
+
+// DecodeHook normalizes one vendor hook payload without retaining the raw JSON.
+func (e Entry) DecodeHook(
+	raw []byte,
+	deliveryID string,
+	receivedAt time.Time,
+) (Signal, error) {
+	if e.decoder == nil {
+		return Signal{}, ErrUnsupportedHook
+	}
+	return e.decoder.Decode(raw, deliveryID, receivedAt)
 }
 
 // Registry 按厂商标识注册与查找适配器。
@@ -50,19 +77,19 @@ type Registry struct {
 // NewRegistry 创建注册表并内置 claude / codex / generic 三款适配器。
 func NewRegistry() *Registry {
 	r := &Registry{entries: make(map[string]Entry)}
-	r.register(claudeRunner{}, claudeHeuristic{})
-	r.register(codexRunner{}, codexHeuristic{})
+	r.register(claudeRunner{}, claudeHeuristic{}, claudeHookDecoder{})
+	r.register(codexRunner{}, codexHeuristic{}, codexHookDecoder{})
 	r.generic = Entry{Runner: genericRunner{}, Heuristic: nil}
 	return r
 }
 
 // register 注册一个实现（panic 防重复注册，属开发期错误）。
-func (r *Registry) register(runner Runner, heur Heuristic) {
+func (r *Registry) register(runner Runner, heur Heuristic, decoder hookDecoder) {
 	v := runner.Vendor()
 	if _, dup := r.entries[v]; dup {
 		panic(fmt.Sprintf("adapter: duplicate vendor %q", v))
 	}
-	r.entries[v] = Entry{Runner: runner, Heuristic: heur}
+	r.entries[v] = Entry{Runner: runner, Heuristic: heur, decoder: decoder}
 }
 
 // For 返回指定厂商的实现；未知厂商回退 generic（无启发式）。

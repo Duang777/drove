@@ -25,21 +25,49 @@ make build
 printf '继续\n' | ./bin/drove send <id> --stdin
 ```
 
-输入审计只记录字节数，不保存输入正文。daemon 尚无认证，不要将监听地址暴露到不可信网络。
+输入审计只记录字节数，不保存输入正文。daemon 只监听 loopback。它在数据目录
+生成 `0600` 控制令牌，并要求 REST 与 WebSocket 客户端使用该令牌。
+
+## 接入状态 hooks
+
+Drove 启动 Claude Code 或 Codex 时会注入当前会话的 signal URL 和随机 token。
+在厂商的受信任 hook 配置中，把需要的事件绑定到以下 command handler：
+
+```bash
+drove hook --vendor claude
+drove hook --vendor codex
+```
+
+至少绑定会话开始、用户提交、工具活动、权限请求、Stop 和会话结束事件。Drove
+不修改 Claude Code 或 Codex 的配置，也不绕过 workspace 或 hook trust。
+
+`config.json` 的 `hook_policy` 支持以下值：
+
+- `auto`：默认值。收到合法 hook 后以 hook 为准，否则使用终端启发式。
+- `off`：不注入 hook relay 环境，只使用终端启发式。
+- `required`：只使用 hook。启动后 2 秒内没有收到合法 hook 时停止该会话。
+
+厂商配置格式见
+[Claude Code hooks](https://code.claude.com/docs/en/hooks) 和
+[Codex hooks](https://developers.openai.com/codex/hooks)。
 
 ## 架构一览
 
 ```
 cmd/drove (CLI/TUI)  ──WebSocket──▶  internal/daemon
                                         │
-                        ┌───────────────┼────────────────┐
-                        ▼               ▼                ▼
-              internal/session   internal/event     internal/store
-                        │          (事件Hub/扇出)      (SQLite 事件日志)
-                        ▼
-              internal/adapter (claude / codex / generic / ACP)
-                        ▼
-              internal/pty (真实终端)  →  agent 进程
+                                        ▼
+                              internal/session
+                       ┌────────┬───────┼─────────┐
+                       ▼        ▼       ▼         ▼
+                internal/detect │ internal/event internal/store
+                (每会话信号融合) │ (事件Hub/扇出) (SQLite 事件日志)
+                                ▼
+                      internal/adapter
+                 (claude / codex / generic / ACP)
+                                │
+                                ▼
+                      internal/pty → agent 进程
 
 web/ (React/TS 控制台)  ──REST + WebSocket──▶  internal/daemon
 ```

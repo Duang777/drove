@@ -7,6 +7,9 @@
 ## 关键设计
 
 - `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
+- 每个运行中会话持有一个 Detector 和一个内存 signal token；token 只授权该
+  Agent 的 signal endpoint，并随会话 detach 失效。
+- 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。
 - PTY 回调在启动前注册，但通过单次 ready channel 等待会话登记完成，防止短进程的输出或退出越过 `starting -> working`。
@@ -15,13 +18,16 @@
 - `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 → 清空运行中会话索引。
 - `Replay(sessionID)`：从 store 读取事件流供回放（CLI `log` 命令 / API）。
 - `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
+- `onOutput` 先持久化并发布原始文本，再把 adapter 的独立清洗分类视图交给
+  Detector；回放和订阅 payload 不受 ANSI 清洗影响。
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input`，但该审计事件不创建会话、不改变状态或时间戳。
-- 状态决策：优先采纳适配器 hint；结合"进程是否存活"（存活→Working，退出→Stopped/Done）兜底，防止误判。
+- 状态决策：进程退出决定终态；激活后的 hook 决定 turn 状态；未激活 hook
+  时才使用达到阈值的启发式。signal 与对应状态迁移必须同批提交。
 
 ## 约束
 
 - 禁止在 session 之外创建 agent 或 PTY 会话。
-- 事件必须**先落库后发布**（保证回放与实时一致），见 `persistAndPublish`。
+- 事件必须经 Committer **先落库、再改投影、最后发布**；Store 失败后 Manager 通过 `Fatal()` 触发 daemon fail-stop。
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
-- 导出类型：`Manager`、`Session`、`StartRequest`、`Status`。
+- 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`。

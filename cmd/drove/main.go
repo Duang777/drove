@@ -8,17 +8,22 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
 )
 
@@ -55,6 +60,7 @@ func newRootCmd() *cobra.Command {
 		newPSCmd(),
 		newLogCmd(),
 		newSendCmd(),
+		newHookCmd(),
 		newStopCmd(),
 		newVersionCmd(),
 	)
@@ -63,12 +69,12 @@ func newRootCmd() *cobra.Command {
 
 // newClient 加载配置并返回已确保 daemon 可用的客户端。
 func newClient(ctx context.Context) (*client.Client, error) {
-	cfg, err := config.Load("")
+	cfg, configPath, err := config.LoadResolved("")
 	if err != nil {
 		return nil, err
 	}
-	c := client.New(cfg.APIBind)
-	if err := c.EnsureDaemon(ctx); err != nil {
+	c := client.New(cfg.APIBind, client.WithTokenFile(auth.TokenPath(cfg.DataDir)))
+	if err := c.EnsureDaemon(ctx, configPath); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -80,15 +86,11 @@ func newInitCmd() *cobra.Command {
 		Short: "初始化配置与数据目录",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg := config.Defaults()
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return err
-			}
-			dir := filepath.Join(home, ".drove")
+			path := config.DefaultPath()
+			dir := filepath.Dir(path)
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return err
 			}
-			path := filepath.Join(dir, "config.json")
 			raw, _ := json.MarshalIndent(cfg, "", "  ")
 			if err := os.WriteFile(path, raw, 0o644); err != nil {
 				return err
@@ -161,7 +163,7 @@ func newLogCmd() *cobra.Command {
 		Use:   "log <agent-id>",
 		Short: "回放某 Agent 的事件流",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			c, err := newClient(ctx)
 			if err != nil {
@@ -171,17 +173,34 @@ func newLogCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for _, r := range rows {
-				ts := r.Timestamp.Format("15:04:05.000")
-				if r.Type == string(event.TypeOutput) {
-					fmt.Printf("%s %-14s %s", ts, "["+shortID(r.AgentID)+"]", r.Payload)
-				} else {
-					fmt.Printf("%s %-14s %s: %s\n", ts, "["+shortID(r.AgentID)+"]", r.Type, r.Reason)
-				}
-			}
-			return nil
+			return writeLogRows(cmd.OutOrStdout(), rows)
 		},
 	}
+}
+
+func writeLogRows(w io.Writer, rows []store.EventRow) error {
+	for _, row := range rows {
+		timestamp := row.Timestamp.Local().Format("15:04:05.000")
+		agentLabel := "[" + shortID(row.AgentID) + "]"
+		if row.Type == string(event.TypeOutput) {
+			payload := strings.TrimRight(row.Payload, "\r\n")
+			if _, err := fmt.Fprintf(w, "%s %-14s %s\n", timestamp, agentLabel, payload); err != nil {
+				return fmt.Errorf("write output event: %w", err)
+			}
+			continue
+		}
+		if _, err := fmt.Fprintf(
+			w,
+			"%s %-14s %s: %s\n",
+			timestamp,
+			agentLabel,
+			row.Type,
+			row.Reason,
+		); err != nil {
+			return fmt.Errorf("write %s event: %w", row.Type, err)
+		}
+	}
+	return nil
 }
 
 func newStopCmd() *cobra.Command {
@@ -240,6 +259,85 @@ func newSendCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "从标准输入读取内容，不自动添加换行")
 	return cmd
+}
+
+func newHookCmd() *cobra.Command {
+	var vendor string
+	cmd := &cobra.Command{
+		Use:   "hook",
+		Short: "转发一个厂商 hook 事件",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if vendor != "claude" && vendor != "codex" {
+				return fmt.Errorf("hook vendor must be claude or codex")
+			}
+			signalURL, token, err := hookRelayEnvironment(vendor)
+			if err != nil {
+				return err
+			}
+			payload, err := io.ReadAll(io.LimitReader(
+				cmd.InOrStdin(),
+				client.MaxHookPayloadBytes+1,
+			))
+			if err != nil {
+				return fmt.Errorf("read hook payload: %w", err)
+			}
+			if len(payload) > client.MaxHookPayloadBytes {
+				return fmt.Errorf(
+					"hook payload exceeds %d bytes",
+					client.MaxHookPayloadBytes,
+				)
+			}
+			return client.RelaySignal(
+				cmd.Context(),
+				signalURL,
+				token,
+				vendor,
+				uuid.NewString(),
+				payload,
+			)
+		},
+	}
+	cmd.Flags().StringVar(&vendor, "vendor", "", "hook 厂商（claude 或 codex）")
+	return cmd
+}
+
+func hookRelayEnvironment(vendor string) (string, string, error) {
+	agentID := os.Getenv(session.SignalAgentIDEnv)
+	signalURL := os.Getenv(session.SignalURLEnv)
+	token := os.Getenv(session.SignalTokenEnv)
+	injectedVendor := os.Getenv(session.SignalVendorEnv)
+	switch {
+	case agentID == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalAgentIDEnv)
+	case signalURL == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalURLEnv)
+	case token == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalTokenEnv)
+	case injectedVendor == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalVendorEnv)
+	case vendor != injectedVendor:
+		return "", "", fmt.Errorf(
+			"hook vendor %q does not match injected vendor %q",
+			vendor,
+			injectedVendor,
+		)
+	}
+
+	parsed, err := url.Parse(signalURL)
+	if err != nil {
+		return "", "", fmt.Errorf("parse %s: %w", session.SignalURLEnv, err)
+	}
+	wantPath := "/api/v1/agents/" + url.PathEscape(agentID) + "/signal"
+	if parsed.EscapedPath() != wantPath {
+		return "", "", fmt.Errorf(
+			"%s path %q does not match agent %q",
+			session.SignalURLEnv,
+			parsed.EscapedPath(),
+			agentID,
+		)
+	}
+	return signalURL, token, nil
 }
 
 func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, error) {

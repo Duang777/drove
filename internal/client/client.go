@@ -13,28 +13,49 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
 
-// ErrDaemonUnreachable 表示 daemon 无法连接且无法自动拉起。
-var ErrDaemonUnreachable = errors.New("client: daemon unreachable")
+var (
+	// ErrDaemonUnreachable 表示 daemon 无法连接且无法自动拉起。
+	ErrDaemonUnreachable = errors.New("client: daemon unreachable")
+	// ErrUnauthorized 表示 daemon 拒绝了本地控制凭据。
+	ErrUnauthorized = errors.New("client: daemon rejected control token")
+)
 
 // Client 封装对 daemon API 的调用。
 type Client struct {
-	baseURL string
-	hc      *http.Client
+	baseURL   string
+	hc        *http.Client
+	tokenPath string
+}
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithTokenFile configures the control token file read before each request.
+func WithTokenFile(path string) Option {
+	return func(client *Client) {
+		client.tokenPath = path
+	}
 }
 
 // New 创建 Client。
-func New(baseURL string) *Client {
-	return &Client{
+func New(baseURL string, options ...Option) *Client {
+	client := &Client{
 		baseURL: "http://" + baseURL,
 		hc:      &http.Client{Timeout: 10 * time.Second},
 	}
+	for _, option := range options {
+		option(client)
+	}
+	return client
 }
 
 // Ping 探测 daemon 是否可达。
@@ -43,13 +64,18 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := c.authorize(req, true); err != nil {
+		return err
+	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return ErrDaemonUnreachable
 	}
 	defer resp.Body.Close()
-	_ = drain(resp.Body)
-	return nil
+	if err := c.responseError(resp, "/api/v1/agents"); err != nil {
+		return err
+	}
+	return drain(resp.Body)
 }
 
 // List 返回全部会话。
@@ -101,13 +127,16 @@ func (c *Client) Replay(ctx context.Context, id string) ([]store.EventRow, error
 	return out, nil
 }
 
-// EnsureDaemon 确保 daemon 可达；不可达时尝试自动拉起，然后等待就绪。
-func (c *Client) EnsureDaemon(ctx context.Context) error {
+// EnsureDaemon 确保 daemon 可达；不可达时使用同一配置自动拉起，然后等待就绪。
+func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	err := c.Ping(probeCtx)
 	cancel()
 	if err == nil {
 		return nil
+	}
+	if !errors.Is(err, ErrDaemonUnreachable) {
+		return err
 	}
 
 	// 尝试启动 daemon。
@@ -124,7 +153,7 @@ func (c *Client) EnsureDaemon(ctx context.Context) error {
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(bin)
+	cmd := exec.Command(bin, daemonArgs(configPath)...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -135,11 +164,15 @@ func (c *Client) EnsureDaemon(ctx context.Context) error {
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		pctx, pcancel := context.WithTimeout(ctx, 300*time.Millisecond)
-		if err := c.Ping(pctx); err == nil {
+		pingErr := c.Ping(pctx)
+		if pingErr == nil {
 			pcancel()
 			return nil
 		}
 		pcancel()
+		if !errors.Is(pingErr, ErrDaemonUnreachable) {
+			return pingErr
+		}
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("%w: daemon did not become ready (see %s)", ErrDaemonUnreachable, logPath)
@@ -147,9 +180,19 @@ func (c *Client) EnsureDaemon(ctx context.Context) error {
 
 // -- internal --
 
+func daemonArgs(configPath string) []string {
+	if configPath == "" {
+		return nil
+	}
+	return []string{"--config", configPath}
+}
+
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
+		return err
+	}
+	if err := c.authorize(req, false); err != nil {
 		return err
 	}
 	resp, err := c.hc.Do(req)
@@ -157,9 +200,8 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 		return ErrDaemonUnreachable
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("client: %s %s: %s", resp.Status, path, string(msg))
+	if err := c.responseError(resp, path); err != nil {
+		return err
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
@@ -174,14 +216,16 @@ func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if err := c.authorize(req, false); err != nil {
+		return err
+	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return ErrDaemonUnreachable
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("client: %s %s: %s", resp.Status, path, string(msg))
+	if err := c.responseError(resp, path); err != nil {
+		return err
 	}
 	if out == nil {
 		return drain(resp.Body)
@@ -194,16 +238,44 @@ func (c *Client) delete(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
+	if err := c.authorize(req, false); err != nil {
+		return err
+	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return ErrDaemonUnreachable
 	}
 	defer resp.Body.Close()
-	_ = drain(resp.Body)
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("client: %s %s", resp.Status, path)
+	if err := c.responseError(resp, path); err != nil {
+		return err
 	}
+	return drain(resp.Body)
+}
+
+func (c *Client) authorize(req *http.Request, allowMissing bool) error {
+	if c.tokenPath == "" {
+		return nil
+	}
+	token, err := auth.Read(c.tokenPath)
+	if err != nil {
+		if allowMissing && errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("client: read control token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	return nil
+}
+
+func (c *Client) responseError(resp *http.Response, path string) error {
+	if resp.StatusCode < http.StatusBadRequest {
+		return nil
+	}
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("%w: %s", ErrUnauthorized, strings.TrimSpace(string(msg)))
+	}
+	return fmt.Errorf("client: %s %s: %s", resp.Status, path, string(msg))
 }
 
 // findDaemonBin 优先使用 CLI 同目录的 droved，其次 PATH。

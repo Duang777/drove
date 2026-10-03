@@ -227,6 +227,33 @@ func TestRecoveryProjectorIgnoresInputOnlySessions(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorIgnoresSignalOnlySessions(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	if err := projector.Apply(store.EventRow{
+		Seq:       1,
+		Timestamp: base,
+		Type:      string(event.TypeAgentSignal),
+		SessionID: "orphan",
+		AgentID:   "orphan",
+		Reason:    "hook",
+		Payload:   `{"version":1}`,
+	}); err != nil {
+		t.Fatalf("apply signal: %v", err)
+	}
+
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if len(plan.Snapshots) != 0 || len(plan.Reconciliation) != 0 {
+		t.Fatalf("plan = %+v, want no sessions", plan)
+	}
+	if plan.Report.ScannedEvents != 1 || plan.Report.Sessions != 0 || plan.Report.LastSeq != 1 {
+		t.Fatalf("report = %+v", plan.Report)
+	}
+}
+
 func TestRecoveryProjectorStateChainCompatibility(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -396,6 +423,11 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "empty session ID",
 		},
 		{
+			name:    "empty signal session",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentSignal)}},
+			wantErr: "empty session ID",
+		},
+		{
 			name:    "mismatched agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeOutput), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
@@ -403,6 +435,11 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 		{
 			name:    "mismatched input agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentInput), SessionID: "s1", AgentID: "a2"}},
+			wantErr: "does not match",
+		},
+		{
+			name:    "mismatched signal agent",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentSignal), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
 		},
 		{

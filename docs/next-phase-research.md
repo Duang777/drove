@@ -29,20 +29,20 @@ Phase 1B，不能与 Detector 核心路径同时引入。
 
 ## 当前实现基线
 
-`88d3148` 已完成 REST 和 CLI 输入，不再是上一版文档所述的“下一阶段”：
+本调研开始时的基线是 `88d3148`。当前实现已完成本调研提出的 Phase 1A，
+并补齐 WebSocket 输入：
 
 | 范围 | 当前状态 | 一手证据 |
 | --- | --- | --- |
-| REST 输入 | 已完成 | `POST /api/v1/agents/{id}/input` 已注册并完成请求校验与错误映射（[`server.go:L54-L62`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/api/server.go#L54-L62)、[`server.go:L118-L177`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/api/server.go#L118-L177)）。 |
-| Session 输入与审计 | 已完成 | `SendInput` 校验并完整写入 PTY，随后记录脱敏的 `agent.input`（[`session.go:L418-L502`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/session/session.go#L418-L502)）。恢复投影已识别该事件（[`projection.go:L77-L100`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/session/projection.go#L77-L100)）。 |
-| CLI 输入 | 已完成 | `drove send <id> [text]` 与 `--stdin` 已实现（[`main.go:L207-L260`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/cmd/drove/main.go#L207-L260)）。 |
-| WebSocket 输入 | **未完成** | 读 goroutine 仍然读取后丢弃全部客户端消息（[`server.go:L189-L217`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/api/server.go#L189-L217)）。 |
-| hooks / Detector | 未开始 | 输出启发式仍直接触发状态迁移，`Confidence` 没有参与决策（[`adapter.go:L13-L20`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/adapter/adapter.go#L13-L20)、[`session.go:L512-L542`](https://github.com/Duang777/drove/blob/88d3148b0f9caf52ddef327f56872c1384030ad2/internal/session/session.go#L512-L542)）。 |
+| REST 输入 | 已完成 | `internal/api/server.go` 与 `internal/session/session.go` 实现输入校验、PTY 写入和脱敏审计。 |
+| Session 输入与审计 | 已完成 | `agent.input` 只保存版本和字节数，恢复投影将它视为 projection-neutral。 |
+| CLI 输入 | 已完成 | `drove send <id> [text]` 与 `--stdin` 均已实现。 |
+| WebSocket 输入 | 已完成 | v1 input、ack 和 error 消息已实现，连接内 request ID 去重上限为 4096。 |
+| hooks / Detector | 已完成 | 每个 live session 持有一个 Detector。hook 权威、启发式 fallback、置信度、去重、Blocked 恢复和 Idle 确认均有 race 测试。 |
 
-因此，Issue [#4](https://github.com/Duang777/drove/issues/4) 只能标记为
-“REST+CLI 已完成，WebSocket 未完成”，**不应关闭**。Phase 1 的实现不能以
-“输入链路仍不存在”为前提，也不能顺手把尚无消息协议和生命周期测试的
-WebSocket 输入算作完成。
+Issue [#2](https://github.com/Duang777/drove/issues/2)、
+[#3](https://github.com/Duang777/drove/issues/3) 和
+[#4](https://github.com/Duang777/drove/issues/4) 的实现条件已经满足。
 
 ## Claude Code 的当前 hook 模型
 

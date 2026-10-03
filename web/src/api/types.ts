@@ -48,6 +48,7 @@ export type EventType =
   | 'error'
   | 'session_lifecycle'
   | 'agent.input'
+  | 'agent.signal'
 
 /** 实时事件（Go: event.Event）。 */
 export interface Event {
@@ -78,6 +79,32 @@ export interface EventRow {
 /** daemon 统一错误响应：{"error": "..."}。 */
 export interface ErrorResponse {
   error: string
+}
+
+/** WebSocket 输入请求（Go: api.webSocketInput）。 */
+export interface WebSocketInput {
+  version: 1
+  type: 'input'
+  request_id: string
+  agent_id: string
+  data: string
+}
+
+/** WebSocket 输入成功响应（Go: api.webSocketAck）。 */
+export interface WebSocketAck {
+  version: 1
+  type: 'ack'
+  request_id: string
+  bytes: number
+}
+
+/** WebSocket 输入失败响应（Go: api.webSocketError）。 */
+export interface WebSocketError {
+  version: 1
+  type: 'error'
+  request_id?: string
+  code: string
+  message: string
 }
 
 /** WebSocket 连接的连接状态。 */

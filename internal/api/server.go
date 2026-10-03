@@ -14,9 +14,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 )
@@ -31,19 +30,33 @@ type ServerOptions struct {
 	Hub *event.Hub
 	// EventBuffer 是每个 WS 订阅的缓冲行数。
 	EventBuffer int
+	// ControlToken 认证 REST 与 WebSocket 控制面请求。
+	ControlToken string
+	// AllowedOrigins 是 WebSocket 可接受的精确 Origin。
+	AllowedOrigins []string
 }
 
 // Server 是 HTTP/WS 服务。
 type Server struct {
-	opts ServerOptions
-	http *http.Server
-	mux  *http.ServeMux
+	opts           ServerOptions
+	http           *http.Server
+	mux            http.Handler
+	allowedOrigins map[string]struct{}
 }
 
 // NewServer 创建 Server（路由已注册）。
 func NewServer(opts ServerOptions) *Server {
-	s := &Server{opts: opts, mux: http.NewServeMux()}
-	s.routes()
+	allowedOrigins := make(map[string]struct{}, len(opts.AllowedOrigins))
+	for _, origin := range opts.AllowedOrigins {
+		allowedOrigins[origin] = struct{}{}
+	}
+	s := &Server{opts: opts, allowedOrigins: allowedOrigins}
+	controlMux := http.NewServeMux()
+	s.routes(controlMux)
+	rootMux := http.NewServeMux()
+	rootMux.HandleFunc("POST /api/v1/agents/{id}/signal", s.handleSignal)
+	rootMux.Handle("/", s.authenticate(controlMux))
+	s.mux = rootMux
 	s.http = &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -51,8 +64,7 @@ func NewServer(opts ServerOptions) *Server {
 	return s
 }
 
-func (s *Server) routes() {
-	mux := s.mux
+func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents", s.handleList)
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
@@ -60,6 +72,18 @@ func (s *Server) routes() {
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
 	mux.HandleFunc("GET /ws", s.handleWS)
+}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		values := r.Header.Values("Authorization")
+		if len(values) != 1 || !auth.Verify(s.opts.ControlToken, values[0]) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Serve 开始监听并服务。
@@ -115,10 +139,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-const maxInputRequestBytes = 6*session.MaxInputBytes + 128
+const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
+const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 2048
 
 type inputRequest struct {
 	Data string `json:"data"`
+}
+
+type signalRequest struct {
+	Version    int             `json:"version"`
+	Vendor     string          `json:"vendor"`
+	DeliveryID string          `json:"delivery_id"`
+	Payload    json.RawMessage `json:"payload"`
 }
 
 func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
@@ -176,6 +208,86 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackRemote(r.RemoteAddr) {
+		writeErr(w, http.StatusForbidden, "signal endpoint accepts loopback requests only")
+		return
+	}
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxSignalRequestBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum size")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if !utf8.Valid(body) {
+		writeErr(w, http.StatusBadRequest, "signal request is not valid UTF-8")
+		return
+	}
+
+	var req signalRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+	if req.Version != 1 {
+		writeErr(w, http.StatusBadRequest, "unsupported signal protocol version")
+		return
+	}
+
+	err = s.opts.Manager.AcceptSignal(
+		r.Context(),
+		agent.ID(r.PathValue("id")),
+		values[0],
+		req.Vendor,
+		req.DeliveryID,
+		req.Payload,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrSignalUnauthorized):
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+		case errors.Is(err, session.ErrUnknownAgent):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, session.ErrNotAttached),
+			errors.Is(err, session.ErrSignalDisabled):
+			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, session.ErrManagerClosed):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		case errors.Is(err, session.ErrSignalVendorMismatch),
+			errors.Is(err, session.ErrSignalInvalid):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rows, err := s.opts.Manager.Replay(id)
@@ -186,49 +298,13 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, rows)
 }
 
-// handleWS 提供实时事件流。
-func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	up := websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 4096,
-		CheckOrigin:     func(*http.Request) bool { return true },
-	}
-	conn, err := up.Upgrade(w, r, nil)
+func isLoopbackRemote(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		slog.Warn("ws upgrade failed", "err", err)
-		return
+		return false
 	}
-	defer conn.Close()
-
-	buf := s.opts.EventBuffer
-	if buf <= 0 {
-		buf = 1024
-	}
-	sub := s.opts.Hub.Subscribe(buf)
-	defer s.opts.Hub.Unsubscribe(sub)
-
-	// 心跳：读侧持续读（丢弃消息），防止连接悬挂。
-	go func() {
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}()
-
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
-
-	for ev := range sub.C() {
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		payload, err := json.Marshal(ev)
-		if err != nil {
-			continue
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-			return
-		}
-	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // -- helpers --

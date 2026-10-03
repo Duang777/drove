@@ -4,6 +4,8 @@
 package event
 
 import (
+	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +25,8 @@ const (
 	TypeSessionLifecycle Type = "session_lifecycle"
 	// TypeAgentInput 表示已写入 Agent PTY 的脱敏输入审计。
 	TypeAgentInput Type = "agent.input"
+	// TypeAgentSignal 表示 Detector 已接受的脱敏状态信号。
+	TypeAgentSignal Type = "agent.signal"
 )
 
 // Event 是不可变事件。所有字段导出供序列化，但外部不得修改。
@@ -104,23 +108,44 @@ func NewAgentInput(seq uint64, sessionID, agentID, payload string) Event {
 	}
 }
 
+// NewAgentSignal 构造 Detector 接受的脱敏状态信号事件。
+func NewAgentSignal(seq uint64, sessionID, agentID, reason, payload string) Event {
+	return Event{
+		Seq:       seq,
+		Timestamp: time.Now().UTC(),
+		Type:      TypeAgentSignal,
+		SessionID: sessionID,
+		AgentID:   agentID,
+		Reason:    reason,
+		Payload:   payload,
+	}
+}
+
+var (
+	// ErrUncommittedEvent 表示调用方尝试发布尚未分配序号的事件草稿。
+	ErrUncommittedEvent = errors.New("event: cannot publish uncommitted event")
+	// ErrSequenceOrder 表示事件没有按全局序号递增发布。
+	ErrSequenceOrder = errors.New("event: publish sequence is not increasing")
+	// ErrHubClosed 表示 Hub 已关闭。
+	ErrHubClosed = errors.New("event: hub closed")
+)
+
 // Hub 将事件广播给订阅者。发布者永不阻塞：
 // 慢订阅者的缓冲溢出后事件被丢弃，并计入 Dropped。
 type Hub struct {
-	seq uint64
-
 	mu      sync.RWMutex
 	subs    map[uint64]*Subscription
 	nextSub uint64
+	lastSeq uint64
 	closed  bool
 }
 
-// NewHub 创建从 initialSeq 之后继续分配序号的事件 Hub。
+// NewHub 创建只接受 initialSeq 之后已提交事件的 Hub。
 func NewHub(initialSeq uint64) *Hub {
 	return &Hub{
-		seq:     initialSeq,
 		subs:    make(map[uint64]*Subscription),
 		nextSub: 1,
+		lastSeq: initialSeq,
 	}
 }
 
@@ -155,22 +180,21 @@ func (h *Hub) Unsubscribe(s *Subscription) {
 	close(s.ch)
 }
 
-// NextSeq 原子分配一个事件序号（落库用，先于 Publish）。
-func (h *Hub) NextSeq() uint64 {
-	return atomic.AddUint64(&h.seq, 1)
-}
-
-// Publish 广播一个事件。若 ev.Seq 为 0 则自动分配序号；否则使用给定序号。
-func (h *Hub) Publish(ev Event) uint64 {
+// Publish 广播一个已提交事件。序号分配由持久化提交器负责。
+func (h *Hub) Publish(ev Event) error {
 	if ev.Seq == 0 {
-		ev.Seq = atomic.AddUint64(&h.seq, 1)
+		return ErrUncommittedEvent
 	}
 
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.closed {
-		return ev.Seq
+		return ErrHubClosed
 	}
+	if ev.Seq != h.lastSeq+1 {
+		return fmt.Errorf("%w: got %d after %d", ErrSequenceOrder, ev.Seq, h.lastSeq)
+	}
+	h.lastSeq = ev.Seq
 
 	for _, s := range h.subs {
 		select {
@@ -179,7 +203,14 @@ func (h *Hub) Publish(ev Event) uint64 {
 			atomic.AddUint64(&s.dropped, 1)
 		}
 	}
-	return ev.Seq
+	return nil
+}
+
+// LastSeq 返回 Hub 最后接受的已提交事件序号。
+func (h *Hub) LastSeq() uint64 {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.lastSeq
 }
 
 // Close 关闭全部订阅并拒绝后续订阅。

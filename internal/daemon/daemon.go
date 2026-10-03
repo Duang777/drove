@@ -15,7 +15,9 @@ import (
 
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/api"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
@@ -38,6 +40,10 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	if err := d.cfg.Validate(); err != nil {
 		return fmt.Errorf("daemon: config: %w", err)
 	}
+	controlToken, err := auth.Ensure(d.cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("daemon: control token: %w", err)
+	}
 
 	// 1. 存储。
 	st, err := store.Open(d.cfg.DBPath)
@@ -51,7 +57,16 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	}()
 
 	// 2. 在 API 对外可见前恢复会话投影。
-	recovered, err := bootstrapSessions(ctx, st)
+	hookPolicy := detect.Policy(d.cfg.HookPolicy)
+	if hookPolicy == "" {
+		hookPolicy = detect.PolicyAuto
+	}
+	recovered, err := bootstrapSessions(
+		ctx,
+		st,
+		session.WithHookPolicy(hookPolicy),
+		session.WithSignalBaseURL("http://"+d.cfg.APIBind),
+	)
 	if err != nil {
 		return err
 	}
@@ -70,15 +85,22 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 
 	// 3. API server。
 	srv := api.NewServer(api.ServerOptions{
-		Bind:        d.cfg.APIBind,
-		Manager:     mgr,
-		Hub:         hub,
-		EventBuffer: d.cfg.EventBuffer,
+		Bind:           d.cfg.APIBind,
+		Manager:        mgr,
+		Hub:            hub,
+		EventBuffer:    d.cfg.EventBuffer,
+		ControlToken:   controlToken,
+		AllowedOrigins: d.cfg.ConsoleOrigins,
 	})
 
 	ln, err := net.Listen("tcp", d.cfg.APIBind)
 	if err != nil {
-		return fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err)
+		closeErr := mgr.Close()
+		hub.Close()
+		return errors.Join(
+			fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err),
+			closeErr,
+		)
 	}
 
 	// 4. 启动 + 优雅关闭。
@@ -98,6 +120,8 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		log.Info("shutdown signal received")
 	case err := <-errCh:
 		runErr = fmt.Errorf("daemon: serve: %w", err)
+	case err := <-mgr.Fatal():
+		runErr = fmt.Errorf("daemon: session event commit: %w", err)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -113,8 +137,12 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	return runErr
 }
 
-func bootstrapSessions(ctx context.Context, st *store.Store) (*session.BootstrapResult, error) {
-	recovered, err := session.Bootstrap(ctx, adapter.NewRegistry(), st)
+func bootstrapSessions(
+	ctx context.Context,
+	st *store.Store,
+	options ...session.ManagerOption,
+) (*session.BootstrapResult, error) {
+	recovered, err := session.Bootstrap(ctx, adapter.NewRegistry(), st, options...)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: bootstrap sessions: %w", err)
 	}

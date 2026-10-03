@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -58,10 +59,9 @@ func TestRestoreRejectsInvalidSnapshot(t *testing.T) {
 	}
 }
 
-func TestRestoreBuildsSnapshotWithoutCallingStateHook(t *testing.T) {
+func TestRestoreBuildsSnapshotAndSupportsPlannedTransition(t *testing.T) {
 	createdAt := time.Date(2026, time.October, 3, 3, 4, 5, 6, time.UTC)
 	updatedAt := createdAt.Add(2 * time.Minute)
-	var transitions int
 
 	a, err := Restore(RestoreSnapshot{
 		ID:        "agent-1",
@@ -72,14 +72,9 @@ func TestRestoreBuildsSnapshotWithoutCallingStateHook(t *testing.T) {
 		LastError: "previous warning",
 		CreatedAt: createdAt,
 		UpdatedAt: updatedAt,
-	}, WithStateChangeHook(func(_ ID, _, _ State, _ string) {
-		transitions++
-	}))
+	})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
-	}
-	if transitions != 0 {
-		t.Fatalf("restore fired %d state hooks, want 0", transitions)
 	}
 	if a.ID() != "agent-1" ||
 		a.Name() != "build-api" ||
@@ -92,11 +87,19 @@ func TestRestoreBuildsSnapshotWithoutCallingStateHook(t *testing.T) {
 		t.Fatalf("restored agent does not match snapshot")
 	}
 
-	if err := a.Transition(StateDone, "completed"); err != nil {
-		t.Fatalf("transition restored agent: %v", err)
+	plan, err := a.PlanTransition(StateDone, "completed")
+	if err != nil {
+		t.Fatalf("plan restored transition: %v", err)
 	}
-	if transitions != 1 {
-		t.Fatalf("transition fired %d state hooks, want 1", transitions)
+	if a.State() != StateWorking {
+		t.Fatalf("planning changed state to %s", a.State())
+	}
+	appliedAt := updatedAt.Add(time.Minute)
+	if err := a.ApplyTransition(plan, appliedAt); err != nil {
+		t.Fatalf("apply restored transition: %v", err)
+	}
+	if a.State() != StateDone || !a.UpdatedAt().Equal(appliedAt) {
+		t.Fatalf("applied state = %s at %s", a.State(), a.UpdatedAt())
 	}
 }
 
@@ -176,6 +179,7 @@ func TestLegalTransitions(t *testing.T) {
 		{StateWorking, StateDone, true},
 		{StateBlocked, StateWorking, true},
 		{StateBlocked, StateDone, true},
+		{StateBlocked, StateIdle, true},
 		{StateIdle, StateWorking, true},
 		{StateIdle, StateDone, true},
 		{StateDone, StateStopped, true},
@@ -193,10 +197,7 @@ func TestLegalTransitions(t *testing.T) {
 }
 
 func TestTransitionLifecycle(t *testing.T) {
-	var events []struct{ from, to State }
-	a := New("a1", WithStateChangeHook(func(_ ID, from, to State, _ string) {
-		events = append(events, struct{ from, to State }{from, to})
-	}))
+	a := New("a1")
 
 	if a.State() != StatePending {
 		t.Fatalf("initial state = %s, want pending", a.State())
@@ -220,13 +221,32 @@ func TestTransitionLifecycle(t *testing.T) {
 		t.Fatalf("stopped transition failed: %v", err)
 	}
 
-	if len(events) != 6 {
-		t.Fatalf("expected 6 state-change callbacks, got %d", len(events))
-	}
-
 	// 终态不可再迁移。
 	if err := a.Transition(StateWorking, "illegal"); err == nil {
 		t.Fatal("expected ErrInvalidTransition from stopped state")
+	}
+}
+
+func TestTransitionPlanRejectsStaleAndForeignApply(t *testing.T) {
+	a := New("a1")
+	first, err := a.PlanTransition(StateStarting, "first")
+	if err != nil {
+		t.Fatalf("plan first transition: %v", err)
+	}
+	if err := a.ApplyTransition(first, time.Now().UTC()); err != nil {
+		t.Fatalf("apply first transition: %v", err)
+	}
+	if err := a.ApplyTransition(first, time.Now().UTC()); !errors.Is(err, ErrStaleTransitionPlan) {
+		t.Fatalf("reapply error = %v, want ErrStaleTransitionPlan", err)
+	}
+
+	foreign := New("a2")
+	foreignPlan, err := foreign.PlanTransition(StateStarting, "foreign")
+	if err != nil {
+		t.Fatalf("plan foreign transition: %v", err)
+	}
+	if err := a.ApplyTransition(foreignPlan, time.Now().UTC()); !errors.Is(err, ErrStaleTransitionPlan) {
+		t.Fatalf("foreign apply error = %v, want ErrStaleTransitionPlan", err)
 	}
 }
 
