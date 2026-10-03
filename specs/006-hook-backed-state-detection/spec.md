@@ -1,6 +1,8 @@
 # Hook-backed agent state detection
 
-Status: Draft, awaiting owner approval
+Status: Approved for implementation
+
+Approved: 2026-10-03
 
 Owner direction: continue RFC-001 Phase 1 after reviewing the open issues and
 the current vendor hook contracts.
