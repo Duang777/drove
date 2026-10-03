@@ -87,18 +87,21 @@ func TestRestoreBuildsSnapshotAndSupportsPlannedTransition(t *testing.T) {
 		t.Fatalf("restored agent does not match snapshot")
 	}
 
-	plan, err := a.PlanTransition(StateDone, "completed")
+	prepared, err := a.Prepare(MoveTo(StateDone, "completed", Evidence{
+		Source:     EvidenceProcess,
+		Event:      "process_exited",
+		Confidence: 1,
+	}))
 	if err != nil {
-		t.Fatalf("plan restored transition: %v", err)
+		t.Fatalf("prepare restored transition: %v", err)
 	}
 	if a.State() != StateWorking {
 		t.Fatalf("planning changed state to %s", a.State())
 	}
-	appliedAt := updatedAt.Add(time.Minute)
-	if err := a.ApplyTransition(plan, appliedAt); err != nil {
+	if err := a.ApplyCommitted(prepared); err != nil {
 		t.Fatalf("apply restored transition: %v", err)
 	}
-	if a.State() != StateDone || !a.UpdatedAt().Equal(appliedAt) {
+	if a.State() != StateDone || !a.UpdatedAt().Equal(prepared.Timestamp()) {
 		t.Fatalf("applied state = %s at %s", a.State(), a.UpdatedAt())
 	}
 }
@@ -206,8 +209,9 @@ func TestLegalTransitions(t *testing.T) {
 		{StateBlocked, StateDone, true},
 		{StateBlocked, StateIdle, true},
 		{StateIdle, StateWorking, true},
+		{StateIdle, StateBlocked, true},
 		{StateIdle, StateDone, true},
-		{StateDone, StateStopped, true},
+		{StateDone, StateStopped, false},
 		// 非法迁移
 		{StateStopped, StateWorking, false},
 		{StateDone, StateWorking, false},
@@ -222,62 +226,130 @@ func TestLegalTransitions(t *testing.T) {
 }
 
 func TestTransitionLifecycle(t *testing.T) {
-	a := New("a1")
+	a := New("a1", WithRunMode(RunModeOneshot))
+	apply := func(to State, reason string, evidence Evidence) {
+		t.Helper()
+		prepared, err := a.Prepare(MoveTo(to, reason, evidence))
+		if err != nil {
+			t.Fatalf("prepare %s: %v", to, err)
+		}
+		if err := a.ApplyCommitted(prepared); err != nil {
+			t.Fatalf("apply %s: %v", to, err)
+		}
+	}
 
 	if a.State() != StatePending {
 		t.Fatalf("initial state = %s, want pending", a.State())
 	}
-	if err := a.Transition(StateStarting, "init"); err != nil {
-		t.Fatalf("starting transition failed: %v", err)
-	}
-	if err := a.Transition(StateWorking, "start"); err != nil {
-		t.Fatalf("working transition failed: %v", err)
-	}
-	if err := a.Transition(StateBlocked, "awaiting input"); err != nil {
-		t.Fatalf("blocked transition failed: %v", err)
-	}
-	if err := a.Transition(StateWorking, "resumed"); err != nil {
-		t.Fatalf("resume transition failed: %v", err)
-	}
-	if err := a.Transition(StateDone, "complete"); err != nil {
-		t.Fatalf("done transition failed: %v", err)
-	}
-	if err := a.Transition(StateStopped, "stopped"); err != nil {
-		t.Fatalf("stopped transition failed: %v", err)
-	}
+	apply(StateStarting, "init", Evidence{Source: EvidenceSession, Event: "session_start", Confidence: 1})
+	apply(StateWorking, "start", Evidence{Source: EvidenceProcess, Event: "process_started", Confidence: 1})
+	apply(StateBlocked, "awaiting input", Evidence{Source: EvidenceHeuristic, Event: "heuristic_blocked", Confidence: 0.9})
+	apply(StateWorking, "resumed", Evidence{Source: EvidenceHeuristic, Event: "output_activity", Confidence: 0.9})
+	apply(StateDone, "complete", Evidence{Source: EvidenceProcess, Event: "process_exited", Confidence: 1})
 
 	// 终态不可再迁移。
-	if err := a.Transition(StateWorking, "illegal"); err == nil {
+	if _, err := a.Prepare(MoveTo(StateWorking, "illegal", Evidence{
+		Source: EvidenceSession, Event: "invalid", Confidence: 1,
+	})); err == nil {
 		t.Fatal("expected ErrInvalidTransition from stopped state")
 	}
 }
 
-func TestTransitionPlanRejectsStaleAndForeignApply(t *testing.T) {
-	a := New("a1")
-	first, err := a.PlanTransition(StateStarting, "first")
+func TestPreparedChangeAppliesStateAndErrorAtomically(t *testing.T) {
+	a := New(
+		"a1",
+		WithRunMode(RunModeOneshot),
+		WithHookPolicy(HooksAuto),
+	)
+	prepared, err := a.Prepare(FailTo(
+		StateStopped,
+		"startup failed",
+		"executable not found",
+		Evidence{
+			Source:     EvidenceProcess,
+			Event:      "process_start_failed",
+			Confidence: 1,
+		},
+	))
 	if err != nil {
-		t.Fatalf("plan first transition: %v", err)
+		t.Fatalf("prepare change: %v", err)
 	}
-	if err := a.ApplyTransition(first, time.Now().UTC()); err != nil {
-		t.Fatalf("apply first transition: %v", err)
+	if snapshot := a.Snapshot(); snapshot.State != StatePending || snapshot.Revision != 0 {
+		t.Fatalf("prepare mutated agent: %+v", snapshot)
 	}
-	if err := a.ApplyTransition(first, time.Now().UTC()); !errors.Is(err, ErrStaleTransitionPlan) {
-		t.Fatalf("reapply error = %v, want ErrStaleTransitionPlan", err)
+	from, to, reason, evidence, ok := prepared.Transition()
+	if !ok ||
+		from != StatePending ||
+		to != StateStopped ||
+		reason != "startup failed" ||
+		evidence.Event != "process_start_failed" {
+		t.Fatalf("prepared transition = %s -> %s %q %+v, ok=%t", from, to, reason, evidence, ok)
+	}
+	if message, ok := prepared.ErrorMessage(); !ok || message != "executable not found" {
+		t.Fatalf("prepared error = %q, ok=%t", message, ok)
 	}
 
-	foreign := New("a2")
-	foreignPlan, err := foreign.PlanTransition(StateStarting, "foreign")
-	if err != nil {
-		t.Fatalf("plan foreign transition: %v", err)
+	if err := a.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply committed: %v", err)
 	}
-	if err := a.ApplyTransition(foreignPlan, time.Now().UTC()); !errors.Is(err, ErrStaleTransitionPlan) {
-		t.Fatalf("foreign apply error = %v, want ErrStaleTransitionPlan", err)
+	if a.State() != StateStopped ||
+		a.LastError() != "executable not found" ||
+		a.LastTransition() == nil ||
+		a.LastTransition().Event != "process_start_failed" ||
+		!a.UpdatedAt().Equal(prepared.Timestamp()) ||
+		a.Snapshot().Revision != 1 {
+		t.Fatalf("applied agent state is inconsistent")
+	}
+	if err := a.ApplyCommitted(prepared); !errors.Is(err, ErrStaleTransitionPlan) {
+		t.Fatalf("reapply error = %v, want ErrStaleTransitionPlan", err)
 	}
 }
 
-func TestSetError(t *testing.T) {
+func TestPreparedChangeRestrictsDoneToProcessExit(t *testing.T) {
+	a := New("a1", WithRunMode(RunModeOneshot))
+	starting, err := a.Prepare(MoveTo(StateStarting, "start", Evidence{
+		Source: EvidenceSession, Event: "session_start", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare starting: %v", err)
+	}
+	if err := a.ApplyCommitted(starting); err != nil {
+		t.Fatalf("apply starting: %v", err)
+	}
+	working, err := a.Prepare(MoveTo(StateWorking, "working", Evidence{
+		Source: EvidenceProcess, Event: "process_started", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare working: %v", err)
+	}
+	if err := a.ApplyCommitted(working); err != nil {
+		t.Fatalf("apply working: %v", err)
+	}
+
+	if _, err := a.Prepare(MoveTo(StateDone, "hook completed", Evidence{
+		Source: EvidenceHook, Event: "TaskCompleted", Confidence: 1,
+		DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
+	})); err == nil {
+		t.Fatal("hook evidence was allowed to produce Done")
+	}
+	if _, err := a.Prepare(MoveTo(StateDone, "process exited", Evidence{
+		Source: EvidenceProcess, Event: "process_exited", Confidence: 1,
+	})); err != nil {
+		t.Fatalf("natural oneshot exit was rejected: %v", err)
+	}
+}
+
+func TestRecordError(t *testing.T) {
 	a := New("a1")
-	a.SetError("boom")
+	prepared, err := a.Prepare(RecordError("boom", Evidence{
+		Source: EvidenceProcess, Event: "process_start_failed", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare error: %v", err)
+	}
+	if err := a.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply error: %v", err)
+	}
 	if a.LastError() != "boom" {
 		t.Fatalf("LastError = %q, want boom", a.LastError())
 	}

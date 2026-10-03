@@ -277,40 +277,30 @@ func (m *Manager) commitDetection(
 	if err != nil {
 		return err
 	}
-	signalDraft := event.NewAgentSignal(
-		0,
+	signalDraft := event.NewAgentSignalDraft(
 		string(a.ID()),
 		string(a.ID()),
-		string(decision.Signal.Source),
 		string(payload),
 	)
 	if decision.Target == "" ||
 		decision.Target == a.State() ||
 		!agent.CanTransition(a.State(), decision.Target) {
-		_, err := m.commitEvents(ctx, []event.Event{signalDraft}, projectionChange{})
+		_, err := m.committer.CommitEvents(ctx, []event.Draft{signalDraft})
 		return err
 	}
 
-	plan, err := a.PlanTransition(decision.Target, decision.Reason)
-	if err != nil {
-		return err
+	evidence := agent.Evidence{
+		Source:     agent.EvidenceSource(decision.Signal.Source),
+		Event:      decision.Signal.VendorEvent,
+		Confidence: decision.Signal.Confidence,
+		DeliveryID: decision.Signal.DeliveryID,
 	}
-	stateDraft := event.NewStateChanged(
-		0,
-		string(a.ID()),
-		string(a.ID()),
-		string(plan.From),
-		string(plan.To),
-		plan.Reason,
+	_, err = m.committer.CommitAgent(
+		ctx,
+		a,
+		agent.MoveTo(decision.Target, decision.Reason, evidence),
+		[]event.Draft{signalDraft},
 	)
-	_, err = m.commitEvents(ctx, []event.Event{signalDraft, stateDraft}, projectionChange{
-		validate: func() error {
-			return a.ValidateTransitionPlan(plan)
-		},
-		apply: func(committed []event.Event) error {
-			return a.ApplyTransition(plan, committed[1].Timestamp)
-		},
-	})
 	return err
 }
 

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
@@ -131,7 +133,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 			id,
 			"Bearer "+token,
 			"claude",
-			delivery.id,
+			testDeliveryID(delivery.id),
 			delivery.raw,
 		); err != nil {
 			t.Fatalf("accept %s: %v", delivery.event, err)
@@ -150,7 +152,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-blocked",
+		testDeliveryID("delivery-blocked"),
 		claudeHook("PermissionRequest"),
 	); err != nil {
 		t.Fatalf("accept duplicate: %v", err)
@@ -172,7 +174,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-resume",
+		testDeliveryID("delivery-resume"),
 		claudeHook("UserPromptSubmit"),
 	); err != nil {
 		t.Fatalf("accept resume: %v", err)
@@ -254,7 +256,7 @@ func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-start",
+		testDeliveryID("delivery-start"),
 		claudeHook("SessionStart"),
 	); err != nil {
 		t.Fatalf("activate hook: %v", err)
@@ -284,7 +286,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-block",
+		testDeliveryID("delivery-block"),
 		claudeHook("PermissionRequest"),
 	); err != nil {
 		t.Fatalf("block: %v", err)
@@ -294,7 +296,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-stop",
+		testDeliveryID("delivery-stop"),
 		claudeHook("Stop"),
 	); err != nil {
 		t.Fatalf("stop turn: %v", err)
@@ -306,7 +308,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-resume",
+		testDeliveryID("delivery-resume"),
 		claudeHook("UserPromptSubmit"),
 	); err != nil {
 		t.Fatalf("resume: %v", err)
@@ -392,7 +394,7 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 			id,
 			"Bearer "+token,
 			"claude",
-			"delivery-start",
+			testDeliveryID("delivery-start"),
 			claudeHook("SessionStart"),
 		); err != nil {
 			t.Fatalf("activate required hook: %v", err)
@@ -418,8 +420,15 @@ func TestAcceptSignalWhileSessionIsStarting(t *testing.T) {
 		agent.WithVendor("claude"),
 		agent.WithRunMode(agent.RunModeInteractive),
 	)
-	if err := a.Transition(agent.StateStarting, "test setup"); err != nil {
-		t.Fatalf("transition to starting: %v", err)
+	if _, err := manager.committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "test setup", agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
+		}),
+		nil,
+	); err != nil {
+		t.Fatalf("commit starting state: %v", err)
 	}
 	running, _, err := manager.prepareRuntime(a, manager.reg.For("claude"))
 	if err != nil {
@@ -441,7 +450,7 @@ func TestAcceptSignalWhileSessionIsStarting(t *testing.T) {
 			a.ID(),
 			"Bearer "+running.signalToken,
 			"claude",
-			"delivery-starting",
+			testDeliveryID("delivery-starting"),
 			claudeHook("SessionStart"),
 		)
 	}()
@@ -502,7 +511,7 @@ func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
 		id,
 		"Bearer "+token,
 		"claude",
-		"delivery-block",
+		testDeliveryID("delivery-block"),
 		claudeHook("PermissionRequest"),
 	)
 	if err == nil {
@@ -580,6 +589,10 @@ func waitForAttachedSignalToken(t *testing.T, manager *Manager) (agent.ID, strin
 
 func claudeHook(eventName string) []byte {
 	return []byte(`{"hook_event_name":"` + eventName + `","session_id":"vendor-session"}`)
+}
+
+func testDeliveryID(label string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String()
 }
 
 func waitForState(t *testing.T, manager *Manager, id agent.ID, want agent.State) {

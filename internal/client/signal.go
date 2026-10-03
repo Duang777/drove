@@ -47,8 +47,10 @@ func RelaySignal(
 	if vendor != "claude" && vendor != "codex" {
 		return fmt.Errorf("client: unsupported hook vendor %q", vendor)
 	}
-	if strings.TrimSpace(deliveryID) == "" {
-		return errors.New("client: delivery ID is required")
+	if deliveryID == "" ||
+		strings.TrimSpace(deliveryID) != deliveryID ||
+		len(deliveryID) > 128 {
+		return errors.New("client: delivery ID must contain 1 to 128 non-space-edge bytes")
 	}
 	if len(payload) == 0 {
 		return errors.New("client: hook payload is empty")

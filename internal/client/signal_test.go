@@ -137,6 +137,32 @@ func TestRelaySignalRejectsUnsafeURLAndInvalidPayload(t *testing.T) {
 	}
 }
 
+func TestRelaySignalRejectsInvalidDeliveryIDBeforeRequest(t *testing.T) {
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	for _, deliveryID := range []string{"", " leading-space", "trailing-space ", strings.Repeat("x", 129)} {
+		err := RelaySignal(
+			context.Background(),
+			server.URL,
+			"token",
+			"claude",
+			deliveryID,
+			[]byte(`{}`),
+		)
+		if err == nil || !strings.Contains(err.Error(), "delivery ID") {
+			t.Fatalf("delivery ID %q error = %v", deliveryID, err)
+		}
+	}
+	if requests != 0 {
+		t.Fatalf("invalid delivery IDs sent %d requests", requests)
+	}
+}
+
 func TestRelaySignalReturnsEndpointError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)

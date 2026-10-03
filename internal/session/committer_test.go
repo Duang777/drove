@@ -5,13 +5,180 @@ import (
 	"errors"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
+
+func TestTypedCommitterSealsDraftsAndAppliesAgentAfterStore(t *testing.T) {
+	a := agent.New(
+		"agent-1",
+		agent.WithRunMode(agent.RunModeOneshot),
+		agent.WithHookPolicy(agent.HooksAuto),
+	)
+	st := &memoryCommitStore{}
+	st.onAppend = func() {
+		if a.State() != agent.StatePending {
+			t.Errorf("agent state changed before SQLite append: %s", a.State())
+		}
+	}
+	hub := event.NewHub(0)
+	subscription := hub.Subscribe(4)
+	defer hub.Unsubscribe(subscription)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	receipt, err := committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "session_start",
+			Confidence: 1,
+		}),
+		[]event.Draft{
+			event.NewSessionLifecycleDraft(
+				"agent-1",
+				"agent-1",
+				"created",
+				`{"version":2}`,
+			),
+		},
+	)
+	if err != nil {
+		t.Fatalf("commit agent: %v", err)
+	}
+	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 2}) {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if a.State() != agent.StateStarting ||
+		a.LastTransition() == nil ||
+		a.LastTransition().Event != "session_start" {
+		t.Fatalf("agent projection = state %s evidence %+v", a.State(), a.LastTransition())
+	}
+	rows := st.Rows()
+	if len(rows) != 2 ||
+		rows[0].Type != string(event.TypeSessionLifecycle) ||
+		rows[1].Type != string(event.TypeStateChanged) ||
+		rows[1].Payload == "" {
+		t.Fatalf("stored rows = %+v", rows)
+	}
+	for want := uint64(1); want <= 2; want++ {
+		select {
+		case published := <-subscription.C():
+			if published.Seq != want || a.State() != agent.StateStarting {
+				t.Fatalf("published event = %+v, agent state = %s", published, a.State())
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sequence %d", want)
+		}
+	}
+}
+
+func TestTypedCommitterStoreFailureLeavesAgentUnchanged(t *testing.T) {
+	storageErr := errors.New("disk unavailable")
+	st := &memoryCommitStore{appendErr: storageErr}
+	hub := event.NewHub(0)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+	a := agent.New("agent-1")
+
+	_, err := committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "session_start",
+			Confidence: 1,
+		}),
+		nil,
+	)
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("commit error = %v, want storage error", err)
+	}
+	if snapshot := a.Snapshot(); snapshot.State != agent.StatePending || snapshot.Revision != 0 {
+		t.Fatalf("agent changed after failed append: %+v", snapshot)
+	}
+}
+
+func TestTypedCommitterPoisonsAfterPostCommitInvariantFailure(t *testing.T) {
+	a := agent.New("agent-1")
+	conflicting, err := a.Prepare(agent.MoveTo(
+		agent.StateStarting,
+		"conflict",
+		agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
+		},
+	))
+	if err != nil {
+		t.Fatalf("prepare conflict: %v", err)
+	}
+	st := &memoryCommitStore{}
+	st.onAppend = func() {
+		if applyErr := a.ApplyCommitted(conflicting); applyErr != nil {
+			t.Errorf("apply conflict: %v", applyErr)
+		}
+	}
+	hub := event.NewHub(0)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	_, err = committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
+		}),
+		nil,
+	)
+	if !errors.Is(err, agent.ErrStaleTransitionPlan) {
+		t.Fatalf("commit error = %v, want stale prepared change", err)
+	}
+	if len(st.Rows()) != 1 {
+		t.Fatalf("stored rows = %+v, want committed state row", st.Rows())
+	}
+	if hub.LastSeq() != 0 {
+		t.Fatalf("hub sequence = %d, want no publication", hub.LastSeq())
+	}
+	select {
+	case fatalErr := <-committer.Fatal():
+		if !errors.Is(fatalErr, agent.ErrStaleTransitionPlan) {
+			t.Fatalf("fatal error = %v", fatalErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("committer did not report post-commit invariant failure")
+	}
+}
+
+func TestTypedCommitterPoisonsAfterPublishFailure(t *testing.T) {
+	st := &memoryCommitStore{}
+	hub := event.NewHub(0)
+	hub.Close()
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	_, err := committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{event.NewOutputDraft("agent-1", "agent-1", "line")},
+	)
+	if !errors.Is(err, event.ErrHubClosed) {
+		t.Fatalf("commit error = %v, want closed Hub", err)
+	}
+	rows := st.Rows()
+	if len(rows) != 1 || rows[0].Seq != 1 {
+		t.Fatalf("stored rows = %+v, want durable sequence 1", rows)
+	}
+	_, err = committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{event.NewOutputDraft("agent-1", "agent-1", "later")},
+	)
+	if !errors.Is(err, errCommitterFailed) {
+		t.Fatalf("second commit error = %v, want failed committer", err)
+	}
+}
 
 func TestCommitterSerializesConcurrentProducers(t *testing.T) {
 	const producerCount = 100
@@ -23,7 +190,6 @@ func TestCommitterSerializesConcurrentProducers(t *testing.T) {
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
 
-	var applied atomic.Int32
 	sequences := make(chan uint64, producerCount)
 	errorsCh := make(chan error, producerCount)
 	var producers sync.WaitGroup
@@ -31,19 +197,17 @@ func TestCommitterSerializesConcurrentProducers(t *testing.T) {
 		producers.Add(1)
 		go func(index int) {
 			defer producers.Done()
-			events, err := committer.Commit(
+			receipt, err := committer.CommitEvents(
 				context.Background(),
-				[]event.Event{event.NewOutput(0, "session", "agent", fmt.Sprintf("line-%d", index))},
-				projectionChange{apply: func([]event.Event) error {
-					applied.Add(1)
-					return nil
-				}},
+				[]event.Draft{
+					event.NewOutputDraft("session", "session", fmt.Sprintf("line-%d", index)),
+				},
 			)
 			if err != nil {
 				errorsCh <- err
 				return
 			}
-			sequences <- events[0].Seq
+			sequences <- receipt.FirstSeq
 		}(i)
 	}
 	producers.Wait()
@@ -60,10 +224,6 @@ func TestCommitterSerializesConcurrentProducers(t *testing.T) {
 		}
 		seen[seq] = true
 	}
-	if applied.Load() != producerCount {
-		t.Fatalf("applied changes = %d, want %d", applied.Load(), producerCount)
-	}
-
 	rows := st.Rows()
 	if len(rows) != producerCount {
 		t.Fatalf("stored rows = %d, want %d", len(rows), producerCount)
@@ -97,10 +257,9 @@ func TestCommitterReturnsAcceptedResultDuringClose(t *testing.T) {
 		committer := newCommitter(0, st, event.NewHub(0))
 		result := make(chan error, 1)
 		go func() {
-			_, err := committer.Commit(
+			_, err := committer.CommitEvents(
 				context.Background(),
-				[]event.Event{event.NewOutput(0, "session", "agent", "line")},
-				projectionChange{},
+				[]event.Draft{event.NewOutputDraft("session", "session", "line")},
 			)
 			result <- err
 		}()
@@ -133,20 +292,12 @@ func TestCommitterStoreFailureDoesNotApplyOrPublish(t *testing.T) {
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
 
-	var applied atomic.Bool
-	_, err := committer.Commit(
+	_, err := committer.CommitEvents(
 		context.Background(),
-		[]event.Event{event.NewOutput(0, "session", "agent", "line")},
-		projectionChange{apply: func([]event.Event) error {
-			applied.Store(true)
-			return nil
-		}},
+		[]event.Draft{event.NewOutputDraft("session", "session", "line")},
 	)
 	if !errors.Is(err, storageErr) {
 		t.Fatalf("commit error = %v, want storage error", err)
-	}
-	if applied.Load() {
-		t.Fatal("projection applied after storage failure")
 	}
 	if rows := st.Rows(); len(rows) != 0 {
 		t.Fatalf("stored rows = %+v, want none", rows)
@@ -168,30 +319,34 @@ func TestCommitterStoreFailureDoesNotApplyOrPublish(t *testing.T) {
 		t.Fatal("committer did not report fatal storage failure")
 	}
 
-	_, err = committer.Commit(
+	_, err = committer.CommitEvents(
 		context.Background(),
-		[]event.Event{event.NewOutput(0, "session", "agent", "later")},
-		projectionChange{},
+		[]event.Draft{event.NewOutputDraft("session", "session", "later")},
 	)
 	if !errors.Is(err, errCommitterFailed) {
 		t.Fatalf("second commit error = %v, want errCommitterFailed", err)
 	}
 }
 
-func TestCommitterRejectsStalePlanWithoutFailing(t *testing.T) {
+func TestCommitterRejectsInvalidAgentChangeWithoutFailing(t *testing.T) {
 	st := &memoryCommitStore{}
 	hub := event.NewHub(0)
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
+	a := agent.New("agent-1")
 
-	staleErr := errors.New("stale plan")
-	_, err := committer.Commit(
+	_, err := committer.CommitAgent(
 		context.Background(),
-		[]event.Event{event.NewStateChanged(0, "session", "agent", "working", "done", "done")},
-		projectionChange{validate: func() error { return staleErr }},
+		a,
+		agent.MoveTo(agent.StateDone, "invalid", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "invalid",
+			Confidence: 1,
+		}),
+		nil,
 	)
-	if !errors.Is(err, staleErr) {
-		t.Fatalf("validation error = %v, want stale plan", err)
+	if !errors.Is(err, agent.ErrInvalidTransition) {
+		t.Fatalf("validation error = %v, want invalid transition", err)
 	}
 	select {
 	case fatalErr := <-committer.Fatal():
@@ -199,16 +354,15 @@ func TestCommitterRejectsStalePlanWithoutFailing(t *testing.T) {
 	default:
 	}
 
-	events, err := committer.Commit(
+	receipt, err := committer.CommitEvents(
 		context.Background(),
-		[]event.Event{event.NewOutput(0, "session", "agent", "still healthy")},
-		projectionChange{},
+		[]event.Draft{event.NewOutputDraft("session", "session", "still healthy")},
 	)
 	if err != nil {
 		t.Fatalf("commit after validation rejection: %v", err)
 	}
-	if len(events) != 1 || events[0].Seq != 1 {
-		t.Fatalf("committed events = %+v, want sequence 1", events)
+	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 1}) {
+		t.Fatalf("receipt = %+v, want sequence 1", receipt)
 	}
 }
 
@@ -217,6 +371,7 @@ type memoryCommitStore struct {
 	lastSeq   uint64
 	rows      []store.EventRow
 	appendErr error
+	onAppend  func()
 }
 
 func (s *memoryCommitStore) AppendEvents(
@@ -231,6 +386,9 @@ func (s *memoryCommitStore) AppendEvents(
 	}
 	if expectedLastSeq != s.lastSeq {
 		return s.lastSeq, fmt.Errorf("stale boundary %d, want %d", expectedLastSeq, s.lastSeq)
+	}
+	if s.onAppend != nil {
+		s.onAppend()
 	}
 	for i, row := range rows {
 		wantSeq := s.lastSeq + uint64(i) + 1
