@@ -77,5 +77,5 @@
 - [x] Run isolated daemon/CLI `/bin/cat`, bearer, Origin, WebSocket input, hook,
   replay, and restart-sequence regressions.
 - [x] Review the final diff for scope and project-rule compliance.
-- [ ] Open the PR, wait for CI, fix failures, and merge.
-- [ ] Update and close #2, #3, #4, #5, #7, #8, and #9 with evidence.
+- [x] Open the PR, wait for CI, fix failures, and merge.
+- [x] Update and close #2, #3, #4, #5, #7, #8, and #9 with evidence.
