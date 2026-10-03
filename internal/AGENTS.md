@@ -9,13 +9,13 @@
 ```
 cmd/* ──▶ internal/client ──▶ internal/session
                                   │
-    ┌─────────────┬──────────────┼──────────────┬─────────────┐
-    ▼             ▼              ▼              ▼             ▼
-  agent        event          store          pty          adapter
- (状态机)     (事件Hub)      (SQLite)       (PTY管理)     (跨厂商)
+    ┌──────────┬────────┬────────┼────────┬─────────┬─────────┐
+    ▼          ▼        ▼        ▼        ▼         ▼
+  agent      event    store     pty    adapter    detect
+ (状态机)  (事件Hub) (SQLite) (PTY管理) (跨厂商) (信号融合)
 ```
 
-- `session` 编排一切：agent + pty + adapter + event + store。
+- `session` 编排一切：agent + pty + adapter + detect + event + store。
 - `daemon` 装配 session/api/config/store/hub（composition root）。
 - `api` 只依赖 `session` 与 `event` 的公开接口。
 - `client` 只做 JSON 透传（HTTP 客户端），不解析领域类型。

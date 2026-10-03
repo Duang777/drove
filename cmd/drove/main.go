@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/Duang777/drove/internal/agent"
@@ -58,6 +60,7 @@ func newRootCmd() *cobra.Command {
 		newPSCmd(),
 		newLogCmd(),
 		newSendCmd(),
+		newHookCmd(),
 		newStopCmd(),
 		newVersionCmd(),
 	)
@@ -256,6 +259,85 @@ func newSendCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "从标准输入读取内容，不自动添加换行")
 	return cmd
+}
+
+func newHookCmd() *cobra.Command {
+	var vendor string
+	cmd := &cobra.Command{
+		Use:   "hook",
+		Short: "转发一个厂商 hook 事件",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if vendor != "claude" && vendor != "codex" {
+				return fmt.Errorf("hook vendor must be claude or codex")
+			}
+			signalURL, token, err := hookRelayEnvironment(vendor)
+			if err != nil {
+				return err
+			}
+			payload, err := io.ReadAll(io.LimitReader(
+				cmd.InOrStdin(),
+				client.MaxHookPayloadBytes+1,
+			))
+			if err != nil {
+				return fmt.Errorf("read hook payload: %w", err)
+			}
+			if len(payload) > client.MaxHookPayloadBytes {
+				return fmt.Errorf(
+					"hook payload exceeds %d bytes",
+					client.MaxHookPayloadBytes,
+				)
+			}
+			return client.RelaySignal(
+				cmd.Context(),
+				signalURL,
+				token,
+				vendor,
+				uuid.NewString(),
+				payload,
+			)
+		},
+	}
+	cmd.Flags().StringVar(&vendor, "vendor", "", "hook 厂商（claude 或 codex）")
+	return cmd
+}
+
+func hookRelayEnvironment(vendor string) (string, string, error) {
+	agentID := os.Getenv(session.SignalAgentIDEnv)
+	signalURL := os.Getenv(session.SignalURLEnv)
+	token := os.Getenv(session.SignalTokenEnv)
+	injectedVendor := os.Getenv(session.SignalVendorEnv)
+	switch {
+	case agentID == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalAgentIDEnv)
+	case signalURL == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalURLEnv)
+	case token == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalTokenEnv)
+	case injectedVendor == "":
+		return "", "", fmt.Errorf("%s is required", session.SignalVendorEnv)
+	case vendor != injectedVendor:
+		return "", "", fmt.Errorf(
+			"hook vendor %q does not match injected vendor %q",
+			vendor,
+			injectedVendor,
+		)
+	}
+
+	parsed, err := url.Parse(signalURL)
+	if err != nil {
+		return "", "", fmt.Errorf("parse %s: %w", session.SignalURLEnv, err)
+	}
+	wantPath := "/api/v1/agents/" + url.PathEscape(agentID) + "/signal"
+	if parsed.EscapedPath() != wantPath {
+		return "", "", fmt.Errorf(
+			"%s path %q does not match agent %q",
+			session.SignalURLEnv,
+			parsed.EscapedPath(),
+			agentID,
+		)
+	}
+	return signalURL, token, nil
 }
 
 func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, error) {

@@ -57,25 +57,25 @@
 
 ## Commit 7: Detector and hook relay
 
-- [ ] Add `internal/detect` and its package rules.
-- [ ] Add normalized hook signal types and private Claude/Codex decoders.
-- [ ] Generate isolated per-session signal credentials.
-- [ ] Inject hook relay environment into supported sessions.
-- [ ] Add the authenticated signal endpoint.
-- [ ] Add `drove hook --vendor` stdin relay.
-- [ ] Implement hook authority, fallback heuristics, confidence filtering,
+- [x] Add `internal/detect` and its package rules.
+- [x] Add normalized hook signal types and private Claude/Codex decoders.
+- [x] Generate isolated per-session signal credentials.
+- [x] Inject hook relay environment into supported sessions.
+- [x] Add the authenticated signal endpoint.
+- [x] Add `drove hook --vendor` stdin relay.
+- [x] Implement hook authority, fallback heuristics, confidence filtering,
   deduplication, blocked recovery, and idle confirmation.
-- [ ] Add focused race tests and hook protocol fixtures.
-- [ ] Commit, push, and comment on #2 and #3.
+- [x] Add focused race tests and hook protocol fixtures.
+- [x] Commit, push, and comment on #2 and #3.
 
 ## Final verification and delivery
 
-- [ ] Run `gofmt` and `git diff --check`.
-- [ ] Run `go test ./... -race -count=1`.
-- [ ] Run `go vet ./...` and `make build`.
-- [ ] Run Web typecheck and build.
-- [ ] Run isolated daemon/CLI `/bin/cat`, bearer, Origin, WebSocket input, hook,
+- [x] Run `gofmt` and `git diff --check`.
+- [x] Run `go test ./... -race -count=1`.
+- [x] Run `go vet ./...` and `make build`.
+- [x] Run Web typecheck and build.
+- [x] Run isolated daemon/CLI `/bin/cat`, bearer, Origin, WebSocket input, hook,
   replay, and restart-sequence regressions.
-- [ ] Review the final diff for scope and project-rule compliance.
+- [x] Review the final diff for scope and project-rule compliance.
 - [ ] Open the PR, wait for CI, fix failures, and merge.
 - [ ] Update and close #2, #3, #4, #5, #7, #8, and #9 with evidence.

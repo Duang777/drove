@@ -16,6 +16,7 @@ import (
 
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
@@ -103,6 +104,10 @@ type processSession interface {
 type runningSession struct {
 	inputMu     sync.Mutex
 	process     processSession
+	detector    *detect.Detector
+	ready       chan struct{}
+	signalToken string
+	vendor      string
 	stopCause   stopCause
 	exitClaimed bool
 }
@@ -118,6 +123,13 @@ type Manager struct {
 	hub       *event.Hub
 	store     *store.Store
 	committer *committer
+
+	hookPolicy             detect.Policy
+	signalBaseURL          string
+	hookActivationTimeout  time.Duration
+	detectorIdleDelay      time.Duration
+	detectorActivityWindow time.Duration
+	detectorActivityCount  int
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
@@ -137,19 +149,36 @@ type BootstrapResult struct {
 }
 
 // NewManager 创建从 initialSeq 继续提交事件的 Manager。
-func NewManager(reg *adapter.Registry, hub *event.Hub, st *store.Store, initialSeq uint64) *Manager {
-	return &Manager{
-		reg:       reg,
-		hub:       hub,
-		store:     st,
-		committer: newCommitter(initialSeq, st, hub),
-		agents:    make(map[agent.ID]*agent.Agent),
-		sessions:  make(map[agent.ID]*runningSession),
+func NewManager(
+	reg *adapter.Registry,
+	hub *event.Hub,
+	st *store.Store,
+	initialSeq uint64,
+	options ...ManagerOption,
+) *Manager {
+	manager := &Manager{
+		reg:                   reg,
+		hub:                   hub,
+		store:                 st,
+		committer:             newCommitter(initialSeq, st, hub),
+		agents:                make(map[agent.ID]*agent.Agent),
+		sessions:              make(map[agent.ID]*runningSession),
+		hookPolicy:            detect.PolicyAuto,
+		hookActivationTimeout: defaultHookActivationTimeout,
 	}
+	for _, option := range options {
+		option(manager)
+	}
+	return manager
 }
 
 // Bootstrap 重建会话投影，并收口当前 daemon 没有 PTY 的历史会话。
-func Bootstrap(ctx context.Context, reg *adapter.Registry, st *store.Store) (*BootstrapResult, error) {
+func Bootstrap(
+	ctx context.Context,
+	reg *adapter.Registry,
+	st *store.Store,
+	options ...ManagerOption,
+) (*BootstrapResult, error) {
 	projector := newRecoveryProjector()
 	lastSeq, err := st.ScanEvents(ctx, projector.Apply)
 	if err != nil {
@@ -174,7 +203,7 @@ func Bootstrap(ctx context.Context, reg *adapter.Registry, st *store.Store) (*Bo
 		return nil, fmt.Errorf("session: bootstrap reconciliation: %w", err)
 	}
 	hub := event.NewHub(committedLastSeq)
-	manager := NewManager(reg, hub, st, committedLastSeq)
+	manager := NewManager(reg, hub, st, committedLastSeq, options...)
 	manager.agents = restoredAgents
 	plan.Report.LastSeq = committedLastSeq
 	return &BootstrapResult{
@@ -231,9 +260,14 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if err != nil {
 		return nil, fmt.Errorf("session: encode creation metadata: %w", err)
 	}
+	running, processEnv, err := m.prepareRuntime(a, entry)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := m.commitEvents(ctx, []event.Event{event.NewSessionLifecycle(
 		0, string(id), string(id), "created", string(payload),
 	)}, projectionChange{}); err != nil {
+		running.detector.Close()
 		return nil, fmt.Errorf("session: persist creation: %w", err)
 	}
 
@@ -241,26 +275,28 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.agents[id] = a
 	m.mu.Unlock()
 	if err := m.transitionAgent(ctx, a, agent.StateStarting, "session start"); err != nil {
+		running.detector.Close()
+		m.cleanup(id)
 		return nil, err
 	}
 
 	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
-	callbacksReady := make(chan struct{})
-	running := &runningSession{}
 	sess, err := pty.Start(pty.Config{
 		Command: cmdName,
 		Args:    cmdArgs,
+		Env:     processEnv,
 		Dir:     req.Dir,
 		OnOutput: func(line string) {
-			<-callbacksReady
+			<-running.ready
 			m.onOutput(id, line, entry)
 		},
 		OnExit: func(info pty.ExitInfo) {
-			<-callbacksReady
+			<-running.ready
 			m.onExit(id, running, info)
 		},
 	})
 	if err != nil {
+		running.detector.Close()
 		startErr := fmt.Errorf("session: start pty: %w", err)
 		errorCommitErr := m.recordAgentError(ctx, a, startErr.Error())
 		stopCommitErr := m.transitionAgent(ctx, a, agent.StateStopped, "startup failed")
@@ -275,12 +311,17 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	// 4. 状态推进：进程活着 -> Working。
 	if err := m.transitionAgent(ctx, a, agent.StateWorking, "process started"); err != nil {
 		m.requestStop(id, running, stopCauseShutdown)
-		close(callbacksReady)
+		close(running.ready)
 		_ = sess.Close()
 		m.cleanup(id)
 		return nil, err
 	}
-	close(callbacksReady)
+	close(running.ready)
+	if err := m.waitForRequiredHook(ctx, running); err != nil {
+		m.requestStop(id, running, stopCauseShutdown)
+		closeErr := sess.Close()
+		return nil, errors.Join(err, closeErr)
+	}
 
 	return m.Status(id)
 }
@@ -318,6 +359,9 @@ func (m *Manager) Close() error {
 					closeErrors,
 					fmt.Errorf("session: close agent %q: %w", item.id, err),
 				)
+			}
+			if item.session.detector != nil {
+				item.session.detector.Close()
 			}
 		}
 
@@ -499,7 +543,7 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 
 // -- 内部回调 --
 
-// onOutput 按行发布输出事件；同时把适配器 hint 融入状态决策。
+// onOutput 按行发布原始输出，再把独立分类视图交给 Detector。
 func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
@@ -513,26 +557,26 @@ func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 		return
 	}
 
+	m.mu.RLock()
+	running := m.sessions[id]
+	m.mu.RUnlock()
+	if running == nil || running.detector == nil {
+		return
+	}
+
 	hint, ok := entry.Classify(line)
-	if !ok {
+	if ok {
+		a, exists := m.agent(id)
+		if !exists {
+			return
+		}
+		_ = running.detector.Submit(
+			context.Background(),
+			adapter.NewHeuristicSignal(a.Vendor(), hint, time.Now().UTC()),
+		)
 		return
 	}
-	a, ok := m.agent(id)
-	if !ok {
-		return
-	}
-	switch hint.State {
-	case agent.StateBlocked:
-		// 仅当当前在 Working/Idle 时采纳 Blocked 提示。
-		cur := a.State()
-		if cur == agent.StateWorking || cur == agent.StateIdle {
-			_ = m.transitionAgent(context.Background(), a, agent.StateBlocked, hint.Reason)
-		}
-	case agent.StateDone:
-		if a.RunMode() == agent.RunModeOneshot && a.State() == agent.StateWorking {
-			_ = m.transitionAgent(context.Background(), a, agent.StateDone, hint.Reason)
-		}
-	}
+	_ = running.detector.ObserveOutput(context.Background(), time.Now().UTC())
 }
 
 type exitDecision struct {
@@ -573,6 +617,9 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 		return
 	}
 	defer m.detach(id, running)
+	if running.detector != nil {
+		running.detector.Close()
+	}
 
 	a, ok := m.agent(id)
 	if !ok {

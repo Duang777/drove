@@ -51,9 +51,12 @@ func NewServer(opts ServerOptions) *Server {
 		allowedOrigins[origin] = struct{}{}
 	}
 	s := &Server{opts: opts, allowedOrigins: allowedOrigins}
-	mux := http.NewServeMux()
-	s.routes(mux)
-	s.mux = s.authenticate(mux)
+	controlMux := http.NewServeMux()
+	s.routes(controlMux)
+	rootMux := http.NewServeMux()
+	rootMux.HandleFunc("POST /api/v1/agents/{id}/signal", s.handleSignal)
+	rootMux.Handle("/", s.authenticate(controlMux))
+	s.mux = rootMux
 	s.http = &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -137,9 +140,17 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
+const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 2048
 
 type inputRequest struct {
 	Data string `json:"data"`
+}
+
+type signalRequest struct {
+	Version    int             `json:"version"`
+	Vendor     string          `json:"vendor"`
+	DeliveryID string          `json:"delivery_id"`
+	Payload    json.RawMessage `json:"payload"`
 }
 
 func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
@@ -197,6 +208,86 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
+	if !isLoopbackRemote(r.RemoteAddr) {
+		writeErr(w, http.StatusForbidden, "signal endpoint accepts loopback requests only")
+		return
+	}
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxSignalRequestBytes)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum size")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "read request body: "+err.Error())
+		return
+	}
+	if !utf8.Valid(body) {
+		writeErr(w, http.StatusBadRequest, "signal request is not valid UTF-8")
+		return
+	}
+
+	var req signalRequest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+	if req.Version != 1 {
+		writeErr(w, http.StatusBadRequest, "unsupported signal protocol version")
+		return
+	}
+
+	err = s.opts.Manager.AcceptSignal(
+		r.Context(),
+		agent.ID(r.PathValue("id")),
+		values[0],
+		req.Vendor,
+		req.DeliveryID,
+		req.Payload,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrSignalUnauthorized):
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+		case errors.Is(err, session.ErrUnknownAgent):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, session.ErrNotAttached),
+			errors.Is(err, session.ErrSignalDisabled):
+			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, session.ErrManagerClosed):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		case errors.Is(err, session.ErrSignalVendorMismatch),
+			errors.Is(err, session.ErrSignalInvalid):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	rows, err := s.opts.Manager.Replay(id)
@@ -205,6 +296,15 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+func isLoopbackRemote(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // -- helpers --

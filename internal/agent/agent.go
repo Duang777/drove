@@ -64,6 +64,7 @@ var transitions = map[State]map[State]bool{
 	StateBlocked: {
 		StateWorking: true,
 		StateDone:    true,
+		StateIdle:    true,
 		StateStopped: true,
 	},
 	StateIdle: {

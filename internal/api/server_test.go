@@ -264,6 +264,171 @@ func TestHandleInputRejectsDetachedAndClosedManager(t *testing.T) {
 	})
 }
 
+func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Vendor:  "claude",
+		Command: "/bin/sh",
+		Args: []string{
+			"-c",
+			`printf 'TOKEN:%s\n' "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	token := waitForSignalTokenOutput(t, manager, status.AgentID)
+	body := `{
+		"version":1,
+		"vendor":"claude",
+		"delivery_id":"delivery-1",
+		"payload":{
+			"hook_event_name":"PermissionRequest",
+			"session_id":"vendor-session"
+		}
+	}`
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/"+status.AgentID+"/signal",
+		strings.NewReader(body),
+	)
+	req.RemoteAddr = "127.0.0.1:43210"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("signal response = %d %q, want 204", rec.Code, rec.Body.String())
+	}
+	current, err := manager.Status(agent.ID(status.AgentID))
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if current.State != agent.StateBlocked {
+		t.Fatalf("state = %s, want blocked", current.State)
+	}
+
+	for _, test := range []struct {
+		name       string
+		remoteAddr string
+		token      string
+		wantStatus int
+	}{
+		{
+			name:       "control token is isolated",
+			remoteAddr: "127.0.0.1:43210",
+			token:      testControlToken,
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "remote caller",
+			remoteAddr: "192.0.2.10:43210",
+			token:      token,
+			wantStatus: http.StatusForbidden,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/agents/"+status.AgentID+"/signal",
+				strings.NewReader(body),
+			)
+			request.RemoteAddr = test.remoteAddr
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer "+test.token)
+			response := httptest.NewRecorder()
+			server.mux.ServeHTTP(response, request)
+			if response.Code != test.wantStatus {
+				t.Fatalf(
+					"response = %d %q, want %d",
+					response.Code,
+					response.Body.String(),
+					test.wantStatus,
+				)
+			}
+		})
+	}
+}
+
+func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Vendor:  "claude",
+		Command: "/bin/sh",
+		Args: []string{
+			"-c",
+			`printf 'TOKEN:%s\n' "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	token := waitForSignalTokenOutput(t, manager, status.AgentID)
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        []byte
+		wantStatus  int
+	}{
+		{
+			name:        "unknown envelope field",
+			contentType: "application/json",
+			body:        []byte(`{"version":1,"vendor":"claude","delivery_id":"d1","payload":{},"extra":true}`),
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unknown version",
+			contentType: "application/json",
+			body:        []byte(`{"version":2,"vendor":"claude","delivery_id":"d1","payload":{}}`),
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "wrong vendor",
+			contentType: "application/json",
+			body:        []byte(`{"version":1,"vendor":"codex","delivery_id":"d1","payload":{"hook_event_name":"SessionStart","session_id":"s1"}}`),
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "unknown hook event",
+			contentType: "application/json",
+			body:        []byte(`{"version":1,"vendor":"claude","delivery_id":"d1","payload":{"hook_event_name":"FutureEvent","session_id":"s1"}}`),
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "invalid UTF-8",
+			contentType: "application/json",
+			body:        append([]byte(`{"version":1,"vendor":"claude","delivery_id":"`), 0xff, '"', '}'),
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "wrong content type",
+			contentType: "text/plain",
+			body:        []byte(`{}`),
+			wantStatus:  http.StatusUnsupportedMediaType,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/agents/"+status.AgentID+"/signal",
+				bytes.NewReader(test.body),
+			)
+			req.RemoteAddr = "127.0.0.1:43210"
+			req.Header.Set("Content-Type", test.contentType)
+			req.Header.Set("Authorization", "Bearer "+token)
+			rec := httptest.NewRecorder()
+			server.mux.ServeHTTP(rec, req)
+			if rec.Code != test.wantStatus {
+				t.Fatalf("response = %d %q, want %d", rec.Code, rec.Body.String(), test.wantStatus)
+			}
+		})
+	}
+}
+
 func TestServerRequiresBearerAuthentication(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	tests := []struct {
@@ -358,7 +523,13 @@ func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 		t.Fatalf("open store: %v", err)
 	}
 	hub := event.NewHub(0)
-	manager := session.NewManager(adapter.NewRegistry(), hub, st, 0)
+	manager := session.NewManager(
+		adapter.NewRegistry(),
+		hub,
+		st,
+		0,
+		session.WithSignalBaseURL("http://127.0.0.1:7373"),
+	)
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)
@@ -374,6 +545,28 @@ func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 		ControlToken:   testControlToken,
 		AllowedOrigins: []string{"http://localhost:5173"},
 	}), manager, st
+}
+
+func waitForSignalTokenOutput(t *testing.T, manager *session.Manager, agentID string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rows, err := manager.Replay(agentID)
+		if err != nil {
+			t.Fatalf("replay: %v", err)
+		}
+		for _, row := range rows {
+			if row.Type == string(event.TypeOutput) &&
+				strings.HasPrefix(row.Payload, "TOKEN:") {
+				return strings.TrimPrefix(row.Payload, "TOKEN:")
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("signal token output missing: %+v", rows)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func serveAuthorized(server *Server, rec *httptest.ResponseRecorder, req *http.Request) {

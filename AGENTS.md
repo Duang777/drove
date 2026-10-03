@@ -25,6 +25,7 @@
 | `cmd/droved` | 常驻 daemon 入口（可选运行模式） |
 | `internal/agent` | Agent 抽象、状态机（唯一的状态权威） |
 | `internal/auth` | 本地控制令牌生成、持久化与校验 |
+| `internal/detect` | 每会话状态信号融合、去重与计时确认 |
 | `internal/pty` | PTY 生命周期管理与字节流桥接 |
 | `internal/event` | 事件模型、Hub 扇出、订阅 |
 | `internal/session` | 会话编排：agent 创建、快照、回放 |

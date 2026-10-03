@@ -142,6 +142,7 @@ hook 收到的是厂商 session ID，不是 Drove agent ID。Drove 启动进程�
 DROVE_AGENT_ID=<drove agent id>
 DROVE_SIGNAL_URL=http://127.0.0.1:<port>/api/v1/agents/<id>/signal
 DROVE_SIGNAL_TOKEN=<per-session random token>
+DROVE_SIGNAL_VENDOR=<claude|codex>
 ```
 
 - `drove hook --vendor <vendor>` 从 stdin 读取厂商 JSON，附上环境变量中的关联信息和 `delivery_id`，再 POST 到 daemon。
@@ -155,7 +156,8 @@ DROVE_SIGNAL_TOKEN=<per-session random token>
 - REST `POST /api/v1/agents/{id}/input` 和 CLI `drove send` 已在 `88d3148` 完成。
 - `agent.input` 只记录版本和字节数，不保存输入正文。
 - 输入本身不改变状态。Phase 1 的 `UserPromptSubmit` signal 负责把 Blocked 或 Idle 恢复为 Working。
-- WebSocket 双向输入仍未实现，Issue #4 继续保持打开。消息 schema、错误响应、背压和连接关闭语义必须先进入独立 spec。
+- WebSocket 双向输入使用 v1 input、ack 和 error 消息。每个连接由一个 writer
+  goroutine 发送事件和响应，并拒绝重复 request ID。
 - `drove attach <id>` 的全交互接管另开 RFC 或 issue。
 
 ### 4.6 事件模型扩展
@@ -163,8 +165,10 @@ DROVE_SIGNAL_TOKEN=<per-session random token>
 事件类型都进入 SQLite 并支持回放：
 
 - `agent.input` 已实现，payload 只包含版本和字节数。
-- `agent.signal` 待实现，只保存 adapter 白名单中的枚举、ID、布尔值和长度摘要，不保存厂商原始 JSON。
-- 状态迁移事件 payload 增加 `source`、`event`、`confidence` 和脱敏证据。
+- `agent.signal` 已实现，只保存 adapter 白名单中的枚举、ID、时间和脱敏证据，
+  不保存厂商原始 JSON。
+- 触发迁移的 `agent.signal` 与 `state_changed` 在同一批次连续提交。信号事件
+  保存 `source`、`vendor_event`、`confidence` 和脱敏证据。
 
 所有事件生产者必须经过一个全局提交器。提交器按接收顺序分配序号，使用
 `Store.AppendEvents` 写入连续 batch，提交成功后更新内存投影，最后按序发布到
@@ -173,10 +177,13 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 ## 5. 分阶段实施
 
 - **Phase 0，已完成**（#1）：runner `mode` 字段、`--oneshot` 和 interactive 默认值。
-- **Phase 1A，待实施**（#2、#3）：事件 reader-first 兼容、全局提交器、`internal/detect`、signal endpoint、`drove hook`、adapter 规范化、手工 hook 配置和 Blocked 恢复。
+- **Phase 1A，已完成**（#2、#3）：事件 reader-first 兼容、全局提交器、
+  `internal/detect`、signal endpoint、`drove hook`、adapter 规范化和 Blocked
+  恢复。
 - **Phase 1B，待实施**：显式 hook 安装、幂等更新、精确卸载和 trust 状态展示。
-- **Phase 2，部分完成**（#4）：REST 和 CLI 输入已完成；WebSocket 双向输入待独立 spec。
-- **Phase 3，部分完成**：ANSI 处理（#5）待实施；daemon 会话投影恢复（#6 短期目标）已完成。
+- **Phase 2，已完成**（#4）：REST、CLI 和 WebSocket 输入已完成。
+- **Phase 3，已完成**：ANSI 分类视图清洗（#5）和 daemon 会话投影恢复（#6）
+  已完成。
 
 ## 6. 安全考虑
 
@@ -187,12 +194,15 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - hook 安装由显式命令触发，不能静默覆盖用户配置或绕过 Claude、Codex 的 trust 流程。
 - signal 持久化必须脱敏，不保存 prompt、tool input、transcript 或 assistant message。
 
-## 7. 开放问题
+## 7. 已定参数与剩余限制
 
-1. **Stop 确认窗口**：同一事件的 matching hooks 并行运行。spec 必须确定 Idle 候选的等待时间、取消信号和可注入时钟。
-2. **无 hook 环境的 Idle 推断**：纯启发式下，输出静默多久才生成 Idle 候选，以及哪些活动取消候选。
-3. **厂商版本探测**：Codex hooks 仍在快速变化。spec 必须定义最低版本、能力探测失败和不支持事件的降级行为。
-4. **Windows PTY**：`creack/pty` 不支持 Windows；本 RFC 不覆盖，interactive 模式暂只支持 Unix。
+1. `Stop`、`StopFailure`、`Interrupt` 和 `idle_prompt` 使用 250 毫秒确认窗口。
+   后续 hook 活动会取消 Idle 候选。
+2. 无 hook 时，输出静默不会生成 Idle。Blocked 状态在 2 秒内收到两行普通输出
+   后恢复为 Working。
+3. `auto` 在厂商事件不受支持时保留启发式行为。`required` 在启动后 2 秒内没有
+   收到合法 hook 时停止会话。
+4. `creack/pty` 不支持 Windows。本 RFC 的 interactive 模式只支持 Unix。
 
 ## 附录 A：hook 事件 → drove 状态映射（初版）
 

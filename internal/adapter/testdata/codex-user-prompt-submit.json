@@ -1,0 +1,6 @@
+{
+  "thread_id": "codex-thread-1",
+  "turn_id": "codex-turn-1",
+  "hook_event_name": "UserPromptSubmit",
+  "cwd": "/tmp/project"
+}

@@ -1135,6 +1135,7 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 	if err := manager.transitionAgent(context.Background(), a, agent.StateWorking, "test working"); err != nil {
 		t.Fatalf("transition working: %v", err)
 	}
+	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
 
 	manager.onOutput(id, "Task complete!", manager.reg.For("claude"))
 
@@ -1161,6 +1162,7 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	if err := manager.transitionAgent(context.Background(), a, agent.StateWorking, "test working"); err != nil {
 		t.Fatalf("transition working: %v", err)
 	}
+	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
 
 	subscription := manager.hub.Subscribe(4)
 	defer manager.hub.Unsubscribe(subscription)
@@ -1316,6 +1318,26 @@ func newTestManager(t *testing.T) (*Manager, *store.Store) {
 		}
 	})
 	return manager, st
+}
+
+func attachTestRuntime(
+	t *testing.T,
+	manager *Manager,
+	a *agent.Agent,
+	entry adapter.Entry,
+) *runningSession {
+	t.Helper()
+
+	running, _, err := manager.prepareRuntime(a, entry)
+	if err != nil {
+		t.Fatalf("prepare runtime: %v", err)
+	}
+	running.process = &fakeProcessSession{}
+	close(running.ready)
+	manager.mu.Lock()
+	manager.sessions[a.ID()] = running
+	manager.mu.Unlock()
+	return running
 }
 
 func newTestStore(t *testing.T) *store.Store {

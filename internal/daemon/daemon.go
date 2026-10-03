@@ -17,6 +17,7 @@ import (
 	"github.com/Duang777/drove/internal/api"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
@@ -56,7 +57,16 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	}()
 
 	// 2. 在 API 对外可见前恢复会话投影。
-	recovered, err := bootstrapSessions(ctx, st)
+	hookPolicy := detect.Policy(d.cfg.HookPolicy)
+	if hookPolicy == "" {
+		hookPolicy = detect.PolicyAuto
+	}
+	recovered, err := bootstrapSessions(
+		ctx,
+		st,
+		session.WithHookPolicy(hookPolicy),
+		session.WithSignalBaseURL("http://"+d.cfg.APIBind),
+	)
 	if err != nil {
 		return err
 	}
@@ -127,8 +137,12 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	return runErr
 }
 
-func bootstrapSessions(ctx context.Context, st *store.Store) (*session.BootstrapResult, error) {
-	recovered, err := session.Bootstrap(ctx, adapter.NewRegistry(), st)
+func bootstrapSessions(
+	ctx context.Context,
+	st *store.Store,
+	options ...session.ManagerOption,
+) (*session.BootstrapResult, error) {
+	recovered, err := session.Bootstrap(ctx, adapter.NewRegistry(), st, options...)
 	if err != nil {
 		return nil, fmt.Errorf("daemon: bootstrap sessions: %w", err)
 	}

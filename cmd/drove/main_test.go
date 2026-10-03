@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -87,6 +90,93 @@ func TestSendCommandIsRegisteredWithStdinFlag(t *testing.T) {
 	flag := command.Flags().Lookup("stdin")
 	if flag == nil || flag.DefValue != "false" {
 		t.Fatalf("stdin flag = %+v, want default false", flag)
+	}
+}
+
+func TestHookCommandRelaysInjectedSessionEnvelope(t *testing.T) {
+	var received struct {
+		Version    int             `json:"version"`
+		Vendor     string          `json:"vendor"`
+		DeliveryID string          `json:"delivery_id"`
+		Payload    json.RawMessage `json:"payload"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/agents/agent-1/signal" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer session-token" {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	t.Setenv(session.SignalAgentIDEnv, "agent-1")
+	t.Setenv(session.SignalURLEnv, server.URL+"/api/v1/agents/agent-1/signal")
+	t.Setenv(session.SignalTokenEnv, "session-token")
+	t.Setenv(session.SignalVendorEnv, "claude")
+	payload := `{"hook_event_name":"SessionStart","session_id":"vendor-session"}`
+
+	command := newHookCmd()
+	command.SetArgs([]string{"--vendor", "claude"})
+	command.SetIn(strings.NewReader(payload))
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute hook: %v", err)
+	}
+	if received.Version != 1 ||
+		received.Vendor != "claude" ||
+		received.DeliveryID == "" ||
+		string(received.Payload) != payload {
+		t.Fatalf("request = %+v", received)
+	}
+}
+
+func TestHookCommandValidatesVendorAndInjectedEnvironment(t *testing.T) {
+	tests := []struct {
+		name           string
+		flagVendor     string
+		injectedVendor string
+		signalURL      string
+		want           string
+	}{
+		{
+			name:       "unknown vendor",
+			flagVendor: "other",
+			want:       "must be claude or codex",
+		},
+		{
+			name:           "vendor mismatch",
+			flagVendor:     "codex",
+			injectedVendor: "claude",
+			signalURL:      "http://127.0.0.1:7373/api/v1/agents/agent-1/signal",
+			want:           "does not match",
+		},
+		{
+			name:           "URL agent mismatch",
+			flagVendor:     "claude",
+			injectedVendor: "claude",
+			signalURL:      "http://127.0.0.1:7373/api/v1/agents/agent-2/signal",
+			want:           "does not match agent",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv(session.SignalAgentIDEnv, "agent-1")
+			t.Setenv(session.SignalURLEnv, test.signalURL)
+			t.Setenv(session.SignalTokenEnv, "session-token")
+			t.Setenv(session.SignalVendorEnv, test.injectedVendor)
+			command := newHookCmd()
+			command.SetArgs([]string{"--vendor", test.flagVendor})
+			command.SetIn(strings.NewReader(`{}`))
+			err := command.Execute()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("hook error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }
 
