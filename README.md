@@ -30,28 +30,33 @@ printf '继续\n' | ./bin/drove send <id> --stdin
 
 ## 接入状态 hooks
 
-Drove 启动 Claude Code 或 Codex 时会注入当前会话的 signal URL 和随机 token。
-在厂商的受信任 hook 配置中，把需要的事件绑定到以下 command handler：
+Drove 启动 Claude Code 或 Codex 时会注入当前会话的 Agent ID、signal URL 和
+随机 token。将厂商事件绑定到对应的 command hook：
 
 ```bash
 drove hook --vendor claude
 drove hook --vendor codex
 ```
 
-至少绑定会话开始、用户提交、工具活动、权限请求、Stop 和会话结束事件。Drove
-不修改 Claude Code 或 Codex 的配置，也不绕过 workspace 或 hook trust。
+通过 `drove up` 选择会话策略：
 
-每个会话的启动请求可通过 `hooks` 选择策略：
+```bash
+drove up claude --hooks auto
+drove up claude --hooks off
+drove up claude --hooks required
+```
 
-- `auto`：支持 hook 的厂商默认值。收到合法 hook 后以 hook 为准，否则使用终端启发式。
-- `off`：不注入 hook relay 环境，只使用终端启发式。
-- `required`：只使用 hook。启动后 5 秒内没有收到合法 hook 时停止该会话。
+`auto` 是 Claude 和 Codex 的默认值。Drove 等待 5 秒，未收到合法 hook 时
+启用终端启发式。`off` 立即使用启发式。`required` 在 5 秒内未收到合法 hook
+时停止会话并返回错误。不支持 hook 的适配器默认使用 `off`，且不能选择
+`required`。
 
-不支持 hook 的适配器默认使用 `off`，且不能选择 `required`。
+`drove hook` 仅上报观察结果。有效命令即使投递失败也返回 0，因此不会阻断
+厂商动作。单次 JSON 上限为 1 MiB。事件日志不保存原始 payload、prompt、
+tool input、transcript path 或 capability token。
 
-厂商配置格式见
-[Claude Code hooks](https://code.claude.com/docs/en/hooks) 和
-[Codex hooks](https://developers.openai.com/codex/hooks)。
+Drove 不修改 Claude Code 或 Codex 配置，也不绕过 workspace、project 或 hook
+trust。配置示例和限制见[状态 hook 配置指南](docs/hooks.md)。
 
 ## 架构一览
 

@@ -1,9 +1,9 @@
 # RFC-001：Agent 状态识别与交互控制架构
 
-- 状态：Draft
+- 状态：已采纳，Phase 1B 待实施
 - 日期：2026-10-03
-- 实现基线：`88d3148`
-- 作者：DD（AI 助手起草，待 Duang777 评审）
+- Phase 1A 实现基线：`2717927`
+- 作者：DD
 - 相关 Issue：[#1](https://github.com/Duang777/drove/issues/1)（runner 交互模式）、[#2](https://github.com/Duang777/drove/issues/2)（hooks 状态权威）、[#3](https://github.com/Duang777/drove/issues/3)（Blocked 恢复）、[#4](https://github.com/Duang777/drove/issues/4)（输入注入）
 - 调研依据：[Phase 1 hooks 与 Detector 资料调研](next-phase-research.md)
 
@@ -11,11 +11,13 @@
 
 Drove 的定位是"跨厂商 Agent 指挥台"：同时运行、观察、回放多个 AI coding agent，并实时识别每个 agent 的状态（Working / Blocked / Done / Idle），最终让人能"把它们往对的方向赶"。
 
-当前实现有三块基础能力：状态机（transition 表）、事件 Hub、SQLite 事件溯源。Phase 0 和输入链路已经补齐了部分控制能力，但状态识别仍不可靠：
+初始实现只有状态机、事件 Hub 和 SQLite 事件溯源。Phase 0、Phase 1A 和输入
+链路现已落地：
 
-1. 状态识别 = 英文子串匹配（`Classify`），`Error` 出现在普通输出里就误判 Blocked；进了 Blocked 永远出不来；Confidence 被忽略。
-2. runner 已支持 `interactive` 和 `oneshot`，新会话默认使用交互模式。
-3. REST 和 CLI 输入已经接通，WebSocket 输入尚未定义双向消息协议。
+1. runner 支持 `interactive` 和 `oneshot`，新会话默认使用交互模式。
+2. 每个运行中会话由 Detector 融合 hook、进程、启发式和 timer 信号。
+3. 全局提交器按一个顺序写入 SQLite、更新投影并发布到 Hub。
+4. REST、CLI 和 WebSocket 输入均已接通。
 
 本 RFC 给出 #1 至 #4 的统一方向。后续实现继续按可独立验证的阶段交付。
 
@@ -142,11 +144,10 @@ hook 收到的是厂商 session ID，不是 Drove agent ID。Drove 启动进程�
 DROVE_AGENT_ID=<drove agent id>
 DROVE_SIGNAL_URL=http://127.0.0.1:<port>/api/v1/agents/<id>/signal
 DROVE_SIGNAL_TOKEN=<per-session random token>
-DROVE_SIGNAL_VENDOR=<claude|codex>
 ```
 
 - `drove hook --vendor <vendor>` 从 stdin 读取厂商 JSON，附上环境变量中的关联信息和 `delivery_id`，再 POST 到 daemon。
-- Phase 1A 只提供手工配置样例或隔离测试配置，不修改用户或项目配置。
+- Phase 1A 只提供[手工配置指南](hooks.md)和隔离测试配置，不修改用户或项目配置。
 - hook 策略分为 `off`、`auto` 和 `required`。`auto` 允许在 hook 不可用时降级，`required` 在未观察到合法 signal 时明确报错。
 - Phase 1B 再提供显式的 `drove hooks install` 与 `uninstall`。安装器必须结构化合并 JSON 或 TOML、原子写入、记录所有权，并且只删除 Drove 拥有的节点。
 - Drove 不代替用户接受 workspace、project 或 hook trust。
@@ -181,6 +182,7 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
   `internal/detect`、signal endpoint、`drove hook`、adapter 规范化和 Blocked
   恢复。
 - **Phase 1B，待实施**：显式 hook 安装、幂等更新、精确卸载和 trust 状态展示。
+  设计输入见 [Phase 1B hook 管理调研](phase-1b-hook-management-research.md)。
 - **Phase 2，已完成**（#4）：REST、CLI 和 WebSocket 输入已完成。
 - **Phase 3，已完成**：ANSI 分类视图清洗（#5）和 daemon 会话投影恢复（#6）
   已完成。
@@ -190,17 +192,17 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - `/signal` 回调端点只接受 loopback，并校验 agent ID 和每会话随机 token。hook 通过继承的环境变量取得这些值。
 - token 只防止会话误串和偶然调用，不抵御 agent 本身或同一 OS 用户下的恶意进程。
 - signal endpoint 限制 body 大小，严格解析 JSON，并拒绝无效 UTF-8、未知字段、错误 vendor、已 detach 会话和过期 token。
-- input 注入在开放远程访问前必须加认证；本 RFC 范围内 daemon 仍只绑 `127.0.0.1`。
+- input 注入使用控制面 bearer token；daemon 仍只绑定 loopback。
 - hook 安装由显式命令触发，不能静默覆盖用户配置或绕过 Claude、Codex 的 trust 流程。
 - signal 持久化必须脱敏，不保存 prompt、tool input、transcript 或 assistant message。
 
 ## 7. 已定参数与剩余限制
 
-1. `Stop`、`StopFailure`、`Interrupt` 和 `idle_prompt` 使用 250 毫秒确认窗口。
+1. `Stop`、`StopFailure`、`Interrupt` 和 `idle_prompt` 使用 1 秒确认窗口。
    后续 hook 活动会取消 Idle 候选。
-2. 无 hook 时，输出静默不会生成 Idle。Blocked 状态在 2 秒内收到两行普通输出
-   后恢复为 Working。
-3. `auto` 在厂商事件不受支持时保留启发式行为。`required` 在启动后 2 秒内没有
+2. 无 hook 时，输出静默 60 秒后可以生成 Idle。Blocked 状态在 1 秒内收到两行
+   普通输出后恢复为 Working。启发式状态信号的最低置信度是 0.85。
+3. `auto` 在厂商事件不受支持时保留启发式行为。`required` 在启动后 5 秒内没有
    收到合法 hook 时停止会话。
 4. `creack/pty` 不支持 Windows。本 RFC 的 interactive 模式只支持 Unix。
 

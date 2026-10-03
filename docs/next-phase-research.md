@@ -2,9 +2,11 @@
 
 - 调研日期：2026-10-03
 - Drove 实现基线：[`88d3148`](https://github.com/Duang777/drove/commit/88d3148b0f9caf52ddef327f56872c1384030ad2)
+- Phase 1A 交付基线：[`2717927`](https://github.com/Duang777/drove/commit/271792720012b072a087e53839823898800fe05d)
 - Claude Code 文档读取日期：2026-10-03
 - Codex 源码快照：[`44dd77b`](https://github.com/openai/codex/commit/44dd77b71e88c78295736bffd3dc3b684c13be6d)
 - 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2) 与 [#3](https://github.com/Duang777/drove/issues/3)
+- 后续调研：[Phase 1B hook 管理调研](phase-1b-hook-management-research.md)
 
 ## 结论
 
@@ -334,7 +336,7 @@ Phase 1A 不自动修改 `~/.claude`、项目 `.claude`、`~/.codex` 或项目
 
 | 模块 | 应负责 | 不应负责 |
 | --- | --- | --- |
-| `cmd/drove` | 从 stdin 读取 vendor JSON，调用 relay client，返回明确退出码 | 解析厂商状态语义、直接写 SQLite |
+| `cmd/drove` | 从 stdin 读取 vendor JSON，调用 relay client；命令形状合法后即使投递失败也返回 0 | 解析厂商状态语义、直接写 SQLite |
 | `internal/api` | loopback、认证、大小限制、严格 JSON 解码、HTTP 状态码 | vendor 映射、状态迁移 |
 | `internal/adapter` | 各厂商事件白名单、payload 解析、规范化 Signal、配置样例 | 持久化、全局状态机 |
 | `internal/detect` | 信号优先级、去抖、timer、状态迁移建议 | Claude/Codex JSON 字段、HTTP |
@@ -372,9 +374,9 @@ session 和过期 token。relay 若重试，必须复用同一个 `delivery_id`�
 边界仍是单用户 localhost daemon、厂商自身 trust 流程、最小化环境变量和
 严格的数据留存策略。
 
-## Phase 1A 验收门槛
+## Phase 1A 验收结果
 
-编码 spec 至少应包含以下可执行验收：
+实现和回归测试覆盖以下行为：
 
 - Claude 与 Codex adapter 使用固定、脱敏的官方 schema fixture 做契约测试。
 - 表驱动测试覆盖每个允许事件、未知事件、未知 Notification、root/subagent
@@ -391,9 +393,14 @@ session 和过期 token。relay 若重试，必须复用同一个 `delivery_id`�
   version 的预定行为。
 - endpoint 覆盖非 loopback、错误 token、超限 body、未知字段、过期 session
   与重复 delivery。
-- 分别在受信任与未受信任配置下做 Claude Code、Codex 手工端到端验证，并明确
-  展示 hook 未激活时的状态，不把静默当作 Idle。
-- Phase 1A 完成不改变 WebSocket 输入状态，Issue #4 继续保持开放。
+- Claude Code `2.1.181` 的隔离 `--settings` 回归确认真实 command hook 可激活
+  当前会话。`--safe-mode` 下 `auto` 进入 fallback，`required` 明确失败。
+- Codex CLI `0.160.0` 的未信任项目配置回归确认 `auto` 进入 fallback，且没有
+  使用 trust bypass。自动化过程不代替用户批准 Codex hook。
+- 隔离 daemon 与官方形状 fixture 验证 Claude 和 Codex 的
+  `Working -> Blocked -> Working -> Idle`、重复 delivery 和持久化脱敏。
+- Phase 1A 本身不包含 WebSocket 输入。该能力后来由独立变更完成，Issue #4
+  已关闭。
 
 ## 一手来源
 
