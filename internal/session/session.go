@@ -107,6 +107,7 @@ type runningSession struct {
 	process     processSession
 	detector    *detect.Detector
 	ready       chan struct{}
+	signalReady chan struct{}
 	signalToken string
 	vendor      string
 	stopCause   stopCause
@@ -135,6 +136,7 @@ type Manager struct {
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
 	sessions map[agent.ID]*runningSession
+	signals  map[agent.ID]*runningSession
 	closed   bool
 
 	starts    sync.WaitGroup
@@ -164,6 +166,7 @@ func NewManager(
 		committer:             newCommitter(initialSeq, st, hub),
 		agents:                make(map[agent.ID]*agent.Agent),
 		sessions:              make(map[agent.ID]*runningSession),
+		signals:               make(map[agent.ID]*runningSession),
 		hookPolicy:            detect.PolicyAuto,
 		hookActivationTimeout: defaultHookActivationTimeout,
 	}
@@ -290,6 +293,9 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.mu.Unlock()
 
 	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
+	m.mu.Lock()
+	m.signals[id] = running
+	m.mu.Unlock()
 	sess, err := pty.Start(pty.Config{
 		Command: cmdName,
 		Args:    cmdArgs,
@@ -297,7 +303,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		Dir:     req.Dir,
 		OnOutput: func(line string) {
 			<-running.ready
-			m.onOutput(id, line, entry)
+			m.onOutput(id, line, entry, running.signalToken)
 		},
 		OnExit: func(info pty.ExitInfo) {
 			<-running.ready
@@ -305,10 +311,12 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		},
 	})
 	if err != nil {
+		m.detachSignal(id, running)
+		close(running.signalReady)
 		running.detector.Close()
 		startErr := fmt.Errorf("session: start pty: %w", err)
 		_, commitErr := m.committer.CommitAgent(
-			ctx,
+			context.Background(),
 			a,
 			agent.FailTo(
 				agent.StateStopped,
@@ -332,7 +340,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 
 	// 4. 状态推进：进程活着 -> Working。
 	if _, err := m.committer.CommitAgent(
-		ctx,
+		context.Background(),
 		a,
 		agent.MoveTo(agent.StateWorking, "process started", agent.Evidence{
 			Source:     agent.EvidenceProcess,
@@ -342,17 +350,21 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		nil,
 	); err != nil {
 		m.requestStop(id, running, stopCauseShutdown)
+		m.detachSignal(id, running)
+		close(running.signalReady)
 		close(running.ready)
 		_ = sess.Close()
-		m.cleanup(id)
 		return nil, err
 	}
-	close(running.ready)
+	close(running.signalReady)
 	if err := m.waitForRequiredHook(ctx, running); err != nil {
 		m.requestStop(id, running, stopCauseShutdown)
+		m.detachSignal(id, running)
+		close(running.ready)
 		closeErr := sess.Close()
 		return nil, errors.Join(err, closeErr)
 	}
+	close(running.ready)
 
 	return m.Status(id)
 }
@@ -400,6 +412,9 @@ func (m *Manager) Close() error {
 		for _, item := range attached {
 			if m.sessions[item.id] == item.session {
 				delete(m.sessions, item.id)
+			}
+			if m.signals[item.id] == item.session {
+				delete(m.signals, item.id)
 			}
 		}
 		m.mu.Unlock()
@@ -575,12 +590,22 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 
 // -- 内部回调 --
 
-// onOutput 按行发布原始输出，再把独立分类视图交给 Detector。
-func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
+// onOutput 脱敏后发布输出，再把独立分类视图交给 Detector。
+func (m *Manager) onOutput(
+	id agent.ID,
+	line string,
+	entry adapter.Entry,
+	signalToken string,
+) {
+	line = redactSignalToken(line, signalToken)
 	line = strings.TrimRight(line, "\r\n")
 	if line == "" {
 		return
 	}
+
+	m.mu.RLock()
+	running := m.sessions[id]
+	m.mu.RUnlock()
 	if _, err := m.committer.CommitEvents(
 		context.Background(),
 		[]event.Draft{event.NewOutputDraft(string(id), string(id), line)},
@@ -588,9 +613,6 @@ func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 		return
 	}
 
-	m.mu.RLock()
-	running := m.sessions[id]
-	m.mu.RUnlock()
 	if running == nil || running.detector == nil {
 		return
 	}
@@ -608,6 +630,13 @@ func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 		return
 	}
 	_ = running.detector.ObserveOutput(context.Background(), time.Now().UTC())
+}
+
+func redactSignalToken(line, token string) string {
+	if token == "" {
+		return line
+	}
+	return strings.ReplaceAll(line, token, "[REDACTED]")
 }
 
 type exitDecision struct {
@@ -743,6 +772,17 @@ func (m *Manager) detach(id agent.ID, running *runningSession) {
 	if m.sessions[id] == running {
 		delete(m.sessions, id)
 	}
+	if m.signals[id] == running {
+		delete(m.signals, id)
+	}
+}
+
+func (m *Manager) detachSignal(id agent.ID, running *runningSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.signals[id] == running {
+		delete(m.signals, id)
+	}
 }
 
 func normalizeRunMode(mode agent.RunMode) (agent.RunMode, error) {
@@ -753,12 +793,4 @@ func normalizeRunMode(mode agent.RunMode) (agent.RunMode, error) {
 		return "", fmt.Errorf("%w: %q", ErrInvalidMode, mode)
 	}
 	return mode, nil
-}
-
-// cleanup 移除未完全启动的会话残留。
-func (m *Manager) cleanup(id agent.ID) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.agents, id)
-	delete(m.sessions, id)
 }

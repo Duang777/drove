@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -374,6 +375,45 @@ func TestStartDoesNotLaunchProcessWhenCreationCannotPersist(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("process marker error = %v, want not exist", statErr)
+	}
+}
+
+func TestStartCancellationAfterCreationKeepsProjectionConsistent(t *testing.T) {
+	manager, st := newTestManager(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.committer.store = &cancelAfterAppendStore{
+		commitStore: manager.committer.store,
+		cancel:      cancel,
+	}
+
+	status, err := manager.Start(ctx, StartRequest{
+		Name:    "canceled-agent",
+		Command: "/bin/cat",
+	})
+	if err != nil {
+		t.Fatalf("start after durable creation: %v", err)
+	}
+	if status == nil || status.State != agent.StateWorking {
+		t.Fatalf("start status = %+v, want working", status)
+	}
+
+	statuses := manager.List()
+	if len(statuses) != 1 ||
+		statuses[0].AgentID != status.AgentID ||
+		statuses[0].State != agent.StateWorking {
+		t.Fatalf("statuses = %+v, want the durable working session", statuses)
+	}
+	rows, replayErr := st.Replay(statuses[0].AgentID)
+	if replayErr != nil {
+		t.Fatalf("replay session: %v", replayErr)
+	}
+	if len(rows) != 3 ||
+		rows[0].Type != string(event.TypeSessionLifecycle) ||
+		rows[1].From != string(agent.StatePending) ||
+		rows[1].To != string(agent.StateStarting) ||
+		rows[2].From != string(agent.StateStarting) ||
+		rows[2].To != string(agent.StateWorking) {
+		t.Fatalf("session history = %+v", rows)
 	}
 }
 
@@ -1140,7 +1180,7 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
 	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
 
-	manager.onOutput(id, "Task complete!", manager.reg.For("claude"))
+	manager.onOutput(id, "Task complete!", manager.reg.For("claude"), "")
 
 	if got := a.State(); got != agent.StateWorking {
 		t.Fatalf("interactive state = %s, want working", got)
@@ -1166,7 +1206,7 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	subscription := manager.hub.Subscribe(4)
 	defer manager.hub.Unsubscribe(subscription)
 	raw := "Waiting \x1b[2K\x1b[1Gfor your input"
-	manager.onOutput(id, raw, manager.reg.For("claude"))
+	manager.onOutput(id, raw, manager.reg.For("claude"), "")
 
 	if got := a.State(); got != agent.StateBlocked {
 		t.Fatalf("state = %s, want blocked from sanitized heuristic text", got)
@@ -1394,4 +1434,22 @@ func (s *fakeProcessSession) Close() error {
 
 func (s *fakeProcessSession) PID() int {
 	return 1
+}
+
+type cancelAfterAppendStore struct {
+	commitStore
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (s *cancelAfterAppendStore) AppendEvents(
+	ctx context.Context,
+	expectedLastSeq uint64,
+	rows []store.EventRow,
+) (uint64, error) {
+	lastSeq, err := s.commitStore.AppendEvents(ctx, expectedLastSeq, rows)
+	if err == nil {
+		s.once.Do(s.cancel)
+	}
+	return lastSeq, err
 }

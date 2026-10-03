@@ -236,9 +236,10 @@ func (d *Detector) handleSignal(
 		}
 	}
 
-	if signal.Kind == adapter.SignalWorking ||
-		signal.Kind == adapter.SignalBlocked ||
-		signal.Kind == adapter.SignalDone {
+	if signal.Source == adapter.SignalSourceHook &&
+		(signal.Kind == adapter.SignalWorking ||
+			signal.Kind == adapter.SignalBlocked ||
+			signal.Kind == adapter.SignalDone) {
 		cancelIdle(state)
 	}
 
@@ -283,7 +284,7 @@ func (d *Detector) target(
 			return ""
 		}
 	}
-	if signal.Scope == adapter.SignalScopeSubagent && signal.Kind == adapter.SignalIdle {
+	if signal.Scope == adapter.SignalScopeSubagent {
 		return ""
 	}
 

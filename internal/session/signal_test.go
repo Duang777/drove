@@ -66,9 +66,13 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	if parts[1] != wantURL {
 		t.Fatalf("signal URL = %q, want %q", parts[1], wantURL)
 	}
-	tokenBytes, decodeErr := hex.DecodeString(parts[2])
+	if parts[2] != "[REDACTED]" {
+		t.Fatalf("persisted signal token = %q, want redaction", parts[2])
+	}
+	token := attachedSignalToken(t, manager, agent.ID(status.AgentID))
+	tokenBytes, decodeErr := hex.DecodeString(token)
 	if decodeErr != nil || len(tokenBytes) != signalTokenBytes {
-		t.Fatalf("signal token = %q, decode error = %v", parts[2], decodeErr)
+		t.Fatalf("signal token = %q, decode error = %v", token, decodeErr)
 	}
 	if parts[3] != "claude" {
 		t.Fatalf("signal vendor = %q, want claude", parts[3])
@@ -218,19 +222,19 @@ func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
 	id := agent.ID(status.AgentID)
 	entry := manager.reg.For("claude")
 
-	manager.onOutput(id, "Error: low confidence", entry)
+	manager.onOutput(id, "Error: low confidence", entry, "")
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("low-confidence hint changed state to %s", got.State)
 	}
-	manager.onOutput(id, "Waiting for your input", entry)
+	manager.onOutput(id, "Waiting for your input", entry, "")
 	if got, _ := manager.Status(id); got.State != agent.StateBlocked {
 		t.Fatalf("blocked hint left state at %s", got.State)
 	}
-	manager.onOutput(id, "resuming first line", entry)
+	manager.onOutput(id, "resuming first line", entry, "")
 	if got, _ := manager.Status(id); got.State != agent.StateBlocked {
 		t.Fatalf("one activity line changed state to %s", got.State)
 	}
-	manager.onOutput(id, "resuming second line", entry)
+	manager.onOutput(id, "resuming second line", entry, "")
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("sustained output left state at %s", got.State)
 	}
@@ -258,7 +262,7 @@ func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
 		t.Fatalf("activate hook: %v", err)
 	}
 
-	manager.onOutput(id, "Waiting for your input", manager.reg.For("claude"))
+	manager.onOutput(id, "Waiting for your input", manager.reg.For("claude"), "")
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("active hook allowed heuristic state %s", got.State)
 	}
@@ -349,6 +353,23 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 		}
 	})
 
+	t.Run("short lived oneshot remains stopped without activation", func(t *testing.T) {
+		manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
+		manager.hookActivationTimeout = 10 * time.Millisecond
+		_, err := manager.Start(context.Background(), StartRequest{
+			Vendor:  "claude",
+			Command: "/usr/bin/true",
+			Mode:    agent.RunModeOneshot,
+		})
+		if !errors.Is(err, ErrHookUnavailable) {
+			t.Fatalf("start error = %v, want ErrHookUnavailable", err)
+		}
+		statuses := manager.List()
+		if len(statuses) != 1 || statuses[0].State != agent.StateStopped {
+			t.Fatalf("statuses = %+v, want one stopped session", statuses)
+		}
+	})
+
 	t.Run("observed activation", func(t *testing.T) {
 		manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
 		manager.hookActivationTimeout = time.Second
@@ -389,6 +410,64 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 			t.Fatal("required start did not return after activation")
 		}
 	})
+}
+
+func TestAcceptSignalWhileSessionIsStarting(t *testing.T) {
+	manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
+	a := agent.New(
+		"starting-agent",
+		agent.WithName("starting-agent"),
+		agent.WithVendor("claude"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	if _, err := manager.committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "test setup", agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
+		}),
+		nil,
+	); err != nil {
+		t.Fatalf("commit starting state: %v", err)
+	}
+	running, _, err := manager.prepareRuntime(a, manager.reg.For("claude"))
+	if err != nil {
+		t.Fatalf("prepare runtime: %v", err)
+	}
+	manager.mu.Lock()
+	manager.agents[a.ID()] = a
+	manager.signals[a.ID()] = running
+	manager.mu.Unlock()
+	t.Cleanup(func() {
+		manager.detachSignal(a.ID(), running)
+		running.detector.Close()
+	})
+
+	result := make(chan error, 1)
+	go func() {
+		result <- manager.AcceptSignal(
+			context.Background(),
+			a.ID(),
+			"Bearer "+running.signalToken,
+			"claude",
+			testDeliveryID("delivery-starting"),
+			claudeHook("SessionStart"),
+		)
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("starting signal returned before readiness: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(running.signalReady)
+	if err := <-result; err != nil {
+		t.Fatalf("accept starting signal: %v", err)
+	}
+	select {
+	case <-running.detector.Active():
+	default:
+		t.Fatal("starting session signal did not activate detector")
+	}
 }
 
 func TestStartRejectsRemoteSignalBaseURLBeforePersisting(t *testing.T) {

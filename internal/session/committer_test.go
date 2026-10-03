@@ -248,6 +248,41 @@ func TestCommitterSerializesConcurrentProducers(t *testing.T) {
 	}
 }
 
+func TestCommitterReturnsAcceptedResultDuringClose(t *testing.T) {
+	for iteration := range 20 {
+		st := &blockingCommitStore{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		}
+		committer := newCommitter(0, st, event.NewHub(0))
+		result := make(chan error, 1)
+		go func() {
+			_, err := committer.CommitEvents(
+				context.Background(),
+				[]event.Draft{event.NewOutputDraft("session", "session", "line")},
+			)
+			result <- err
+		}()
+
+		<-st.started
+		closed := make(chan struct{})
+		go func() {
+			committer.Close()
+			close(closed)
+		}()
+		time.Sleep(time.Millisecond)
+		close(st.release)
+
+		if err := <-result; err != nil {
+			t.Fatalf("iteration %d accepted commit error = %v", iteration, err)
+		}
+		<-closed
+		if rows := st.Rows(); len(rows) != 1 {
+			t.Fatalf("iteration %d rows = %+v, want durable commit", iteration, rows)
+		}
+	}
+}
+
 func TestCommitterStoreFailureDoesNotApplyOrPublish(t *testing.T) {
 	storageErr := errors.New("disk unavailable")
 	st := &memoryCommitStore{appendErr: storageErr}
@@ -382,4 +417,21 @@ func (s *memoryCommitStore) Rows() []store.EventRow {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]store.EventRow(nil), s.rows...)
+}
+
+type blockingCommitStore struct {
+	memoryCommitStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingCommitStore) AppendEvents(
+	ctx context.Context,
+	expectedLastSeq uint64,
+	rows []store.EventRow,
+) (uint64, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return s.memoryCommitStore.AppendEvents(ctx, expectedLastSeq, rows)
 }

@@ -76,6 +76,7 @@ export class EventStream {
         }
         if (isWebSocketError(raw)) {
           this.rejectInput(raw)
+          if (raw.code === 'request_limit') ws.close()
           return
         }
         if (isEvent(raw)) this.onEvent(raw)

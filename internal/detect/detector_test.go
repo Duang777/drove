@@ -230,6 +230,49 @@ func TestDetectorConfirmsAndCancelsIdleCandidate(t *testing.T) {
 			t.Fatalf("state = %s, decisions = %+v", state, decisions)
 		}
 	})
+
+	t.Run("suppressed heuristic does not cancel", func(t *testing.T) {
+		detector, harness := newDetectorHarness(t, PolicyRequired, agent.StateWorking)
+		stop := hookSignal("delivery-stop", adapter.SignalIdle)
+		stop.VendorEvent = "Stop"
+		if err := detector.Submit(context.Background(), stop); err != nil {
+			t.Fatalf("submit stop: %v", err)
+		}
+		timer := <-harness.timers
+		if err := detector.Submit(
+			context.Background(),
+			heuristicSignal(adapter.SignalBlocked, 0.6),
+		); err != nil {
+			t.Fatalf("submit suppressed heuristic: %v", err)
+		}
+		timer <- time.Now()
+
+		select {
+		case decision := <-harness.applied:
+			if decision.Signal.Source != adapter.SignalSourceHook {
+				t.Fatalf("first decision = %+v", decision)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("missing Stop audit decision")
+		}
+		select {
+		case decision := <-harness.applied:
+			if decision.Signal.Source != adapter.SignalSourceHeuristic ||
+				decision.Target != "" {
+				t.Fatalf("suppressed decision = %+v", decision)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("missing heuristic audit decision")
+		}
+		select {
+		case decision := <-harness.applied:
+			if decision.Target != agent.StateIdle {
+				t.Fatalf("timer decision = %+v", decision)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("missing Idle confirmation")
+		}
+	})
 }
 
 func TestDetectorPoliciesAndSubagentIdle(t *testing.T) {
@@ -275,6 +318,20 @@ func TestDetectorPoliciesAndSubagentIdle(t *testing.T) {
 		case <-harness.timers:
 			t.Fatal("subagent Stop created Idle timer")
 		default:
+		}
+	})
+
+	t.Run("subagent activity does not overwrite root", func(t *testing.T) {
+		detector, harness := newDetectorHarness(t, PolicyAuto, agent.StateBlocked)
+		signal := hookSignal("delivery-1", adapter.SignalWorking)
+		signal.VendorEvent = "SubagentStop"
+		signal.Scope = adapter.SignalScopeSubagent
+		if err := detector.Submit(context.Background(), signal); err != nil {
+			t.Fatalf("submit subagent activity: %v", err)
+		}
+		state, decisions := harness.snapshot()
+		if state != agent.StateBlocked || len(decisions) != 1 || decisions[0].Target != "" {
+			t.Fatalf("state = %s, decisions = %+v", state, decisions)
 		}
 	})
 }

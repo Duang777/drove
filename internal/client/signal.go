@@ -47,8 +47,10 @@ func RelaySignal(
 	if vendor != "claude" && vendor != "codex" {
 		return fmt.Errorf("client: unsupported hook vendor %q", vendor)
 	}
-	if strings.TrimSpace(deliveryID) == "" {
-		return errors.New("client: delivery ID is required")
+	if deliveryID == "" ||
+		strings.TrimSpace(deliveryID) != deliveryID ||
+		len(deliveryID) > 128 {
+		return errors.New("client: delivery ID must contain 1 to 128 non-space-edge bytes")
 	}
 	if len(payload) == 0 {
 		return errors.New("client: hook payload is empty")
@@ -67,20 +69,22 @@ func RelaySignal(
 		return errors.New("client: hook payload must be one JSON object")
 	}
 
-	body, err := json.Marshal(signalRequest{
+	var body bytes.Buffer
+	encoder := json.NewEncoder(&body)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(signalRequest{
 		Version:    1,
 		Vendor:     vendor,
 		DeliveryID: deliveryID,
 		Payload:    json.RawMessage(payload),
-	})
-	if err != nil {
+	}); err != nil {
 		return fmt.Errorf("client: encode signal request: %w", err)
 	}
 	request, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
 		signalURL,
-		bytes.NewReader(body),
+		&body,
 	)
 	if err != nil {
 		return fmt.Errorf("client: create signal request: %w", err)

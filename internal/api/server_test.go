@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -266,18 +268,21 @@ func TestHandleInputRejectsDetachedAndClosedManager(t *testing.T) {
 
 func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 	server, manager, _ := newTestServer(t)
+	tokenPath := filepath.Join(t.TempDir(), "signal.token")
 	status, err := manager.Start(context.Background(), session.StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/sh",
 		Args: []string{
 			"-c",
-			`printf 'TOKEN:%s\n' "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
+			`printf '%s' "$DROVE_SIGNAL_TOKEN" > "$1"; exec /bin/cat`,
+			"sh",
+			tokenPath,
 		},
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	token := waitForSignalTokenOutput(t, manager, status.AgentID)
+	token := waitForSignalTokenFile(t, tokenPath)
 	body := `{
 		"version":1,
 		"vendor":"claude",
@@ -353,18 +358,21 @@ func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 
 func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 	server, manager, _ := newTestServer(t)
+	tokenPath := filepath.Join(t.TempDir(), "signal.token")
 	status, err := manager.Start(context.Background(), session.StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/sh",
 		Args: []string{
 			"-c",
-			`printf 'TOKEN:%s\n' "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
+			`printf '%s' "$DROVE_SIGNAL_TOKEN" > "$1"; exec /bin/cat`,
+			"sh",
+			tokenPath,
 		},
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	token := waitForSignalTokenOutput(t, manager, status.AgentID)
+	token := waitForSignalTokenFile(t, tokenPath)
 
 	tests := []struct {
 		name        string
@@ -407,6 +415,16 @@ func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 			contentType: "text/plain",
 			body:        []byte(`{}`),
 			wantStatus:  http.StatusUnsupportedMediaType,
+		},
+		{
+			name:        "oversized decoded payload",
+			contentType: "application/json",
+			body: []byte(
+				`{"version":1,"vendor":"claude","delivery_id":"d1","payload":{"padding":"` +
+					strings.Repeat("x", session.MaxSignalPayloadBytes) +
+					`"}}`,
+			),
+			wantStatus: http.StatusRequestEntityTooLarge,
 		},
 	}
 
@@ -547,23 +565,20 @@ func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 	}), manager, st
 }
 
-func waitForSignalTokenOutput(t *testing.T, manager *session.Manager, agentID string) string {
+func waitForSignalTokenFile(t *testing.T, path string) string {
 	t.Helper()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		rows, err := manager.Replay(agentID)
-		if err != nil {
-			t.Fatalf("replay: %v", err)
+		raw, err := os.ReadFile(path)
+		if err == nil && len(raw) > 0 {
+			return string(raw)
 		}
-		for _, row := range rows {
-			if row.Type == string(event.TypeOutput) &&
-				strings.HasPrefix(row.Payload, "TOKEN:") {
-				return strings.TrimPrefix(row.Payload, "TOKEN:")
-			}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read signal token file: %v", err)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("signal token output missing: %+v", rows)
+			t.Fatalf("signal token file %q missing", path)
 		}
 		time.Sleep(time.Millisecond)
 	}
