@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -23,7 +24,59 @@ import (
 	"github.com/Duang777/drove/internal/store"
 )
 
-const testControlToken = "test-control-token"
+const (
+	testControlToken     = "test-control-token"
+	testSignalDeliveryID = "550e8400-e29b-41d4-a716-446655440000"
+)
+
+func TestHandleCreateMapsHookConfigurationErrors(t *testing.T) {
+	tests := []struct {
+		name            string
+		configureOrigin bool
+		body            string
+		wantStatus      int
+	}{
+		{
+			name:            "invalid policy",
+			configureOrigin: true,
+			body:            `{"vendor":"generic","command":"/bin/true","hooks":"sometimes"}`,
+			wantStatus:      http.StatusBadRequest,
+		},
+		{
+			name:            "required unsupported",
+			configureOrigin: true,
+			body:            `{"vendor":"generic","command":"/bin/true","hooks":"required"}`,
+			wantStatus:      http.StatusBadRequest,
+		},
+		{
+			name:       "signal origin unavailable",
+			body:       `{"vendor":"claude","command":"/bin/true","hooks":"auto"}`,
+			wantStatus: http.StatusServiceUnavailable,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, _, _ := newTestServerWithSignalOrigin(t, test.configureOrigin)
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/agents",
+				strings.NewReader(test.body),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			serveAuthorized(server, rec, req)
+			if rec.Code != test.wantStatus {
+				t.Fatalf(
+					"response = %d %q, want %d",
+					rec.Code,
+					rec.Body.String(),
+					test.wantStatus,
+				)
+			}
+		})
+	}
+}
 
 func TestHandleCreateRejectsInvalidModeWithoutHistory(t *testing.T) {
 	server, manager, st := newTestServer(t)
@@ -314,6 +367,23 @@ func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 	if current.State != agent.StateBlocked {
 		t.Fatalf("state = %s, want blocked", current.State)
 	}
+	duplicate := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/"+status.AgentID+"/signal",
+		strings.NewReader(body),
+	)
+	duplicate.RemoteAddr = "127.0.0.1:43210"
+	duplicate.Header.Set("Content-Type", "application/json")
+	duplicate.Header.Set("Authorization", "Bearer "+token)
+	duplicateResponse := httptest.NewRecorder()
+	server.mux.ServeHTTP(duplicateResponse, duplicate)
+	if duplicateResponse.Code != http.StatusNoContent {
+		t.Fatalf(
+			"duplicate response = %d %q, want 204",
+			duplicateResponse.Code,
+			duplicateResponse.Body.String(),
+		)
+	}
 
 	for _, test := range []struct {
 		name       string
@@ -321,6 +391,11 @@ func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 		token      string
 		wantStatus int
 	}{
+		{
+			name:       "missing token",
+			remoteAddr: "127.0.0.1:43210",
+			wantStatus: http.StatusUnauthorized,
+		},
 		{
 			name:       "control token is isolated",
 			remoteAddr: "127.0.0.1:43210",
@@ -396,14 +471,38 @@ func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 		{
 			name:        "wrong vendor",
 			contentType: "application/json",
-			body:        []byte(`{"version":1,"vendor":"codex","delivery_id":"d1","payload":{"hook_event_name":"SessionStart","session_id":"s1"}}`),
-			wantStatus:  http.StatusConflict,
+			body: []byte(
+				`{"version":1,"vendor":"codex","delivery_id":"` +
+					testSignalDeliveryID +
+					`","payload":{"hook_event_name":"SessionStart","session_id":"s1"}}`,
+			),
+			wantStatus: http.StatusConflict,
 		},
 		{
 			name:        "unknown hook event",
 			contentType: "application/json",
-			body:        []byte(`{"version":1,"vendor":"claude","delivery_id":"d1","payload":{"hook_event_name":"FutureEvent","session_id":"s1"}}`),
-			wantStatus:  http.StatusUnprocessableEntity,
+			body: []byte(
+				`{"version":1,"vendor":"claude","delivery_id":"` +
+					testSignalDeliveryID +
+					`","payload":{"hook_event_name":"FutureEvent","session_id":"s1"}}`,
+			),
+			wantStatus: http.StatusUnprocessableEntity,
+		},
+		{
+			name:        "invalid delivery ID",
+			contentType: "application/json",
+			body:        []byte(`{"version":1,"vendor":"claude","delivery_id":"d1","payload":{}}`),
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "non-object payload",
+			contentType: "application/json",
+			body: []byte(
+				`{"version":1,"vendor":"claude","delivery_id":"` +
+					testSignalDeliveryID +
+					`","payload":[]}`,
+			),
+			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:        "invalid UTF-8",
@@ -415,7 +514,7 @@ func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 			name:        "wrong content type",
 			contentType: "text/plain",
 			body:        []byte(`{}`),
-			wantStatus:  http.StatusUnsupportedMediaType,
+			wantStatus:  http.StatusBadRequest,
 		},
 		{
 			name:        "oversized decoded payload",
@@ -426,6 +525,12 @@ func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 					`"}}`,
 			),
 			wantStatus: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:        "oversized envelope",
+			contentType: "application/json",
+			body:        bytes.Repeat([]byte(" "), maxSignalRequestBytes+1),
+			wantStatus:  http.StatusRequestEntityTooLarge,
 		},
 	}
 
@@ -443,6 +548,64 @@ func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 			server.mux.ServeHTTP(rec, req)
 			if rec.Code != test.wantStatus {
 				t.Fatalf("response = %d %q, want %d", rec.Code, rec.Body.String(), test.wantStatus)
+			}
+		})
+	}
+}
+
+func TestWriteSignalErrorMapsSessionSentinels(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantHeader string
+	}{
+		{
+			name:       "unauthorized",
+			err:        session.ErrHookUnauthorized,
+			wantStatus: http.StatusUnauthorized,
+			wantHeader: "Bearer",
+		},
+		{name: "unknown agent", err: session.ErrUnknownAgent, wantStatus: http.StatusNotFound},
+		{name: "hooks disabled", err: session.ErrHookDisabled, wantStatus: http.StatusConflict},
+		{name: "hooks unsupported", err: session.ErrHookUnsupported, wantStatus: http.StatusConflict},
+		{name: "vendor mismatch", err: session.ErrHookVendorMismatch, wantStatus: http.StatusConflict},
+		{name: "detached", err: session.ErrHookDetached, wantStatus: http.StatusGone},
+		{
+			name:       "backpressure",
+			err:        session.ErrHookBackpressure,
+			wantStatus: http.StatusTooManyRequests,
+			wantHeader: "1",
+		},
+		{name: "manager closed", err: session.ErrManagerClosed, wantStatus: http.StatusServiceUnavailable},
+		{
+			name:       "committer unavailable",
+			err:        session.ErrEventCommitterUnavailable,
+			wantStatus: http.StatusServiceUnavailable,
+		},
+		{name: "invalid hook", err: session.ErrHookInvalid, wantStatus: http.StatusUnprocessableEntity},
+		{name: "internal", err: errors.New("internal"), wantStatus: http.StatusInternalServerError},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeSignalError(rec, fmt.Errorf("wrapped: %w", test.err))
+			if rec.Code != test.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, test.wantStatus)
+			}
+			switch test.wantStatus {
+			case http.StatusUnauthorized:
+				if got := rec.Header().Get("WWW-Authenticate"); got != test.wantHeader {
+					t.Fatalf("WWW-Authenticate = %q, want %q", got, test.wantHeader)
+				}
+				if strings.Contains(rec.Body.String(), "wrapped") {
+					t.Fatalf("unauthorized response exposed error: %q", rec.Body.String())
+				}
+			case http.StatusTooManyRequests:
+				if got := rec.Header().Get("Retry-After"); got != test.wantHeader {
+					t.Fatalf("Retry-After = %q, want %q", got, test.wantHeader)
+				}
 			}
 		})
 	}
@@ -536,6 +699,14 @@ func TestWebSocketRequiresAllowedOrigin(t *testing.T) {
 
 func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 	t.Helper()
+	return newTestServerWithSignalOrigin(t, true)
+}
+
+func newTestServerWithSignalOrigin(
+	t *testing.T,
+	configureOrigin bool,
+) (*Server, *session.Manager, *store.Store) {
+	t.Helper()
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "drove.db"))
 	if err != nil {
@@ -548,12 +719,14 @@ func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 		st,
 		0,
 	)
-	signalOrigin, err := url.Parse("http://127.0.0.1:7373")
-	if err != nil {
-		t.Fatalf("parse signal origin: %v", err)
-	}
-	if err := manager.ConfigureSignalOrigin(signalOrigin); err != nil {
-		t.Fatalf("configure signal origin: %v", err)
+	if configureOrigin {
+		signalOrigin, err := url.Parse("http://127.0.0.1:7373")
+		if err != nil {
+			t.Fatalf("parse signal origin: %v", err)
+		}
+		if err := manager.ConfigureSignalOrigin(signalOrigin); err != nil {
+			t.Fatalf("configure signal origin: %v", err)
+		}
 	}
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {

@@ -31,7 +31,7 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 		Command: "/bin/sh",
 		Args: []string{
 			"-c",
-			`printf '%s|%s|%s|%s\n' "$DROVE_AGENT_ID" "$DROVE_SIGNAL_URL" "$DROVE_SIGNAL_TOKEN" "$DROVE_SIGNAL_VENDOR"; exec /bin/cat`,
+			`printf '%s|%s|%s\n' "$DROVE_AGENT_ID" "$DROVE_SIGNAL_URL" "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
 		},
 	})
 	if err != nil {
@@ -61,7 +61,7 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	}
 
 	parts := strings.Split(envLine, "|")
-	if len(parts) != 4 {
+	if len(parts) != 3 {
 		t.Fatalf("environment line = %q", envLine)
 	}
 	if parts[0] != status.AgentID {
@@ -78,9 +78,6 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	tokenBytes, decodeErr := base64.RawURLEncoding.DecodeString(token)
 	if decodeErr != nil || len(tokenBytes) != signalTokenBytes {
 		t.Fatalf("signal token = %q, decode error = %v", token, decodeErr)
-	}
-	if parts[3] != "claude" {
-		t.Fatalf("signal vendor = %q, want claude", parts[3])
 	}
 }
 

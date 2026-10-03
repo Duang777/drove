@@ -21,6 +21,7 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 		name        string
 		arg         string
 		oneshot     bool
+		hooks       agent.HookPolicy
 		wantVendor  string
 		wantCommand string
 		wantMode    agent.RunMode
@@ -35,6 +36,7 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 			name:       "oneshot vendor",
 			arg:        "codex",
 			oneshot:    true,
+			hooks:      agent.HooksRequired,
 			wantVendor: "codex",
 			wantMode:   agent.RunModeOneshot,
 		},
@@ -57,25 +59,43 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			req := sessionStartRequest(test.arg, "name", "/tmp", test.oneshot)
+			req := sessionStartRequest(
+				test.arg,
+				"name",
+				"/tmp",
+				test.oneshot,
+				test.hooks,
+			)
 			if req.Vendor != test.wantVendor ||
 				req.Command != test.wantCommand ||
 				req.Mode != test.wantMode ||
 				req.Name != "name" ||
-				req.Dir != "/tmp" {
+				req.Dir != "/tmp" ||
+				req.Hooks != test.hooks {
 				t.Fatalf("request = %+v", req)
 			}
 		})
 	}
 }
 
-func TestUpCommandExposesOneshotFlag(t *testing.T) {
-	flag := newUpCmd().Flags().Lookup("oneshot")
-	if flag == nil {
-		t.Fatal("up command has no --oneshot flag")
+func TestUpCommandExposesRunnerAndHookFlags(t *testing.T) {
+	flags := newUpCmd().Flags()
+	oneshot := flags.Lookup("oneshot")
+	if oneshot == nil || oneshot.DefValue != "false" {
+		t.Fatalf("--oneshot flag = %+v, want default false", oneshot)
 	}
-	if flag.DefValue != "false" {
-		t.Fatalf("--oneshot default = %q, want false", flag.DefValue)
+	hooks := flags.Lookup("hooks")
+	if hooks == nil || hooks.DefValue != "" {
+		t.Fatalf("--hooks flag = %+v, want empty default", hooks)
+	}
+}
+
+func TestUpCommandRejectsInvalidHookPolicyBeforeClientSetup(t *testing.T) {
+	command := newUpCmd()
+	command.SetArgs([]string{"claude", "--hooks", "sometimes"})
+	err := command.Execute()
+	if !errors.Is(err, session.ErrInvalidHookPolicy) {
+		t.Fatalf("up error = %v, want ErrInvalidHookPolicy", err)
 	}
 }
 
@@ -117,14 +137,20 @@ func TestHookCommandRelaysInjectedSessionEnvelope(t *testing.T) {
 	t.Setenv(session.SignalAgentIDEnv, "agent-1")
 	t.Setenv(session.SignalURLEnv, server.URL+"/api/v1/agents/agent-1/signal")
 	t.Setenv(session.SignalTokenEnv, "session-token")
-	t.Setenv(session.SignalVendorEnv, "claude")
 	payload := `{"hook_event_name":"SessionStart","session_id":"vendor-session"}`
 
 	command := newHookCmd()
 	command.SetArgs([]string{"--vendor", "claude"})
 	command.SetIn(strings.NewReader(payload))
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
 	if err := command.Execute(); err != nil {
 		t.Fatalf("execute hook: %v", err)
+	}
+	if stdout.Len() != 0 || stderr.Len() != 0 {
+		t.Fatalf("stdout = %q, stderr = %q, want both empty", stdout.String(), stderr.String())
 	}
 	if received.Version != 1 ||
 		received.Vendor != "claude" ||
@@ -134,49 +160,90 @@ func TestHookCommandRelaysInjectedSessionEnvelope(t *testing.T) {
 	}
 }
 
-func TestHookCommandValidatesVendorAndInjectedEnvironment(t *testing.T) {
+func TestHookCommandReportsFailureWithoutBlockingVendor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, `{"error":"secret response"}`, http.StatusUnauthorized)
+	}))
+	defer server.Close()
+
 	tests := []struct {
-		name           string
-		flagVendor     string
-		injectedVendor string
-		signalURL      string
-		want           string
+		name      string
+		agentID   string
+		signalURL string
+		token     string
+		payload   string
 	}{
 		{
-			name:       "unknown vendor",
-			flagVendor: "other",
-			want:       "must be claude or codex",
+			name:      "missing environment",
+			signalURL: server.URL + "/api/v1/agents/agent-1/signal",
+			token:     "session-token",
+			payload:   `{}`,
 		},
 		{
-			name:           "vendor mismatch",
-			flagVendor:     "codex",
-			injectedVendor: "claude",
-			signalURL:      "http://127.0.0.1:7373/api/v1/agents/agent-1/signal",
-			want:           "does not match",
+			name:      "URL agent mismatch",
+			agentID:   "agent-1",
+			signalURL: server.URL + "/api/v1/agents/agent-2/signal",
+			token:     "session-token",
+			payload:   `{}`,
 		},
 		{
-			name:           "URL agent mismatch",
-			flagVendor:     "claude",
-			injectedVendor: "claude",
-			signalURL:      "http://127.0.0.1:7373/api/v1/agents/agent-2/signal",
-			want:           "does not match agent",
+			name:      "malformed payload",
+			agentID:   "agent-1",
+			signalURL: server.URL + "/api/v1/agents/agent-1/signal",
+			token:     "session-token",
+			payload:   `[]`,
+		},
+		{
+			name:      "endpoint rejection",
+			agentID:   "agent-1",
+			signalURL: server.URL + "/api/v1/agents/agent-1/signal",
+			token:     "session-token",
+			payload:   `{"secret":"payload"}`,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			t.Setenv(session.SignalAgentIDEnv, "agent-1")
+			t.Setenv(session.SignalAgentIDEnv, test.agentID)
 			t.Setenv(session.SignalURLEnv, test.signalURL)
-			t.Setenv(session.SignalTokenEnv, "session-token")
-			t.Setenv(session.SignalVendorEnv, test.injectedVendor)
+			t.Setenv(session.SignalTokenEnv, test.token)
 			command := newHookCmd()
-			command.SetArgs([]string{"--vendor", test.flagVendor})
-			command.SetIn(strings.NewReader(`{}`))
-			err := command.Execute()
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("hook error = %v, want %q", err, test.want)
+			command.SetArgs([]string{"--vendor", "claude"})
+			command.SetIn(strings.NewReader(test.payload))
+			var stdout bytes.Buffer
+			var stderr bytes.Buffer
+			command.SetOut(&stdout)
+			command.SetErr(&stderr)
+			if err := command.Execute(); err != nil {
+				t.Fatalf("hook error = %v, want nil", err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout = %q, want empty", stdout.String())
+			}
+			if stderr.String() != "drove hook: signal delivery failed\n" {
+				t.Fatalf("stderr = %q", stderr.String())
+			}
+			for _, secret := range []string{
+				test.agentID,
+				test.signalURL,
+				test.token,
+				test.payload,
+				"secret response",
+			} {
+				if secret != "" && strings.Contains(stderr.String(), secret) {
+					t.Fatalf("stderr exposed %q: %q", secret, stderr.String())
+				}
 			}
 		})
+	}
+}
+
+func TestHookCommandRequiresVendorFlag(t *testing.T) {
+	command := newHookCmd()
+	command.SetArgs(nil)
+	command.SetIn(strings.NewReader(`{}`))
+	if err := command.Execute(); err == nil {
+		t.Fatal("hook command succeeded without --vendor")
 	}
 }
 

@@ -8,13 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/Duang777/drove/internal/agent"
@@ -105,17 +103,25 @@ func newUpCmd() *cobra.Command {
 	var name string
 	var dir string
 	var oneshot bool
+	var hooks string
 	cmd := &cobra.Command{
 		Use:   "up <vendor|command>",
 		Short: "启动一个 Agent 会话（自动拉起 daemon）",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
+			hookPolicy := agent.HookPolicy(hooks)
+			if hookPolicy != "" && !agent.ValidHookPolicy(hookPolicy) {
+				return fmt.Errorf("%w: %q", session.ErrInvalidHookPolicy, hooks)
+			}
 			ctx := context.Background()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
 			}
-			st, err := c.Start(ctx, sessionStartRequest(args[0], name, dir, oneshot))
+			st, err := c.Start(
+				ctx,
+				sessionStartRequest(args[0], name, dir, oneshot, hookPolicy),
+			)
 			if err != nil {
 				return err
 			}
@@ -127,6 +133,7 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "", "agent 显示名")
 	cmd.Flags().StringVar(&dir, "dir", "", "agent 工作目录")
 	cmd.Flags().BoolVar(&oneshot, "oneshot", false, "以单次执行模式启动 agent")
+	cmd.Flags().StringVar(&hooks, "hooks", "", "hook 策略（off、auto 或 required）")
 	return cmd
 }
 
@@ -268,76 +275,44 @@ func newHookCmd() *cobra.Command {
 		Short: "转发一个厂商 hook 事件",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if vendor != "claude" && vendor != "codex" {
-				return fmt.Errorf("hook vendor must be claude or codex")
-			}
-			signalURL, token, err := hookRelayEnvironment(vendor)
-			if err != nil {
-				return err
-			}
-			payload, err := io.ReadAll(io.LimitReader(
-				cmd.InOrStdin(),
-				client.MaxHookPayloadBytes+1,
-			))
-			if err != nil {
-				return fmt.Errorf("read hook payload: %w", err)
-			}
-			if len(payload) > client.MaxHookPayloadBytes {
-				return fmt.Errorf(
-					"hook payload exceeds %d bytes",
-					client.MaxHookPayloadBytes,
+			if err := forwardHook(cmd, vendor); err != nil {
+				_, _ = fmt.Fprintln(
+					cmd.ErrOrStderr(),
+					"drove hook: signal delivery failed",
 				)
 			}
-			return client.RelaySignal(
-				cmd.Context(),
-				signalURL,
-				token,
-				vendor,
-				uuid.NewString(),
-				payload,
-			)
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&vendor, "vendor", "", "hook 厂商（claude 或 codex）")
+	_ = cmd.MarkFlagRequired("vendor")
 	return cmd
 }
 
-func hookRelayEnvironment(vendor string) (string, string, error) {
-	agentID := os.Getenv(session.SignalAgentIDEnv)
-	signalURL := os.Getenv(session.SignalURLEnv)
-	token := os.Getenv(session.SignalTokenEnv)
-	injectedVendor := os.Getenv(session.SignalVendorEnv)
-	switch {
-	case agentID == "":
-		return "", "", fmt.Errorf("%s is required", session.SignalAgentIDEnv)
-	case signalURL == "":
-		return "", "", fmt.Errorf("%s is required", session.SignalURLEnv)
-	case token == "":
-		return "", "", fmt.Errorf("%s is required", session.SignalTokenEnv)
-	case injectedVendor == "":
-		return "", "", fmt.Errorf("%s is required", session.SignalVendorEnv)
-	case vendor != injectedVendor:
-		return "", "", fmt.Errorf(
-			"hook vendor %q does not match injected vendor %q",
-			vendor,
-			injectedVendor,
-		)
+func forwardHook(cmd *cobra.Command, vendor string) error {
+	relay, err := client.NewHookRelay(client.HookRelayConfig{
+		AgentID:   os.Getenv(session.SignalAgentIDEnv),
+		SignalURL: os.Getenv(session.SignalURLEnv),
+		Token:     os.Getenv(session.SignalTokenEnv),
+	})
+	if err != nil {
+		return err
 	}
 
-	parsed, err := url.Parse(signalURL)
+	payload, err := io.ReadAll(io.LimitReader(
+		cmd.InOrStdin(),
+		client.MaxHookPayloadBytes+1,
+	))
 	if err != nil {
-		return "", "", fmt.Errorf("parse %s: %w", session.SignalURLEnv, err)
+		return fmt.Errorf("read hook payload: %w", err)
 	}
-	wantPath := "/api/v1/agents/" + url.PathEscape(agentID) + "/signal"
-	if parsed.EscapedPath() != wantPath {
-		return "", "", fmt.Errorf(
-			"%s path %q does not match agent %q",
-			session.SignalURLEnv,
-			parsed.EscapedPath(),
-			agentID,
+	if len(payload) > client.MaxHookPayloadBytes {
+		return fmt.Errorf(
+			"hook payload exceeds %d bytes",
+			client.MaxHookPayloadBytes,
 		)
 	}
-	return signalURL, token, nil
+	return relay.Forward(cmd.Context(), vendor, payload)
 }
 
 func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, error) {
@@ -382,7 +357,13 @@ func newVersionCmd() *cobra.Command {
 
 // sessionStartRequest 把 CLI 参数映射为 daemon 的 StartRequest。
 // 若第一个参数不是内置厂商名，则视为 generic 命令。
-func sessionStartRequest(arg, name, dir string, oneshot bool) session.StartRequest {
+func sessionStartRequest(
+	arg string,
+	name string,
+	dir string,
+	oneshot bool,
+	hooks agent.HookPolicy,
+) session.StartRequest {
 	vendor := arg
 	cmdName := ""
 	if !isKnownVendor(arg) {
@@ -398,6 +379,7 @@ func sessionStartRequest(arg, name, dir string, oneshot bool) session.StartReque
 		Command: cmdName,
 		Dir:     dir,
 		Mode:    mode,
+		Hooks:   hooks,
 	}
 }
 

@@ -28,8 +28,6 @@ const (
 	SignalURLEnv = "DROVE_SIGNAL_URL"
 	// SignalTokenEnv contains the in-memory per-session callback credential.
 	SignalTokenEnv = "DROVE_SIGNAL_TOKEN"
-	// SignalVendorEnv contains the selected adapter vendor.
-	SignalVendorEnv = "DROVE_SIGNAL_VENDOR"
 
 	signalTokenBytes    = 32
 	signalAdmissionWait = 250 * time.Millisecond
@@ -200,7 +198,6 @@ func (m *Manager) prepareRuntime(
 		SignalAgentIDEnv + "=" + string(a.ID()),
 		SignalURLEnv + "=" + signalURL,
 		SignalTokenEnv + "=" + token,
-		SignalVendorEnv + "=" + a.Vendor(),
 	}, token, nil
 }
 

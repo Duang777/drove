@@ -17,7 +17,8 @@
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
 - 所有 REST 与 WebSocket 请求必须先通过本地 Bearer 令牌认证；WebSocket 还要求 Origin 缺失或与配置的本地 Origin 精确匹配。
 - signal endpoint 是唯一例外：它只接受 loopback，并使用目标会话的内存 token，
-  不接受控制面 token。
+  不接受控制面 token；请求 envelope 必须严格校验，只有已提交或重复的 delivery
+  返回 204。
 - 每个 WebSocket 连接只有一个读协程和一个写协程；写协程独占事件、ack/error、ping/pong 和 close 帧。
 - 输入消息必须携带版本、连接内唯一 `request_id` 和 Agent ID；响应以同一 `request_id` 返回稳定 ack/error。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。

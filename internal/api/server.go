@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
+
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
@@ -228,9 +230,15 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	token, ok := strings.CutPrefix(values[0], "Bearer ")
+	if !ok || token == "" {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
-		writeErr(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		writeErr(w, http.StatusBadRequest, "content type must be application/json")
 		return
 	}
 
@@ -261,19 +269,12 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
 		return
 	}
-	if req.Version != 1 {
-		writeErr(w, http.StatusBadRequest, "unsupported signal protocol version")
-		return
-	}
 	if len(req.Payload) > session.MaxSignalPayloadBytes {
 		writeErr(w, http.StatusRequestEntityTooLarge, "signal payload exceeds maximum size")
 		return
 	}
-
-	token, ok := strings.CutPrefix(values[0], "Bearer ")
-	if !ok || token == "" {
-		w.Header().Set("WWW-Authenticate", "Bearer")
-		writeErr(w, http.StatusUnauthorized, "unauthorized")
+	if err := validateSignalRequest(req); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	err = s.opts.Manager.DeliverHook(
@@ -287,32 +288,54 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		},
 	)
 	if err != nil {
-		switch {
-		case errors.Is(err, session.ErrHookUnauthorized):
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			writeErr(w, http.StatusUnauthorized, "unauthorized")
-		case errors.Is(err, session.ErrUnknownAgent):
-			writeErr(w, http.StatusNotFound, err.Error())
-		case errors.Is(err, session.ErrHookDisabled),
-			errors.Is(err, session.ErrHookUnsupported),
-			errors.Is(err, session.ErrHookVendorMismatch):
-			writeErr(w, http.StatusConflict, err.Error())
-		case errors.Is(err, session.ErrHookDetached):
-			writeErr(w, http.StatusGone, err.Error())
-		case errors.Is(err, session.ErrHookBackpressure):
-			w.Header().Set("Retry-After", "1")
-			writeErr(w, http.StatusTooManyRequests, err.Error())
-		case errors.Is(err, session.ErrManagerClosed),
-			errors.Is(err, session.ErrEventCommitterUnavailable):
-			writeErr(w, http.StatusServiceUnavailable, err.Error())
-		case errors.Is(err, session.ErrHookInvalid):
-			writeErr(w, http.StatusUnprocessableEntity, err.Error())
-		default:
-			writeErr(w, http.StatusInternalServerError, err.Error())
-		}
+		writeSignalError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func validateSignalRequest(req signalRequest) error {
+	if req.Version != 1 {
+		return errors.New("unsupported signal protocol version")
+	}
+	if req.Vendor == "" || strings.TrimSpace(req.Vendor) != req.Vendor {
+		return errors.New("signal vendor is required")
+	}
+	deliveryID, err := uuid.Parse(req.DeliveryID)
+	if err != nil || deliveryID.String() != req.DeliveryID {
+		return errors.New("signal delivery ID must be a canonical UUID")
+	}
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(req.Payload, &payload); err != nil || payload == nil {
+		return errors.New("signal payload must be one JSON object")
+	}
+	return nil
+}
+
+func writeSignalError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, session.ErrHookUnauthorized):
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+	case errors.Is(err, session.ErrUnknownAgent):
+		writeErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, session.ErrHookDisabled),
+		errors.Is(err, session.ErrHookUnsupported),
+		errors.Is(err, session.ErrHookVendorMismatch):
+		writeErr(w, http.StatusConflict, err.Error())
+	case errors.Is(err, session.ErrHookDetached):
+		writeErr(w, http.StatusGone, err.Error())
+	case errors.Is(err, session.ErrHookBackpressure):
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusTooManyRequests, err.Error())
+	case errors.Is(err, session.ErrManagerClosed),
+		errors.Is(err, session.ErrEventCommitterUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+	case errors.Is(err, session.ErrHookInvalid):
+		writeErr(w, http.StatusUnprocessableEntity, err.Error())
+	default:
+		writeErr(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
