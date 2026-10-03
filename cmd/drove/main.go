@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -19,6 +20,7 @@ import (
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
 )
 
@@ -63,12 +65,12 @@ func newRootCmd() *cobra.Command {
 
 // newClient 加载配置并返回已确保 daemon 可用的客户端。
 func newClient(ctx context.Context) (*client.Client, error) {
-	cfg, err := config.Load("")
+	cfg, configPath, err := config.LoadResolved("")
 	if err != nil {
 		return nil, err
 	}
 	c := client.New(cfg.APIBind)
-	if err := c.EnsureDaemon(ctx); err != nil {
+	if err := c.EnsureDaemon(ctx, configPath); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -80,15 +82,11 @@ func newInitCmd() *cobra.Command {
 		Short: "初始化配置与数据目录",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg := config.Defaults()
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return err
-			}
-			dir := filepath.Join(home, ".drove")
+			path := config.DefaultPath()
+			dir := filepath.Dir(path)
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				return err
 			}
-			path := filepath.Join(dir, "config.json")
 			raw, _ := json.MarshalIndent(cfg, "", "  ")
 			if err := os.WriteFile(path, raw, 0o644); err != nil {
 				return err
@@ -161,7 +159,7 @@ func newLogCmd() *cobra.Command {
 		Use:   "log <agent-id>",
 		Short: "回放某 Agent 的事件流",
 		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			c, err := newClient(ctx)
 			if err != nil {
@@ -171,17 +169,34 @@ func newLogCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for _, r := range rows {
-				ts := r.Timestamp.Format("15:04:05.000")
-				if r.Type == string(event.TypeOutput) {
-					fmt.Printf("%s %-14s %s", ts, "["+shortID(r.AgentID)+"]", r.Payload)
-				} else {
-					fmt.Printf("%s %-14s %s: %s\n", ts, "["+shortID(r.AgentID)+"]", r.Type, r.Reason)
-				}
-			}
-			return nil
+			return writeLogRows(cmd.OutOrStdout(), rows)
 		},
 	}
+}
+
+func writeLogRows(w io.Writer, rows []store.EventRow) error {
+	for _, row := range rows {
+		timestamp := row.Timestamp.Local().Format("15:04:05.000")
+		agentLabel := "[" + shortID(row.AgentID) + "]"
+		if row.Type == string(event.TypeOutput) {
+			payload := strings.TrimRight(row.Payload, "\r\n")
+			if _, err := fmt.Fprintf(w, "%s %-14s %s\n", timestamp, agentLabel, payload); err != nil {
+				return fmt.Errorf("write output event: %w", err)
+			}
+			continue
+		}
+		if _, err := fmt.Fprintf(
+			w,
+			"%s %-14s %s: %s\n",
+			timestamp,
+			agentLabel,
+			row.Type,
+			row.Reason,
+		); err != nil {
+			return fmt.Errorf("write %s event: %w", row.Type, err)
+		}
+	}
+	return nil
 }
 
 func newStopCmd() *cobra.Command {

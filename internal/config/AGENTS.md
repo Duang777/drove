@@ -6,7 +6,8 @@
 
 ## 关键设计
 
-- `Config` 结构体是唯一配置模型；`Load(path)` 读取 TOML/JSON（MVP 用 JSON，经 `os.ReadFile` + `encoding/json`），缺失字段用默认值。
+- `Config` 结构体是唯一配置模型；`Load(path)` 读取 JSON，空路径解析为 `~/.drove/config.json`，缺失文件或字段使用默认值。
+- `LoadResolved(path)` 同时返回绝对配置路径，供 CLI 自动拉起 daemon 时精确透传。
 - `Defaults()` 提供安全默认值（数据目录、API 地址、事件缓冲大小）。
 - `Validate()` 在启动早期校验（如数据目录可写、端口合法），失败即返回错误，避免运行到一半才炸。
 

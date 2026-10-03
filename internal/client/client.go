@@ -101,8 +101,8 @@ func (c *Client) Replay(ctx context.Context, id string) ([]store.EventRow, error
 	return out, nil
 }
 
-// EnsureDaemon 确保 daemon 可达；不可达时尝试自动拉起，然后等待就绪。
-func (c *Client) EnsureDaemon(ctx context.Context) error {
+// EnsureDaemon 确保 daemon 可达；不可达时使用同一配置自动拉起，然后等待就绪。
+func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	err := c.Ping(probeCtx)
 	cancel()
@@ -124,7 +124,7 @@ func (c *Client) EnsureDaemon(ctx context.Context) error {
 	}
 	defer logFile.Close()
 
-	cmd := exec.Command(bin)
+	cmd := exec.Command(bin, daemonArgs(configPath)...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -146,6 +146,13 @@ func (c *Client) EnsureDaemon(ctx context.Context) error {
 }
 
 // -- internal --
+
+func daemonArgs(configPath string) []string {
+	if configPath == "" {
+		return nil
+	}
+	return []string{"--config", configPath}
+}
 
 func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)

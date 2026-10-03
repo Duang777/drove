@@ -5,9 +5,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/store"
 )
 
 func TestSessionStartRequestMapsRunMode(t *testing.T) {
@@ -165,5 +168,39 @@ func TestReadSendInput(t *testing.T) {
 				t.Fatalf("input = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestWriteLogRowsUsesLocalTimeAndOneOutputLine(t *testing.T) {
+	previousLocal := time.Local
+	time.Local = time.FixedZone("test-local", 8*60*60)
+	t.Cleanup(func() {
+		time.Local = previousLocal
+	})
+
+	rows := []store.EventRow{
+		{
+			Timestamp: time.Date(2026, time.October, 3, 1, 2, 3, 4_000_000, time.UTC),
+			Type:      string(event.TypeOutput),
+			AgentID:   "12345678-abcd",
+			Payload:   "first line\r\n",
+		},
+		{
+			Timestamp: time.Date(2026, time.October, 3, 1, 2, 4, 5_000_000, time.UTC),
+			Type:      string(event.TypeStateChanged),
+			AgentID:   "12345678-abcd",
+			Reason:    "ready",
+		},
+	}
+
+	var output bytes.Buffer
+	if err := writeLogRows(&output, rows); err != nil {
+		t.Fatalf("write log rows: %v", err)
+	}
+	want := "" +
+		"09:02:03.004 [12345678]     first line\n" +
+		"09:02:04.005 [12345678]     state_changed: ready\n"
+	if output.String() != want {
+		t.Fatalf("output = %q, want %q", output.String(), want)
 	}
 }

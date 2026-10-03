@@ -72,3 +72,11 @@ func TestSendInputReturnsServerError(t *testing.T) {
 		t.Fatalf("send input error = %v, want 409 context", err)
 	}
 }
+
+func TestDaemonArgsPreserveResolvedConfigPath(t *testing.T) {
+	path := "/tmp/drove profile/config.json"
+	args := daemonArgs(path)
+	if len(args) != 2 || args[0] != "--config" || args[1] != path {
+		t.Fatalf("daemon args = %#v, want exact config path", args)
+	}
+}

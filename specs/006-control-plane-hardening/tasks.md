@@ -2,19 +2,19 @@
 
 ## Commit 1: specification
 
-- [ ] Add the approved architecture, review checklist, and delivery plan.
-- [ ] Run `git diff --check`.
-- [ ] Commit and push as `docs: specify control-plane hardening`.
+- [x] Add the approved architecture, review checklist, and delivery plan.
+- [x] Run `git diff --check`.
+- [x] Commit and push as `docs: specify control-plane hardening`.
 
 ## Commit 2: config and log fixes
 
-- [ ] Add config tests for missing default, present default, explicit path, and
+- [x] Add config tests for missing default, present default, explicit path, and
   environment precedence.
-- [ ] Resolve and return the effective config path.
-- [ ] Pass that exact path to an auto-started daemon.
-- [ ] Add log formatting tests for local time and line endings.
-- [ ] Fix output formatting without changing stored UTC timestamps.
-- [ ] Run focused race tests, commit, push, and comment on #7 and #8.
+- [x] Resolve and return the effective config path.
+- [x] Pass that exact path to an auto-started daemon.
+- [x] Add log formatting tests for local time and line endings.
+- [x] Fix output formatting without changing stored UTC timestamps.
+- [x] Run focused race tests, commit, push, and comment on #7 and #8.
 
 ## Commit 3: ordered event commit
 

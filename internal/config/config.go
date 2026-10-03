@@ -29,6 +29,11 @@ func Defaults() *Config {
 	}
 }
 
+// DefaultPath 返回 drove init 与隐式加载共享的默认配置路径。
+func DefaultPath() string {
+	return filepath.Join(defaultDataDir(), "config.json")
+}
+
 // defaultDataDir 按平台返回默认数据目录（$HOME/.drove 或 /tmp 兜底）。
 func defaultDataDir() string {
 	home, err := os.UserHomeDir()
@@ -38,19 +43,31 @@ func defaultDataDir() string {
 	return filepath.Join(home, ".drove")
 }
 
-// Load 从 path 读取配置；文件不存在则返回默认配置。
-// 环境变量 DROVE_DATA_DIR 可覆盖 DataDir。
+// Load 从 path 读取配置。空路径使用 DefaultPath，文件不存在则返回默认配置。
 func Load(path string) (*Config, error) {
+	cfg, _, err := LoadResolved(path)
+	return cfg, err
+}
+
+// LoadResolved 加载配置并返回传给 daemon 的绝对配置路径。
+// 环境变量 DROVE_DATA_DIR 可覆盖 DataDir。
+func LoadResolved(path string) (*Config, string, error) {
+	if path == "" {
+		path = DefaultPath()
+	}
+	resolvedPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("config: resolve %q: %w", path, err)
+	}
+
 	cfg := Defaults()
-	if path != "" {
-		raw, err := os.ReadFile(path)
-		if err != nil && !os.IsNotExist(err) {
-			return nil, fmt.Errorf("config: read %q: %w", path, err)
-		}
-		if err == nil {
-			if err := json.Unmarshal(raw, cfg); err != nil {
-				return nil, fmt.Errorf("config: parse %q: %w", path, err)
-			}
+	raw, err := os.ReadFile(resolvedPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, "", fmt.Errorf("config: read %q: %w", resolvedPath, err)
+	}
+	if err == nil {
+		if err := json.Unmarshal(raw, cfg); err != nil {
+			return nil, "", fmt.Errorf("config: parse %q: %w", resolvedPath, err)
 		}
 	}
 	if dir := os.Getenv("DROVE_DATA_DIR"); dir != "" {
@@ -59,7 +76,7 @@ func Load(path string) (*Config, error) {
 	if cfg.DBPath == "" {
 		cfg.DBPath = filepath.Join(cfg.DataDir, "drove.db")
 	}
-	return cfg, nil
+	return cfg, resolvedPath, nil
 }
 
 // Validate 检查配置的合法性，返回首个错误。
