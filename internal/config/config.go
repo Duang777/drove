@@ -4,8 +4,12 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 )
 
 // Config 是 Drove 的运行时配置。
@@ -16,6 +20,8 @@ type Config struct {
 	APIBind string `json:"api_bind"`
 	// EventBuffer 是每个事件订阅者的缓冲行数。
 	EventBuffer int `json:"event_buffer"`
+	// ConsoleOrigins 是允许建立 WebSocket 的本地控制台 Origin。
+	ConsoleOrigins []string `json:"console_origins"`
 	// DBPath 是 SQLite 文件路径（由 DataDir 派生，可不配置）。
 	DBPath string `json:"db_path,omitempty"`
 }
@@ -26,6 +32,10 @@ func Defaults() *Config {
 		DataDir:     defaultDataDir(),
 		APIBind:     "127.0.0.1:7373",
 		EventBuffer: 1024,
+		ConsoleOrigins: []string{
+			"http://localhost:5173",
+			"http://127.0.0.1:5173",
+		},
 	}
 }
 
@@ -90,8 +100,59 @@ func (c *Config) Validate() error {
 	if c.APIBind == "" {
 		return fmt.Errorf("config: api_bind must not be empty")
 	}
+	host, port, err := net.SplitHostPort(c.APIBind)
+	if err != nil {
+		return fmt.Errorf("config: api_bind %q: %w", c.APIBind, err)
+	}
+	if !isLoopbackHost(host) {
+		return fmt.Errorf("config: api_bind host %q must be loopback", host)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("config: api_bind port %q must be between 1 and 65535", port)
+	}
 	if c.EventBuffer <= 0 {
 		return fmt.Errorf("config: event_buffer must be positive")
 	}
+	if len(c.ConsoleOrigins) == 0 {
+		return fmt.Errorf("config: console_origins must not be empty")
+	}
+	seenOrigins := make(map[string]struct{}, len(c.ConsoleOrigins))
+	for _, origin := range c.ConsoleOrigins {
+		if err := validateConsoleOrigin(origin); err != nil {
+			return err
+		}
+		if _, exists := seenOrigins[origin]; exists {
+			return fmt.Errorf("config: duplicate console origin %q", origin)
+		}
+		seenOrigins[origin] = struct{}{}
+	}
 	return nil
+}
+
+func validateConsoleOrigin(origin string) error {
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return fmt.Errorf("config: console origin %q: %w", origin, err)
+	}
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.Path != "" ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return fmt.Errorf("config: console origin %q must be an HTTP origin", origin)
+	}
+	if !isLoopbackHost(parsed.Hostname()) {
+		return fmt.Errorf("config: console origin host %q must be loopback", parsed.Hostname())
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

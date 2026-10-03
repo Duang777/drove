@@ -19,7 +19,7 @@
 
 - **实时与回放双轨**：WebSocket 承载实时事件；回放走 REST（`/api/v1/agents/{id}/events`），两者展示在同一个 EventLog。
 - **本地投影仅是视图**：前端从事件流推导的状态只是展示用，权威状态永远以 daemon 为准（刷新列表纠正）。
-- **Dev 代理**：`vite.config.ts` 将 `/api`、`/ws` 代理到 `127.0.0.1:7373`（可用 `DROVE_DAEMON` 覆盖），避免 CORS。
+- **Dev 代理**：`vite.config.ts` 将 `/api`、`/ws` 代理到 loopback daemon，并在每次 HTTP 请求与 WebSocket upgrade 时从 DataDir 读取控制令牌注入 Bearer 认证。
 
 ## 约束
 

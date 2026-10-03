@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
@@ -69,7 +70,7 @@ func newClient(ctx context.Context) (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := client.New(cfg.APIBind)
+	c := client.New(cfg.APIBind, client.WithTokenFile(auth.TokenPath(cfg.DataDir)))
 	if err := c.EnsureDaemon(ctx, configPath); err != nil {
 		return nil, err
 	}

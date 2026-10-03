@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -88,5 +89,73 @@ func TestLoadResolvedHonorsExplicitPathAndEnvironment(t *testing.T) {
 	}
 	if cfg.DBPath != filepath.Join(overrideDir, "drove.db") {
 		t.Fatalf("DB path = %q, want derived environment path", cfg.DBPath)
+	}
+}
+
+func TestDefaultsUseLoopbackBindAndLocalConsoleOrigins(t *testing.T) {
+	cfg := Defaults()
+	cfg.DataDir = t.TempDir()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate defaults: %v", err)
+	}
+	if len(cfg.ConsoleOrigins) != 2 ||
+		cfg.ConsoleOrigins[0] != "http://localhost:5173" ||
+		cfg.ConsoleOrigins[1] != "http://127.0.0.1:5173" {
+		t.Fatalf("console origins = %#v", cfg.ConsoleOrigins)
+	}
+}
+
+func TestValidateRejectsUnsafeAPIBind(t *testing.T) {
+	tests := []string{
+		"0.0.0.0:7373",
+		"[::]:7373",
+		":7373",
+		"192.0.2.10:7373",
+		"localhost",
+		"127.0.0.1:0",
+		"127.0.0.1:not-a-port",
+	}
+	for _, bind := range tests {
+		t.Run(bind, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.DataDir = t.TempDir()
+			cfg.APIBind = bind
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), "api_bind") {
+				t.Fatalf("validate %q error = %v, want api_bind error", bind, err)
+			}
+		})
+	}
+}
+
+func TestValidateConsoleOrigins(t *testing.T) {
+	tests := []struct {
+		name    string
+		origins []string
+		wantErr bool
+	}{
+		{name: "loopback IPv4", origins: []string{"http://127.0.0.1:4173"}},
+		{name: "loopback IPv6", origins: []string{"https://[::1]:4173"}},
+		{name: "localhost", origins: []string{"http://localhost"}},
+		{name: "empty", origins: nil, wantErr: true},
+		{name: "remote host", origins: []string{"https://example.com"}, wantErr: true},
+		{name: "path", origins: []string{"http://localhost:5173/"}, wantErr: true},
+		{name: "credentials", origins: []string{"http://user@localhost:5173"}, wantErr: true},
+		{name: "duplicate", origins: []string{"http://localhost:5173", "http://localhost:5173"}, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.DataDir = t.TempDir()
+			cfg.ConsoleOrigins = test.origins
+			err := cfg.Validate()
+			if test.wantErr && err == nil {
+				t.Fatal("validate succeeded, want error")
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+		})
 	}
 }

@@ -29,14 +29,14 @@
 
 ## Commit 4: local authentication
 
-- [ ] Add `internal/auth` and its package rules.
-- [ ] Generate and atomically persist a stable 256-bit token with mode `0600`.
-- [ ] Reject non-loopback API binds.
-- [ ] Require bearer auth for REST and WebSocket.
-- [ ] Enforce exact local WebSocket Origin policy.
-- [ ] Teach the Go client and CLI to read and send the token.
-- [ ] Inject the token in the Vite development proxy.
-- [ ] Run security-focused tests and Web build, commit, push, and comment on #9.
+- [x] Add `internal/auth` and its package rules.
+- [x] Generate and atomically persist a stable 256-bit token with mode `0600`.
+- [x] Reject non-loopback API binds.
+- [x] Require bearer auth for REST and WebSocket.
+- [x] Enforce exact local WebSocket Origin policy.
+- [x] Teach the Go client and CLI to read and send the token.
+- [x] Inject the token in the Vite development proxy.
+- [x] Run security-focused tests and Web build, commit, push, and comment on #9.
 
 ## Commit 5: WebSocket input
 

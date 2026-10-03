@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 )
@@ -31,19 +32,30 @@ type ServerOptions struct {
 	Hub *event.Hub
 	// EventBuffer 是每个 WS 订阅的缓冲行数。
 	EventBuffer int
+	// ControlToken 认证 REST 与 WebSocket 控制面请求。
+	ControlToken string
+	// AllowedOrigins 是 WebSocket 可接受的精确 Origin。
+	AllowedOrigins []string
 }
 
 // Server 是 HTTP/WS 服务。
 type Server struct {
-	opts ServerOptions
-	http *http.Server
-	mux  *http.ServeMux
+	opts           ServerOptions
+	http           *http.Server
+	mux            http.Handler
+	allowedOrigins map[string]struct{}
 }
 
 // NewServer 创建 Server（路由已注册）。
 func NewServer(opts ServerOptions) *Server {
-	s := &Server{opts: opts, mux: http.NewServeMux()}
-	s.routes()
+	allowedOrigins := make(map[string]struct{}, len(opts.AllowedOrigins))
+	for _, origin := range opts.AllowedOrigins {
+		allowedOrigins[origin] = struct{}{}
+	}
+	s := &Server{opts: opts, allowedOrigins: allowedOrigins}
+	mux := http.NewServeMux()
+	s.routes(mux)
+	s.mux = s.authenticate(mux)
 	s.http = &http.Server{
 		Handler:           s.mux,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -51,8 +63,7 @@ func NewServer(opts ServerOptions) *Server {
 	return s
 }
 
-func (s *Server) routes() {
-	mux := s.mux
+func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents", s.handleList)
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
@@ -60,6 +71,18 @@ func (s *Server) routes() {
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
 	mux.HandleFunc("GET /ws", s.handleWS)
+}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		values := r.Header.Values("Authorization")
+		if len(values) != 1 || !auth.Verify(s.opts.ControlToken, values[0]) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Serve 开始监听并服务。
@@ -191,7 +214,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	up := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 4096,
-		CheckOrigin:     func(*http.Request) bool { return true },
+		CheckOrigin:     s.checkWebSocketOrigin,
 	}
 	conn, err := up.Upgrade(w, r, nil)
 	if err != nil {
@@ -207,8 +230,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	sub := s.opts.Hub.Subscribe(buf)
 	defer s.opts.Hub.Unsubscribe(sub)
 
-	// 心跳：读侧持续读（丢弃消息），防止连接悬挂。
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
@@ -219,16 +243,36 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
 
-	for ev := range sub.C() {
-		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		payload, err := json.Marshal(ev)
-		if err != nil {
-			continue
-		}
-		if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+	for {
+		select {
+		case <-readDone:
 			return
+		case ev, ok := <-sub.C():
+			if !ok {
+				return
+			}
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			payload, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				return
+			}
 		}
 	}
+}
+
+func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return true
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	_, allowed := s.allowedOrigins[origins[0]]
+	return allowed
 }
 
 // -- helpers --

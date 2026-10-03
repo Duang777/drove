@@ -14,6 +14,7 @@
   - `POST /api/v1/agents/{id}/input`：向已连接 PTY 写入一段受限 UTF-8 文本
   - `GET  /api/v1/agents/{id}/events`：回放事件流（REST，JSON 数组）
   - `GET  /ws`：WebSocket 实时事件流（每订阅一个连接）
+- 所有 REST 与 WebSocket 请求必须先通过本地 Bearer 令牌认证；WebSocket 还要求 Origin 缺失或与配置的本地 Origin 精确匹配。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。
 - WebSocket 发送带 write deadline + ping/pong 保活，防止死连接。

@@ -15,6 +15,7 @@ import (
 
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/api"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -37,6 +38,10 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 
 	if err := d.cfg.Validate(); err != nil {
 		return fmt.Errorf("daemon: config: %w", err)
+	}
+	controlToken, err := auth.Ensure(d.cfg.DataDir)
+	if err != nil {
+		return fmt.Errorf("daemon: control token: %w", err)
 	}
 
 	// 1. 存储。
@@ -70,10 +75,12 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 
 	// 3. API server。
 	srv := api.NewServer(api.ServerOptions{
-		Bind:        d.cfg.APIBind,
-		Manager:     mgr,
-		Hub:         hub,
-		EventBuffer: d.cfg.EventBuffer,
+		Bind:           d.cfg.APIBind,
+		Manager:        mgr,
+		Hub:            hub,
+		EventBuffer:    d.cfg.EventBuffer,
+		ControlToken:   controlToken,
+		AllowedOrigins: d.cfg.ConsoleOrigins,
 	})
 
 	ln, err := net.Listen("tcp", d.cfg.APIBind)

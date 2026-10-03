@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
@@ -49,10 +50,11 @@ func TestRunBootstrapsBeforeOpeningListener(t *testing.T) {
 	defer occupied.Close()
 
 	err = New(&config.Config{
-		DataDir:     dataDir,
-		DBPath:      dbPath,
-		APIBind:     occupied.Addr().String(),
-		EventBuffer: 1,
+		DataDir:        dataDir,
+		DBPath:         dbPath,
+		APIBind:        occupied.Addr().String(),
+		EventBuffer:    1,
+		ConsoleOrigins: []string{"http://localhost:5173"},
 	}).Run(context.Background())
 	if err == nil {
 		t.Fatal("daemon run succeeded with corrupt recovery history")
@@ -172,18 +174,23 @@ func TestRunStopsLiveSessionBeforeClosingStore(t *testing.T) {
 	addr := reserveAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	controlToken, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
 
 	runResult := make(chan error, 1)
 	go func() {
 		runResult <- New(&config.Config{
-			DataDir:     dataDir,
-			DBPath:      dbPath,
-			APIBind:     addr,
-			EventBuffer: 16,
+			DataDir:        dataDir,
+			DBPath:         dbPath,
+			APIBind:        addr,
+			EventBuffer:    16,
+			ConsoleOrigins: []string{"http://localhost:5173"},
 		}).Run(ctx)
 	}()
 
-	started := startAgentThroughAPI(t, addr)
+	started := startAgentThroughAPI(t, addr, controlToken)
 	childNeedsCleanup := true
 	t.Cleanup(func() {
 		if childNeedsCleanup {
@@ -263,17 +270,22 @@ func TestRunStopsAfterRuntimeEventCommitFailure(t *testing.T) {
 	addr := reserveAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	controlToken, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
 
 	runResult := make(chan error, 1)
 	go func() {
 		runResult <- New(&config.Config{
-			DataDir:     dataDir,
-			DBPath:      dbPath,
-			APIBind:     addr,
-			EventBuffer: 16,
+			DataDir:        dataDir,
+			DBPath:         dbPath,
+			APIBind:        addr,
+			EventBuffer:    16,
+			ConsoleOrigins: []string{"http://localhost:5173"},
 		}).Run(ctx)
 	}()
-	waitForAPI(t, addr)
+	waitForAPI(t, addr, controlToken)
 
 	db, err := sql.Open("sqlite", "file:"+dbPath)
 	if err != nil {
@@ -287,11 +299,17 @@ func TestRunStopsAfterRuntimeEventCommitFailure(t *testing.T) {
 		t.Fatalf("close raw database: %v", err)
 	}
 
-	response, err := http.Post(
+	request, err := http.NewRequest(
+		http.MethodPost,
 		"http://"+addr+"/api/v1/agents",
-		"application/json",
 		strings.NewReader(`{"vendor":"generic","command":"/bin/cat"}`),
 	)
+	if err != nil {
+		t.Fatalf("build start request: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer "+controlToken)
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		t.Fatalf("start request after storage failure: %v", err)
 	}
@@ -326,16 +344,23 @@ func reserveAddress(t *testing.T) string {
 	return addr
 }
 
-func waitForAPI(t *testing.T, addr string) {
+func waitForAPI(t *testing.T, addr, controlToken string) {
 	t.Helper()
 
 	client := &http.Client{Timeout: 250 * time.Millisecond}
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		response, err := client.Get("http://" + addr + "/api/v1/agents")
+		request, err := http.NewRequest(http.MethodGet, "http://"+addr+"/api/v1/agents", nil)
+		if err != nil {
+			t.Fatalf("build readiness request: %v", err)
+		}
+		request.Header.Set("Authorization", "Bearer "+controlToken)
+		response, err := client.Do(request)
 		if err == nil {
 			_ = response.Body.Close()
-			return
+			if response.StatusCode == http.StatusOK {
+				return
+			}
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("daemon API did not become ready: %v", err)
@@ -344,17 +369,23 @@ func waitForAPI(t *testing.T, addr string) {
 	}
 }
 
-func startAgentThroughAPI(t *testing.T, addr string) *session.Status {
+func startAgentThroughAPI(t *testing.T, addr, controlToken string) *session.Status {
 	t.Helper()
 
 	client := &http.Client{Timeout: 250 * time.Millisecond}
 	deadline := time.Now().Add(3 * time.Second)
 	for {
-		response, err := client.Post(
+		request, err := http.NewRequest(
+			http.MethodPost,
 			"http://"+addr+"/api/v1/agents",
-			"application/json",
 			strings.NewReader(`{"vendor":"generic","name":"shutdown-agent","command":"/bin/cat"}`),
 		)
+		if err != nil {
+			t.Fatalf("build create request: %v", err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+controlToken)
+		response, err := client.Do(request)
 		if err == nil {
 			var status session.Status
 			decodeErr := json.NewDecoder(response.Body).Decode(&status)
