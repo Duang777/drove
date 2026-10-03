@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -93,6 +94,64 @@ func TestDaemonArgsPreserveResolvedConfigPath(t *testing.T) {
 	args := daemonArgs(path)
 	if len(args) != 2 || args[0] != "--config" || args[1] != path {
 		t.Fatalf("daemon args = %#v, want exact config path", args)
+	}
+}
+
+func TestDaemonLogUsesPrivateConfiguredDataDirectory(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	client := New(
+		"127.0.0.1:7373",
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	logPath := client.daemonLogPath()
+	if want := filepath.Join(dataDir, "drove.log"); logPath != want {
+		t.Fatalf("daemon log path = %q, want %q", logPath, want)
+	}
+	file, err := openDaemonLog(logPath)
+	if err != nil {
+		t.Fatalf("open daemon log: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close daemon log: %v", err)
+	}
+
+	dirInfo, err := os.Lstat(dataDir)
+	if err != nil {
+		t.Fatalf("inspect daemon log directory: %v", err)
+	}
+	if dirInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("daemon log directory mode = %04o, want 0700", dirInfo.Mode().Perm())
+	}
+	fileInfo, err := os.Lstat(logPath)
+	if err != nil {
+		t.Fatalf("inspect daemon log: %v", err)
+	}
+	if fileInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("daemon log mode = %04o, want 0600", fileInfo.Mode().Perm())
+	}
+}
+
+func TestDaemonLogDoesNotChangeExistingDirectoryMode(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDir, 0o755); err != nil {
+		t.Fatalf("create existing data directory: %v", err)
+	}
+	if err := os.Chmod(dataDir, 0o755); err != nil {
+		t.Fatalf("set existing data directory mode: %v", err)
+	}
+	file, err := openDaemonLog(filepath.Join(dataDir, "drove.log"))
+	if err != nil {
+		t.Fatalf("open daemon log: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close daemon log: %v", err)
+	}
+	info, err := os.Lstat(dataDir)
+	if err != nil {
+		t.Fatalf("inspect existing data directory: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("existing data directory mode = %04o, want unchanged 0755", info.Mode().Perm())
 	}
 }
 

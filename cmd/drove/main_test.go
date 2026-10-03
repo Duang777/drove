@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -75,6 +78,38 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 				t.Fatalf("request = %+v", req)
 			}
 		})
+	}
+}
+
+func TestInitCreatesPrivateDataDirectoryWithRetentionDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cmd := newInitCmd()
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("run init: %v", err)
+	}
+
+	dataDir := filepath.Join(home, ".drove")
+	info, err := os.Lstat(dataDir)
+	if err != nil {
+		t.Fatalf("inspect data directory: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("data directory mode = %04o, want 0700", info.Mode().Perm())
+	}
+	raw, err := os.ReadFile(filepath.Join(dataDir, "config.json"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var cfg config.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if cfg.Storage.OutputRetentionDays != 30 {
+		t.Fatalf(
+			"output retention = %d, want 30",
+			cfg.Storage.OutputRetentionDays,
+		)
 	}
 }
 

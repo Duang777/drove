@@ -144,10 +144,8 @@ func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 	if findErr != nil {
 		return fmt.Errorf("%w: %v", ErrDaemonUnreachable, findErr)
 	}
-	home, _ := os.UserHomeDir()
-	logPath := filepath.Join(home, ".drove", "drove.log")
-	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logPath := c.daemonLogPath()
+	logFile, err := openDaemonLog(logPath)
 	if err != nil {
 		return fmt.Errorf("%w: open log: %v", ErrDaemonUnreachable, err)
 	}
@@ -176,6 +174,25 @@ func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 		time.Sleep(200 * time.Millisecond)
 	}
 	return fmt.Errorf("%w: daemon did not become ready (see %s)", ErrDaemonUnreachable, logPath)
+}
+
+func (c *Client) daemonLogPath() string {
+	if c.tokenPath != "" {
+		return filepath.Join(filepath.Dir(c.tokenPath), "drove.log")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".drove", "drove.log")
+}
+
+func openDaemonLog(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create daemon log directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
 }
 
 // -- internal --

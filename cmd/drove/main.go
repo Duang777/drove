@@ -87,7 +87,7 @@ func newInitCmd() *cobra.Command {
 			cfg := config.Defaults()
 			path := config.DefaultPath()
 			dir := filepath.Dir(path)
-			if err := os.MkdirAll(dir, 0o755); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				return err
 			}
 			raw, _ := json.MarshalIndent(cfg, "", "  ")

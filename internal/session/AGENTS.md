@@ -16,6 +16,8 @@
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
   `<data_dir>/sessions/<agent-id>/` 原子写入私有文件；退出回调完成后清理。
+- 缺失的 signal injection 根目录和会话目录使用 `0700`；既有根目录只校验类型，
+  不自动修改其模式。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。
 - PTY 回调在启动前注册；signal 与输出/退出使用独立 readiness gate，使启动期 hook
   可等待 `starting -> working`，同时防止短进程先提交错误终态。

@@ -7,7 +7,8 @@
 ## 关键设计
 
 - 命令树用 `spf13/cobra`；`root` 只挂子命令，不做业务。
-- `drove init` 生成默认配置到 `~/.drove/config.json`。
+- `drove init` 以 `0700` 创建缺失的数据目录，并把含 30 天输出保留期的默认配置写到
+  `~/.drove/config.json`。
 - `drove up <vendor|command>` 启动一个 agent：默认 `interactive`，`--oneshot`
   切换为单次执行，`--hooks` 选择 `off|auto|required`；未知厂商名仍视为
   generic 命令。

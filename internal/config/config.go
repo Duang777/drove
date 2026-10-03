@@ -27,6 +27,12 @@ type AgentConfig struct {
 	SignalInjection SignalInjection `json:"signal_injection,omitempty"`
 }
 
+// StorageConfig controls retention for non-projection attachment data.
+type StorageConfig struct {
+	// OutputRetentionDays is the number of days to retain raw output. Zero keeps it.
+	OutputRetentionDays int `json:"output_retention_days"`
+}
+
 // Config 是 Drove 的运行时配置。
 type Config struct {
 	// DataDir 存放 SQLite 事件日志与工作区数据。
@@ -41,6 +47,8 @@ type Config struct {
 	DBPath string `json:"db_path,omitempty"`
 	// Agents contains vendor-keyed launch behavior without vendor semantics.
 	Agents map[string]AgentConfig `json:"agents,omitempty"`
+	// Storage controls retention for raw attachment data.
+	Storage StorageConfig `json:"storage"`
 }
 
 // Defaults 返回安全默认配置。
@@ -52,6 +60,9 @@ func Defaults() *Config {
 		ConsoleOrigins: []string{
 			"http://localhost:5173",
 			"http://127.0.0.1:5173",
+		},
+		Storage: StorageConfig{
+			OutputRetentionDays: 30,
 		},
 	}
 }
@@ -111,7 +122,7 @@ func (c *Config) Validate() error {
 	if c.DataDir == "" {
 		return fmt.Errorf("config: data_dir must not be empty")
 	}
-	if err := os.MkdirAll(c.DataDir, 0o755); err != nil {
+	if err := os.MkdirAll(c.DataDir, 0o700); err != nil {
 		return fmt.Errorf("config: create data_dir: %w", err)
 	}
 	if c.APIBind == "" {
@@ -130,6 +141,9 @@ func (c *Config) Validate() error {
 	}
 	if c.EventBuffer <= 0 {
 		return fmt.Errorf("config: event_buffer must be positive")
+	}
+	if c.Storage.OutputRetentionDays < 0 {
+		return fmt.Errorf("config: storage.output_retention_days must not be negative")
 	}
 	if len(c.ConsoleOrigins) == 0 {
 		return fmt.Errorf("config: console_origins must not be empty")

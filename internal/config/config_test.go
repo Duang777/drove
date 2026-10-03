@@ -61,6 +61,12 @@ func TestLoadResolvedAllowsMissingDefaultConfig(t *testing.T) {
 	if cfg.APIBind != Defaults().APIBind {
 		t.Fatalf("API bind = %q, want default %q", cfg.APIBind, Defaults().APIBind)
 	}
+	if cfg.Storage.OutputRetentionDays != 30 {
+		t.Fatalf(
+			"output retention = %d, want 30",
+			cfg.Storage.OutputRetentionDays,
+		)
+	}
 }
 
 func TestLoadResolvedHonorsExplicitPathAndEnvironment(t *testing.T) {
@@ -219,5 +225,93 @@ func TestLoadResolvedParsesAgentSignalInjection(t *testing.T) {
 	if cfg.SignalInjectionFor("claude", true) != SignalInjectionOff ||
 		cfg.SignalInjectionFor("codex", true) != SignalInjectionAuto {
 		t.Fatalf("agent settings = %+v", cfg.Agents)
+	}
+}
+
+func TestLoadResolvedParsesOutputRetentionAndIgnoresFutureStorageFields(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DROVE_DATA_DIR", "")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"data_dir": "/tmp/drove",
+		"api_bind": "127.0.0.1:7373",
+		"event_buffer": 16,
+		"console_origins": ["http://localhost:5173"],
+		"storage": {
+			"output_retention_days": 0,
+			"future_policy": "ignored"
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, _, err := LoadResolved(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.Storage.OutputRetentionDays != 0 {
+		t.Fatalf("output retention = %d, want permanent", cfg.Storage.OutputRetentionDays)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate config: %v", err)
+	}
+}
+
+func TestValidateRejectsNegativeOutputRetention(t *testing.T) {
+	cfg := Defaults()
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
+	cfg.Storage.OutputRetentionDays = -1
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "output_retention_days") {
+		t.Fatalf("validate error = %v, want output retention error", err)
+	}
+}
+
+func TestValidateCreatesPrivateDataDirectoryWithoutChangingExistingMode(t *testing.T) {
+	parent := t.TempDir()
+	newPath := filepath.Join(parent, "new-data")
+	cfg := Defaults()
+	cfg.DataDir = newPath
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate new data directory: %v", err)
+	}
+	info, err := os.Lstat(newPath)
+	if err != nil {
+		t.Fatalf("inspect new data directory: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("new data directory mode = %04o, want 0700", info.Mode().Perm())
+	}
+
+	existingPath := filepath.Join(parent, "existing-data")
+	if err := os.Mkdir(existingPath, 0o755); err != nil {
+		t.Fatalf("create existing data directory: %v", err)
+	}
+	if err := os.Chmod(existingPath, 0o755); err != nil {
+		t.Fatalf("set existing data directory mode: %v", err)
+	}
+	cfg.DataDir = existingPath
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate existing data directory: %v", err)
+	}
+	info, err = os.Lstat(existingPath)
+	if err != nil {
+		t.Fatalf("inspect existing data directory: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("existing data directory mode = %04o, want unchanged 0755", info.Mode().Perm())
+	}
+}
+
+func TestValidateRejectsDataDirectoryFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data")
+	if err := os.WriteFile(path, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("write data path: %v", err)
+	}
+	cfg := Defaults()
+	cfg.DataDir = path
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("validate accepted a data directory file")
 	}
 }

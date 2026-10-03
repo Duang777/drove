@@ -9,7 +9,7 @@ import (
 )
 
 func TestEnsureCreatesStablePrivateToken(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := filepath.Join(t.TempDir(), "data")
 
 	first, err := Ensure(dataDir)
 	if err != nil {
@@ -32,6 +32,13 @@ func TestEnsureCreatesStablePrivateToken(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("token mode = %04o, want 0600", info.Mode().Perm())
+	}
+	info, err = os.Lstat(dataDir)
+	if err != nil {
+		t.Fatalf("stat data directory: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("data directory mode = %04o, want 0700", info.Mode().Perm())
 	}
 }
 

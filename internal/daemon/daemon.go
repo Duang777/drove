@@ -25,7 +25,10 @@ import (
 
 // Daemon 是常驻服务。
 type Daemon struct {
-	cfg *config.Config
+	cfg            *config.Config
+	now            func() time.Time
+	retentionTicks <-chan time.Time
+	pruneOutput    outputRetentionPruner
 }
 
 // New 创建 Daemon。
@@ -39,6 +42,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 
 	if err := d.cfg.Validate(); err != nil {
 		return fmt.Errorf("daemon: config: %w", err)
+	}
+	if err := inspectStoragePaths(log, d.cfg.DataDir, d.cfg.DBPath); err != nil {
+		return fmt.Errorf("daemon: storage: %w", err)
 	}
 	controlToken, err := auth.Ensure(d.cfg.DataDir)
 	if err != nil {
@@ -55,6 +61,12 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 			runErr = errors.Join(runErr, fmt.Errorf("daemon: close store: %w", closeErr))
 		}
 	}()
+
+	deleted, err := d.pruneRetainedOutput(ctx, st, d.retentionNow())
+	if err != nil {
+		return fmt.Errorf("daemon: startup output retention: %w", err)
+	}
+	log.Info("startup output retention completed", "deleted", deleted)
 
 	// 2. 在 API 对外可见前恢复会话投影。
 	recovered, err := bootstrapSessions(ctx, st, signalInjectionOption(d.cfg))
@@ -115,6 +127,8 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		)
 	}
 
+	stopRetention, retentionDone := d.startRetentionLoop(st, log)
+
 	// 4. 启动 + 优雅关闭。
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -135,6 +149,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	case err := <-mgr.Fatal():
 		runErr = fmt.Errorf("daemon: session event commit: %w", err)
 	}
+
+	stopRetention()
+	<-retentionDone
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

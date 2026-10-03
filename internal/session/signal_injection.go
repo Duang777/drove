@@ -198,9 +198,6 @@ func (m *Manager) materializeSignalInjection(
 	} else {
 		return fmt.Errorf("session: inspect signal injection root: %w", err)
 	}
-	if err := m.injectionFS.chmod(root, 0o700); err != nil {
-		return fmt.Errorf("session: secure signal injection root: %w", err)
-	}
 	if info, err := m.injectionFS.lstat(sessionDir); err == nil {
 		return fmt.Errorf(
 			"session: signal injection directory already exists with mode %s",

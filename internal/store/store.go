@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/Duang777/drove/internal/event"
@@ -37,6 +38,9 @@ const schemaVersion = 2
 
 // Open 打开（或创建）位于 path 的数据库，并执行迁移。
 func Open(path string) (*Store, error) {
+	if err := prepareDatabaseFile(path); err != nil {
+		return nil, err
+	}
 	dsn := fmt.Sprintf(
 		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
 		path,
@@ -54,11 +58,40 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.enableSecureDelete(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func prepareDatabaseFile(path string) error {
+	info, err := os.Lstat(path)
+	switch {
+	case err == nil:
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("store: database %q must be a regular file", path)
+		}
+		return nil
+	case !errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("store: inspect database %q: %w", path, err)
+	}
+
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return prepareDatabaseFile(path)
+	}
+	if err != nil {
+		return fmt.Errorf("store: create database %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("store: close new database %q: %w", path, err)
+	}
+	return nil
 }
 
 func (s *Store) enableForeignKeys() error {
@@ -71,6 +104,20 @@ func (s *Store) enableForeignKeys() error {
 	}
 	if enabled != 1 {
 		return errors.New("store: foreign keys remain disabled")
+	}
+	return nil
+}
+
+func (s *Store) enableSecureDelete() error {
+	if _, err := s.db.Exec(`PRAGMA secure_delete = ON`); err != nil {
+		return fmt.Errorf("store: enable secure delete: %w", err)
+	}
+	var enabled int
+	if err := s.db.QueryRow(`PRAGMA secure_delete`).Scan(&enabled); err != nil {
+		return fmt.Errorf("store: verify secure delete: %w", err)
+	}
+	if enabled != 1 {
+		return errors.New("store: secure delete remains disabled")
 	}
 	return nil
 }
@@ -319,6 +366,48 @@ func (s *Store) LastSeq() (uint64, error) {
 		return 0, fmt.Errorf("store: last seq: %w", err)
 	}
 	return uint64(v.Int64), nil
+}
+
+// PruneOutputAttachments removes retained output bodies older than cutoff.
+// Event envelopes and their global sequences remain unchanged.
+func (s *Store) PruneOutputAttachments(
+	ctx context.Context,
+	cutoff time.Time,
+) (int64, error) {
+	result, err := s.db.ExecContext(
+		ctx,
+		`DELETE FROM output_chunks
+		 WHERE event_seq IN (
+			SELECT o.event_seq
+			FROM output_chunks AS o
+			JOIN events AS e ON e.seq = o.event_seq
+			WHERE e.type = ? AND julianday(e.ts) < julianday(?)
+		 )`,
+		string(event.TypeOutputChunk),
+		cutoff.UTC().Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("store: prune output attachments: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: count pruned output attachments: %w", err)
+	}
+
+	var busy, logFrames, checkpointedFrames int
+	if err := s.db.QueryRowContext(
+		ctx,
+		`PRAGMA wal_checkpoint(TRUNCATE)`,
+	).Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return deleted, fmt.Errorf("store: checkpoint output retention: %w", err)
+	}
+	if busy != 0 {
+		return deleted, fmt.Errorf(
+			"store: checkpoint output retention remained busy with %d WAL frames",
+			logFrames,
+		)
+	}
+	return deleted, nil
 }
 
 // Close 关闭数据库。

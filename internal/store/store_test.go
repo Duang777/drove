@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -90,6 +91,86 @@ func TestOpenEnablesForeignKeys(t *testing.T) {
 		[]byte("orphan"),
 	); err == nil {
 		t.Fatal("foreign key accepted an orphaned output attachment")
+	}
+}
+
+func TestOpenCreatesPrivateDatabaseAndPreservesExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	newPath := filepath.Join(dir, "new.db")
+	s, err := Open(newPath)
+	if err != nil {
+		t.Fatalf("open new database: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close new database: %v", err)
+	}
+	info, err := os.Lstat(newPath)
+	if err != nil {
+		t.Fatalf("inspect new database: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("new database mode = %04o, want 0600", info.Mode().Perm())
+	}
+
+	existingPath := filepath.Join(dir, "existing.db")
+	if err := os.WriteFile(existingPath, nil, 0o666); err != nil {
+		t.Fatalf("write existing database: %v", err)
+	}
+	if err := os.Chmod(existingPath, 0o666); err != nil {
+		t.Fatalf("set existing database mode: %v", err)
+	}
+	s, err = Open(existingPath)
+	if err != nil {
+		t.Fatalf("open existing database: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close existing database: %v", err)
+	}
+	info, err = os.Lstat(existingPath)
+	if err != nil {
+		t.Fatalf("inspect existing database: %v", err)
+	}
+	if info.Mode().Perm() != 0o666 {
+		t.Fatalf("existing database mode = %04o, want unchanged 0666", info.Mode().Perm())
+	}
+}
+
+func TestOpenRejectsNonRegularDatabasePaths(t *testing.T) {
+	dir := t.TempDir()
+	directoryPath := filepath.Join(dir, "database-directory")
+	if err := os.Mkdir(directoryPath, 0o700); err != nil {
+		t.Fatalf("create database directory: %v", err)
+	}
+	if _, err := Open(directoryPath); err == nil {
+		t.Fatal("open accepted a database directory")
+	}
+
+	target := filepath.Join(dir, "target.db")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	symlinkPath := filepath.Join(dir, "database-link")
+	if err := os.Symlink(target, symlinkPath); err != nil {
+		t.Fatalf("create database symlink: %v", err)
+	}
+	if _, err := Open(symlinkPath); err == nil {
+		t.Fatal("open accepted a database symlink")
+	}
+}
+
+func TestOpenEnablesSecureDelete(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	var enabled int
+	if err := s.db.QueryRow(`PRAGMA secure_delete`).Scan(&enabled); err != nil {
+		t.Fatalf("read secure_delete setting: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("secure_delete = %d, want 1", enabled)
 	}
 }
 
@@ -652,5 +733,180 @@ func TestPersistenceAcrossReopen(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Payload != "persisted" {
 		t.Fatalf("persistence broken: %+v", rows)
+	}
+}
+
+func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	cutoff := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	rows := []EventRow{
+		{
+			Seq:              1,
+			Timestamp:        cutoff.Add(-48 * time.Hour),
+			Type:             string(event.TypeOutputChunk),
+			SessionID:        "s1",
+			AgentID:          "s1",
+			Payload:          `{"version":1,"offset":0,"len":3}`,
+			OutputAttachment: []byte("old"),
+		},
+		{
+			Seq:              2,
+			Timestamp:        cutoff,
+			Type:             string(event.TypeOutputChunk),
+			SessionID:        "s1",
+			AgentID:          "s1",
+			Payload:          `{"version":1,"offset":3,"len":6}`,
+			OutputAttachment: []byte("cutoff"),
+		},
+		{
+			Seq:              3,
+			Timestamp:        cutoff.Add(time.Hour),
+			Type:             string(event.TypeOutputChunk),
+			SessionID:        "s1",
+			AgentID:          "s1",
+			Payload:          `{"version":1,"offset":9,"len":3}`,
+			OutputAttachment: []byte("new"),
+		},
+		{
+			Seq:       4,
+			Timestamp: cutoff.Add(-72 * time.Hour),
+			Type:      string(event.TypeOutput),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   "legacy",
+		},
+		{
+			Seq:       5,
+			Timestamp: cutoff.Add(-72 * time.Hour),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "s1",
+			AgentID:   "s1",
+			From:      "working",
+			To:        "blocked",
+		},
+		{
+			Seq:       6,
+			Timestamp: cutoff.Add(-72 * time.Hour),
+			Type:      string(event.TypeError),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   "kept error",
+		},
+		{
+			Seq:       7,
+			Timestamp: cutoff.Add(-72 * time.Hour),
+			Type:      string(event.TypeAgentInput),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1,"bytes":4}`,
+		},
+	}
+	if _, err := s.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("append fixture: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO output_chunks (event_seq, data) VALUES (?, ?)`,
+		4,
+		[]byte("non-output"),
+	); err != nil {
+		t.Fatalf("insert non-output attachment fixture: %v", err)
+	}
+
+	beforeLastSeq, err := s.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq before prune: %v", err)
+	}
+	deleted, err := s.PruneOutputAttachments(context.Background(), cutoff)
+	if err != nil {
+		t.Fatalf("prune output attachments: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted attachments = %d, want 1", deleted)
+	}
+	afterLastSeq, err := s.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq after prune: %v", err)
+	}
+	if afterLastSeq != beforeLastSeq || afterLastSeq != 7 {
+		t.Fatalf("last seq changed from %d to %d", beforeLastSeq, afterLastSeq)
+	}
+
+	replayed, err := s.Replay("s1")
+	if err != nil {
+		t.Fatalf("replay after prune: %v", err)
+	}
+	if len(replayed) != len(rows) {
+		t.Fatalf("event row count = %d, want %d", len(replayed), len(rows))
+	}
+	if replayed[0].OutputAttachment != nil {
+		t.Fatalf("expired attachment remains: %q", replayed[0].OutputAttachment)
+	}
+	if !bytes.Equal(replayed[1].OutputAttachment, []byte("cutoff")) ||
+		!bytes.Equal(replayed[2].OutputAttachment, []byte("new")) {
+		t.Fatalf("retained output changed: %+v", replayed[:3])
+	}
+	if !bytes.Equal(replayed[3].OutputAttachment, []byte("non-output")) {
+		t.Fatalf("non-output attachment was deleted: %q", replayed[3].OutputAttachment)
+	}
+	if replayed[3].Payload != "legacy" ||
+		replayed[4].Type != string(event.TypeStateChanged) ||
+		replayed[5].Payload != "kept error" ||
+		replayed[6].Type != string(event.TypeAgentInput) {
+		t.Fatalf("non-output history changed: %+v", replayed[3:])
+	}
+
+	scanned := 0
+	lastSeq, err := s.ScanEvents(context.Background(), func(EventRow) error {
+		scanned++
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan after prune: %v", err)
+	}
+	if scanned != len(rows) || lastSeq != 7 {
+		t.Fatalf("scan after prune = (%d rows, seq %d)", scanned, lastSeq)
+	}
+}
+
+func TestPruneOutputAttachmentsCheckpointsWALWhenNothingExpires(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	row := EventRow{
+		Seq:              1,
+		Timestamp:        time.Now().UTC(),
+		Type:             string(event.TypeOutputChunk),
+		SessionID:        "s1",
+		AgentID:          "s1",
+		Payload:          `{"version":1,"offset":0,"len":4}`,
+		OutputAttachment: []byte("kept"),
+	}
+	if _, err := s.AppendEvents(context.Background(), 0, []EventRow{row}); err != nil {
+		t.Fatalf("append output: %v", err)
+	}
+	deleted, err := s.PruneOutputAttachments(
+		context.Background(),
+		row.Timestamp.Add(-time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("zero-row prune: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("deleted attachments = %d, want 0", deleted)
+	}
+	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
+		t.Fatalf("WAL size after truncate checkpoint = %d, want 0", info.Size())
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspect WAL: %v", err)
 	}
 }

@@ -32,7 +32,7 @@ func Ensure(dataDir string) (string, error) {
 	if dataDir == "" {
 		return "", errors.New("auth: data directory must not be empty")
 	}
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return "", fmt.Errorf("auth: create data directory: %w", err)
 	}
 

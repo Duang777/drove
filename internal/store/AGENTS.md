@@ -11,8 +11,13 @@
   以 `seq` 为单调主键；`output_chunks(event_seq, data)` 保存可过期的原始输出附件。
 - `Store` 封装 `database/sql`，提供 `AppendEvent` / `Replay(sessionID)` / `Close`。
 - WAL 模式开启（`_pragma=journal_mode(WAL)`），daemon 长生命周期下并发读写安全。
+- 缺失的数据库文件在 SQLite 打开前以 `0600` 创建；既有数据库必须是普通文件，
+  且本包不自动修改它的权限。
+- Store 启用并验证 `foreign_keys` 与 `secure_delete`。
 - `output.chunk` envelope 与附件在同一事务中追加；`ScanEvents` 不加载附件，
   `Replay` 通过 left join 返回仍保留的附件。
+- `PruneOutputAttachments` 只删除截止时间前的 `output.chunk` 附件，保留所有 event
+  envelope，并在每次清理后执行 `wal_checkpoint(TRUNCATE)`。
 
 ## 约束
 

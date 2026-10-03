@@ -11,6 +11,11 @@
   一次性配置给 Manager → 启动 API server → 阻塞直到 ctx 取消或收到 SIGINT/SIGTERM。
 - 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
+- Store 打开后、投影恢复前执行一次严格的输出附件保留清理；首次失败中止启动。
+  启动成功后每 24 小时重试，计划清理失败只记录警告。
+- 保留循环在 Store 关闭前取消并等待退出；当前时间、tick 和 prune 操作可由聚焦测试注入。
+- 启动时用 `Lstat` 校验数据目录和数据库类型；既有路径开放 group/other 权限时记录
+  结构化警告，但不自动修改模式。
 - 启动时清理无法跨重启存活的 session 注入目录，并解析同目录或 PATH 中的
   `drove` relay，再通过 ManagerOption 注入；厂商参数仍由 adapter 决定。
 - 信号取消与 Serve 异常共用关闭路径；任一步失败都继续清理剩余资源，并汇总返回错误。

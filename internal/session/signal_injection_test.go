@@ -326,6 +326,44 @@ func TestCleanupStaleSignalInjectionsLeavesUnknownEntries(t *testing.T) {
 	}
 }
 
+func TestSignalInjectionKeepsExistingRootMode(t *testing.T) {
+	dataDir := t.TempDir()
+	root := filepath.Join(dataDir, signalInjectionDirectory)
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatalf("create signal injection root: %v", err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatalf("set signal injection root mode: %v", err)
+	}
+	manager := newInjectionTestManager(t, dataDir, "/bin/echo", nil)
+	sessionDir := filepath.Join(root, "550e8400-e29b-41d4-a716-446655440000")
+	if err := manager.materializeSignalInjection(
+		sessionDir,
+		[]adapter.SignalInjectionFile{{
+			Path:    claudeSettingsName,
+			Content: []byte("{}\n"),
+			Mode:    0o600,
+		}},
+	); err != nil {
+		t.Fatalf("materialize signal injection: %v", err)
+	}
+
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatalf("inspect signal injection root: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("existing root mode = %04o, want unchanged 0755", info.Mode().Perm())
+	}
+	info, err = os.Lstat(sessionDir)
+	if err != nil {
+		t.Fatalf("inspect session injection directory: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("new session directory mode = %04o, want 0700", info.Mode().Perm())
+	}
+}
+
 func TestSignalInjectionRejectsSymlinkRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	target := t.TempDir()
