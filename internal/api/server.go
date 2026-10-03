@@ -14,8 +14,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
@@ -138,7 +136,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-const maxInputRequestBytes = 6*session.MaxInputBytes + 128
+const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
 
 type inputRequest struct {
 	Data string `json:"data"`
@@ -207,72 +205,6 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
-}
-
-// handleWS 提供实时事件流。
-func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	up := websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 4096,
-		CheckOrigin:     s.checkWebSocketOrigin,
-	}
-	conn, err := up.Upgrade(w, r, nil)
-	if err != nil {
-		slog.Warn("ws upgrade failed", "err", err)
-		return
-	}
-	defer conn.Close()
-
-	buf := s.opts.EventBuffer
-	if buf <= 0 {
-		buf = 1024
-	}
-	sub := s.opts.Hub.Subscribe(buf)
-	defer s.opts.Hub.Unsubscribe(sub)
-
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}()
-
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello"}`))
-
-	for {
-		select {
-		case <-readDone:
-			return
-		case ev, ok := <-sub.C():
-			if !ok {
-				return
-			}
-			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			payload, err := json.Marshal(ev)
-			if err != nil {
-				continue
-			}
-			if err := conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
-	origins := r.Header.Values("Origin")
-	if len(origins) == 0 {
-		return true
-	}
-	if len(origins) != 1 {
-		return false
-	}
-	_, allowed := s.allowedOrigins[origins[0]]
-	return allowed
 }
 
 // -- helpers --

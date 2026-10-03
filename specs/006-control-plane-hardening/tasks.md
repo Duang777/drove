@@ -40,13 +40,13 @@
 
 ## Commit 5: WebSocket input
 
-- [ ] Define versioned input, ack, and error messages.
-- [ ] Refactor each connection to one reader and one writer.
-- [ ] Preserve the current outbound event envelope.
-- [ ] Validate request IDs, Agent IDs, UTF-8, and size.
-- [ ] Map session failures to stable protocol error codes.
-- [ ] Add race and end-to-end WebSocket tests.
-- [ ] Commit, push, and comment on #4.
+- [x] Define versioned input, ack, and error messages.
+- [x] Refactor each connection to one reader and one writer.
+- [x] Preserve the current outbound event envelope.
+- [x] Validate request IDs, Agent IDs, UTF-8, and size.
+- [x] Map session failures to stable protocol error codes.
+- [x] Add race and end-to-end WebSocket tests.
+- [x] Commit, push, and comment on #4.
 
 ## Commit 6: terminal sanitization
 
