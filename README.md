@@ -41,11 +41,13 @@ drove hook --vendor codex
 至少绑定会话开始、用户提交、工具活动、权限请求、Stop 和会话结束事件。Drove
 不修改 Claude Code 或 Codex 的配置，也不绕过 workspace 或 hook trust。
 
-`config.json` 的 `hook_policy` 支持以下值：
+每个会话的启动请求可通过 `hooks` 选择策略：
 
-- `auto`：默认值。收到合法 hook 后以 hook 为准，否则使用终端启发式。
+- `auto`：支持 hook 的厂商默认值。收到合法 hook 后以 hook 为准，否则使用终端启发式。
 - `off`：不注入 hook relay 环境，只使用终端启发式。
-- `required`：只使用 hook。启动后 2 秒内没有收到合法 hook 时停止该会话。
+- `required`：只使用 hook。启动后 5 秒内没有收到合法 hook 时停止该会话。
+
+不支持 hook 的适配器默认使用 `off`，且不能选择 `required`。
 
 厂商配置格式见
 [Claude Code hooks](https://code.claude.com/docs/en/hooks) 和

@@ -408,6 +408,22 @@ func TestRequiredActivationTimerFailsSession(t *testing.T) {
 			state.Snapshot().HookStatus(),
 		)
 	}
+	late := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, hookSignal(t, "late-required", KindSessionStarted, ScopeRoot)),
+	)
+	_, outcome, _ := late.Signal()
+	if outcome != OutcomeTerminal ||
+		state.Snapshot().HookStatus() != HookRequiredFailed {
+		t.Fatalf(
+			"late hook outcome = %s, hook status = %s",
+			outcome,
+			state.Snapshot().HookStatus(),
+		)
+	}
 }
 
 func TestApplyCommittedRejectsAStaleDecision(t *testing.T) {

@@ -103,30 +103,6 @@ func TestDefaultsUseLoopbackBindAndLocalConsoleOrigins(t *testing.T) {
 		cfg.ConsoleOrigins[1] != "http://127.0.0.1:5173" {
 		t.Fatalf("console origins = %#v", cfg.ConsoleOrigins)
 	}
-	if cfg.HookPolicy != "auto" {
-		t.Fatalf("hook policy = %q, want auto", cfg.HookPolicy)
-	}
-}
-
-func TestValidateHookPolicy(t *testing.T) {
-	for _, policy := range []string{"", "off", "auto", "required"} {
-		t.Run("valid "+policy, func(t *testing.T) {
-			cfg := Defaults()
-			cfg.DataDir = t.TempDir()
-			cfg.HookPolicy = policy
-			if err := cfg.Validate(); err != nil {
-				t.Fatalf("validate %q: %v", policy, err)
-			}
-		})
-	}
-
-	cfg := Defaults()
-	cfg.DataDir = t.TempDir()
-	cfg.HookPolicy = "sometimes"
-	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "hook_policy") {
-		t.Fatalf("validate invalid policy error = %v", err)
-	}
 }
 
 func TestValidateRejectsUnsafeAPIBind(t *testing.T) {

@@ -72,7 +72,9 @@ func TestClaudeHookEventMapping(t *testing.T) {
 		{event: "SessionStart", wantKind: detect.KindSessionStarted, wantScope: detect.ScopeRoot},
 		{event: "UserPromptSubmit", wantKind: detect.KindTurnStarted, wantScope: detect.ScopeRoot},
 		{event: "PreToolUse", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
+		{event: "PostToolUse", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
 		{event: "PostToolUseFailure", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
+		{event: "PostToolBatch", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
 		{event: "PermissionRequest", wantKind: detect.KindPermissionRequested, wantScope: detect.ScopeRoot},
 		{event: "PermissionDenied", wantKind: detect.KindPermissionResolved, wantScope: detect.ScopeRoot},
 		{event: "Elicitation", wantKind: detect.KindHumanInputRequired, wantScope: detect.ScopeRoot},
@@ -80,6 +82,13 @@ func TestClaudeHookEventMapping(t *testing.T) {
 		{event: "Stop", wantKind: detect.KindTurnStopped, wantScope: detect.ScopeRoot},
 		{event: "StopFailure", wantKind: detect.KindTurnFailed, wantScope: detect.ScopeRoot},
 		{event: "TaskCompleted", wantKind: detect.KindTaskCompleted, wantScope: detect.ScopeRoot},
+		{event: "SessionEnd", wantKind: detect.KindSessionEnded, wantScope: detect.ScopeRoot},
+		{
+			event:     "SubagentStart",
+			agentID:   "subagent-1",
+			wantKind:  detect.KindSubagentStarted,
+			wantScope: detect.ScopeSubagent,
+		},
 		{
 			event:     "SubagentStop",
 			agentID:   "subagent-1",
@@ -153,19 +162,33 @@ func TestClaudeHookEventMapping(t *testing.T) {
 
 func TestCodexHookEventMapping(t *testing.T) {
 	tests := []struct {
-		event    string
-		agentID  string
-		wantKind detect.Kind
+		event     string
+		agentID   string
+		wantKind  detect.Kind
+		wantScope detect.Scope
 	}{
-		{event: "SessionStart", wantKind: detect.KindSessionStarted},
-		{event: "UserPromptSubmit", wantKind: detect.KindTurnStarted},
-		{event: "PreToolUse", wantKind: detect.KindToolActivity},
-		{event: "PostToolUse", wantKind: detect.KindToolActivity},
-		{event: "PermissionRequest", wantKind: detect.KindPermissionRequested},
-		{event: "Stop", wantKind: detect.KindTurnStopped},
-		{event: "Interrupt", wantKind: detect.KindInterrupted},
-		{event: "SessionEnd", wantKind: detect.KindSessionEnded},
-		{event: "SubagentStop", agentID: "subagent-1", wantKind: detect.KindSubagentStopped},
+		{event: "SessionStart", wantKind: detect.KindSessionStarted, wantScope: detect.ScopeRoot},
+		{event: "UserPromptSubmit", wantKind: detect.KindTurnStarted, wantScope: detect.ScopeRoot},
+		{event: "PreToolUse", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
+		{event: "PostToolUse", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
+		{event: "PermissionRequest", wantKind: detect.KindPermissionRequested, wantScope: detect.ScopeRoot},
+		{event: "PreCompact", wantKind: detect.KindObserved, wantScope: detect.ScopeRoot},
+		{event: "PostCompact", wantKind: detect.KindObserved, wantScope: detect.ScopeRoot},
+		{event: "Stop", wantKind: detect.KindTurnStopped, wantScope: detect.ScopeRoot},
+		{event: "Interrupt", wantKind: detect.KindInterrupted, wantScope: detect.ScopeRoot},
+		{event: "SessionEnd", wantKind: detect.KindSessionEnded, wantScope: detect.ScopeRoot},
+		{
+			event:     "SubagentStart",
+			agentID:   "subagent-1",
+			wantKind:  detect.KindSubagentStarted,
+			wantScope: detect.ScopeSubagent,
+		},
+		{
+			event:     "SubagentStop",
+			agentID:   "subagent-1",
+			wantKind:  detect.KindSubagentStopped,
+			wantScope: detect.ScopeSubagent,
+		},
 	}
 
 	entry := NewRegistry().For("codex")
@@ -187,8 +210,13 @@ func TestCodexHookEventMapping(t *testing.T) {
 			if err != nil {
 				t.Fatalf("normalize hook: %v", err)
 			}
-			if signal.Kind != test.wantKind {
-				t.Fatalf("signal kind = %s, want %s", signal.Kind, test.wantKind)
+			if signal.Kind != test.wantKind || signal.Scope != test.wantScope {
+				t.Fatalf(
+					"signal = %+v, want kind=%s scope=%s",
+					signal,
+					test.wantKind,
+					test.wantScope,
+				)
 			}
 		})
 	}

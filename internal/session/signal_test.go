@@ -2,9 +2,11 @@ package session
 
 import (
 	"context"
-	"encoding/hex"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +20,13 @@ import (
 	"github.com/Duang777/drove/internal/store"
 )
 
+const testSignalToken = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
-	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
+		Hooks:   agent.HooksAuto,
 		Name:    "hook-env",
 		Command: "/bin/sh",
 		Args: []string{
@@ -70,7 +75,7 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 		t.Fatalf("persisted signal token = %q, want redaction", parts[2])
 	}
 	token := attachedSignalToken(t, manager, agent.ID(status.AgentID))
-	tokenBytes, decodeErr := hex.DecodeString(token)
+	tokenBytes, decodeErr := base64.RawURLEncoding.DecodeString(token)
 	if decodeErr != nil || len(tokenBytes) != signalTokenBytes {
 		t.Fatalf("signal token = %q, decode error = %v", token, decodeErr)
 	}
@@ -79,10 +84,104 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	}
 }
 
-func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
-	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
+func TestStartNormalizesHookPolicyByAdapterCapability(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+
+	claudeStatus, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "claude",
+		Command: "/bin/cat",
+	})
+	if err != nil {
+		t.Fatalf("start Claude: %v", err)
+	}
+	if claudeStatus.HookPolicy != agent.HooksAuto ||
+		claudeStatus.HookStatus != detect.HookAwaiting {
+		t.Fatalf("Claude status = %+v, want auto awaiting_hook", claudeStatus)
+	}
+
+	genericStatus, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "generic",
+		Command: "/bin/cat",
+	})
+	if err != nil {
+		t.Fatalf("start generic: %v", err)
+	}
+	if genericStatus.HookPolicy != agent.HooksOff ||
+		genericStatus.HookStatus != detect.HookOff {
+		t.Fatalf("generic status = %+v, want off", genericStatus)
+	}
+
+	fallbackStatus, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "generic",
+		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
+	})
+	if err != nil {
+		t.Fatalf("start generic auto: %v", err)
+	}
+	if fallbackStatus.HookPolicy != agent.HooksAuto ||
+		fallbackStatus.HookStatus != detect.HookFallback {
+		t.Fatalf("generic auto status = %+v, want auto fallback", fallbackStatus)
+	}
+}
+
+func TestHookEnabledStartRequiresConfiguredOriginBeforePersistence(t *testing.T) {
+	manager, st := newSignalTestManager(t, "")
+
+	_, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "claude",
+		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
+	})
+	if !errors.Is(err, ErrSignalOriginUnavailable) {
+		t.Fatalf("start error = %v, want ErrSignalOriginUnavailable", err)
+	}
+	lastSeq, seqErr := st.LastSeq()
+	if seqErr != nil {
+		t.Fatalf("last sequence: %v", seqErr)
+	}
+	if lastSeq != 0 || len(manager.List()) != 0 {
+		t.Fatalf("failed start persisted state: seq=%d statuses=%+v", lastSeq, manager.List())
+	}
+
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
+		Command: "/bin/cat",
+		Hooks:   agent.HooksOff,
+	})
+	if err != nil {
+		t.Fatalf("start hooks-off session without origin: %v", err)
+	}
+	if status.HookStatus != detect.HookOff {
+		t.Fatalf("hook status = %s, want off", status.HookStatus)
+	}
+}
+
+func TestStartRejectsInvalidHookPolicyBeforePersistence(t *testing.T) {
+	manager, st := newSignalTestManager(t, "")
+
+	_, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "generic",
+		Command: "/bin/cat",
+		Hooks:   "sometimes",
+	})
+	if !errors.Is(err, ErrInvalidHookPolicy) {
+		t.Fatalf("start error = %v, want ErrInvalidHookPolicy", err)
+	}
+	lastSeq, seqErr := st.LastSeq()
+	if seqErr != nil {
+		t.Fatalf("last sequence: %v", seqErr)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last sequence = %d, want 0", lastSeq)
+	}
+}
+
+func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	status, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "claude",
+		Hooks:   agent.HooksAuto,
 		Command: "/bin/cat",
 	})
 	if err != nil {
@@ -91,25 +190,25 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 	id := agent.ID(status.AgentID)
 	token := attachedSignalToken(t, manager, id)
 
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer wrong",
 		"claude",
 		"delivery-auth",
 		claudeHook("SessionStart"),
-	); !errors.Is(err, ErrSignalUnauthorized) {
-		t.Fatalf("wrong token error = %v, want ErrSignalUnauthorized", err)
+	); !errors.Is(err, ErrHookUnauthorized) {
+		t.Fatalf("wrong token error = %v, want ErrHookUnauthorized", err)
 	}
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
 		"codex",
 		"delivery-vendor",
 		claudeHook("SessionStart"),
-	); !errors.Is(err, ErrSignalVendorMismatch) {
-		t.Fatalf("wrong vendor error = %v, want ErrSignalVendorMismatch", err)
+	); !errors.Is(err, ErrHookVendorMismatch) {
+		t.Fatalf("wrong vendor error = %v, want ErrHookVendorMismatch", err)
 	}
 
 	for _, delivery := range []struct {
@@ -128,7 +227,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 			}`),
 		},
 	} {
-		if err := manager.AcceptSignal(
+		if err := deliverTestHook(manager,
 			context.Background(),
 			id,
 			"Bearer "+token,
@@ -142,12 +241,24 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 	if got, err := manager.Status(id); err != nil || got.State != agent.StateBlocked {
 		t.Fatalf("blocked status = %+v, error = %v", got, err)
 	}
+	blockedStatus, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("blocked status: %v", err)
+	}
+	if blockedStatus.HookPolicy != agent.HooksAuto ||
+		blockedStatus.HookStatus != detect.HookActive ||
+		blockedStatus.LastTransition == nil ||
+		blockedStatus.LastTransition.Source != agent.EvidenceHook ||
+		blockedStatus.LastTransition.Event != "Elicitation" ||
+		blockedStatus.LastTransition.DeliveryID != testDeliveryID("delivery-blocked") {
+		t.Fatalf("blocked status metadata = %+v", blockedStatus)
+	}
 
 	rowsBeforeDuplicate, err := manager.Replay(status.AgentID)
 	if err != nil {
 		t.Fatalf("replay before duplicate: %v", err)
 	}
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -169,7 +280,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		)
 	}
 
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -211,11 +322,12 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 }
 
 func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
-	manager, _ := newSignalTestManager(t, agent.HooksAuto, "")
+	manager, _ := newSignalTestManager(t, "")
 	manager.detectConfig.HeuristicConfirmation = 5 * time.Millisecond
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
+		Hooks:   agent.HooksOff,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -240,17 +352,18 @@ func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
 }
 
 func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
-	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
 	id := agent.ID(status.AgentID)
 	token := attachedSignalToken(t, manager, id)
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -268,11 +381,12 @@ func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
 }
 
 func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
-	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 	manager.detectConfig.StopConfirmation = 5 * time.Millisecond
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -280,7 +394,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 	id := agent.ID(status.AgentID)
 	token := attachedSignalToken(t, manager, id)
 
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -290,7 +404,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 	); err != nil {
 		t.Fatalf("block: %v", err)
 	}
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -302,7 +416,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 	}
 	waitForState(t, manager, id, agent.StateIdle)
 
-	if err := manager.AcceptSignal(
+	if err := deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -317,13 +431,14 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 
 func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) {
 	t.Run("unsupported vendor", func(t *testing.T) {
-		manager, st := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager, st := newSignalTestManager(t, "http://127.0.0.1:7373")
 		_, err := manager.Start(context.Background(), StartRequest{
 			Vendor:  "generic",
 			Command: "/bin/cat",
+			Hooks:   agent.HooksRequired,
 		})
-		if !errors.Is(err, ErrHookUnavailable) {
-			t.Fatalf("start error = %v, want ErrHookUnavailable", err)
+		if !errors.Is(err, ErrHookUnsupported) {
+			t.Fatalf("start error = %v, want ErrHookUnsupported", err)
 		}
 		lastSeq, seqErr := st.LastSeq()
 		if seqErr != nil {
@@ -335,14 +450,15 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 
 	t.Run("activation timeout", func(t *testing.T) {
-		manager, _ := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 		manager.detectConfig.HookActivation = 10 * time.Millisecond
 		_, err := manager.Start(context.Background(), StartRequest{
 			Vendor:  "claude",
 			Command: "/bin/cat",
+			Hooks:   agent.HooksRequired,
 		})
-		if !errors.Is(err, ErrHookUnavailable) {
-			t.Fatalf("start error = %v, want ErrHookUnavailable", err)
+		if !errors.Is(err, ErrHookRequired) {
+			t.Fatalf("start error = %v, want ErrHookRequired", err)
 		}
 		statuses := manager.List()
 		if len(statuses) != 1 ||
@@ -353,15 +469,16 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 
 	t.Run("short lived oneshot remains stopped without activation", func(t *testing.T) {
-		manager, _ := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 		manager.detectConfig.HookActivation = 10 * time.Millisecond
 		_, err := manager.Start(context.Background(), StartRequest{
 			Vendor:  "claude",
 			Command: "/usr/bin/true",
 			Mode:    agent.RunModeOneshot,
+			Hooks:   agent.HooksRequired,
 		})
-		if !errors.Is(err, ErrHookUnavailable) {
-			t.Fatalf("start error = %v, want ErrHookUnavailable", err)
+		if !errors.Is(err, ErrHookRequired) {
+			t.Fatalf("start error = %v, want ErrHookRequired", err)
 		}
 		statuses := manager.List()
 		if len(statuses) != 1 || statuses[0].State != agent.StateStopped {
@@ -370,7 +487,7 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 
 	t.Run("observed activation", func(t *testing.T) {
-		manager, _ := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 		manager.detectConfig.HookActivation = time.Second
 		result := make(chan struct {
 			status *Status
@@ -380,6 +497,7 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 			status, err := manager.Start(context.Background(), StartRequest{
 				Vendor:  "claude",
 				Command: "/bin/cat",
+				Hooks:   agent.HooksRequired,
 			})
 			result <- struct {
 				status *Status
@@ -388,7 +506,7 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 		}()
 
 		id, token := waitForAttachedSignalToken(t, manager)
-		if err := manager.AcceptSignal(
+		if err := deliverTestHook(manager,
 			context.Background(),
 			id,
 			"Bearer "+token,
@@ -411,10 +529,74 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 }
 
-func TestAcceptSignalWaitsForProcessStartCommit(t *testing.T) {
+func TestUnknownHookEventDoesNotActivatePolicy(t *testing.T) {
+	t.Run("auto falls back", func(t *testing.T) {
+		manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+		manager.detectConfig.HookActivation = 20 * time.Millisecond
+		status, err := manager.Start(context.Background(), StartRequest{
+			Vendor:  "claude",
+			Command: "/bin/cat",
+			Hooks:   agent.HooksAuto,
+		})
+		if err != nil {
+			t.Fatalf("start: %v", err)
+		}
+		id := agent.ID(status.AgentID)
+		err = deliverTestHook(
+			manager,
+			context.Background(),
+			id,
+			"Bearer "+attachedSignalToken(t, manager, id),
+			"claude",
+			testDeliveryID("unknown-auto"),
+			claudeHook("FutureEvent"),
+		)
+		if !errors.Is(err, ErrHookInvalid) {
+			t.Fatalf("unknown event error = %v, want ErrHookInvalid", err)
+		}
+		waitForHookStatus(t, manager, id, detect.HookFallback)
+	})
+
+	t.Run("required fails", func(t *testing.T) {
+		manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+		manager.detectConfig.HookActivation = 20 * time.Millisecond
+		result := make(chan error, 1)
+		go func() {
+			_, err := manager.Start(context.Background(), StartRequest{
+				Vendor:  "codex",
+				Command: "/bin/cat",
+				Hooks:   agent.HooksRequired,
+			})
+			result <- err
+		}()
+
+		id, token := waitForAttachedSignalToken(t, manager)
+		err := deliverTestHook(
+			manager,
+			context.Background(),
+			id,
+			"Bearer "+token,
+			"codex",
+			testDeliveryID("unknown-required"),
+			[]byte(`{"hook_event_name":"FutureEvent","session_id":"vendor-session"}`),
+		)
+		if !errors.Is(err, ErrHookInvalid) {
+			t.Fatalf("unknown event error = %v, want ErrHookInvalid", err)
+		}
+		select {
+		case err := <-result:
+			if !errors.Is(err, ErrHookRequired) {
+				t.Fatalf("start error = %v, want ErrHookRequired", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("required start did not fail after activation deadline")
+		}
+	})
+}
+
+func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 	manager, _ := newSignalTestManager(
 		t,
-		agent.HooksRequired,
 		"http://127.0.0.1:7373",
 	)
 	a := agent.New(
@@ -425,7 +607,7 @@ func TestAcceptSignalWaitsForProcessStartCommit(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksRequired),
 	)
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
-	running, _, err := manager.prepareRuntime(a, manager.reg.For("claude"))
+	running, _, _, err := manager.prepareRuntime(a, manager.reg.For("claude"))
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}
@@ -441,10 +623,10 @@ func TestAcceptSignalWaitsForProcessStartCommit(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- manager.AcceptSignal(
+		result <- deliverTestHook(manager,
 			context.Background(),
 			a.ID(),
-			"Bearer "+running.signalToken,
+			"Bearer "+testSignalToken,
 			"claude",
 			testDeliveryID("delivery-starting"),
 			claudeHook("SessionStart"),
@@ -478,29 +660,138 @@ func TestAcceptSignalWaitsForProcessStartCommit(t *testing.T) {
 	}
 }
 
-func TestStartRejectsRemoteSignalBaseURLBeforePersisting(t *testing.T) {
-	manager, st := newSignalTestManager(t, agent.HooksAuto, "http://example.com:7373")
-	_, err := manager.Start(context.Background(), StartRequest{
+func TestConfigureSignalOriginRejectsRemoteHost(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "")
+	err := manager.ConfigureSignalOrigin(&url.URL{
+		Scheme: "http",
+		Host:   "example.com:7373",
+	})
+	if !errors.Is(err, ErrSignalOriginUnavailable) {
+		t.Fatalf("configure error = %v, want ErrSignalOriginUnavailable", err)
+	}
+}
+
+func TestConfigureSignalOriginAcceptsOnePathlessLoopbackOrigin(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "")
+	origin := &url.URL{Scheme: "http", Host: "[::1]:7373"}
+	if err := manager.ConfigureSignalOrigin(origin); err != nil {
+		t.Fatalf("configure origin: %v", err)
+	}
+	if err := manager.ConfigureSignalOrigin(origin); !errors.Is(err, ErrSignalOriginUnavailable) {
+		t.Fatalf("second configure error = %v, want ErrSignalOriginUnavailable", err)
+	}
+
+	other, _ := newSignalTestManager(t, "")
+	for _, invalid := range []*url.URL{
+		{Scheme: "https", Host: "127.0.0.1:7373"},
+		{Scheme: "http", Host: "127.0.0.1:7373", Path: "/"},
+		{Scheme: "http", Host: "127.0.0.1:7373", RawQuery: "debug=1"},
+		{Scheme: "http", Host: "127.0.0.1:7373", Fragment: "signal"},
+	} {
+		if err := other.ConfigureSignalOrigin(invalid); !errors.Is(err, ErrSignalOriginUnavailable) {
+			t.Fatalf("configure %+v error = %v, want ErrSignalOriginUnavailable", invalid, err)
+		}
+	}
+}
+
+func TestExitClaimInvalidatesSignalCredential(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
 	})
-	if err == nil || !strings.Contains(err.Error(), "must be loopback") {
-		t.Fatalf("start error = %v, want loopback rejection", err)
+	if err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	lastSeq, seqErr := st.LastSeq()
-	if seqErr != nil {
-		t.Fatalf("last seq: %v", seqErr)
+	id := agent.ID(status.AgentID)
+	token := attachedSignalToken(t, manager, id)
+
+	manager.mu.RLock()
+	running := manager.sessions[id]
+	manager.mu.RUnlock()
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop: %v", err)
 	}
-	if lastSeq != 0 {
-		t.Fatalf("last seq = %d, want no persisted session", lastSeq)
+	waitForState(t, manager, id, agent.StateStopped)
+
+	manager.mu.RLock()
+	hasToken := running.hasSignalToken
+	digest := running.signalDigest
+	manager.mu.RUnlock()
+	if hasToken || digest != (signalTokenDigest{}) {
+		t.Fatalf("signal credential remains after exit: present=%t digest=%x", hasToken, digest)
+	}
+	err = deliverTestHook(
+		manager,
+		context.Background(),
+		id,
+		"Bearer "+token,
+		"claude",
+		testDeliveryID("delivery-after-exit"),
+		claudeHook("SessionStart"),
+	)
+	if !errors.Is(err, ErrHookDetached) {
+		t.Fatalf("delivery after exit error = %v, want ErrHookDetached", err)
+	}
+}
+
+func TestDeliverHookReturnsBackpressureWhenObservationInboxIsFull(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	status, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "claude",
+		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	token := attachedSignalToken(t, manager, id)
+
+	saturated := &observationActor{
+		requests: make(chan observationRequest, observationInboxSize),
+	}
+	for range observationInboxSize {
+		saturated.requests <- observationRequest{}
+	}
+	manager.mu.Lock()
+	running := manager.sessions[id]
+	original := running.observer
+	running.observer = saturated
+	manager.mu.Unlock()
+	t.Cleanup(func() {
+		manager.mu.Lock()
+		if manager.sessions[id] == running {
+			running.observer = original
+		}
+		manager.mu.Unlock()
+	})
+
+	startedAt := time.Now()
+	err = deliverTestHook(
+		manager,
+		context.Background(),
+		id,
+		"Bearer "+token,
+		"claude",
+		testDeliveryID("delivery-backpressure"),
+		claudeHook("SessionStart"),
+	)
+	if !errors.Is(err, ErrHookBackpressure) {
+		t.Fatalf("delivery error = %v, want ErrHookBackpressure", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed < signalAdmissionWait {
+		t.Fatalf("delivery returned after %s, want at least %s", elapsed, signalAdmissionWait)
 	}
 }
 
 func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
-	manager, st := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
+	manager, st := newSignalTestManager(t, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
 	})
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -514,7 +805,7 @@ func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
 		t.Fatalf("close store: %v", err)
 	}
 
-	err = manager.AcceptSignal(
+	err = deliverTestHook(manager,
 		context.Background(),
 		id,
 		"Bearer "+token,
@@ -522,8 +813,8 @@ func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
 		testDeliveryID("delivery-block"),
 		claudeHook("PermissionRequest"),
 	)
-	if err == nil {
-		t.Fatal("signal succeeded with closed store")
+	if !errors.Is(err, ErrEventCommitterUnavailable) {
+		t.Fatalf("signal error = %v, want ErrEventCommitterUnavailable", err)
 	}
 	if got, _ := manager.Status(id); got.State != agent.StateWorking {
 		t.Fatalf("state = %s, want unchanged working", got.State)
@@ -540,20 +831,26 @@ func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
 
 func newSignalTestManager(
 	t *testing.T,
-	policy agent.HookPolicy,
 	signalBaseURL string,
 ) (*Manager, *store.Store) {
 	t.Helper()
 
 	st := newTestStore(t)
-	manager := NewManager(
-		adapter.NewRegistry(),
-		event.NewHub(0),
-		st,
-		0,
-		WithHookPolicy(policy),
-		WithSignalBaseURL(signalBaseURL),
-	)
+	manager := NewManager(adapter.NewRegistry(), event.NewHub(0), st, 0)
+	manager.newCredential = func() (string, signalTokenDigest, error) {
+		return testSignalToken,
+			signalTokenDigest(sha256.Sum256([]byte(testSignalToken))),
+			nil
+	}
+	if signalBaseURL != "" {
+		origin, err := url.Parse(signalBaseURL)
+		if err != nil {
+			t.Fatalf("parse signal origin: %v", err)
+		}
+		if err := manager.ConfigureSignalOrigin(origin); err != nil {
+			t.Fatalf("configure signal origin: %v", err)
+		}
+	}
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)
@@ -568,10 +865,11 @@ func attachedSignalToken(t *testing.T, manager *Manager, id agent.ID) string {
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
 	running := manager.sessions[id]
-	if running == nil || running.signalToken == "" {
+	if running == nil ||
+		!verifySignalToken(running.signalDigest, running.hasSignalToken, testSignalToken) {
 		t.Fatalf("agent %q has no signal token", id)
 	}
-	return running.signalToken
+	return testSignalToken
 }
 
 func waitForAttachedSignalToken(t *testing.T, manager *Manager) (agent.ID, string) {
@@ -581,10 +879,13 @@ func waitForAttachedSignalToken(t *testing.T, manager *Manager) (agent.ID, strin
 	for {
 		manager.mu.RLock()
 		for id, running := range manager.sessions {
-			if running.signalToken != "" {
-				token := running.signalToken
+			if verifySignalToken(
+				running.signalDigest,
+				running.hasSignalToken,
+				testSignalToken,
+			) {
 				manager.mu.RUnlock()
-				return id, token
+				return id, testSignalToken
 			}
 		}
 		manager.mu.RUnlock()
@@ -593,6 +894,24 @@ func waitForAttachedSignalToken(t *testing.T, manager *Manager) (agent.ID, strin
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func deliverTestHook(
+	manager *Manager,
+	ctx context.Context,
+	id agent.ID,
+	authorization string,
+	vendor string,
+	deliveryID string,
+	payload []byte,
+) error {
+	token, _ := strings.CutPrefix(authorization, "Bearer ")
+	return manager.DeliverHook(ctx, id, HookDelivery{
+		Token:      token,
+		Vendor:     vendor,
+		DeliveryID: deliveryID,
+		Payload:    payload,
+	})
 }
 
 func claudeHook(eventName string) []byte {
@@ -617,6 +936,30 @@ func waitForState(t *testing.T, manager *Manager, id agent.ID, want agent.State)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("state = %s, want %s", status.State, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForHookStatus(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+	want detect.HookStatus,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		status, err := manager.Status(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if status.HookStatus == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("hook status = %s, want %s", status.HookStatus, want)
 		}
 		time.Sleep(time.Millisecond)
 	}

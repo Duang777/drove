@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -110,11 +111,19 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := s.opts.Manager.Start(r.Context(), req)
 	if err != nil {
-		if errors.Is(err, session.ErrInvalidMode) {
+		switch {
+		case errors.Is(err, session.ErrInvalidMode),
+			errors.Is(err, session.ErrInvalidHookPolicy),
+			errors.Is(err, session.ErrHookUnsupported):
 			writeErr(w, http.StatusBadRequest, err.Error())
-			return
+		case errors.Is(err, session.ErrHookRequired),
+			errors.Is(err, session.ErrManagerClosed),
+			errors.Is(err, session.ErrEventCommitterUnavailable),
+			errors.Is(err, session.ErrSignalOriginUnavailable):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
 		}
-		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusCreated, st)
@@ -140,7 +149,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
-const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 2048
+const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 4096
 
 type inputRequest struct {
 	Data string `json:"data"`
@@ -261,29 +270,43 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = s.opts.Manager.AcceptSignal(
+	token, ok := strings.CutPrefix(values[0], "Bearer ")
+	if !ok || token == "" {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	err = s.opts.Manager.DeliverHook(
 		r.Context(),
 		agent.ID(r.PathValue("id")),
-		values[0],
-		req.Vendor,
-		req.DeliveryID,
-		req.Payload,
+		session.HookDelivery{
+			Token:      token,
+			Vendor:     req.Vendor,
+			DeliveryID: req.DeliveryID,
+			Payload:    req.Payload,
+		},
 	)
 	if err != nil {
 		switch {
-		case errors.Is(err, session.ErrSignalUnauthorized):
+		case errors.Is(err, session.ErrHookUnauthorized):
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 		case errors.Is(err, session.ErrUnknownAgent):
 			writeErr(w, http.StatusNotFound, err.Error())
-		case errors.Is(err, session.ErrNotAttached),
-			errors.Is(err, session.ErrSignalDisabled):
+		case errors.Is(err, session.ErrHookDisabled),
+			errors.Is(err, session.ErrHookUnsupported),
+			errors.Is(err, session.ErrHookVendorMismatch):
 			writeErr(w, http.StatusConflict, err.Error())
-		case errors.Is(err, session.ErrManagerClosed):
+		case errors.Is(err, session.ErrHookDetached):
+			writeErr(w, http.StatusGone, err.Error())
+		case errors.Is(err, session.ErrHookBackpressure):
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusTooManyRequests, err.Error())
+		case errors.Is(err, session.ErrManagerClosed),
+			errors.Is(err, session.ErrEventCommitterUnavailable):
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
-		case errors.Is(err, session.ErrSignalVendorMismatch),
-			errors.Is(err, session.ErrSignalInvalid):
-			writeErr(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, session.ErrHookInvalid):
+			writeErr(w, http.StatusUnprocessableEntity, err.Error())
 		default:
 			writeErr(w, http.StatusInternalServerError, err.Error())
 		}

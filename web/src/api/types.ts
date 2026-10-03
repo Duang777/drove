@@ -62,6 +62,7 @@ export interface StartRequest {
   args?: string[]
   dir?: string
   mode?: RunMode
+  hooks?: HookPolicy
 }
 
 /** 事件类型（Go: event.Type）。 */

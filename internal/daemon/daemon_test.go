@@ -16,6 +16,7 @@ import (
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -142,6 +143,13 @@ func TestBootstrapSessionsRestoresHistoricalSession(t *testing.T) {
 	}
 	if status.State != agent.StateStopped || status.PID != 0 {
 		t.Fatalf("restored status = %+v", status)
+	}
+	if status.HookPolicy != agent.HooksOff ||
+		status.HookStatus != detect.HookDetached ||
+		status.LastTransition == nil ||
+		status.LastTransition.Source != agent.EvidenceRecovery ||
+		status.LastTransition.Event != "daemon_restart" {
+		t.Fatalf("restored hook status = %+v", status)
 	}
 	if recovered.Recovery.Sessions != 1 ||
 		recovered.Recovery.LegacyMetadata != 1 ||

@@ -496,7 +496,7 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
 		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"auto"}` {
+		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"off"}` {
 		t.Fatalf("creation event = %+v", rows[0])
 	}
 	if rows[1].Seq != 2 ||
@@ -1332,7 +1332,7 @@ func attachTestRuntime(
 ) *runningSession {
 	t.Helper()
 
-	running, _, err := manager.prepareRuntime(a, entry)
+	running, _, _, err := manager.prepareRuntime(a, entry)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}

@@ -7,8 +7,8 @@
 ## 关键设计
 
 - `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
-- 每个运行中会话持有一个 observation actor、Detector State 和一个内存 signal token；token 只授权该
-  Agent 的 signal endpoint，并随会话 detach 失效。
+- 每个运行中会话持有一个 observation actor、Detector State 和 signal token 的 SHA-256 digest；
+  token 只授权该 Agent 的 signal endpoint，并在启动失败或退出认领时失效。
 - observation actor 独占容量 64 的 inbox 和真实计时器，一次只提交一个 Decision；
   Detector 本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。

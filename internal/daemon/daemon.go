@@ -8,13 +8,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/Duang777/drove/internal/adapter"
-	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/api"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
@@ -57,16 +57,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	}()
 
 	// 2. 在 API 对外可见前恢复会话投影。
-	hookPolicy := agent.HookPolicy(d.cfg.HookPolicy)
-	if hookPolicy == "" {
-		hookPolicy = agent.HooksAuto
-	}
-	recovered, err := bootstrapSessions(
-		ctx,
-		st,
-		session.WithHookPolicy(hookPolicy),
-		session.WithSignalBaseURL("http://"+d.cfg.APIBind),
-	)
+	recovered, err := bootstrapSessions(ctx, st)
 	if err != nil {
 		return err
 	}
@@ -99,6 +90,18 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		hub.Close()
 		return errors.Join(
 			fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err),
+			closeErr,
+		)
+	}
+	if err := mgr.ConfigureSignalOrigin(&url.URL{
+		Scheme: "http",
+		Host:   ln.Addr().String(),
+	}); err != nil {
+		closeErr := mgr.Close()
+		hub.Close()
+		_ = ln.Close()
+		return errors.Join(
+			fmt.Errorf("daemon: configure signal origin: %w", err),
 			closeErr,
 		)
 	}

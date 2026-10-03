@@ -15,7 +15,10 @@ import (
 
 const observationInboxSize = 64
 
-var errObservationActorClosed = errors.New("session: observation actor closed")
+var (
+	errObservationActorClosed = errors.New("session: observation actor closed")
+	errObservationCommit      = errors.New("session: observation commit failed")
+)
 
 type observationClock interface {
 	Now() time.Time
@@ -262,7 +265,7 @@ func (a *observationActor) handle(
 		},
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errObservationCommit, err)
 	}
 	a.applyTimer(decision.Timer(), timer, timerC, timerGeneration)
 	a.notifyStatus()

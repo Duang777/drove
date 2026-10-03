@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -396,13 +397,13 @@ func TestSignalEndpointStrictlyValidatesEnvelopeAndVendorPayload(t *testing.T) {
 			name:        "wrong vendor",
 			contentType: "application/json",
 			body:        []byte(`{"version":1,"vendor":"codex","delivery_id":"d1","payload":{"hook_event_name":"SessionStart","session_id":"s1"}}`),
-			wantStatus:  http.StatusBadRequest,
+			wantStatus:  http.StatusConflict,
 		},
 		{
 			name:        "unknown hook event",
 			contentType: "application/json",
 			body:        []byte(`{"version":1,"vendor":"claude","delivery_id":"d1","payload":{"hook_event_name":"FutureEvent","session_id":"s1"}}`),
-			wantStatus:  http.StatusBadRequest,
+			wantStatus:  http.StatusUnprocessableEntity,
 		},
 		{
 			name:        "invalid UTF-8",
@@ -546,8 +547,14 @@ func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 		hub,
 		st,
 		0,
-		session.WithSignalBaseURL("http://127.0.0.1:7373"),
 	)
+	signalOrigin, err := url.Parse("http://127.0.0.1:7373")
+	if err != nil {
+		t.Fatalf("parse signal origin: %v", err)
+	}
+	if err := manager.ConfigureSignalOrigin(signalOrigin); err != nil {
+		t.Fatalf("configure signal origin: %v", err)
+	}
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)

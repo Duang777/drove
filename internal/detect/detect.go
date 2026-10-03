@@ -771,6 +771,16 @@ func (d *Detector) decideHook(
 	}
 
 	decision := newDecision(state, signal, OutcomeObserved)
+	if state.data.terminal {
+		decision.outcome = OutcomeTerminal
+		rememberDelivery(
+			&decision.next,
+			signal.DeliveryID,
+			decision.outcome,
+			d.config.DeliveryRememberCount,
+		)
+		return decision, nil
+	}
 	wasActive := decision.next.status == HookActive
 	decision.next.status = HookActive
 
@@ -970,6 +980,7 @@ func (d *Detector) decideTimer(
 	switch timer {
 	case timerHookActivation:
 		if state.data.policy == agent.HooksRequired {
+			decision.next.terminal = true
 			decision.next.status = HookRequiredFailed
 			transition(
 				&decision,

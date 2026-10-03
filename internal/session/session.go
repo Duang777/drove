@@ -24,15 +24,18 @@ import (
 
 // Status 是对外暴露的会话视图（供 daemon/api/CLI 使用）。
 type Status struct {
-	AgentID   string        `json:"agent_id"`
-	Name      string        `json:"name"`
-	Vendor    string        `json:"vendor"`
-	Mode      agent.RunMode `json:"mode"`
-	State     agent.State   `json:"state"`
-	PID       int           `json:"pid,omitempty"`
-	CreatedAt time.Time     `json:"created_at"`
-	UpdatedAt time.Time     `json:"updated_at"`
-	LastError string        `json:"last_error,omitempty"`
+	AgentID        string            `json:"agent_id"`
+	Name           string            `json:"name"`
+	Vendor         string            `json:"vendor"`
+	Mode           agent.RunMode     `json:"mode"`
+	State          agent.State       `json:"state"`
+	PID            int               `json:"pid,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
+	UpdatedAt      time.Time         `json:"updated_at"`
+	LastError      string            `json:"last_error,omitempty"`
+	HookPolicy     agent.HookPolicy  `json:"hook_policy"`
+	HookStatus     detect.HookStatus `json:"hook_status"`
+	LastTransition *agent.Evidence   `json:"last_transition,omitempty"`
 }
 
 // StartRequest 描述启动一个新 agent 会话的参数。
@@ -49,6 +52,8 @@ type StartRequest struct {
 	Dir string `json:"dir,omitempty"`
 	// Mode 是运行模式；空则 interactive。
 	Mode agent.RunMode `json:"mode,omitempty"`
+	// Hooks controls hook authority; empty selects a capability-based default.
+	Hooks agent.HookPolicy `json:"hooks,omitempty"`
 }
 
 type createdPayload struct {
@@ -108,7 +113,8 @@ type runningSession struct {
 	observer       *observationActor
 	callbacksReady chan struct{}
 	signalReady    chan struct{}
-	signalToken    string
+	signalDigest   signalTokenDigest
+	hasSignalToken bool
 	vendor         string
 	stopCause      stopCause
 	exitClaimed    bool
@@ -126,10 +132,11 @@ type Manager struct {
 	store     *store.Store
 	committer *committer
 
-	hookPolicy    agent.HookPolicy
-	signalBaseURL string
-	detectConfig  detect.Config
-	clock         observationClock
+	signalOrigin     string
+	originConfigured bool
+	detectConfig     detect.Config
+	clock            observationClock
+	newCredential    signalCredentialSource
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
@@ -157,15 +164,15 @@ func NewManager(
 	options ...ManagerOption,
 ) *Manager {
 	manager := &Manager{
-		reg:          reg,
-		hub:          hub,
-		store:        st,
-		committer:    newCommitter(initialSeq, st, hub),
-		agents:       make(map[agent.ID]*agent.Agent),
-		sessions:     make(map[agent.ID]*runningSession),
-		hookPolicy:   agent.HooksAuto,
-		detectConfig: detect.DefaultConfig(),
-		clock:        systemObservationClock{},
+		reg:           reg,
+		hub:           hub,
+		store:         st,
+		committer:     newCommitter(initialSeq, st, hub),
+		agents:        make(map[agent.ID]*agent.Agent),
+		sessions:      make(map[agent.ID]*runningSession),
+		detectConfig:  detect.DefaultConfig(),
+		clock:         systemObservationClock{},
+		newCredential: generateSignalCredential,
 	}
 	for _, option := range options {
 		option(manager)
@@ -230,6 +237,11 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	}
 	req.Mode = mode
 	entry := m.reg.For(req.Vendor)
+	hookPolicy, err := normalizeHookPolicy(req.Hooks, entry.SupportsHooks())
+	if err != nil {
+		return nil, err
+	}
+	req.Hooks = hookPolicy
 
 	// 1. 在创建持久化会话前解析并校验命令。
 	cmdName, cmdArgs := entry.Runner.Command(req.Mode)
@@ -250,10 +262,10 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
 		agent.WithRunMode(req.Mode),
-		agent.WithHookPolicy(m.hookPolicy),
+		agent.WithHookPolicy(req.Hooks),
 	)
 	persistedMode := req.Mode
-	persistedPolicy := m.hookPolicy
+	persistedPolicy := req.Hooks
 	payload, err := json.Marshal(createdPayload{
 		Version:    2,
 		Name:       req.Name,
@@ -264,7 +276,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if err != nil {
 		return nil, fmt.Errorf("session: encode creation metadata: %w", err)
 	}
-	running, processEnv, err := m.prepareRuntime(a, entry)
+	running, processEnv, signalToken, err := m.prepareRuntime(a, entry)
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +312,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		Dir:     req.Dir,
 		OnOutput: func(line string) {
 			<-running.callbacksReady
-			m.onOutput(id, line, entry, running.signalToken)
+			m.onOutput(id, line, entry, signalToken)
 		},
 		OnExit: func(info pty.ExitInfo) {
 			<-running.callbacksReady
@@ -321,9 +333,9 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		if observationErr == nil {
 			commitErr = running.observer.Terminate(observation)
 		}
+		m.detach(id, running)
 		close(running.signalReady)
 		close(running.callbacksReady)
-		m.detach(id, running)
 		running.observer.Close()
 		return nil, errors.Join(startErr, commitErr)
 	}
@@ -336,7 +348,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	started, err := processObservation(
 		detect.KindProcessStarted,
 		m.clock.Now(),
-		&detect.ProcessFact{HookAvailable: running.signalToken != ""},
+		&detect.ProcessFact{HookAvailable: running.hasSignalToken},
 	)
 	if err == nil {
 		err = running.observer.Deliver(context.Background(), started)
@@ -350,7 +362,8 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, err
 	}
 	close(running.signalReady)
-	if err := m.waitForRequiredHook(ctx, running); err != nil {
+	if err := m.waitForRequiredHook(ctx, a, running); err != nil {
+		m.invalidateSignal(id, running)
 		m.requestStop(id, running, stopCauseShutdown)
 		close(running.callbacksReady)
 		closeErr := sess.Close()
@@ -452,20 +465,27 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	m.mu.RLock()
 	sess, _ := m.sessions[id]
 	var process processSession
+	hookStatus := detect.HookDetached
 	if sess != nil {
 		process = sess.process
+		if sess.observer != nil {
+			hookStatus = sess.observer.Snapshot().HookStatus()
+		}
 	}
 	m.mu.RUnlock()
 
 	st := &Status{
-		AgentID:   string(a.ID()),
-		Name:      a.Name(),
-		Vendor:    a.Vendor(),
-		Mode:      a.RunMode(),
-		State:     a.State(),
-		CreatedAt: a.CreatedAt(),
-		UpdatedAt: a.UpdatedAt(),
-		LastError: a.LastError(),
+		AgentID:        string(a.ID()),
+		Name:           a.Name(),
+		Vendor:         a.Vendor(),
+		Mode:           a.RunMode(),
+		State:          a.State(),
+		CreatedAt:      a.CreatedAt(),
+		UpdatedAt:      a.UpdatedAt(),
+		LastError:      a.LastError(),
+		HookPolicy:     a.HookPolicy(),
+		HookStatus:     hookStatus,
+		LastTransition: a.LastTransition(),
 	}
 	if process != nil {
 		st.PID = process.PID()
@@ -785,6 +805,8 @@ func (m *Manager) claimExit(id agent.ID, running *runningSession) (stopCause, bo
 		return stopCauseNone, false
 	}
 	running.exitClaimed = true
+	running.signalDigest = signalTokenDigest{}
+	running.hasSignalToken = false
 	return running.stopCause, true
 }
 
@@ -792,7 +814,18 @@ func (m *Manager) detach(id agent.ID, running *runningSession) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sessions[id] == running {
+		running.signalDigest = signalTokenDigest{}
+		running.hasSignalToken = false
 		delete(m.sessions, id)
+	}
+}
+
+func (m *Manager) invalidateSignal(id agent.ID, running *runningSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[id] == running {
+		running.signalDigest = signalTokenDigest{}
+		running.hasSignalToken = false
 	}
 }
 

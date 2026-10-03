@@ -22,8 +22,6 @@ type Config struct {
 	EventBuffer int `json:"event_buffer"`
 	// ConsoleOrigins 是允许建立 WebSocket 的本地控制台 Origin。
 	ConsoleOrigins []string `json:"console_origins"`
-	// HookPolicy 控制 vendor hook 的使用方式：off、auto 或 required。
-	HookPolicy string `json:"hook_policy"`
 	// DBPath 是 SQLite 文件路径（由 DataDir 派生，可不配置）。
 	DBPath string `json:"db_path,omitempty"`
 }
@@ -34,7 +32,6 @@ func Defaults() *Config {
 		DataDir:     defaultDataDir(),
 		APIBind:     "127.0.0.1:7373",
 		EventBuffer: 1024,
-		HookPolicy:  "auto",
 		ConsoleOrigins: []string{
 			"http://localhost:5173",
 			"http://127.0.0.1:5173",
@@ -116,11 +113,6 @@ func (c *Config) Validate() error {
 	}
 	if c.EventBuffer <= 0 {
 		return fmt.Errorf("config: event_buffer must be positive")
-	}
-	switch c.HookPolicy {
-	case "", "off", "auto", "required":
-	default:
-		return fmt.Errorf("config: hook_policy %q must be off, auto, or required", c.HookPolicy)
 	}
 	if len(c.ConsoleOrigins) == 0 {
 		return fmt.Errorf("config: console_origins must not be empty")

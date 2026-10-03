@@ -7,8 +7,8 @@
 ## 关键设计
 
 - `Daemon.Run(ctx)`：校验配置并确保本地控制令牌 → 打开 store → 构建
-  Hub/Registry/Manager，并注入 hook policy 与 loopback signal URL → 启动 API
-  server → 阻塞直到 ctx 取消或收到 SIGINT/SIGTERM。
+  Hub/Registry/Manager → 恢复投影 → 打开 loopback listener → 把实际 signal origin
+  一次性配置给 Manager → 启动 API server → 阻塞直到 ctx 取消或收到 SIGINT/SIGTERM。
 - 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
 - 信号取消与 Serve 异常共用关闭路径；任一步失败都继续清理剩余资源，并汇总返回错误。
