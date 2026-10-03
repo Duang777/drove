@@ -1,7 +1,9 @@
 package event
 
 import (
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -38,6 +40,19 @@ func TestNewAgentInputCarriesRedactedPayload(t *testing.T) {
 	}
 }
 
+func TestNewAgentSignalCarriesNormalizedPayload(t *testing.T) {
+	ev := NewAgentSignal(9, "session-1", "agent-1", "hook", `{"version":1}`)
+
+	if ev.Seq != 9 ||
+		ev.Type != TypeAgentSignal ||
+		ev.SessionID != "session-1" ||
+		ev.AgentID != "agent-1" ||
+		ev.Reason != "hook" ||
+		ev.Payload != `{"version":1}` {
+		t.Fatalf("agent signal event = %+v", ev)
+	}
+}
+
 func TestHubFanOut(t *testing.T) {
 	h := NewHub(0)
 	s1 := h.Subscribe(16)
@@ -45,11 +60,9 @@ func TestHubFanOut(t *testing.T) {
 	defer h.Unsubscribe(s1)
 	defer h.Unsubscribe(s2)
 
-	ev := NewOutput(0, "sess", "agent", "hello\n")
-	seq := h.Publish(ev)
-
-	if seq != 1 {
-		t.Fatalf("first seq = %d, want 1", seq)
+	ev := NewOutput(1, "sess", "agent", "hello\n")
+	if err := h.Publish(ev); err != nil {
+		t.Fatalf("publish: %v", err)
 	}
 
 	for _, s := range []*Subscription{s1, s2} {
@@ -69,10 +82,16 @@ func TestHubSlowSubscriberDropped(t *testing.T) {
 	s := h.Subscribe(1)
 	defer h.Unsubscribe(s)
 
-	h.Publish(NewOutput(0, "s", "a", "one"))
+	if err := h.Publish(NewOutput(1, "s", "a", "one")); err != nil {
+		t.Fatalf("publish first event: %v", err)
+	}
 	// 缓冲已满，第二条被丢弃（发布者不阻塞）。
-	h.Publish(NewOutput(0, "s", "a", "two"))
-	h.Publish(NewOutput(0, "s", "a", "three"))
+	if err := h.Publish(NewOutput(2, "s", "a", "two")); err != nil {
+		t.Fatalf("publish second event: %v", err)
+	}
+	if err := h.Publish(NewOutput(3, "s", "a", "three")); err != nil {
+		t.Fatalf("publish third event: %v", err)
+	}
 
 	<-s.C() // 消费第一条
 	time.Sleep(10 * time.Millisecond)
@@ -83,10 +102,27 @@ func TestHubSlowSubscriberDropped(t *testing.T) {
 }
 
 func TestPublishWithPresetSeq(t *testing.T) {
-	h := NewHub(0)
+	h := NewHub(41)
 	ev := NewStateChanged(42, "s", "a", "working", "blocked", "waiting")
-	if got := h.Publish(ev); got != 42 {
-		t.Fatalf("preset seq publish = %d, want 42", got)
+	if err := h.Publish(ev); err != nil {
+		t.Fatalf("publish preset sequence: %v", err)
+	}
+	if got := h.LastSeq(); got != 42 {
+		t.Fatalf("last seq = %d, want 42", got)
+	}
+}
+
+func TestHubRejectsUncommittedAndOutOfOrderEvents(t *testing.T) {
+	h := NewHub(4)
+
+	if err := h.Publish(NewOutput(0, "s", "a", "draft")); !errors.Is(err, ErrUncommittedEvent) {
+		t.Fatalf("uncommitted publish error = %v, want ErrUncommittedEvent", err)
+	}
+	if err := h.Publish(NewOutput(4, "s", "a", "old")); !errors.Is(err, ErrSequenceOrder) {
+		t.Fatalf("out-of-order publish error = %v, want ErrSequenceOrder", err)
+	}
+	if got := h.LastSeq(); got != 4 {
+		t.Fatalf("last seq = %d, want unchanged 4", got)
 	}
 }
 
@@ -104,14 +140,11 @@ func TestUnsubscribeClosesChannel(t *testing.T) {
 	}
 }
 
-func TestHubContinuesAfterInitialSequence(t *testing.T) {
+func TestHubTracksInitialSequence(t *testing.T) {
 	h := NewHub(41)
 
-	if got := h.NextSeq(); got != 42 {
-		t.Fatalf("first seq = %d, want 42", got)
-	}
-	if got := h.NextSeq(); got != 43 {
-		t.Fatalf("second seq = %d, want 43", got)
+	if got := h.LastSeq(); got != 41 {
+		t.Fatalf("last seq = %d, want 41", got)
 	}
 }
 
@@ -145,8 +178,8 @@ func TestHubCloseClosesSubscriptionsAndIsIdempotent(t *testing.T) {
 	default:
 		t.Fatal("subscription created after Hub.Close was not closed")
 	}
-	if got := h.Publish(NewOutput(0, "session", "agent", "ignored")); got != 1 {
-		t.Fatalf("publish sequence after close = %d, want 1", got)
+	if err := h.Publish(NewOutput(1, "session", "agent", "ignored")); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("publish after close error = %v, want ErrHubClosed", err)
 	}
 }
 
@@ -154,6 +187,7 @@ func TestHubCloseIsSafeWithConcurrentPublishAndUnsubscribe(t *testing.T) {
 	h := NewHub(0)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
+	var seq atomic.Uint64
 
 	for i := 0; i < 16; i++ {
 		sub := h.Subscribe(32)
@@ -162,7 +196,7 @@ func TestHubCloseIsSafeWithConcurrentPublishAndUnsubscribe(t *testing.T) {
 			defer wg.Done()
 			<-start
 			for j := 0; j < 100; j++ {
-				h.Publish(NewOutput(0, "session", "agent", "line"))
+				h.Publish(NewOutput(seq.Add(1), "session", "agent", "line"))
 			}
 		}()
 		go func(sub *Subscription) {

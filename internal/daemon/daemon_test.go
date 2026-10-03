@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -86,8 +87,8 @@ func TestBootstrapSessionsContinuesPersistedSequence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootstrap sessions: %v", err)
 	}
-	if got := recovered.Hub.NextSeq(); got != 42 {
-		t.Fatalf("next seq = %d, want 42", got)
+	if got := recovered.Hub.LastSeq(); got != 41 {
+		t.Fatalf("last seq = %d, want 41", got)
 	}
 	if len(recovered.Manager.List()) != 0 {
 		t.Fatal("output-only history restored a session")
@@ -105,8 +106,8 @@ func TestBootstrapSessionsStartsEmptyDatabaseAtOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bootstrap sessions: %v", err)
 	}
-	if got := recovered.Hub.NextSeq(); got != 1 {
-		t.Fatalf("next seq = %d, want 1", got)
+	if got := recovered.Hub.LastSeq(); got != 0 {
+		t.Fatalf("last seq = %d, want 0", got)
 	}
 }
 
@@ -256,6 +257,61 @@ func TestRunStopsLiveSessionBeforeClosingStore(t *testing.T) {
 	}
 }
 
+func TestRunStopsAfterRuntimeEventCommitFailure(t *testing.T) {
+	dataDir := t.TempDir()
+	dbPath := filepath.Join(dataDir, "drove.db")
+	addr := reserveAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- New(&config.Config{
+			DataDir:     dataDir,
+			DBPath:      dbPath,
+			APIBind:     addr,
+			EventBuffer: 16,
+		}).Run(ctx)
+	}()
+	waitForAPI(t, addr)
+
+	db, err := sql.Open("sqlite", "file:"+dbPath)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := db.Exec(`DROP TABLE events`); err != nil {
+		_ = db.Close()
+		t.Fatalf("drop events table: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	response, err := http.Post(
+		"http://"+addr+"/api/v1/agents",
+		"application/json",
+		strings.NewReader(`{"vendor":"generic","command":"/bin/cat"}`),
+	)
+	if err != nil {
+		t.Fatalf("start request after storage failure: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("start status = %d, want 500", response.StatusCode)
+	}
+
+	select {
+	case runErr := <-runResult:
+		if runErr == nil ||
+			!strings.Contains(runErr.Error(), "session event commit") ||
+			!strings.Contains(runErr.Error(), "no such table") {
+			t.Fatalf("daemon error = %v, want fatal event commit failure", runErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon continued running after event commit failure")
+	}
+}
+
 func reserveAddress(t *testing.T) string {
 	t.Helper()
 
@@ -268,6 +324,24 @@ func reserveAddress(t *testing.T) string {
 		t.Fatalf("release address: %v", err)
 	}
 	return addr
+}
+
+func waitForAPI(t *testing.T, addr string) {
+	t.Helper()
+
+	client := &http.Client{Timeout: 250 * time.Millisecond}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		response, err := client.Get("http://" + addr + "/api/v1/agents")
+		if err == nil {
+			_ = response.Body.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon API did not become ready: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func startAgentThroughAPI(t *testing.T, addr string) *session.Status {

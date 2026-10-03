@@ -78,7 +78,12 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 
 	ln, err := net.Listen("tcp", d.cfg.APIBind)
 	if err != nil {
-		return fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err)
+		closeErr := mgr.Close()
+		hub.Close()
+		return errors.Join(
+			fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err),
+			closeErr,
+		)
 	}
 
 	// 4. 启动 + 优雅关闭。
@@ -98,6 +103,8 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		log.Info("shutdown signal received")
 	case err := <-errCh:
 		runErr = fmt.Errorf("daemon: serve: %w", err)
+	case err := <-mgr.Fatal():
+		runErr = fmt.Errorf("daemon: session event commit: %w", err)
 	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

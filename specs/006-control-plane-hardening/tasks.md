@@ -18,14 +18,14 @@
 
 ## Commit 3: ordered event commit
 
-- [ ] Add projection-neutral `agent.signal` reader compatibility first.
-- [ ] Add failure and concurrency tests for durable event ordering.
-- [ ] Make Hub committed-event fan-out only.
-- [ ] Add revisioned Agent transition plans.
-- [ ] Add the session-owned Committer actor.
-- [ ] Migrate lifecycle, output, input, error, and recovery reconciliation.
-- [ ] Add daemon fail-stop propagation for runtime Store failure.
-- [ ] Run focused and full race tests, commit, and push.
+- [x] Add projection-neutral `agent.signal` reader compatibility first.
+- [x] Add failure and concurrency tests for durable event ordering.
+- [x] Make Hub committed-event fan-out only.
+- [x] Add revisioned Agent transition plans.
+- [x] Add the session-owned Committer actor.
+- [x] Migrate lifecycle, output, input, error, and recovery reconciliation.
+- [x] Add daemon fail-stop propagation for runtime Store failure.
+- [x] Run focused and full race tests, commit, and push.
 
 ## Commit 4: local authentication
 

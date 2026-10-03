@@ -7,6 +7,7 @@
 ## 关键设计
 
 - `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
+- 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。
 - PTY 回调在启动前注册，但通过单次 ready channel 等待会话登记完成，防止短进程的输出或退出越过 `starting -> working`。
@@ -22,6 +23,6 @@
 ## 约束
 
 - 禁止在 session 之外创建 agent 或 PTY 会话。
-- 事件必须**先落库后发布**（保证回放与实时一致），见 `persistAndPublish`。
+- 事件必须经 Committer **先落库、再改投影、最后发布**；Store 失败后 Manager 通过 `Fatal()` 触发 daemon fail-stop。
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
 - 导出类型：`Manager`、`Session`、`StartRequest`、`Status`。

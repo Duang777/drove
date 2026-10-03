@@ -268,7 +268,7 @@ func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 		t.Fatalf("open store: %v", err)
 	}
 	hub := event.NewHub(0)
-	manager := session.NewManager(adapter.NewRegistry(), hub, st)
+	manager := session.NewManager(adapter.NewRegistry(), hub, st, 0)
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)

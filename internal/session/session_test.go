@@ -30,8 +30,8 @@ func TestBootstrapEmptyStore(t *testing.T) {
 	if result.Recovery != (RecoveryReport{}) {
 		t.Fatalf("recovery report = %+v, want zero", result.Recovery)
 	}
-	if got := result.Hub.NextSeq(); got != 1 {
-		t.Fatalf("first hub seq = %d, want 1", got)
+	if got := result.Hub.LastSeq(); got != 0 {
+		t.Fatalf("hub last seq = %d, want 0", got)
 	}
 }
 
@@ -103,8 +103,8 @@ func TestBootstrapRestoresLegacySessionIdempotently(t *testing.T) {
 	if len(secondRows) != 3 {
 		t.Fatalf("second replay event count = %d, want 3", len(secondRows))
 	}
-	if got := second.Hub.NextSeq(); got != 4 {
-		t.Fatalf("next hub seq = %d, want 4", got)
+	if got := second.Hub.LastSeq(); got != 3 {
+		t.Fatalf("hub last seq = %d, want 3", got)
 	}
 }
 
@@ -374,6 +374,49 @@ func TestStartDoesNotLaunchProcessWhenCreationCannotPersist(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("process marker error = %v, want not exist", statErr)
+	}
+}
+
+func TestTransitionPersistenceFailureLeavesAgentAndHubUnchanged(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("agent-1")
+	a := agent.New(
+		id,
+		agent.WithName("agent"),
+		agent.WithVendor("generic"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.mu.Unlock()
+	subscription := manager.hub.Subscribe(1)
+	defer manager.hub.Unsubscribe(subscription)
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	err := manager.transitionAgent(context.Background(), a, agent.StateStarting, "test")
+	if err == nil {
+		t.Fatal("transition succeeded with closed store")
+	}
+	if a.State() != agent.StatePending {
+		t.Fatalf("agent state = %s, want unchanged pending", a.State())
+	}
+	if manager.hub.LastSeq() != 0 {
+		t.Fatalf("hub last sequence = %d, want 0", manager.hub.LastSeq())
+	}
+	select {
+	case published := <-subscription.C():
+		t.Fatalf("published event after failed append: %+v", published)
+	default:
+	}
+	select {
+	case fatalErr := <-manager.Fatal():
+		if fatalErr == nil {
+			t.Fatal("manager reported nil fatal error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manager did not report fatal commit error")
 	}
 }
 
@@ -1082,17 +1125,16 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 		agent.WithName("interactive-agent"),
 		agent.WithVendor("claude"),
 		agent.WithRunMode(agent.RunModeInteractive),
-		agent.WithStateChangeHook(manager.onStateChange),
 	)
-	if err := a.Transition(agent.StateStarting, "test start"); err != nil {
-		t.Fatalf("transition starting: %v", err)
-	}
-	if err := a.Transition(agent.StateWorking, "test working"); err != nil {
-		t.Fatalf("transition working: %v", err)
-	}
 	manager.mu.Lock()
 	manager.agents[id] = a
 	manager.mu.Unlock()
+	if err := manager.transitionAgent(context.Background(), a, agent.StateStarting, "test start"); err != nil {
+		t.Fatalf("transition starting: %v", err)
+	}
+	if err := manager.transitionAgent(context.Background(), a, agent.StateWorking, "test working"); err != nil {
+		t.Fatalf("transition working: %v", err)
+	}
 
 	manager.onOutput(id, "Task complete!", manager.reg.For("claude"))
 
@@ -1105,7 +1147,7 @@ func TestStopCauseAndExitClaimHaveOneWinner(t *testing.T) {
 	t.Run("stop first", func(t *testing.T) {
 		manager, _ := newTestManager(t)
 		id := agent.ID("agent-1")
-		running := &runningSession{}
+		running := &runningSession{process: &fakeProcessSession{}}
 		manager.sessions[id] = running
 
 		manager.requestStop(id, running, stopCauseUser)
@@ -1121,7 +1163,7 @@ func TestStopCauseAndExitClaimHaveOneWinner(t *testing.T) {
 	t.Run("exit first", func(t *testing.T) {
 		manager, _ := newTestManager(t)
 		id := agent.ID("agent-1")
-		running := &runningSession{}
+		running := &runningSession{process: &fakeProcessSession{}}
 		manager.sessions[id] = running
 
 		cause, ok := manager.claimExit(id, running)
@@ -1216,7 +1258,13 @@ func newTestManager(t *testing.T) (*Manager, *store.Store) {
 	t.Helper()
 
 	st := newTestStore(t)
-	return NewManager(adapter.NewRegistry(), event.NewHub(0), st), st
+	manager := NewManager(adapter.NewRegistry(), event.NewHub(0), st, 0)
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+	})
+	return manager, st
 }
 
 func newTestStore(t *testing.T) *store.Store {
