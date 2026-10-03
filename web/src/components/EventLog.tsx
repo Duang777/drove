@@ -5,6 +5,7 @@ import { replayAgent } from '../api/client'
 const KIND_STYLE: Record<string, string> = {
   state_changed: 'text-purple-600',
   output: 'text-gray-700',
+  'output.chunk': 'text-amber-600',
   error: 'text-red-600',
   session_lifecycle: 'text-blue-600',
   'agent.input': 'text-cyan-600',
@@ -79,6 +80,7 @@ export function EventLog({ liveEvents, replayID }: Props) {
 }
 
 function formatEventText(kind: string, text: string): string {
+  if (kind === 'output.chunk') return formatOutputChunk(text)
   if (kind !== 'agent.signal' || text === '') return text
   try {
     const value: unknown = JSON.parse(text)
@@ -89,6 +91,28 @@ function formatEventText(kind: string, text: string): string {
     return parts.length > 0 ? parts.join(' · ') : text
   } catch {
     return text
+  }
+}
+
+function formatOutputChunk(text: string): string {
+  try {
+    const value: unknown = JSON.parse(text)
+    if (!isRecord(value)) return 'invalid output chunk metadata'
+    const offset = value.offset
+    const length = value.len
+    if (
+      typeof offset !== 'number' ||
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      typeof length !== 'number' ||
+      !Number.isSafeInteger(length) ||
+      length < 1
+    ) {
+      return 'invalid output chunk metadata'
+    }
+    return `offset ${offset} · ${length} bytes`
+  } catch {
+    return 'invalid output chunk metadata'
   }
 }
 

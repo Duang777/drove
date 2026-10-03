@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,56 @@ import (
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
+
+func TestCommitterStoresOutputMetadataAndPublishesHydratedChunk(t *testing.T) {
+	st := &memoryCommitStore{}
+	hub := event.NewHub(0)
+	subscription := hub.Subscribe(1)
+	defer hub.Unsubscribe(subscription)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	data := []byte("prompt\x00")
+	draft, err := event.NewOutputChunkDraft("agent-1", "agent-1", 12, data)
+	if err != nil {
+		t.Fatalf("new output chunk draft: %v", err)
+	}
+	if _, err := committer.CommitEvents(context.Background(), []event.Draft{draft}); err != nil {
+		t.Fatalf("commit output chunk: %v", err)
+	}
+
+	rows := st.Rows()
+	if len(rows) != 1 {
+		t.Fatalf("stored row count = %d, want 1", len(rows))
+	}
+	stored, err := event.DecodeOutputChunkPayload(rows[0].Payload)
+	if err != nil {
+		t.Fatalf("decode stored output metadata: %v", err)
+	}
+	if stored.DataB64 != "" || stored.Offset != 12 || stored.Len != len(data) {
+		t.Fatalf("stored payload = %+v", stored)
+	}
+	if !bytes.Equal(rows[0].OutputAttachment, data) {
+		t.Fatalf("stored attachment = %q, want %q", rows[0].OutputAttachment, data)
+	}
+
+	select {
+	case published := <-subscription.C():
+		payload, err := event.DecodeOutputChunkPayload(published.Payload)
+		if err != nil {
+			t.Fatalf("decode published output payload: %v", err)
+		}
+		decoded, err := payload.DecodeData()
+		if err != nil {
+			t.Fatalf("decode published output data: %v", err)
+		}
+		if !bytes.Equal(decoded, data) {
+			t.Fatalf("published data = %q, want %q", decoded, data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for output chunk")
+	}
+}
 
 func TestTypedCommitterSealsDraftsAndAppliesAgentAfterStore(t *testing.T) {
 	a := agent.New(

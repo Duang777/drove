@@ -7,9 +7,12 @@
 ## 关键设计
 
 - **只追加**：事件日志只 INSERT，不 UPDATE/DELETE；重建会话视图 = 重放事件（事件溯源）。
-- 表结构：`events(seq, ts, type, session_id, agent_id, from, to, reason, payload)`，以 `seq` 为单调主键。
+- 表结构：`events(seq, ts, type, session_id, agent_id, from, to, reason, payload)`
+  以 `seq` 为单调主键；`output_chunks(event_seq, data)` 保存可过期的原始输出附件。
 - `Store` 封装 `database/sql`，提供 `AppendEvent` / `Replay(sessionID)` / `Close`。
 - WAL 模式开启（`_pragma=journal_mode(WAL)`），daemon 长生命周期下并发读写安全。
+- `output.chunk` envelope 与附件在同一事务中追加；`ScanEvents` 不加载附件，
+  `Replay` 通过 left join 返回仍保留的附件。
 
 ## 约束
 

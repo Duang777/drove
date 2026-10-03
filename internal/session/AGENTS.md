@@ -21,12 +21,14 @@
 - 运行中会话记录停止原因和退出认领状态；`Stop`、`Close` 与自然退出通过同一个锁确定唯一终态。
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 → 清空运行中会话索引。
-- `Replay(sessionID)`：从 store 读取事件流供回放（CLI `log` 命令 / API）。
+- `Replay(sessionID)`：从 store 读取事件流供回放；仍保留的 `output.chunk` 附件被编码进
+  Base64 payload，已过期的附件只返回 offset/len metadata。
 - `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
 - `onOutput` 仅替换当前会话 signal token 后持久化并发布文本，再把 adapter 的独立
   清洗分类视图交给 Detector；回放和订阅 payload 不受 ANSI 清洗影响。
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
-- 恢复投影显式识别 `agent.input`，但该审计事件不创建会话、不改变状态或时间戳。
+- 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
+  `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。
 - 信号与状态证据 reader 同时接受 v1 和 v2；v2 的 notify 只在 fallback 下确认
   Idle。adapter 标记为忽略的厂商内部通知不提交事件。
 - 状态决策：进程退出决定终态；激活后的 hook 决定 turn 状态；只有进入

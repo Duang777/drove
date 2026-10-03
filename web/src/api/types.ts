@@ -69,6 +69,7 @@ export interface StartRequest {
 export type EventType =
   | 'state_changed'
   | 'output'
+  | 'output.chunk'
   | 'error'
   | 'session_lifecycle'
   | 'agent.input'

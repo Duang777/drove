@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -16,6 +17,95 @@ import (
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
+
+func TestReplayHydratesRetainedOutputAndLeavesExpiredMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "drove.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Date(2026, time.October, 4, 3, 0, 0, 0, time.UTC)
+	var rows []store.EventRow
+	for i, item := range []struct {
+		offset uint64
+		data   []byte
+	}{
+		{offset: 0, data: []byte("retained")},
+		{offset: 8, data: []byte("expired")},
+	} {
+		draft, err := event.NewOutputChunkDraft("agent-1", "agent-1", item.offset, item.data)
+		if err != nil {
+			t.Fatalf("new output chunk %d: %v", i, err)
+		}
+		committed, err := event.Commit(uint64(i+1), base.Add(time.Duration(i)*time.Second), draft)
+		if err != nil {
+			t.Fatalf("commit output chunk %d: %v", i, err)
+		}
+		rows = append(rows, eventRow(committed))
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("append output chunks: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open raw database: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM output_chunks WHERE event_seq = 2`); err != nil {
+		t.Fatalf("expire output attachment: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close raw database: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	manager := NewManager(adapter.NewRegistry(), event.NewHub(2), st, 2)
+	defer func() {
+		if err := manager.Close(); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+		if err := st.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	}()
+
+	replayed, err := manager.Replay("agent-1")
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(replayed) != 2 {
+		t.Fatalf("replayed row count = %d, want 2", len(replayed))
+	}
+	retained, err := event.DecodeOutputChunkPayload(replayed[0].Payload)
+	if err != nil {
+		t.Fatalf("decode retained payload: %v", err)
+	}
+	retainedData, err := retained.DecodeData()
+	if err != nil {
+		t.Fatalf("decode retained data: %v", err)
+	}
+	if string(retainedData) != "retained" {
+		t.Fatalf("retained data = %q, want retained", retainedData)
+	}
+	expired, err := event.DecodeOutputChunkPayload(replayed[1].Payload)
+	if err != nil {
+		t.Fatalf("decode expired metadata: %v", err)
+	}
+	if expired.DataB64 != "" || expired.Offset != 8 || expired.Len != len("expired") {
+		t.Fatalf("expired payload = %+v", expired)
+	}
+	for _, row := range replayed {
+		if row.OutputAttachment != nil {
+			t.Fatalf("manager replay exposed attachment at seq %d", row.Seq)
+		}
+	}
+}
 
 func TestBootstrapEmptyStore(t *testing.T) {
 	st := newTestStore(t)

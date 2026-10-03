@@ -4,8 +4,11 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/Duang777/drove/internal/event"
 
 	_ "modernc.org/sqlite"
 )
@@ -21,6 +24,8 @@ type EventRow struct {
 	To        string
 	Reason    string
 	Payload   string
+
+	OutputAttachment []byte `json:"-"`
 }
 
 // Store 封装 SQLite 存储。
@@ -28,11 +33,14 @@ type Store struct {
 	db *sql.DB
 }
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 // Open 打开（或创建）位于 path 的数据库，并执行迁移。
 func Open(path string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)", path)
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)",
+		path,
+	)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open %q: %w", path, err)
@@ -42,11 +50,29 @@ func Open(path string) (*Store, error) {
 	db.SetMaxIdleConns(1)
 
 	s := &Store{db: db}
+	if err := s.enableForeignKeys(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
+}
+
+func (s *Store) enableForeignKeys() error {
+	if _, err := s.db.Exec(`PRAGMA foreign_keys = ON`); err != nil {
+		return fmt.Errorf("store: enable foreign keys: %w", err)
+	}
+	var enabled int
+	if err := s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		return fmt.Errorf("store: verify foreign keys: %w", err)
+	}
+	if enabled != 1 {
+		return errors.New("store: foreign keys remain disabled")
+	}
+	return nil
 }
 
 // migrate 执行版本化迁移。
@@ -79,6 +105,18 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("store: migrate v1: %w", err)
 		}
 	}
+	if v < 2 {
+		_, err := s.db.Exec(`
+			CREATE TABLE IF NOT EXISTS output_chunks (
+				event_seq INTEGER PRIMARY KEY,
+				data      BLOB NOT NULL CHECK(length(data) BETWEEN 1 AND 32768),
+				FOREIGN KEY(event_seq) REFERENCES events(seq) ON DELETE CASCADE
+			);
+		`)
+		if err != nil {
+			return fmt.Errorf("store: migrate v2: %w", err)
+		}
+	}
 	_, err := s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion))
 	if err != nil {
 		return fmt.Errorf("store: set version: %w", err)
@@ -88,14 +126,19 @@ func (s *Store) migrate() error {
 
 // AppendEvent 追加一条事件。
 func (s *Store) AppendEvent(ev EventRow) error {
-	_, err := s.db.Exec(
-		`INSERT INTO events (seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.Seq, ev.Timestamp.UTC().Format(time.RFC3339Nano), ev.Type, ev.SessionID, ev.AgentID,
-		ev.From, ev.To, ev.Reason, ev.Payload,
-	)
+	if err := validateOutputAttachment(ev); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
+		return fmt.Errorf("store: begin append event: %w", err)
+	}
+	defer tx.Rollback()
+	if err := appendEventRow(context.Background(), tx, ev); err != nil {
 		return fmt.Errorf("store: append event: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("store: commit append event: %w", err)
 	}
 	return nil
 }
@@ -134,14 +177,16 @@ func (s *Store) AppendEvents(ctx context.Context, expectedLastSeq uint64, events
 				expectedSeq,
 			)
 		}
+		if err := validateOutputAttachment(event); err != nil {
+			return expectedLastSeq, fmt.Errorf(
+				"store: validate event batch at seq %d: %w",
+				event.Seq,
+				err,
+			)
+		}
 	}
 	for _, event := range events {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO events (seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			event.Seq, event.Timestamp.UTC().Format(time.RFC3339Nano), event.Type, event.SessionID,
-			event.AgentID, event.From, event.To, event.Reason, event.Payload,
-		); err != nil {
+		if err := appendEventRow(ctx, tx, event); err != nil {
 			return expectedLastSeq, fmt.Errorf("store: append event batch at seq %d: %w", event.Seq, err)
 		}
 	}
@@ -149,6 +194,42 @@ func (s *Store) AppendEvents(ctx context.Context, expectedLastSeq uint64, events
 		return expectedLastSeq, fmt.Errorf("store: commit event batch: %w", err)
 	}
 	return expectedLastSeq + uint64(len(events)), nil
+}
+
+func validateOutputAttachment(row EventRow) error {
+	if row.Type == string(event.TypeOutputChunk) {
+		if len(row.OutputAttachment) == 0 {
+			return errors.New("store: output chunk requires an attachment")
+		}
+		return nil
+	}
+	if row.OutputAttachment != nil {
+		return fmt.Errorf("store: event type %q cannot have an output attachment", row.Type)
+	}
+	return nil
+}
+
+func appendEventRow(ctx context.Context, tx *sql.Tx, row EventRow) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		row.Seq, row.Timestamp.UTC().Format(time.RFC3339Nano), row.Type, row.SessionID,
+		row.AgentID, row.From, row.To, row.Reason, row.Payload,
+	); err != nil {
+		return fmt.Errorf("append envelope: %w", err)
+	}
+	if row.Type != string(event.TypeOutputChunk) {
+		return nil
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`INSERT INTO output_chunks (event_seq, data) VALUES (?, ?)`,
+		row.Seq,
+		row.OutputAttachment,
+	); err != nil {
+		return fmt.Errorf("append output attachment: %w", err)
+	}
+	return nil
 }
 
 // ScanEvents 按全局 seq 升序访问全部事件，并返回最后一个序号。
@@ -197,8 +278,12 @@ func (s *Store) ScanEvents(ctx context.Context, visit func(EventRow) error) (uin
 // Replay 按 seq 升序回放某会话的全部事件。
 func (s *Store) Replay(sessionID string) ([]EventRow, error) {
 	rows, err := s.db.Query(
-		`SELECT seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload
-		 FROM events WHERE session_id = ? ORDER BY seq ASC`,
+		`SELECT e.seq, e.ts, e.type, e.session_id, e.agent_id, e.from_state,
+		        e.to_state, e.reason, e.payload, o.data
+		 FROM events AS e
+		 LEFT JOIN output_chunks AS o ON o.event_seq = e.seq
+		 WHERE e.session_id = ?
+		 ORDER BY e.seq ASC`,
 		sessionID,
 	)
 	if err != nil {
@@ -211,7 +296,7 @@ func (s *Store) Replay(sessionID string) ([]EventRow, error) {
 		var r EventRow
 		var ts string
 		if err := rows.Scan(&r.Seq, &ts, &r.Type, &r.SessionID, &r.AgentID,
-			&r.From, &r.To, &r.Reason, &r.Payload); err != nil {
+			&r.From, &r.To, &r.Reason, &r.Payload, &r.OutputAttachment); err != nil {
 			return nil, fmt.Errorf("store: scan: %w", err)
 		}
 		t, err := time.Parse(time.RFC3339Nano, ts)

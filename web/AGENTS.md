@@ -18,6 +18,8 @@
 ## 关键设计
 
 - **实时与回放双轨**：WebSocket 承载实时事件；回放走 REST（`/api/v1/agents/{id}/events`），两者展示在同一个 EventLog。
+- **原始输出摘要**：`output.chunk` 只显示 offset 和解码长度；EventLog 不渲染
+  `data_b64`。
 - **本地投影仅是视图**：前端从事件流推导的状态只是展示用，权威状态永远以 daemon 为准（刷新列表纠正）。
 - **Dev 代理**：`vite.config.ts` 将 `/api`、`/ws` 代理到 loopback daemon，并在每次 HTTP 请求与 WebSocket upgrade 时从 DataDir 读取控制令牌注入 Bearer 认证。
 

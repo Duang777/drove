@@ -1,6 +1,8 @@
 package event
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -73,6 +75,138 @@ func TestCommitSealsDraft(t *testing.T) {
 	}
 	if _, err := Commit(0, at, NewOutputDraft("agent-1", "agent-1", "line")); !errors.Is(err, ErrUncommittedEvent) {
 		t.Fatalf("zero-sequence commit error = %v", err)
+	}
+}
+
+func TestOutputChunkDraftCopiesPrivateAttachment(t *testing.T) {
+	data := []byte("prompt\x00without newline")
+	draft, err := NewOutputChunkDraft("agent-1", "agent-1", 17, data)
+	if err != nil {
+		t.Fatalf("new output chunk draft: %v", err)
+	}
+	data[0] = 'X'
+
+	at := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	committed, err := Commit(8, at, draft)
+	if err != nil {
+		t.Fatalf("commit output chunk: %v", err)
+	}
+	if committed.Type != TypeOutputChunk {
+		t.Fatalf("event type = %q, want %q", committed.Type, TypeOutputChunk)
+	}
+	payload, err := DecodeOutputChunkPayload(committed.Payload)
+	if err != nil {
+		t.Fatalf("decode hydrated payload: %v", err)
+	}
+	decoded, err := payload.DecodeData()
+	if err != nil {
+		t.Fatalf("decode output data: %v", err)
+	}
+	want := []byte("prompt\x00without newline")
+	if !bytes.Equal(decoded, want) {
+		t.Fatalf("decoded data = %q, want %q", decoded, want)
+	}
+	if payload.Offset != 17 || payload.Len != len(want) {
+		t.Fatalf("payload = %+v, want offset 17 and len %d", payload, len(want))
+	}
+
+	stored, err := DecodeOutputChunkPayload(committed.StoredPayload())
+	if err != nil {
+		t.Fatalf("decode stored metadata: %v", err)
+	}
+	if stored.DataB64 != "" {
+		t.Fatalf("stored metadata contains Base64 data: %+v", stored)
+	}
+	attachment := committed.OutputAttachment()
+	if !bytes.Equal(attachment, want) {
+		t.Fatalf("attachment = %q, want %q", attachment, want)
+	}
+	attachment[0] = 'Y'
+	if got := committed.OutputAttachment(); !bytes.Equal(got, want) {
+		t.Fatalf("event attachment mutated through accessor: %q", got)
+	}
+
+	encoded, err := json.Marshal(committed)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`outputAttachment`)) ||
+		bytes.Contains(encoded, []byte(`prompt`)) {
+		t.Fatalf("marshaled event exposed private attachment: %s", encoded)
+	}
+}
+
+func TestOutputChunkPayloadValidation(t *testing.T) {
+	valid := OutputChunkPayloadV1{
+		Version: OutputChunkPayloadVersion,
+		Offset:  4,
+		Len:     3,
+		DataB64: "YWJj",
+	}
+	if err := valid.ValidateMetadata(); err != nil {
+		t.Fatalf("validate metadata: %v", err)
+	}
+	if err := valid.ValidateHydrated(); err != nil {
+		t.Fatalf("validate hydrated payload: %v", err)
+	}
+	expired := valid
+	expired.DataB64 = ""
+	if err := expired.ValidateMetadata(); err != nil {
+		t.Fatalf("validate expired metadata: %v", err)
+	}
+	if err := expired.ValidateHydrated(); err == nil {
+		t.Fatal("hydrated validation accepted missing data")
+	}
+
+	tests := []struct {
+		name    string
+		payload OutputChunkPayloadV1
+	}{
+		{name: "unknown version", payload: OutputChunkPayloadV1{Version: 2, Len: 1}},
+		{name: "empty", payload: OutputChunkPayloadV1{Version: 1}},
+		{name: "oversized", payload: OutputChunkPayloadV1{Version: 1, Len: MaxOutputChunkBytes + 1}},
+		{name: "malformed Base64", payload: OutputChunkPayloadV1{Version: 1, Len: 1, DataB64: "!"}},
+		{name: "unpadded Base64", payload: OutputChunkPayloadV1{Version: 1, Len: 2, DataB64: "YWI"}},
+		{name: "length mismatch", payload: OutputChunkPayloadV1{Version: 1, Len: 2, DataB64: "YWJj"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.payload.ValidateHydrated(); err == nil {
+				t.Fatalf("validation accepted %+v", test.payload)
+			}
+		})
+	}
+}
+
+func TestNewOutputChunkDraftRejectsInvalidLengths(t *testing.T) {
+	if _, err := NewOutputChunkDraft("agent", "agent", 0, nil); err == nil {
+		t.Fatal("constructor accepted an empty chunk")
+	}
+	if _, err := NewOutputChunkDraft(
+		"agent",
+		"agent",
+		0,
+		make([]byte, MaxOutputChunkBytes+1),
+	); err == nil {
+		t.Fatal("constructor accepted an oversized chunk")
+	}
+}
+
+func TestHydrateOutputChunkPayloadRejectsLengthMismatch(t *testing.T) {
+	metadata := `{"version":1,"offset":9,"len":3}`
+	hydrated, err := HydrateOutputChunkPayload(metadata, []byte("abc"))
+	if err != nil {
+		t.Fatalf("hydrate output chunk: %v", err)
+	}
+	payload, err := DecodeOutputChunkPayload(hydrated)
+	if err != nil {
+		t.Fatalf("decode hydrated output chunk: %v", err)
+	}
+	if err := payload.ValidateHydrated(); err != nil {
+		t.Fatalf("validate hydrated output chunk: %v", err)
+	}
+	if _, err := HydrateOutputChunkPayload(metadata, []byte("ab")); err == nil {
+		t.Fatal("hydration accepted a length-mismatched attachment")
 	}
 }
 

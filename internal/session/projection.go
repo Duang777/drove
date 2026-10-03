@@ -95,7 +95,7 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 		return validateAgentID(row)
 	case event.TypeAgentSignal:
 		return p.applySignal(row)
-	case event.TypeOutput:
+	case event.TypeOutput, event.TypeOutputChunk:
 		if row.SessionID == "" {
 			return nil
 		}

@@ -187,24 +187,26 @@ func newLogCmd() *cobra.Command {
 
 func writeLogRows(w io.Writer, rows []store.EventRow) error {
 	for _, row := range rows {
-		timestamp := row.Timestamp.Local().Format("15:04:05.000")
-		agentLabel := "[" + shortID(row.AgentID) + "]"
-		if row.Type == string(event.TypeOutput) {
-			payload := strings.TrimRight(row.Payload, "\r\n")
-			if _, err := fmt.Fprintf(w, "%s %-14s %s\n", timestamp, agentLabel, payload); err != nil {
-				return fmt.Errorf("write output event: %w", err)
+		switch event.Type(row.Type) {
+		case event.TypeOutput:
+			if _, err := io.WriteString(w, strings.TrimRight(row.Payload, "\r\n")+"\n"); err != nil {
+				return fmt.Errorf("write legacy output event at seq %d: %w", row.Seq, err)
 			}
-			continue
-		}
-		if _, err := fmt.Fprintf(
-			w,
-			"%s %-14s %s: %s\n",
-			timestamp,
-			agentLabel,
-			row.Type,
-			row.Reason,
-		); err != nil {
-			return fmt.Errorf("write %s event: %w", row.Type, err)
+		case event.TypeOutputChunk:
+			payload, err := event.DecodeOutputChunkPayload(row.Payload)
+			if err != nil {
+				return fmt.Errorf("decode output chunk at seq %d: %w", row.Seq, err)
+			}
+			if payload.DataB64 == "" {
+				continue
+			}
+			data, err := payload.DecodeData()
+			if err != nil {
+				return fmt.Errorf("decode output chunk data at seq %d: %w", row.Seq, err)
+			}
+			if _, err := w.Write(data); err != nil {
+				return fmt.Errorf("write output chunk at seq %d: %w", row.Seq, err)
+			}
 		}
 	}
 	return nil

@@ -569,7 +569,38 @@ func (m *Manager) List() []*Status {
 
 // Replay 返回某会话的事件流（来自 store，按 seq 升序）。
 func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
-	return m.store.Replay(sessionID)
+	rows, err := m.store.Replay(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range rows {
+		if rows[i].Type != string(event.TypeOutputChunk) {
+			continue
+		}
+		if _, err := event.DecodeOutputChunkPayload(rows[i].Payload); err != nil {
+			return nil, fmt.Errorf(
+				"session: decode output chunk metadata at seq %d: %w",
+				rows[i].Seq,
+				err,
+			)
+		}
+		if len(rows[i].OutputAttachment) != 0 {
+			payload, err := event.HydrateOutputChunkPayload(
+				rows[i].Payload,
+				rows[i].OutputAttachment,
+			)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"session: hydrate output chunk at seq %d: %w",
+					rows[i].Seq,
+					err,
+				)
+			}
+			rows[i].Payload = payload
+		}
+		rows[i].OutputAttachment = nil
+	}
+	return rows, nil
 }
 
 // SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。

@@ -1,13 +1,97 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Duang777/drove/internal/event"
 )
+
+func TestOpenMigratesV1WithoutRewritingEvents(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE events (
+			seq        INTEGER PRIMARY KEY,
+			ts         TEXT    NOT NULL,
+			type       TEXT    NOT NULL,
+			session_id TEXT    NOT NULL,
+			agent_id   TEXT    NOT NULL DEFAULT '',
+			from_state TEXT    NOT NULL DEFAULT '',
+			to_state   TEXT    NOT NULL DEFAULT '',
+			reason     TEXT    NOT NULL DEFAULT '',
+			payload    TEXT    NOT NULL DEFAULT ''
+		);
+		INSERT INTO events (
+			seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload
+		) VALUES (
+			41, '2026-10-04T01:02:03Z', 'output', 'legacy', 'legacy', '', '', '', 'kept'
+		);
+		PRAGMA user_version = 1;
+	`); err != nil {
+		t.Fatalf("seed version 1 database: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate database: %v", err)
+	}
+	defer s.Close()
+
+	var version int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read migrated version: %v", err)
+	}
+	if version != schemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, schemaVersion)
+	}
+	rows, err := s.Replay("legacy")
+	if err != nil {
+		t.Fatalf("replay legacy row: %v", err)
+	}
+	if len(rows) != 1 ||
+		rows[0].Seq != 41 ||
+		rows[0].Payload != "kept" ||
+		rows[0].Type != string(event.TypeOutput) {
+		t.Fatalf("legacy row changed during migration: %+v", rows)
+	}
+}
+
+func TestOpenEnablesForeignKeys(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	var enabled int
+	if err := s.db.QueryRow(`PRAGMA foreign_keys`).Scan(&enabled); err != nil {
+		t.Fatalf("read foreign key setting: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("foreign_keys = %d, want 1", enabled)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO output_chunks (event_seq, data) VALUES (?, ?)`,
+		99,
+		[]byte("orphan"),
+	); err == nil {
+		t.Fatal("foreign key accepted an orphaned output attachment")
+	}
+}
 
 func TestScanEventsReturnsZeroForEmptyStore(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
@@ -284,7 +368,15 @@ func TestAppendEventsRollsBackAfterInsertFailure(t *testing.T) {
 	}
 
 	newLastSeq, err := s.AppendEvents(context.Background(), 0, []EventRow{
-		{Seq: 1, Timestamp: time.Now().UTC(), Type: "output", SessionID: "s1"},
+		{
+			Seq:              1,
+			Timestamp:        time.Now().UTC(),
+			Type:             string(event.TypeOutputChunk),
+			SessionID:        "s1",
+			AgentID:          "s1",
+			Payload:          `{"version":1,"offset":0,"len":3}`,
+			OutputAttachment: []byte("one"),
+		},
 		{Seq: 2, Timestamp: time.Now().UTC(), Type: "output", SessionID: "s1"},
 	})
 	if err == nil {
@@ -300,6 +392,54 @@ func TestAppendEventsRollsBackAfterInsertFailure(t *testing.T) {
 	}
 	if lastSeq != 0 {
 		t.Fatalf("last seq after rolled-back batch = %d, want 0", lastSeq)
+	}
+	var attachments int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM output_chunks`).Scan(&attachments); err != nil {
+		t.Fatalf("count output attachments: %v", err)
+	}
+	if attachments != 0 {
+		t.Fatalf("output attachment count = %d, want 0", attachments)
+	}
+}
+
+func TestAppendEventsRollsBackAfterAttachmentFailure(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if _, err := s.db.Exec(`
+		CREATE TRIGGER fail_output_attachment
+		BEFORE INSERT ON output_chunks
+		BEGIN
+			SELECT RAISE(ABORT, 'forced attachment failure');
+		END;
+	`); err != nil {
+		t.Fatalf("create failure trigger: %v", err)
+	}
+	row := EventRow{
+		Seq:              1,
+		Timestamp:        time.Now().UTC(),
+		Type:             string(event.TypeOutputChunk),
+		SessionID:        "s1",
+		AgentID:          "s1",
+		Payload:          `{"version":1,"offset":0,"len":3}`,
+		OutputAttachment: []byte("one"),
+	}
+	lastSeq, err := s.AppendEvents(context.Background(), 0, []EventRow{row})
+	if err == nil || !strings.Contains(err.Error(), "attachment") {
+		t.Fatalf("append result = (%d, %v), want attachment failure", lastSeq, err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+	var envelopes int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM events`).Scan(&envelopes); err != nil {
+		t.Fatalf("count event envelopes: %v", err)
+	}
+	if envelopes != 0 {
+		t.Fatalf("event envelope count = %d, want 0", envelopes)
 	}
 }
 
@@ -366,6 +506,88 @@ func TestAppendAndReplay(t *testing.T) {
 		if !r.Timestamp.Equal(rows[i].Timestamp) {
 			t.Errorf("row %d ts mismatch: %v vs %v", i, r.Timestamp, rows[i].Timestamp)
 		}
+	}
+}
+
+func TestOutputChunkAttachmentIsAtomicAndReplayOnly(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	data := []byte{0, 1, 2, '\n', 0xff}
+	row := EventRow{
+		Seq:              1,
+		Timestamp:        time.Now().UTC(),
+		Type:             string(event.TypeOutputChunk),
+		SessionID:        "s1",
+		AgentID:          "s1",
+		Payload:          `{"version":1,"offset":7,"len":5}`,
+		OutputAttachment: data,
+	}
+	if _, err := s.AppendEvents(context.Background(), 0, []EventRow{row}); err != nil {
+		t.Fatalf("append output chunk: %v", err)
+	}
+
+	var scanned EventRow
+	if _, err := s.ScanEvents(context.Background(), func(row EventRow) error {
+		scanned = row
+		return nil
+	}); err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if scanned.OutputAttachment != nil {
+		t.Fatalf("projection scan loaded an attachment: %v", scanned.OutputAttachment)
+	}
+
+	replayed, err := s.Replay("s1")
+	if err != nil {
+		t.Fatalf("replay output chunk: %v", err)
+	}
+	if len(replayed) != 1 || !bytes.Equal(replayed[0].OutputAttachment, data) {
+		t.Fatalf("replayed attachment = %+v, want %v", replayed, data)
+	}
+	if replayed[0].Payload != row.Payload {
+		t.Fatalf("replayed payload = %q, want metadata %q", replayed[0].Payload, row.Payload)
+	}
+	encoded, err := json.Marshal(replayed[0])
+	if err != nil {
+		t.Fatalf("marshal replay row: %v", err)
+	}
+	if bytes.Contains(encoded, data) || bytes.Contains(encoded, []byte("OutputAttachment")) {
+		t.Fatalf("JSON exposed output attachment: %s", encoded)
+	}
+}
+
+func TestAppendRejectsInvalidOutputAttachments(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.AppendEvent(EventRow{
+		Seq:       1,
+		Type:      string(event.TypeOutputChunk),
+		SessionID: "s1",
+	}); err == nil {
+		t.Fatal("append accepted an output chunk without an attachment")
+	}
+	if err := s.AppendEvent(EventRow{
+		Seq:              1,
+		Type:             string(event.TypeOutput),
+		SessionID:        "s1",
+		OutputAttachment: []byte("hidden"),
+	}); err == nil {
+		t.Fatal("append accepted an attachment on a legacy output event")
+	}
+	lastSeq, err := s.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq after rejected rows = %d, want 0", lastSeq)
 	}
 }
 

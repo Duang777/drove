@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
@@ -399,25 +398,34 @@ func TestReadSendInput(t *testing.T) {
 	}
 }
 
-func TestWriteLogRowsUsesLocalTimeAndOneOutputLine(t *testing.T) {
-	previousLocal := time.Local
-	time.Local = time.FixedZone("test-local", 8*60*60)
-	t.Cleanup(func() {
-		time.Local = previousLocal
-	})
-
+func TestWriteLogRowsWritesRawChunksAndLegacyNewline(t *testing.T) {
+	retained, err := event.HydrateOutputChunkPayload(
+		`{"version":1,"offset":11,"len":6}`,
+		[]byte{0x1b, '[', '2', 'J', 0, 0xff},
+	)
+	if err != nil {
+		t.Fatalf("hydrate retained chunk: %v", err)
+	}
 	rows := []store.EventRow{
 		{
-			Timestamp: time.Date(2026, time.October, 3, 1, 2, 3, 4_000_000, time.UTC),
-			Type:      string(event.TypeOutput),
-			AgentID:   "12345678-abcd",
-			Payload:   "first line\r\n",
+			Seq:     1,
+			Type:    string(event.TypeOutput),
+			Payload: "first line\r\n",
 		},
 		{
-			Timestamp: time.Date(2026, time.October, 3, 1, 2, 4, 5_000_000, time.UTC),
-			Type:      string(event.TypeStateChanged),
-			AgentID:   "12345678-abcd",
-			Reason:    "ready",
+			Seq:     2,
+			Type:    string(event.TypeOutputChunk),
+			Payload: retained,
+		},
+		{
+			Seq:     3,
+			Type:    string(event.TypeOutputChunk),
+			Payload: `{"version":1,"offset":17,"len":4}`,
+		},
+		{
+			Seq:    4,
+			Type:   string(event.TypeStateChanged),
+			Reason: "ready",
 		},
 	}
 
@@ -425,10 +433,23 @@ func TestWriteLogRowsUsesLocalTimeAndOneOutputLine(t *testing.T) {
 	if err := writeLogRows(&output, rows); err != nil {
 		t.Fatalf("write log rows: %v", err)
 	}
-	want := "" +
-		"09:02:03.004 [12345678]     first line\n" +
-		"09:02:04.005 [12345678]     state_changed: ready\n"
-	if output.String() != want {
-		t.Fatalf("output = %q, want %q", output.String(), want)
+	want := append([]byte("first line\n"), []byte{0x1b, '[', '2', 'J', 0, 0xff}...)
+	if !bytes.Equal(output.Bytes(), want) {
+		t.Fatalf("output = %q, want %q", output.Bytes(), want)
+	}
+}
+
+func TestWriteLogRowsRejectsMalformedOutputChunk(t *testing.T) {
+	var output bytes.Buffer
+	err := writeLogRows(&output, []store.EventRow{{
+		Seq:     9,
+		Type:    string(event.TypeOutputChunk),
+		Payload: `{"version":1,"offset":0,"len":2,"data_b64":"YQ=="}`,
+	}})
+	if err == nil || !strings.Contains(err.Error(), "seq 9") {
+		t.Fatalf("write error = %v, want malformed chunk at seq 9", err)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("malformed chunk wrote %q", output.Bytes())
 	}
 }

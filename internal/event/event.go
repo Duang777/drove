@@ -4,6 +4,9 @@
 package event
 
 import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -24,6 +27,8 @@ const (
 	TypeStateChanged Type = "state_changed"
 	// TypeOutput 表示 agent 输出增量（PTY 字节流按行切分）。
 	TypeOutput Type = "output"
+	// TypeOutputChunk 表示带会话内字节偏移的终端输出块。
+	TypeOutputChunk Type = "output.chunk"
 	// TypeError 表示 agent 或系统错误。
 	TypeError Type = "error"
 	// TypeSessionLifecycle 表示会话创建/销毁。
@@ -34,7 +39,7 @@ const (
 	TypeAgentSignal Type = "agent.signal"
 )
 
-// Event 是不可变事件。所有字段导出供序列化，但外部不得修改。
+// Event 是不可变事件。公开字段供序列化，私有字段保存持久化附件。
 type Event struct {
 	Seq       uint64    `json:"seq"`
 	Timestamp time.Time `json:"timestamp"`
@@ -47,6 +52,9 @@ type Event struct {
 	Reason string `json:"reason,omitempty"`
 	// Payload 承载具体事件类型定义的内容。
 	Payload string `json:"payload,omitempty"`
+
+	storedPayload    string
+	outputAttachment []byte
 }
 
 // Draft is an unsequenced event value. Its fields stay private so callers
@@ -59,6 +67,9 @@ type Draft struct {
 	to        string
 	reason    string
 	payload   string
+
+	storedPayload    string
+	outputAttachment []byte
 }
 
 // NewStateChangedDraft constructs an uncommitted state transition.
@@ -82,6 +93,141 @@ func NewOutputDraft(sessionID, agentID, line string) Draft {
 		agentID:   agentID,
 		payload:   line,
 	}
+}
+
+const (
+	// OutputChunkPayloadVersion 是当前 output.chunk payload 版本。
+	OutputChunkPayloadVersion = 1
+	// MaxOutputChunkBytes 是单个 output.chunk 可携带的最大解码字节数。
+	MaxOutputChunkBytes = 32 * 1024
+)
+
+// OutputChunkPayloadV1 是 output.chunk 的版本 1 传输载荷。
+type OutputChunkPayloadV1 struct {
+	Version int    `json:"version"`
+	Offset  uint64 `json:"offset"`
+	Len     int    `json:"len"`
+	DataB64 string `json:"data_b64,omitempty"`
+}
+
+// ValidateMetadata 校验可持久化的 output.chunk 元数据。
+func (p OutputChunkPayloadV1) ValidateMetadata() error {
+	if p.Version != OutputChunkPayloadVersion {
+		return fmt.Errorf("event: output chunk version %d is unsupported", p.Version)
+	}
+	if p.Len < 1 || p.Len > MaxOutputChunkBytes {
+		return fmt.Errorf(
+			"event: output chunk length %d is outside 1..%d",
+			p.Len,
+			MaxOutputChunkBytes,
+		)
+	}
+	return nil
+}
+
+// ValidateHydrated 校验带 Base64 正文的 output.chunk 载荷。
+func (p OutputChunkPayloadV1) ValidateHydrated() error {
+	if err := p.ValidateMetadata(); err != nil {
+		return err
+	}
+	data, err := base64.StdEncoding.DecodeString(p.DataB64)
+	if err != nil {
+		return fmt.Errorf("event: decode output chunk data: %w", err)
+	}
+	if p.DataB64 == "" || base64.StdEncoding.EncodeToString(data) != p.DataB64 {
+		return errors.New("event: output chunk data is not canonical padded Base64")
+	}
+	if len(data) != p.Len {
+		return fmt.Errorf(
+			"event: output chunk decoded length %d does not match %d",
+			len(data),
+			p.Len,
+		)
+	}
+	return nil
+}
+
+// DecodeData 返回校验后的 output.chunk 原始字节副本。
+func (p OutputChunkPayloadV1) DecodeData() ([]byte, error) {
+	if err := p.ValidateHydrated(); err != nil {
+		return nil, err
+	}
+	data, err := base64.StdEncoding.DecodeString(p.DataB64)
+	if err != nil {
+		return nil, fmt.Errorf("event: decode validated output chunk data: %w", err)
+	}
+	return append([]byte(nil), data...), nil
+}
+
+// DecodeOutputChunkPayload 解码并校验 output.chunk 元数据。
+func DecodeOutputChunkPayload(payload string) (OutputChunkPayloadV1, error) {
+	var decoded OutputChunkPayloadV1
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return OutputChunkPayloadV1{}, fmt.Errorf("event: decode output chunk payload: %w", err)
+	}
+	if err := decoded.ValidateMetadata(); err != nil {
+		return OutputChunkPayloadV1{}, err
+	}
+	return decoded, nil
+}
+
+// HydrateOutputChunkPayload 将持久化元数据和附件编码为传输载荷。
+func HydrateOutputChunkPayload(payload string, data []byte) (string, error) {
+	decoded, err := DecodeOutputChunkPayload(payload)
+	if err != nil {
+		return "", err
+	}
+	if len(data) != decoded.Len {
+		return "", fmt.Errorf(
+			"event: output chunk attachment length %d does not match %d",
+			len(data),
+			decoded.Len,
+		)
+	}
+	decoded.DataB64 = base64.StdEncoding.EncodeToString(data)
+	if validateErr := decoded.ValidateHydrated(); validateErr != nil {
+		return "", validateErr
+	}
+	hydrated, err := json.Marshal(decoded)
+	if err != nil {
+		return "", fmt.Errorf("event: encode hydrated output chunk payload: %w", err)
+	}
+	return string(hydrated), nil
+}
+
+// NewOutputChunkDraft constructs an uncommitted output chunk event.
+func NewOutputChunkDraft(
+	sessionID string,
+	agentID string,
+	offset uint64,
+	data []byte,
+) (Draft, error) {
+	payload := OutputChunkPayloadV1{
+		Version: OutputChunkPayloadVersion,
+		Offset:  offset,
+		Len:     len(data),
+		DataB64: base64.StdEncoding.EncodeToString(data),
+	}
+	if err := payload.ValidateHydrated(); err != nil {
+		return Draft{}, err
+	}
+	hydrated, err := json.Marshal(payload)
+	if err != nil {
+		return Draft{}, fmt.Errorf("event: encode output chunk payload: %w", err)
+	}
+	payload.DataB64 = ""
+	stored, err := json.Marshal(payload)
+	if err != nil {
+		return Draft{}, fmt.Errorf("event: encode output chunk metadata: %w", err)
+	}
+	return Draft{
+		typ:              TypeOutputChunk,
+		sessionID:        sessionID,
+		agentID:          agentID,
+		payload:          string(hydrated),
+		storedPayload:    string(stored),
+		outputAttachment: append([]byte(nil), data...),
+	}, nil
 }
 
 // NewErrorDraft constructs an uncommitted error event.
@@ -138,6 +284,7 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	switch draft.typ {
 	case TypeStateChanged,
 		TypeOutput,
+		TypeOutputChunk,
 		TypeError,
 		TypeSessionLifecycle,
 		TypeAgentInput,
@@ -151,17 +298,63 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	if draft.sessionID != draft.agentID {
 		return Event{}, errors.New("event: draft session and agent IDs must match")
 	}
+	storedPayload := draft.payload
+	var outputAttachment []byte
+	if draft.typ == TypeOutputChunk {
+		hydrated, err := DecodeOutputChunkPayload(draft.payload)
+		if err != nil {
+			return Event{}, err
+		}
+		data, err := hydrated.DecodeData()
+		if err != nil {
+			return Event{}, err
+		}
+		if !bytes.Equal(data, draft.outputAttachment) {
+			return Event{}, errors.New("event: output chunk attachment does not match payload")
+		}
+		metadata, err := DecodeOutputChunkPayload(draft.storedPayload)
+		if err != nil {
+			return Event{}, err
+		}
+		if metadata.DataB64 != "" {
+			return Event{}, errors.New("event: stored output chunk metadata contains data")
+		}
+		if metadata.Version != hydrated.Version ||
+			metadata.Offset != hydrated.Offset ||
+			metadata.Len != hydrated.Len {
+			return Event{}, errors.New("event: stored output chunk metadata does not match payload")
+		}
+		storedPayload = draft.storedPayload
+		outputAttachment = append([]byte(nil), draft.outputAttachment...)
+	} else if len(draft.outputAttachment) != 0 || draft.storedPayload != "" {
+		return Event{}, errors.New("event: non-output chunk draft contains private output data")
+	}
 	return Event{
-		Seq:       seq,
-		Timestamp: at,
-		Type:      draft.typ,
-		AgentID:   draft.agentID,
-		SessionID: draft.sessionID,
-		From:      draft.from,
-		To:        draft.to,
-		Reason:    draft.reason,
-		Payload:   draft.payload,
+		Seq:              seq,
+		Timestamp:        at,
+		Type:             draft.typ,
+		AgentID:          draft.agentID,
+		SessionID:        draft.sessionID,
+		From:             draft.from,
+		To:               draft.to,
+		Reason:           draft.reason,
+		Payload:          draft.payload,
+		storedPayload:    storedPayload,
+		outputAttachment: outputAttachment,
 	}, nil
+}
+
+// StoredPayload 返回事件写入不可变 envelope 时使用的载荷。
+func (e Event) StoredPayload() string {
+	if e.storedPayload != "" {
+		return e.storedPayload
+	}
+	return e.Payload
+}
+
+// OutputAttachment 返回事件私有输出附件的副本。
+func (e Event) OutputAttachment() []byte {
+	return append([]byte(nil), e.outputAttachment...)
 }
 
 // SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.

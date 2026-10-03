@@ -522,6 +522,8 @@ func eventRow(ev event.Event) store.EventRow {
 		From:      ev.From,
 		To:        ev.To,
 		Reason:    ev.Reason,
-		Payload:   ev.Payload,
+		Payload:   ev.StoredPayload(),
+
+		OutputAttachment: ev.OutputAttachment(),
 	}
 }

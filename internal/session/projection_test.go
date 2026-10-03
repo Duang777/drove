@@ -143,6 +143,13 @@ func TestRecoveryProjectorUsesLegacyMetadataAndFactTimestamps(t *testing.T) {
 		},
 		{
 			Seq:       4,
+			Timestamp: createdAt.Add(90 * time.Minute),
+			Type:      string(event.TypeOutputChunk),
+			SessionID: "legacy-agent",
+			Payload:   `{"version":99}`,
+		},
+		{
+			Seq:       5,
 			Timestamp: createdAt.Add(2 * time.Hour),
 			Type:      string(event.TypeError),
 			SessionID: "legacy-agent",
@@ -157,7 +164,7 @@ func TestRecoveryProjectorUsesLegacyMetadataAndFactTimestamps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finish projection: %v", err)
 	}
-	if plan.Report.LegacyMetadata != 1 || plan.Report.Sessions != 1 || plan.Report.LastSeq != 4 {
+	if plan.Report.LegacyMetadata != 1 || plan.Report.Sessions != 1 || plan.Report.LastSeq != 5 {
 		t.Fatalf("report = %+v", plan.Report)
 	}
 	if len(plan.Reconciliation) != 0 {
@@ -179,9 +186,11 @@ func TestRecoveryProjectorIgnoresOutputAndErrorOnlySessions(t *testing.T) {
 	projector := newRecoveryProjector()
 	for _, row := range []store.EventRow{
 		{Seq: 1, Timestamp: base, Type: string(event.TypeOutput), SessionID: "orphan", Payload: "line"},
-		{Seq: 2, Timestamp: base, Type: string(event.TypeError), SessionID: "orphan", Payload: "failure"},
-		{Seq: 3, Timestamp: base, Type: string(event.TypeOutput), Payload: "daemon output"},
-		{Seq: 4, Timestamp: base, Type: string(event.TypeError), Payload: "daemon error"},
+		{Seq: 2, Timestamp: base, Type: string(event.TypeOutputChunk), SessionID: "orphan", Payload: `{"version":99}`},
+		{Seq: 3, Timestamp: base, Type: string(event.TypeError), SessionID: "orphan", Payload: "failure"},
+		{Seq: 4, Timestamp: base, Type: string(event.TypeOutput), Payload: "daemon output"},
+		{Seq: 5, Timestamp: base, Type: string(event.TypeOutputChunk), Payload: `{"version":99}`},
+		{Seq: 6, Timestamp: base, Type: string(event.TypeError), Payload: "daemon error"},
 	} {
 		if err := projector.Apply(row); err != nil {
 			t.Fatalf("apply seq %d: %v", row.Seq, err)
@@ -195,7 +204,7 @@ func TestRecoveryProjectorIgnoresOutputAndErrorOnlySessions(t *testing.T) {
 	if len(plan.Snapshots) != 0 || len(plan.Reconciliation) != 0 {
 		t.Fatalf("plan = %+v, want no sessions", plan)
 	}
-	if plan.Report.ScannedEvents != 4 || plan.Report.Sessions != 0 || plan.Report.LastSeq != 4 {
+	if plan.Report.ScannedEvents != 6 || plan.Report.Sessions != 0 || plan.Report.LastSeq != 6 {
 		t.Fatalf("report = %+v", plan.Report)
 	}
 }
