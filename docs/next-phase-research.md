@@ -3,10 +3,11 @@
 - 调研日期：2026-10-03
 - Drove 实现基线：[`88d3148`](https://github.com/Duang777/drove/commit/88d3148b0f9caf52ddef327f56872c1384030ad2)
 - Phase 1A 交付基线：[`2717927`](https://github.com/Duang777/drove/commit/271792720012b072a087e53839823898800fe05d)
+- Phase 1B 会话注入基线：[`48d68bd`](https://github.com/Duang777/drove/commit/48d68bdb9dd6bdf761983d4e3724209010d0ab60)
 - Claude Code 文档读取日期：2026-10-03
 - Codex 源码快照：[`44dd77b`](https://github.com/openai/codex/commit/44dd77b71e88c78295736bffd3dc3b684c13be6d)
-- 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2) 与 [#3](https://github.com/Duang777/drove/issues/3)
-- 后续调研：[Phase 1B hook 管理调研](phase-1b-hook-management-research.md)
+- 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2)、[#3](https://github.com/Duang777/drove/issues/3) 与 [#15](https://github.com/Duang777/drove/issues/15)
+- 可选持久安装调研：[hook 管理调研](phase-1b-hook-management-research.md)
 
 ## 结论
 
@@ -26,8 +27,8 @@ Phase 1A 编码前必须固定五项协议：
 4. hook 激活、降级和配置所有权，不在第一阶段自动改写用户或项目配置。
 5. vendor adapter、通用 Detector、HTTP 边界和 session 编排之间的职责。
 
-这些协议定案后，Phase 1A 才是可实现状态。hook 自动安装与精确卸载应放到
-Phase 1B，不能与 Detector 核心路径同时引入。
+这些协议定案后，Phase 1A 才是可实现状态。Issue #15 后续选择按会话注入作为
+默认路径。持久安装与精确卸载仍是可选能力，不与 Detector 核心路径绑定。
 
 ## 当前实现基线
 
@@ -41,10 +42,32 @@ Phase 1B，不能与 Detector 核心路径同时引入。
 | CLI 输入 | 已完成 | `drove send <id> [text]` 与 `--stdin` 均已实现。 |
 | WebSocket 输入 | 已完成 | v1 input、ack 和 error 消息已实现，连接内 request ID 去重上限为 4096。 |
 | hooks / Detector | 已完成 | 每个 live session 持有一个 Detector。hook 权威、启发式 fallback、置信度、去重、Blocked 恢复和 Idle 确认均有 race 测试。 |
+| 会话信号注入 | 已完成 | Claude 使用临时 `--settings`，Codex 使用进程级 `notify`。两种方式都不修改厂商持久配置。 |
 
 Issue [#2](https://github.com/Duang777/drove/issues/2)、
 [#3](https://github.com/Duang777/drove/issues/3) 和
 [#4](https://github.com/Duang777/drove/issues/4) 的实现条件已经满足。
+
+## Issue #15 的会话注入决策
+
+Phase 1A 只提供 relay、signal endpoint 和手工 hook 配置。Issue #15 在该边界
+之上增加进程级配置：
+
+- Claude adapter 生成只含 17 组 hooks 的 settings 文件。session 层以 `0600`
+  权限写入该文件，并通过 `--settings` 加载。
+- Codex adapter 通过顶层 `-c notify=[...]` 传入 relay argv。Codex 将
+  `agent-turn-complete` JSON 作为最后一个参数传给 relay。
+- `internal/adapter` 只规划厂商参数和临时文件。`internal/session` 负责私有
+  目录、原子写入、进程生命周期和清理。
+- `signal_injection` 与 hook 策略分开。`auto` 尝试注入，`off` 保留原命令。
+  原生 hook 决定 `hook_active`，注入成功本身不代表 hook 已运行。
+
+Codex notify 不是原生 hook。它只在 Detector 已进入 fallback 后生成一秒 Idle
+候选，不能满足 `required`，也不能推断 Working、Blocked 或终态。原生 hook
+激活后，Detector 只记录 notify，不让它驱动状态迁移。
+
+Drove 不注入 Codex trust hash，不使用 trust bypass，也不写用户或项目配置。
+OSC 9 与终端屏幕权威留在 Issue #14。持久安装器保留为可选后续能力。
 
 ## Claude Code 的当前 hook 模型
 
@@ -323,7 +346,9 @@ Phase 1A 建议只交付：
   激活时明确报错，`auto` 才允许启发式降级。
 
 Phase 1A 不自动修改 `~/.claude`、项目 `.claude`、`~/.codex` 或项目
-`.codex`。自动安装属于 Phase 1B，且必须满足：
+`.codex`。Issue #15 后续增加会话级参数和临时文件，但仍不修改这些持久配置。
+
+可选的持久安装器若继续实施，必须满足：
 
 - 由显式命令触发，不由 `drove up` 静默写配置；
 - 使用 JSON/TOML parser 做结构化合并；
@@ -374,7 +399,7 @@ session 和过期 token。relay 若重试，必须复用同一个 `delivery_id`�
 边界仍是单用户 localhost daemon、厂商自身 trust 流程、最小化环境变量和
 严格的数据留存策略。
 
-## Phase 1A 验收结果
+## Phase 1 验收结果
 
 实现和回归测试覆盖以下行为：
 
@@ -393,24 +418,42 @@ session 和过期 token。relay 若重试，必须复用同一个 `delivery_id`�
   version 的预定行为。
 - endpoint 覆盖非 loopback、错误 token、超限 body、未知字段、过期 session
   与重复 delivery。
-- Claude Code `2.1.181` 的隔离 `--settings` 回归确认真实 command hook 可激活
-  当前会话。`--safe-mode` 下 `auto` 进入 fallback，`required` 明确失败。
-- Codex CLI `0.160.0` 的未信任项目配置回归确认 `auto` 进入 fallback，且没有
-  使用 trust bypass。自动化过程不代替用户批准 Codex hook。
+- Claude Code `2.1.288` 的隔离回归确认注入的 `SessionStart` 可满足
+  `required`。会话目录和 settings 文件权限分别为 `0700` 与 `0600`，退出后
+  Drove 删除该目录。
+- Claude 用户 settings 与会话 settings 中的相同 command 只执行一次。用户
+  设置 `disableAllHooks: true` 时没有原生 hook signal，`auto` 在 5 秒后进入
+  fallback。
+- Codex CLI `0.160.0` 通过隔离的本地 Responses SSE provider 完成真实
+  oneshot turn，并调用注入的 notify relay。Drove 保存版本 2 的
+  `agent-turn-complete` signal，但没有把 notify 当作 hook 激活。
+- 长生命周期 relay 回归确认 fallback 中的 notify 经过 1 秒确认后进入 Idle，
+  且 hook 状态保持 fallback。
+- Claude 和 Codex 的显式 `signal_injection: "off"` 均不增加参数或临时文件。
+  手工 Claude hook 在关闭注入后仍可满足 `required`。
+- Claude 三层 settings 的运行前后哈希一致。Codex oneshot 和显式 `off`
+  场景的 `config.toml` 运行前后哈希一致。Codex TUI 自己写入了 `[tui]`
+  状态。事件日志没有保存测试 prompt、assistant response 或内部标题 prompt。
 - 隔离 daemon 与官方形状 fixture 验证 Claude 和 Codex 的
   `Working -> Blocked -> Working -> Idle`、重复 delivery 和持久化脱敏。
 - Phase 1A 本身不包含 WebSocket 输入。该能力后来由独立变更完成，Issue #4
   已关闭。
+
+Codex TUI 会在绘制首屏前查询终端能力。当前 PTY 桥接器按行交付输出，不能
+完成该终端查询握手。真实 notify 因此通过 oneshot 路径验证。TUI 屏幕处理和
+OSC 解析继续由 Issue #14 跟踪。
 
 ## 一手来源
 
 ### Drove
 
 - [`88d3148` 输入实现基线](https://github.com/Duang777/drove/commit/88d3148b0f9caf52ddef327f56872c1384030ad2)
+- [`48d68bd` 会话信号注入基线](https://github.com/Duang777/drove/commit/48d68bdb9dd6bdf761983d4e3724209010d0ab60)
 - [RFC-001](rfc-001-agent-state-and-control.md)
 - [Issue #2：hook 状态识别](https://github.com/Duang777/drove/issues/2)
 - [Issue #3：Blocked 恢复](https://github.com/Duang777/drove/issues/3)
 - [Issue #4：输入注入](https://github.com/Duang777/drove/issues/4)
+- [Issue #15：会话信号注入](https://github.com/Duang777/drove/issues/15)
 
 ### Claude Code
 

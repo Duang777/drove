@@ -11,6 +11,8 @@ Related issue:
 
 - [#15](https://github.com/Duang777/drove/issues/15), hook availability without
   manual configuration
+- [#24](https://github.com/Duang777/drove/issues/24), optional persistent
+  installer
 
 Research:
 

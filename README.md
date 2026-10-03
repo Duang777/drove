@@ -30,13 +30,17 @@ printf '继续\n' | ./bin/drove send <id> --stdin
 
 ## 接入状态 hooks
 
-Drove 启动 Claude Code 或 Codex 时会注入当前会话的 Agent ID、signal URL 和
-随机 token。将厂商事件绑定到对应的 command hook：
+Drove 默认只为自己启动的进程注入状态上报，不修改用户或项目配置：
 
-```bash
-drove hook --vendor claude
-drove hook --vendor codex
-```
+- Claude Code 通过会话专用的 `--settings` 文件注入完整 command hooks，收到
+  `SessionStart` 后成为状态权威。
+- Codex 通过进程级 `notify` 上报 turn 结束。notify 只能确认 Idle，不会被误当成
+  完整 hooks，因此 Working 和 Blocked 仍由 fallback 或用户已配置的原生 hooks
+  判断。
+
+两种路径都继承当前会话的 Agent ID、signal URL 和随机 token。Claude 临时
+目录位于 `<data_dir>/sessions/<agent-id>/`，目录权限为 `0700`，文件权限为
+`0600`。进程退出后，Drove 删除该目录。
 
 通过 `drove up` 选择会话策略：
 
@@ -46,17 +50,29 @@ drove up claude --hooks off
 drove up claude --hooks required
 ```
 
-`auto` 是 Claude 和 Codex 的默认值。Drove 等待 5 秒，未收到合法 hook 时
-启用终端启发式。`off` 立即使用启发式。`required` 在 5 秒内未收到合法 hook
-时停止会话并返回错误。不支持 hook 的适配器默认使用 `off`，且不能选择
-`required`。
+`auto` 是 Claude 和 Codex 的默认值。Drove 等待 5 秒，未收到合法原生 hook
+时启用终端启发式。Codex notify 仍可在 fallback 中确认 Idle。`off` 不注入
+状态上报，并立即使用启发式。`required` 在 5 秒内未收到合法原生 hook 时停止
+会话并返回错误。不支持 hook 的适配器默认使用 `off`，且不能选择 `required`。
+
+可按厂商关闭自动注入：
+
+```json
+{
+  "agents": {
+    "claude": {"signal_injection": "off"},
+    "codex": {"signal_injection": "off"}
+  }
+}
+```
 
 `drove hook` 仅上报观察结果。有效命令即使投递失败也返回 0，因此不会阻断
 厂商动作。单次 JSON 上限为 1 MiB。事件日志不保存原始 payload、prompt、
 tool input、transcript path 或 capability token。
 
-Drove 不修改 Claude Code 或 Codex 配置，也不绕过 workspace、project 或 hook
-trust。配置示例和限制见[状态 hook 配置指南](docs/hooks.md)。
+Drove 不修改 Claude Code 或 Codex 的持久配置，也不绕过 workspace、project
+或 hook trust。手工配置原生 hooks 仍受支持，详见
+[状态 hook 配置指南](docs/hooks.md)。
 
 ## 架构一览
 
