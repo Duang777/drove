@@ -1,12 +1,11 @@
 # Managed hook configuration
 
-Status: Draft, awaiting owner approval
+Status: Draft, deferred until session signal injection
 
 Date: 2026-10-03
 
-Owner direction: continue RFC-001 Phase 1B with explicit hook installation,
-idempotent updates, exact uninstall, ownership tracking, and separate trust
-status.
+Owner direction: keep explicit hook installation as an optional follow-up.
+Implement the per-session injection path in Issue #15 first.
 
 Related issue:
 
@@ -922,9 +921,9 @@ but create a second configuration lifecycle and do not solve explicit
 ownership, update, or uninstall. Codex session hook trust also relies on
 version-sensitive behavior.
 
-This phase follows the RFC and the approved continuation direction: implement
-an explicit installer first. Per-session injection remains separate work under
-Issue #15 and must reuse the same adapter node definitions if implemented.
+Per-session injection is the default path under Issue #15. This specification
+defines the optional persistent installer that follows it. Both paths must use
+the same adapter node definitions and managed command identity.
 
 ### Whole-file backup restore
 
@@ -1100,5 +1099,5 @@ are separate.
 
 ## Approval gate
 
-Implementation starts only after the owner approves this specification,
-`checklist.md`, and `tasks.md`.
+Implementation starts only after session signal injection is complete and the
+owner separately approves this specification, `checklist.md`, and `tasks.md`.

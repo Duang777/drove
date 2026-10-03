@@ -2,11 +2,13 @@
 
 ## Direction
 
-- [x] Phase 1B uses explicit local hook-management commands.
+- [x] This optional follow-up uses explicit local hook-management commands.
 - [x] `drove up` does not mutate vendor configuration.
-- [x] Per-session settings, notify, and OSC injection remain separate work.
+- [x] Per-session settings and notify injection land first under Issue #15.
+- [x] OSC parsing remains separate work under Issue #14.
 - [x] The spec records the difference from the current Issue #15 body.
-- [x] The design follows RFC-001 and the Phase 1B research.
+- [x] The design follows the Phase 1B research without overriding Issue #15.
+- [x] Implementation is deferred until session injection is complete.
 - [x] The implementation starts only after owner approval.
 
 ## Scope

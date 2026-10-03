@@ -7,11 +7,11 @@ starting the next commit.
 
 Before implementation:
 
+- confirm that the per-session injection work in Issue #15 is complete;
 - change `spec.md` status to `Approved for implementation`;
 - add the approval date;
 - check the approval item in `checklist.md`;
-- keep Issue #15 open and note that this specification implements the explicit
-  installer path, not per-session injection.
+- link the separate issue that tracks this optional persistent installer.
 
 Commit and push:
 
@@ -489,10 +489,8 @@ Record exact Claude, Codex, Go, and operating-system versions in
 
 ### T21: Update issue state
 
-- Add a comment to Issue #15 that links the approved specification and lists
-  the explicit installer behavior delivered here.
-- Keep Issue #15 open because per-session injection, notify, and OSC remain
-  outside this specification.
+- Update the separate persistent-installer issue with the delivered behavior.
+- Do not close or change the scope of Issue #15 from this specification.
 - Do not claim that Drove can approve vendor trust.
 
 Commit and push:
