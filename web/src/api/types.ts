@@ -18,6 +18,26 @@ export type AgentState =
 /** agent 运行模式（与 internal/agent.RunMode 对齐）。 */
 export type RunMode = 'interactive' | 'oneshot'
 
+/** 会话级 hook 策略（与 internal/agent.HookPolicy 对齐）。 */
+export type HookPolicy = 'off' | 'auto' | 'required'
+
+/** 当前观测到的 hook 状态（与 internal/detect.HookStatus 对齐）。 */
+export type HookStatus =
+  | 'off'
+  | 'awaiting_hook'
+  | 'fallback'
+  | 'hook_active'
+  | 'required_failed'
+  | 'detached'
+
+/** 状态迁移的脱敏证据。 */
+export interface StateEvidence {
+  source: 'session' | 'process' | 'hook' | 'heuristic' | 'timer' | 'recovery'
+  event: string
+  confidence: number
+  delivery_id?: string
+}
+
 /** 会话状态视图（Go: session.Status）。 */
 export interface AgentStatus {
   agent_id: string
@@ -29,6 +49,9 @@ export interface AgentStatus {
   created_at: string
   updated_at: string
   last_error?: string
+  hook_policy?: HookPolicy
+  hook_status?: HookStatus
+  last_transition?: StateEvidence
 }
 
 /** 启动会话请求（Go: session.StartRequest）。 */

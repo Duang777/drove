@@ -53,6 +53,71 @@ func TestNewAgentSignalCarriesNormalizedPayload(t *testing.T) {
 	}
 }
 
+func TestSignalPayloadV1Validation(t *testing.T) {
+	payload := SignalPayloadV1{
+		Version:     1,
+		Source:      "hook",
+		Kind:        "tool_activity",
+		Vendor:      "claude",
+		VendorEvent: "PostToolUse",
+		Scope:       "root",
+		Confidence:  1,
+		ReceivedAt:  time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DeliveryID:  "550e8400-e29b-41d4-a716-446655440000",
+		Outcome:     "observed",
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate signal payload: %v", err)
+	}
+	legacy := payload
+	legacy.Kind = ""
+	legacy.Outcome = ""
+	legacy.Evidence = "activity"
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("validate transitional signal payload: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		change func(*SignalPayloadV1)
+	}{
+		{name: "unknown source", change: func(p *SignalPayloadV1) { p.Source = "config" }},
+		{name: "unknown kind", change: func(p *SignalPayloadV1) { p.Kind = "completed" }},
+		{name: "missing event", change: func(p *SignalPayloadV1) { p.VendorEvent = "" }},
+		{name: "invalid scope", change: func(p *SignalPayloadV1) { p.Scope = "child" }},
+		{name: "invalid confidence", change: func(p *SignalPayloadV1) { p.Confidence = 2 }},
+		{name: "invalid receive time", change: func(p *SignalPayloadV1) { p.ReceivedAt = "today" }},
+		{name: "invalid delivery ID", change: func(p *SignalPayloadV1) { p.DeliveryID = "delivery-1" }},
+		{name: "unknown outcome", change: func(p *SignalPayloadV1) { p.Outcome = "ignored" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := payload
+			test.change(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatalf("validation accepted %+v", invalid)
+			}
+		})
+	}
+}
+
+func TestStateEvidencePayloadV1Validation(t *testing.T) {
+	evidence := StateEvidencePayloadV1{
+		Version:    1,
+		Source:     "process",
+		Event:      "process_started",
+		Confidence: 1,
+	}
+	if err := evidence.Validate(); err != nil {
+		t.Fatalf("validate state evidence: %v", err)
+	}
+
+	evidence.DeliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	if err := evidence.Validate(); err == nil {
+		t.Fatal("validation accepted a non-hook delivery ID")
+	}
+}
+
 func TestHubFanOut(t *testing.T) {
 	h := NewHub(0)
 	s1 := h.Subscribe(16)

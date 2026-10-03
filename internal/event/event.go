@@ -6,9 +6,14 @@ package event
 import (
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 // Type 是事件类型。
@@ -42,6 +47,175 @@ type Event struct {
 	Reason string `json:"reason,omitempty"`
 	// Payload 承载具体事件类型定义的内容。
 	Payload string `json:"payload,omitempty"`
+}
+
+// SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.
+type SignalPayloadV1 struct {
+	Version         int     `json:"version"`
+	Source          string  `json:"source"`
+	Kind            string  `json:"kind"`
+	Vendor          string  `json:"vendor,omitempty"`
+	VendorEvent     string  `json:"vendor_event"`
+	Scope           string  `json:"scope"`
+	VendorSessionID string  `json:"vendor_session_id,omitempty"`
+	VendorTurnID    string  `json:"vendor_turn_id,omitempty"`
+	Notification    string  `json:"notification,omitempty"`
+	Evidence        string  `json:"evidence,omitempty"`
+	Confidence      float64 `json:"confidence"`
+	OccurredAt      string  `json:"occurred_at,omitempty"`
+	ReceivedAt      string  `json:"received_at"`
+	DeliveryID      string  `json:"delivery_id,omitempty"`
+	Outcome         string  `json:"outcome"`
+	ExitCode        *int    `json:"exit_code,omitempty"`
+	ExitKind        string  `json:"exit_kind,omitempty"`
+}
+
+// Validate rejects malformed or privacy-unsafe signal metadata.
+func (p SignalPayloadV1) Validate() error {
+	if p.Version != 1 {
+		return fmt.Errorf("event: unsupported signal payload version %d", p.Version)
+	}
+	if !oneOf(p.Source, "process", "hook", "heuristic", "timer") {
+		return fmt.Errorf("event: invalid signal source %q", p.Source)
+	}
+	legacyTransitional := p.Kind == "" && p.Outcome == "" && p.Evidence != ""
+	if !legacyTransitional && !oneOf(
+		p.Kind,
+		"session_started",
+		"observed",
+		"turn_started",
+		"tool_activity",
+		"human_input_required",
+		"human_input_resolved",
+		"permission_requested",
+		"permission_resolved",
+		"turn_stopped",
+		"turn_failed",
+		"interrupted",
+		"idle_prompt",
+		"session_ended",
+		"subagent_started",
+		"subagent_stopped",
+		"task_completed",
+		"output_activity",
+		"heuristic_blocked",
+		"process_started",
+		"process_start_failed",
+		"process_exited",
+		"hook_activation_expired",
+		"timer_fired",
+	) {
+		return fmt.Errorf("event: invalid signal kind %q", p.Kind)
+	}
+	if p.VendorEvent == "" || len(p.VendorEvent) > 64 || !ascii(p.VendorEvent) {
+		return errors.New("event: signal vendor_event must contain 1 to 64 ASCII bytes")
+	}
+	if !oneOf(p.Scope, "root", "subagent") {
+		return fmt.Errorf("event: invalid signal scope %q", p.Scope)
+	}
+	if len(p.Vendor) > 64 ||
+		len(p.VendorSessionID) > 256 ||
+		len(p.VendorTurnID) > 256 ||
+		len(p.Notification) > 64 ||
+		len(p.Evidence) > 128 {
+		return errors.New("event: signal metadata exceeds its size limit")
+	}
+	if math.IsNaN(p.Confidence) || math.IsInf(p.Confidence, 0) ||
+		p.Confidence < 0 || p.Confidence > 1 {
+		return fmt.Errorf("event: invalid signal confidence %v", p.Confidence)
+	}
+	if p.ReceivedAt == "" {
+		return errors.New("event: signal received_at is required")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, p.ReceivedAt); err != nil {
+		return fmt.Errorf("event: invalid signal received_at: %w", err)
+	}
+	if p.OccurredAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, p.OccurredAt); err != nil {
+			return fmt.Errorf("event: invalid signal occurred_at: %w", err)
+		}
+	}
+	if p.Source == "hook" {
+		if p.Vendor == "" {
+			return errors.New("event: hook signal vendor is required")
+		}
+		if !canonicalUUID(p.DeliveryID) {
+			return errors.New("event: hook signal delivery_id must be a canonical UUID")
+		}
+	} else if p.DeliveryID != "" {
+		return errors.New("event: only hook signals may contain delivery_id")
+	}
+	if !legacyTransitional &&
+		!oneOf(p.Outcome, "observed", "candidate", "transitioned", "suppressed", "stale", "terminal") {
+		return fmt.Errorf("event: invalid signal outcome %q", p.Outcome)
+	}
+	if p.ExitKind != "" && !oneOf(p.ExitKind, "success", "failure", "stopped", "startup_failed") {
+		return fmt.Errorf("event: invalid process exit kind %q", p.ExitKind)
+	}
+	if p.Source != "process" && (p.ExitCode != nil || p.ExitKind != "") {
+		return errors.New("event: only process signals may contain exit metadata")
+	}
+	return nil
+}
+
+// StateEvidencePayloadV1 explains one durable state transition.
+type StateEvidencePayloadV1 struct {
+	Version    int     `json:"version"`
+	Source     string  `json:"source"`
+	Event      string  `json:"event"`
+	Confidence float64 `json:"confidence"`
+	DeliveryID string  `json:"delivery_id,omitempty"`
+}
+
+// Validate rejects malformed transition evidence.
+func (p StateEvidencePayloadV1) Validate() error {
+	if p.Version != 1 {
+		return fmt.Errorf("event: unsupported state evidence version %d", p.Version)
+	}
+	if !oneOf(p.Source, "session", "process", "hook", "heuristic", "timer", "recovery") {
+		return fmt.Errorf("event: invalid state evidence source %q", p.Source)
+	}
+	if p.Event == "" || len(p.Event) > 64 || !ascii(p.Event) {
+		return errors.New("event: state evidence event must contain 1 to 64 ASCII bytes")
+	}
+	if math.IsNaN(p.Confidence) || math.IsInf(p.Confidence, 0) ||
+		p.Confidence < 0 || p.Confidence > 1 {
+		return fmt.Errorf("event: invalid state evidence confidence %v", p.Confidence)
+	}
+	if p.Source == "hook" {
+		if !canonicalUUID(p.DeliveryID) {
+			return errors.New("event: hook state evidence delivery_id must be a canonical UUID")
+		}
+	} else if p.DeliveryID != "" {
+		return errors.New("event: only hook state evidence may contain delivery_id")
+	}
+	return nil
+}
+
+func oneOf(value string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+func ascii(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if r > 0x7f || r < 0x20 {
+			return false
+		}
+	}
+	return strings.TrimSpace(value) == value
+}
+
+func canonicalUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
 }
 
 // NewStateChanged 构造状态迁移事件。

@@ -237,7 +237,10 @@ func TestRecoveryProjectorIgnoresSignalOnlySessions(t *testing.T) {
 		SessionID: "orphan",
 		AgentID:   "orphan",
 		Reason:    "hook",
-		Payload:   `{"version":1}`,
+		Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+			`"vendor_event":"SessionStart","scope":"root","confidence":1,` +
+			`"received_at":"2026-10-03T05:00:00Z",` +
+			`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
 	}); err != nil {
 		t.Fatalf("apply signal: %v", err)
 	}
@@ -250,6 +253,98 @@ func TestRecoveryProjectorIgnoresSignalOnlySessions(t *testing.T) {
 		t.Fatalf("plan = %+v, want no sessions", plan)
 	}
 	if plan.Report.ScannedEvents != 1 || plan.Report.Sessions != 0 || plan.Report.LastSeq != 1 {
+		t.Fatalf("report = %+v", plan.Report)
+	}
+}
+
+func TestRecoveryProjectorReadsVersionTwoMetadataAndEvidence(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+				`"mode":"interactive","hook_policy":"auto"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+			Reason:    "startup failed",
+			Payload: `{"version":1,"source":"process","event":"process_start_failed",` +
+				`"confidence":1}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	snapshot := plan.Snapshots[0]
+	if snapshot.HookPolicy != agent.HooksAuto ||
+		snapshot.LastTransition == nil ||
+		snapshot.LastTransition.Source != agent.EvidenceProcess ||
+		snapshot.LastTransition.Event != "process_start_failed" {
+		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	for _, row := range []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"generic"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Payload:   `{"version":2}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+			Payload:   `{"version":2}`,
+		},
+	} {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if plan.Report.UnknownSignalPayloadVersions != 1 ||
+		plan.Report.UnknownStateEvidenceVersions != 1 {
 		t.Fatalf("report = %+v", plan.Report)
 	}
 }
@@ -443,6 +538,18 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "does not match",
 		},
 		{
+			name: "malformed known signal payload",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeAgentSignal),
+				SessionID: "s1",
+				AgentID:   "s1",
+				Payload:   `{"version":1}`,
+			}},
+			wantErr: "validate signal payload",
+		},
+		{
 			name:    "unknown lifecycle reason",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "deleted"}},
 			wantErr: "unknown lifecycle reason",
@@ -463,7 +570,7 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 		{
 			name: "unsupported metadata",
 			rows: []store.EventRow{
-				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":2,"name":"agent","vendor":"generic"}`},
+				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":3,"name":"agent","vendor":"generic"}`},
 			},
 			wantErr: "unsupported",
 		},
@@ -515,6 +622,20 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 				{Seq: 1, Timestamp: base, Type: string(event.TypeStateChanged), SessionID: "s1", From: "stopped", To: "working"},
 			},
 			wantErr: "invalid state transition",
+		},
+		{
+			name: "malformed known state evidence",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeStateChanged),
+				SessionID: "s1",
+				AgentID:   "s1",
+				From:      "pending",
+				To:        "stopped",
+				Payload:   `{"version":1,"source":"unknown","event":"stop","confidence":1}`,
+			}},
+			wantErr: "validate state evidence",
 		},
 	}
 

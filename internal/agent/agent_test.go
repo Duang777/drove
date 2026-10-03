@@ -156,6 +156,31 @@ func TestRunMode(t *testing.T) {
 	}
 }
 
+func TestHookPolicyAndEvidenceValidation(t *testing.T) {
+	for _, policy := range []HookPolicy{HooksOff, HooksAuto, HooksRequired} {
+		if !ValidHookPolicy(policy) {
+			t.Errorf("expected %q to be valid", policy)
+		}
+	}
+	if ValidHookPolicy("") || ValidHookPolicy("sometimes") {
+		t.Fatal("invalid hook policy was accepted")
+	}
+
+	evidence := Evidence{
+		Source:     EvidenceHook,
+		Event:      "PostToolUse",
+		Confidence: 1,
+		DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
+	}
+	if err := evidence.Validate(); err != nil {
+		t.Fatalf("validate evidence: %v", err)
+	}
+	evidence.DeliveryID = "delivery-1"
+	if err := evidence.Validate(); err == nil {
+		t.Fatal("non-canonical delivery ID was accepted")
+	}
+}
+
 func TestValidStates(t *testing.T) {
 	valid := []State{StatePending, StateStarting, StateWorking, StateBlocked, StateDone, StateIdle, StateStopped}
 	for _, s := range valid {

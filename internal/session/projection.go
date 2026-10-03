@@ -19,12 +19,14 @@ const (
 
 // RecoveryReport 汇总一次启动投影恢复的结果。
 type RecoveryReport struct {
-	ScannedEvents  int
-	Sessions       int
-	Interrupted    int
-	LegacyMetadata int
-	PartialHistory int
-	LastSeq        uint64
+	ScannedEvents                int
+	Sessions                     int
+	Interrupted                  int
+	LegacyMetadata               int
+	PartialHistory               int
+	UnknownSignalPayloadVersions int
+	UnknownStateEvidenceVersions int
+	LastSeq                      uint64
 }
 
 type recoveryProjector struct {
@@ -39,8 +41,10 @@ type sessionDraft struct {
 	name                   string
 	vendor                 string
 	runMode                agent.RunMode
+	hookPolicy             agent.HookPolicy
 	state                  agent.State
 	lastError              string
+	lastTransition         *agent.Evidence
 	createdAt              time.Time
 	updatedAt              time.Time
 	firstSeq               uint64
@@ -81,11 +85,13 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 		return p.applyState(row)
 	case event.TypeError:
 		return p.applyError(row)
-	case event.TypeAgentInput, event.TypeAgentSignal:
+	case event.TypeAgentInput:
 		if row.SessionID == "" {
 			return projectionError(row, "%s event has empty session ID", row.Type)
 		}
 		return validateAgentID(row)
+	case event.TypeAgentSignal:
+		return p.applySignal(row)
 	case event.TypeOutput:
 		if row.SessionID == "" {
 			return nil
@@ -123,21 +129,33 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	if err := json.Unmarshal([]byte(row.Payload), &metadata); err != nil {
 		return projectionWrapError(row, "decode creation metadata", err)
 	}
-	if metadata.Version != 1 {
-		return projectionError(row, "unsupported creation metadata version %d", metadata.Version)
-	}
 	if strings.TrimSpace(metadata.Name) == "" {
 		return projectionError(row, "creation metadata name is empty")
 	}
 	if strings.TrimSpace(metadata.Vendor) == "" {
 		return projectionError(row, "creation metadata vendor is empty")
 	}
-	if metadata.Mode == nil {
-		draft.runMode = agent.RunModeOneshot
-	} else if !agent.ValidRunMode(*metadata.Mode) {
-		return projectionError(row, "creation metadata mode %q is invalid", *metadata.Mode)
-	} else {
+	switch metadata.Version {
+	case 1:
+		draft.hookPolicy = agent.HooksOff
+		if metadata.Mode == nil {
+			draft.runMode = agent.RunModeOneshot
+		} else if !agent.ValidRunMode(*metadata.Mode) {
+			return projectionError(row, "creation metadata mode %q is invalid", *metadata.Mode)
+		} else {
+			draft.runMode = *metadata.Mode
+		}
+	case 2:
+		if metadata.Mode == nil || !agent.ValidRunMode(*metadata.Mode) {
+			return projectionError(row, "creation metadata version 2 requires a valid mode")
+		}
+		if metadata.HookPolicy == nil || !agent.ValidHookPolicy(*metadata.HookPolicy) {
+			return projectionError(row, "creation metadata version 2 requires a valid hook policy")
+		}
 		draft.runMode = *metadata.Mode
+		draft.hookPolicy = *metadata.HookPolicy
+	default:
+		return projectionError(row, "unsupported creation metadata version %d", metadata.Version)
 	}
 
 	draft.name = metadata.Name
@@ -164,8 +182,15 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 	if !agent.Valid(to) {
 		return projectionError(row, "invalid to state %q", row.To)
 	}
-	if !agent.CanTransition(from, to) {
+	if !agent.CanRecoverTransition(from, to) {
 		return projectionError(row, "invalid state transition %s -> %s", from, to)
+	}
+	evidence, known, err := parseStateEvidence(row)
+	if err != nil {
+		return err
+	}
+	if !known && row.Payload != "" {
+		p.report.UnknownStateEvidenceVersions++
 	}
 
 	draft := p.draft(row)
@@ -184,10 +209,78 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		p.report.PartialHistory++
 	}
 	draft.state = to
+	if known {
+		draft.lastTransition = evidence
+	}
 	draft.updatedAt = row.Timestamp
 	draft.lastStateGapGeneration = p.gapGeneration
 	draft.hasState = true
 	return nil
+}
+
+func (p *recoveryProjector) applySignal(row store.EventRow) error {
+	if row.SessionID == "" {
+		return projectionError(row, "signal event has empty session ID")
+	}
+	if err := validateAgentID(row); err != nil {
+		return err
+	}
+	var version struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(row.Payload), &version); err != nil {
+		return projectionWrapError(row, "decode signal payload version", err)
+	}
+	if version.Version == 0 {
+		return projectionError(row, "signal payload version is required")
+	}
+	if version.Version != 1 {
+		p.report.UnknownSignalPayloadVersions++
+		return nil
+	}
+	var payload event.SignalPayloadV1
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return projectionWrapError(row, "decode signal payload", err)
+	}
+	if err := payload.Validate(); err != nil {
+		return projectionWrapError(row, "validate signal payload", err)
+	}
+	return nil
+}
+
+func parseStateEvidence(row store.EventRow) (*agent.Evidence, bool, error) {
+	if row.Payload == "" {
+		return nil, false, nil
+	}
+	var version struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(row.Payload), &version); err != nil {
+		return nil, false, projectionWrapError(row, "decode state evidence version", err)
+	}
+	if version.Version == 0 {
+		return nil, false, projectionError(row, "state evidence version is required")
+	}
+	if version.Version != 1 {
+		return nil, false, nil
+	}
+	var payload event.StateEvidencePayloadV1
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return nil, false, projectionWrapError(row, "decode state evidence", err)
+	}
+	if err := payload.Validate(); err != nil {
+		return nil, false, projectionWrapError(row, "validate state evidence", err)
+	}
+	evidence := &agent.Evidence{
+		Source:     agent.EvidenceSource(payload.Source),
+		Event:      payload.Event,
+		Confidence: payload.Confidence,
+		DeliveryID: payload.DeliveryID,
+	}
+	if err := evidence.Validate(); err != nil {
+		return nil, false, projectionWrapError(row, "validate agent evidence", err)
+	}
+	return evidence, true, nil
 }
 
 func (p *recoveryProjector) applyError(row store.EventRow) error {
@@ -243,6 +336,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			draft.name = draft.id
 			draft.vendor = "unknown"
 			draft.runMode = agent.RunModeOneshot
+			draft.hookPolicy = agent.HooksOff
 			plan.Report.LegacyMetadata++
 		}
 
@@ -273,7 +367,13 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 				From:      string(state),
 				To:        string(agent.StateStopped),
 				Reason:    restartStopReason,
+				Payload:   recoveryEvidencePayload(),
 			})
+			draft.lastTransition = &agent.Evidence{
+				Source:     agent.EvidenceRecovery,
+				Event:      "daemon_restart",
+				Confidence: 1,
+			}
 			state = agent.StateStopped
 			updatedAt = recoveryTime
 		}
@@ -281,19 +381,34 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			updatedAt = draft.createdAt
 		}
 		plan.Snapshots = append(plan.Snapshots, agent.RestoreSnapshot{
-			ID:        agent.ID(draft.id),
-			Name:      draft.name,
-			Vendor:    draft.vendor,
-			RunMode:   draft.runMode,
-			State:     state,
-			LastError: lastError,
-			CreatedAt: draft.createdAt,
-			UpdatedAt: updatedAt,
+			ID:             agent.ID(draft.id),
+			Name:           draft.name,
+			Vendor:         draft.vendor,
+			RunMode:        draft.runMode,
+			HookPolicy:     draft.hookPolicy,
+			State:          state,
+			LastError:      lastError,
+			LastTransition: draft.lastTransition,
+			CreatedAt:      draft.createdAt,
+			UpdatedAt:      updatedAt,
 		})
 	}
 	plan.Report.Sessions = len(plan.Snapshots)
 	plan.Report.LastSeq = nextSeq
 	return plan, nil
+}
+
+func recoveryEvidencePayload() string {
+	payload, err := json.Marshal(event.StateEvidencePayloadV1{
+		Version:    1,
+		Source:     string(agent.EvidenceRecovery),
+		Event:      "daemon_restart",
+		Confidence: 1,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("session: encode fixed recovery evidence: %v", err))
+	}
+	return string(payload)
 }
 
 func validateAgentID(row store.EventRow) error {

@@ -49,14 +49,25 @@ export function EventLog({ liveEvents, replayID }: Props) {
       <div className="max-h-96 space-y-0.5 overflow-y-auto">
         {isReplay
           ? rows!.map((r) => (
-              <Row key={r.Seq} ts={r.Timestamp} kind={r.Type} text={r.Payload || r.Reason} />
+              <Row
+                key={r.Seq}
+                ts={r.Timestamp}
+                kind={r.Type}
+                text={formatEventText(r.Type, r.Payload || r.Reason)}
+              />
             ))
           : liveEvents.map((ev) => (
               <Row
                 key={ev.seq}
                 ts={ev.timestamp}
                 kind={ev.type}
-                text={ev.payload ?? (ev.to ? `${ev.from ?? '?'} → ${ev.to}${ev.reason ? ' · ' + ev.reason : ''}` : ev.reason ?? '')}
+                text={formatEventText(
+                  ev.type,
+                  ev.payload ??
+                    (ev.to
+                      ? `${ev.from ?? '?'} → ${ev.to}${ev.reason ? ' · ' + ev.reason : ''}`
+                      : ev.reason ?? ''),
+                )}
               />
             ))}
         {!isReplay && liveEvents.length === 0 && (
@@ -65,6 +76,24 @@ export function EventLog({ liveEvents, replayID }: Props) {
       </div>
     </div>
   )
+}
+
+function formatEventText(kind: string, text: string): string {
+  if (kind !== 'agent.signal' || text === '') return text
+  try {
+    const value: unknown = JSON.parse(text)
+    if (!isRecord(value)) return text
+    const parts = [value.source, value.kind, value.vendor_event, value.outcome].filter(
+      (part): part is string => typeof part === 'string' && part !== '',
+    )
+    return parts.length > 0 ? parts.join(' · ') : text
+  } catch {
+    return text
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function Row({ ts, kind, text }: { ts: string; kind: string; text: string }) {

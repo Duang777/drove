@@ -7,9 +7,13 @@ package agent
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 // ID 是 agent 的稳定标识（UUID 字符串）。
@@ -21,11 +25,21 @@ type State string
 // RunMode 控制 agent 进程的启动方式和自然退出语义。
 type RunMode string
 
+// HookPolicy controls hook activation for one immutable session.
+type HookPolicy string
+
 const (
 	// RunModeInteractive 启动常驻交互进程。
 	RunModeInteractive RunMode = "interactive"
 	// RunModeOneshot 启动执行一次后退出的进程。
 	RunModeOneshot RunMode = "oneshot"
+
+	// HooksOff disables hook delivery and enables heuristic fallback.
+	HooksOff HookPolicy = "off"
+	// HooksAuto prefers an observed hook and otherwise enables fallback.
+	HooksAuto HookPolicy = "auto"
+	// HooksRequired requires a hook signal during startup.
+	HooksRequired HookPolicy = "required"
 
 	// StatePending 已创建、尚未启动（初始态）。
 	StatePending State = "pending"
@@ -42,6 +56,68 @@ const (
 	// StateStopped 已停止（生命周期边界态）。
 	StateStopped State = "stopped"
 )
+
+// EvidenceSource identifies the authority behind one state transition.
+type EvidenceSource string
+
+const (
+	EvidenceSession   EvidenceSource = "session"
+	EvidenceProcess   EvidenceSource = "process"
+	EvidenceHook      EvidenceSource = "hook"
+	EvidenceHeuristic EvidenceSource = "heuristic"
+	EvidenceTimer     EvidenceSource = "timer"
+	EvidenceRecovery  EvidenceSource = "recovery"
+)
+
+// Evidence is the bounded, redacted explanation for one state transition.
+type Evidence struct {
+	Source     EvidenceSource `json:"source"`
+	Event      string         `json:"event"`
+	Confidence float64        `json:"confidence"`
+	DeliveryID string         `json:"delivery_id,omitempty"`
+}
+
+// Validate checks that evidence can be stored in a versioned state payload.
+func (e Evidence) Validate() error {
+	switch e.Source {
+	case EvidenceSession,
+		EvidenceProcess,
+		EvidenceHook,
+		EvidenceHeuristic,
+		EvidenceTimer,
+		EvidenceRecovery:
+	default:
+		return fmt.Errorf("agent: invalid evidence source %q", e.Source)
+	}
+	if e.Event == "" || len(e.Event) > 64 || !asciiToken(e.Event) {
+		return errors.New("agent: evidence event must contain 1 to 64 ASCII bytes")
+	}
+	if math.IsNaN(e.Confidence) || math.IsInf(e.Confidence, 0) ||
+		e.Confidence < 0 || e.Confidence > 1 {
+		return fmt.Errorf("agent: invalid evidence confidence %v", e.Confidence)
+	}
+	if e.Source == EvidenceHook {
+		parsed, err := uuid.Parse(e.DeliveryID)
+		if err != nil || parsed.String() != e.DeliveryID {
+			return errors.New("agent: hook evidence delivery ID must be a canonical UUID")
+		}
+	} else if e.DeliveryID != "" {
+		return errors.New("agent: only hook evidence may contain a delivery ID")
+	}
+	return nil
+}
+
+func asciiToken(value string) bool {
+	if !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r > 0x7f {
+			return false
+		}
+	}
+	return true
+}
 
 // transitions 定义合法状态迁移表。
 // 语义：from -> to 是否允许。非法迁移一律返回错误。
@@ -89,6 +165,11 @@ func ValidRunMode(mode RunMode) bool {
 	return mode == RunModeInteractive || mode == RunModeOneshot
 }
 
+// ValidHookPolicy reports whether policy is supported.
+func ValidHookPolicy(policy HookPolicy) bool {
+	return policy == HooksOff || policy == HooksAuto || policy == HooksRequired
+}
+
 // CanTransition 报告 from -> to 是否合法。
 func CanTransition(from, to State) bool {
 	m, ok := transitions[from]
@@ -96,6 +177,12 @@ func CanTransition(from, to State) bool {
 		return false
 	}
 	return m[to]
+}
+
+// CanRecoverTransition accepts historical transitions plus restart
+// reconciliation from Done to Stopped.
+func CanRecoverTransition(from, to State) bool {
+	return CanTransition(from, to) || (from == StateDone && to == StateStopped)
 }
 
 var (
@@ -119,12 +206,14 @@ type TransitionPlan struct {
 type Agent struct {
 	mu sync.RWMutex
 
-	id        ID
-	name      string
-	vendor    string // 适配器厂商标识，如 "claude" / "codex" / "generic"
-	runMode   RunMode
-	state     State
-	lastError string
+	id             ID
+	name           string
+	vendor         string // 适配器厂商标识，如 "claude" / "codex" / "generic"
+	runMode        RunMode
+	hookPolicy     HookPolicy
+	state          State
+	lastError      string
+	lastTransition *Evidence
 
 	createdAt time.Time
 	updatedAt time.Time
@@ -136,14 +225,16 @@ type Option func(*Agent)
 
 // RestoreSnapshot 是从持久化事件投影出的 Agent 状态。
 type RestoreSnapshot struct {
-	ID        ID
-	Name      string
-	Vendor    string
-	RunMode   RunMode
-	State     State
-	LastError string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID             ID
+	Name           string
+	Vendor         string
+	RunMode        RunMode
+	HookPolicy     HookPolicy
+	State          State
+	LastError      string
+	LastTransition *Evidence
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // WithName 设置 agent 显示名。
@@ -161,14 +252,20 @@ func WithRunMode(mode RunMode) Option {
 	return func(a *Agent) { a.runMode = mode }
 }
 
+// WithHookPolicy sets the immutable hook policy for a new Agent.
+func WithHookPolicy(policy HookPolicy) Option {
+	return func(a *Agent) { a.hookPolicy = policy }
+}
+
 // New 创建处于 StatePending 的 agent。
 func New(id ID, opts ...Option) *Agent {
 	a := &Agent{
-		id:        id,
-		runMode:   RunModeInteractive,
-		state:     StatePending,
-		createdAt: time.Now().UTC(),
-		updatedAt: time.Now().UTC(),
+		id:         id,
+		runMode:    RunModeInteractive,
+		hookPolicy: HooksOff,
+		state:      StatePending,
+		createdAt:  time.Now().UTC(),
+		updatedAt:  time.Now().UTC(),
 	}
 	for _, o := range opts {
 		o(a)
@@ -178,15 +275,21 @@ func New(id ID, opts ...Option) *Agent {
 
 // Restore 从已验证的持久化快照构造 Agent，不触发状态变更回调。
 func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
+	hookPolicy := snapshot.HookPolicy
+	if hookPolicy == "" {
+		hookPolicy = HooksOff
+	}
 	a := &Agent{
-		id:        snapshot.ID,
-		name:      snapshot.Name,
-		vendor:    snapshot.Vendor,
-		runMode:   snapshot.RunMode,
-		state:     snapshot.State,
-		lastError: snapshot.LastError,
-		createdAt: snapshot.CreatedAt,
-		updatedAt: snapshot.UpdatedAt,
+		id:             snapshot.ID,
+		name:           snapshot.Name,
+		vendor:         snapshot.Vendor,
+		runMode:        snapshot.RunMode,
+		hookPolicy:     hookPolicy,
+		state:          snapshot.State,
+		lastError:      snapshot.LastError,
+		lastTransition: cloneEvidence(snapshot.LastTransition),
+		createdAt:      snapshot.CreatedAt,
+		updatedAt:      snapshot.UpdatedAt,
 	}
 	for _, option := range opts {
 		option(a)
@@ -210,6 +313,9 @@ func validateRestoredAgent(a *Agent) error {
 	if !ValidRunMode(a.runMode) {
 		return fmt.Errorf("agent: restore: invalid run mode %q", a.runMode)
 	}
+	if !ValidHookPolicy(a.hookPolicy) {
+		return fmt.Errorf("agent: restore: invalid hook policy %q", a.hookPolicy)
+	}
 	if !Valid(a.state) {
 		return fmt.Errorf("agent: restore: invalid state %q", a.state)
 	}
@@ -222,7 +328,20 @@ func validateRestoredAgent(a *Agent) error {
 	if a.updatedAt.Before(a.createdAt) {
 		return errors.New("agent: restore: update time is before creation time")
 	}
+	if a.lastTransition != nil {
+		if err := a.lastTransition.Validate(); err != nil {
+			return fmt.Errorf("agent: restore: last transition: %w", err)
+		}
+	}
 	return nil
+}
+
+func cloneEvidence(evidence *Evidence) *Evidence {
+	if evidence == nil {
+		return nil
+	}
+	copy := *evidence
+	return &copy
 }
 
 // ID 返回 agent 标识。
@@ -249,6 +368,13 @@ func (a *Agent) RunMode() RunMode {
 	return a.runMode
 }
 
+// HookPolicy returns the immutable session hook policy.
+func (a *Agent) HookPolicy() HookPolicy {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.hookPolicy
+}
+
 // State 返回当前状态（读取权威入口）。
 func (a *Agent) State() State {
 	a.mu.RLock()
@@ -261,6 +387,13 @@ func (a *Agent) LastError() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.lastError
+}
+
+// LastTransition returns a copy of the newest understood state evidence.
+func (a *Agent) LastTransition() *Evidence {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return cloneEvidence(a.lastTransition)
 }
 
 // PlanTransition 验证并生成不会立即改变状态的迁移计划。

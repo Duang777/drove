@@ -52,10 +52,11 @@ type StartRequest struct {
 }
 
 type createdPayload struct {
-	Version int            `json:"version"`
-	Name    string         `json:"name"`
-	Vendor  string         `json:"vendor"`
-	Mode    *agent.RunMode `json:"mode,omitempty"`
+	Version    int               `json:"version"`
+	Name       string            `json:"name"`
+	Vendor     string            `json:"vendor"`
+	Mode       *agent.RunMode    `json:"mode,omitempty"`
+	HookPolicy *agent.HookPolicy `json:"hook_policy,omitempty"`
 }
 
 type inputAuditPayload struct {

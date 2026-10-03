@@ -9,6 +9,8 @@ Agent 的**抽象与状态机**。这是全项目唯一的状态权威（source 
 - `State` 枚举：`Working` / `Blocked` / `Done` / `Idle`，外加 `Starting` / `Stopped` 作为生命周期边界态。
 - `Blocked -> Idle` 表示 hook 确认当前 turn 已结束但交互进程仍存活。
 - `RunMode` 是不可变运行元数据：新 Agent 默认 `interactive`，历史恢复必须提供已校验的 `interactive` 或 `oneshot`。
+- `HookPolicy` 是会话级不可变元数据；版本 1 历史记录恢复为 `off`。
+- `Evidence` 是状态迁移的脱敏来源，恢复投影保留最近一条已理解的证据。
 - `PlanTransition` 在持久化前校验并生成带 revision 的计划，`ApplyTransition` 只在事件提交后应用；陈旧计划不得覆盖新状态。
 - `Agent.Transition` 是包独立使用时的同步便利入口；会话编排必须使用 plan/apply 两阶段接口。
 - Agent 本身**不产生事件**；事件由上层（session/event 包）负责落库与扇出。
