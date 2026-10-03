@@ -478,8 +478,10 @@ The Detector applies these rules:
 - a notify never satisfies `required`;
 - a notify received while `HookStatus` is `hook_active` is persisted with
   outcome `suppressed`;
-- a notify received while policy is `auto` and status is `awaiting_hook` or
-  `fallback` arms the existing one-second turn-stop confirmation;
+- a notify received while policy is `auto` and status is `fallback` arms the
+  existing one-second turn-stop confirmation;
+- a notify received while status is `awaiting_hook` is persisted as
+  `suppressed`, so it cannot replace the five-second activation timer;
 - hook, output activity, or a newer notify cancels or replaces the candidate
   under the existing timer-generation rules;
 - a confirmed notify candidate can move Working or Blocked to Idle;

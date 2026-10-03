@@ -160,6 +160,77 @@ func TestHookCommandRelaysInjectedSessionEnvelope(t *testing.T) {
 	}
 }
 
+func TestHookCommandRelaysArgvPayloadWithManagedMarker(t *testing.T) {
+	var received struct {
+		Vendor  string          `json:"vendor"`
+		Payload json.RawMessage `json:"payload"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	t.Setenv(session.SignalAgentIDEnv, "agent-1")
+	t.Setenv(session.SignalURLEnv, server.URL+"/api/v1/agents/agent-1/signal")
+	t.Setenv(session.SignalTokenEnv, "session-token")
+	payload := `{"type":"agent-turn-complete","thread-id":"thread-1"}`
+
+	command := newHookCmd()
+	command.SetArgs([]string{
+		"--vendor", "codex",
+		"--managed-by", "drove/v1",
+		"--payload-argv",
+		payload,
+	})
+	var stderr bytes.Buffer
+	command.SetErr(&stderr)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute hook: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	if received.Vendor != "codex" || string(received.Payload) != payload {
+		t.Fatalf("request = %+v", received)
+	}
+}
+
+func TestHookCommandValidatesManagedAndPayloadModes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{
+			name: "invalid managed marker",
+			args: []string{"--vendor", "claude", "--managed-by", "other"},
+		},
+		{
+			name: "stdin mode rejects positional payload",
+			args: []string{"--vendor", "claude", `{}`},
+		},
+		{
+			name: "argv mode requires payload",
+			args: []string{"--vendor", "codex", "--payload-argv"},
+		},
+		{
+			name: "argv mode rejects extra payload",
+			args: []string{"--vendor", "codex", "--payload-argv", `{}`, `{}`},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			command := newHookCmd()
+			command.SetArgs(test.args)
+			if err := command.Execute(); err == nil {
+				t.Fatal("hook command succeeded")
+			}
+		})
+	}
+}
+
 func TestHookCommandReportsFailureWithoutBlockingVendor(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"error":"secret response"}`, http.StatusUnauthorized)

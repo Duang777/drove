@@ -269,13 +269,31 @@ func newSendCmd() *cobra.Command {
 }
 
 func newHookCmd() *cobra.Command {
-	var vendor string
+	var (
+		vendor      string
+		managedBy   string
+		payloadArgv bool
+	)
 	cmd := &cobra.Command{
-		Use:   "hook",
+		Use:   "hook [payload]",
 		Short: "转发一个厂商 hook 事件",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := forwardHook(cmd, vendor); err != nil {
+		Args: func(_ *cobra.Command, args []string) error {
+			if managedBy != "" && managedBy != "drove/v1" {
+				return errors.New("hook --managed-by must be drove/v1")
+			}
+			if payloadArgv {
+				if len(args) != 1 {
+					return errors.New("hook --payload-argv requires exactly one payload")
+				}
+				return nil
+			}
+			if len(args) != 0 {
+				return errors.New("hook reads stdin unless --payload-argv is set")
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := forwardHook(cmd, vendor, payloadArgv, args); err != nil {
 				_, _ = fmt.Fprintln(
 					cmd.ErrOrStderr(),
 					"drove hook: signal delivery failed",
@@ -285,11 +303,18 @@ func newHookCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&vendor, "vendor", "", "hook 厂商（claude 或 codex）")
+	cmd.Flags().StringVar(&managedBy, "managed-by", "", "受管命令标识")
+	cmd.Flags().BoolVar(&payloadArgv, "payload-argv", false, "从唯一位置参数读取 JSON")
 	_ = cmd.MarkFlagRequired("vendor")
 	return cmd
 }
 
-func forwardHook(cmd *cobra.Command, vendor string) error {
+func forwardHook(
+	cmd *cobra.Command,
+	vendor string,
+	payloadArgv bool,
+	args []string,
+) error {
 	relay, err := client.NewHookRelay(client.HookRelayConfig{
 		AgentID:   os.Getenv(session.SignalAgentIDEnv),
 		SignalURL: os.Getenv(session.SignalURLEnv),
@@ -299,12 +324,17 @@ func forwardHook(cmd *cobra.Command, vendor string) error {
 		return err
 	}
 
-	payload, err := io.ReadAll(io.LimitReader(
-		cmd.InOrStdin(),
-		client.MaxHookPayloadBytes+1,
-	))
-	if err != nil {
-		return fmt.Errorf("read hook payload: %w", err)
+	var payload []byte
+	if payloadArgv {
+		payload = []byte(args[0])
+	} else {
+		payload, err = io.ReadAll(io.LimitReader(
+			cmd.InOrStdin(),
+			client.MaxHookPayloadBytes+1,
+		))
+		if err != nil {
+			return fmt.Errorf("read hook payload: %w", err)
+		}
 	}
 	if len(payload) > client.MaxHookPayloadBytes {
 		return fmt.Errorf(

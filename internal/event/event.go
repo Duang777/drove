@@ -187,10 +187,26 @@ type SignalPayloadV1 struct {
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
 func (p SignalPayloadV1) Validate() error {
-	if p.Version != 1 {
+	return validateSignalPayload(p, 1, false)
+}
+
+// SignalPayloadV2 adds the non-authoritative notify source.
+type SignalPayloadV2 SignalPayloadV1
+
+// Validate rejects malformed or privacy-unsafe signal metadata.
+func (p SignalPayloadV2) Validate() error {
+	return validateSignalPayload(SignalPayloadV1(p), 2, true)
+}
+
+func validateSignalPayload(p SignalPayloadV1, version int, allowNotify bool) error {
+	if p.Version != version {
 		return fmt.Errorf("event: unsupported signal payload version %d", p.Version)
 	}
-	if !oneOf(p.Source, "process", "hook", "heuristic", "timer") {
+	validSource := oneOf(p.Source, "process", "hook", "heuristic", "timer")
+	if allowNotify {
+		validSource = validSource || p.Source == "notify"
+	}
+	if !validSource {
 		return fmt.Errorf("event: invalid signal source %q", p.Source)
 	}
 	legacyTransitional := p.Kind == "" && p.Outcome == "" && p.Evidence != ""
@@ -250,15 +266,18 @@ func (p SignalPayloadV1) Validate() error {
 			return fmt.Errorf("event: invalid signal occurred_at: %w", err)
 		}
 	}
-	if p.Source == "hook" {
+	if p.Source == "hook" || p.Source == "notify" {
 		if p.Vendor == "" {
-			return errors.New("event: hook signal vendor is required")
+			return errors.New("event: delivered signal vendor is required")
 		}
 		if !canonicalUUID(p.DeliveryID) {
-			return errors.New("event: hook signal delivery_id must be a canonical UUID")
+			return errors.New("event: delivered signal delivery_id must be a canonical UUID")
 		}
 	} else if p.DeliveryID != "" {
-		return errors.New("event: only hook signals may contain delivery_id")
+		return errors.New("event: only delivered signals may contain delivery_id")
+	}
+	if p.Source == "notify" && p.Kind != "turn_stopped" {
+		return fmt.Errorf("event: notify source cannot report kind %q", p.Kind)
 	}
 	if !legacyTransitional &&
 		!oneOf(p.Outcome, "observed", "candidate", "transitioned", "suppressed", "stale", "terminal") {
@@ -284,10 +303,38 @@ type StateEvidencePayloadV1 struct {
 
 // Validate rejects malformed transition evidence.
 func (p StateEvidencePayloadV1) Validate() error {
-	if p.Version != 1 {
+	return validateStateEvidencePayload(p, 1, false)
+}
+
+// StateEvidencePayloadV2 adds transition evidence from a notify candidate.
+type StateEvidencePayloadV2 StateEvidencePayloadV1
+
+// Validate rejects malformed transition evidence.
+func (p StateEvidencePayloadV2) Validate() error {
+	return validateStateEvidencePayload(StateEvidencePayloadV1(p), 2, true)
+}
+
+func validateStateEvidencePayload(
+	p StateEvidencePayloadV1,
+	version int,
+	allowNotify bool,
+) error {
+	if p.Version != version {
 		return fmt.Errorf("event: unsupported state evidence version %d", p.Version)
 	}
-	if !oneOf(p.Source, "session", "process", "hook", "heuristic", "timer", "recovery") {
+	validSource := oneOf(
+		p.Source,
+		"session",
+		"process",
+		"hook",
+		"heuristic",
+		"timer",
+		"recovery",
+	)
+	if allowNotify {
+		validSource = validSource || p.Source == "notify"
+	}
+	if !validSource {
 		return fmt.Errorf("event: invalid state evidence source %q", p.Source)
 	}
 	if p.Event == "" || len(p.Event) > 64 || !ascii(p.Event) {
@@ -297,12 +344,16 @@ func (p StateEvidencePayloadV1) Validate() error {
 		p.Confidence < 0 || p.Confidence > 1 {
 		return fmt.Errorf("event: invalid state evidence confidence %v", p.Confidence)
 	}
-	if p.Source == "hook" {
+	if p.Source == "hook" || p.Source == "notify" {
 		if !canonicalUUID(p.DeliveryID) {
-			return errors.New("event: hook state evidence delivery_id must be a canonical UUID")
+			return errors.New(
+				"event: delivered state evidence delivery_id must be a canonical UUID",
+			)
 		}
 	} else if p.DeliveryID != "" {
-		return errors.New("event: only hook state evidence may contain delivery_id")
+		return errors.New(
+			"event: only delivered state evidence may contain delivery_id",
+		)
 	}
 	return nil
 }

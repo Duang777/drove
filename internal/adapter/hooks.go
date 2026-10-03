@@ -16,6 +16,8 @@ var (
 	ErrInvalidHookPayload = errors.New("adapter: invalid hook payload")
 	// ErrUnknownHookEvent indicates an event outside the vendor allowlist.
 	ErrUnknownHookEvent = errors.New("adapter: unknown hook event")
+	// ErrIgnoredHookPayload indicates a valid vendor-internal event with no Drove meaning.
+	ErrIgnoredHookPayload = errors.New("adapter: ignored hook payload")
 )
 
 func validateHookEnvelope(

@@ -3,6 +3,7 @@ package adapter
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/Duang777/drove/internal/detect"
 )
@@ -10,14 +11,18 @@ import (
 type codexHookDecoder struct{}
 
 type codexHookPayload struct {
-	HookEventName string `json:"hook_event_name"`
-	EventName     string `json:"event_name"`
-	SessionID     string `json:"session_id"`
-	ThreadID      string `json:"thread_id"`
-	TurnID        string `json:"turn_id"`
-	AgentID       string `json:"agent_id"`
-	Scope         string `json:"scope"`
-	Timestamp     string `json:"timestamp"`
+	Type          string   `json:"type"`
+	HookEventName string   `json:"hook_event_name"`
+	EventName     string   `json:"event_name"`
+	SessionID     string   `json:"session_id"`
+	ThreadID      string   `json:"thread_id"`
+	TurnID        string   `json:"turn_id"`
+	NotifyThread  string   `json:"thread-id"`
+	NotifyTurn    string   `json:"turn-id"`
+	AgentID       string   `json:"agent_id"`
+	Scope         string   `json:"scope"`
+	Timestamp     string   `json:"timestamp"`
+	InputMessages []string `json:"input-messages"`
 }
 
 func (codexHookDecoder) NormalizeHook(input HookInput) (detect.Signal, error) {
@@ -28,6 +33,9 @@ func (codexHookDecoder) NormalizeHook(input HookInput) (detect.Signal, error) {
 			ErrInvalidHookPayload,
 			err,
 		)
+	}
+	if payload.Type != "" {
+		return normalizeCodexNotify(input, payload)
 	}
 	eventName := payload.HookEventName
 	if eventName == "" {
@@ -72,6 +80,50 @@ func (codexHookDecoder) NormalizeHook(input HookInput) (detect.Signal, error) {
 		Evidence:        evidence,
 		Confidence:      1,
 		OccurredAt:      occurredAt,
+		ReceivedAt:      input.ReceivedAt,
+		DeliveryID:      input.DeliveryID,
+	})
+	if err != nil {
+		return detect.Signal{}, fmt.Errorf("%w: %v", ErrInvalidHookPayload, err)
+	}
+	return signal, nil
+}
+
+func normalizeCodexNotify(
+	input HookInput,
+	payload codexHookPayload,
+) (detect.Signal, error) {
+	if payload.Type != "agent-turn-complete" {
+		return detect.Signal{}, fmt.Errorf(
+			"%w: codex notify %q",
+			ErrUnknownHookEvent,
+			payload.Type,
+		)
+	}
+	if len(payload.InputMessages) == 1 &&
+		strings.HasPrefix(
+			payload.InputMessages[0],
+			"Generate a concise, single-line task title",
+		) {
+		return detect.Signal{}, ErrIgnoredHookPayload
+	}
+	if err := validateHookEnvelope(
+		input.DeliveryID,
+		payload.Type,
+		payload.NotifyThread,
+		input.ReceivedAt,
+	); err != nil {
+		return detect.Signal{}, err
+	}
+	signal, err := detect.NewNotifySignal(detect.Signal{
+		Kind:            detect.KindTurnStopped,
+		Vendor:          "codex",
+		VendorEvent:     payload.Type,
+		Scope:           detect.ScopeRoot,
+		VendorSessionID: payload.NotifyThread,
+		VendorTurnID:    payload.NotifyTurn,
+		Evidence:        "turn stopped",
+		Confidence:      1,
 		ReceivedAt:      input.ReceivedAt,
 		DeliveryID:      input.DeliveryID,
 	})

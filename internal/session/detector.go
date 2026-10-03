@@ -355,6 +355,18 @@ func encodeSignalAudit(
 		payload.ExitCode = signal.Process.ExitCode
 		payload.ExitKind = string(signal.Process.ExitKind)
 	}
+	if signal.Source == detect.SourceNotify {
+		payload.Version = 2
+		versioned := event.SignalPayloadV2(payload)
+		if err := versioned.Validate(); err != nil {
+			return nil, fmt.Errorf("session: validate signal audit: %w", err)
+		}
+		encoded, err := json.Marshal(versioned)
+		if err != nil {
+			return nil, fmt.Errorf("session: encode signal audit: %w", err)
+		}
+		return encoded, nil
+	}
 	if err := payload.Validate(); err != nil {
 		return nil, fmt.Errorf("session: validate signal audit: %w", err)
 	}

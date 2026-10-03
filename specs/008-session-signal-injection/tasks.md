@@ -48,7 +48,8 @@ Work:
 - Permit only root `turn_stopped` with a canonical delivery ID.
 - Never change hook status from a notify.
 - Suppress notify while native hooks are active.
-- Allow notify to arm the existing stop confirmation in awaiting or fallback.
+- Suppress notify while awaiting so the activation timer remains authoritative.
+- Allow notify to arm the existing stop confirmation only in fallback.
 - Keep required-hook activation unchanged.
 - Add state evidence source `notify`.
 - Test every authority and timer-generation branch.

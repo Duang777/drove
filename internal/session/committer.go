@@ -409,13 +409,7 @@ func prepareCommitOperation(
 			))
 		}
 		if from, to, reason, evidence, ok := prepared.Transition(); ok {
-			payload, encodeErr := json.Marshal(event.StateEvidencePayloadV1{
-				Version:    1,
-				Source:     string(evidence.Source),
-				Event:      evidence.Event,
-				Confidence: evidence.Confidence,
-				DeliveryID: evidence.DeliveryID,
-			})
+			payload, encodeErr := encodeStateEvidence(evidence)
 			if encodeErr != nil {
 				return nil, nil, time.Time{}, fmt.Errorf(
 					"session: encode state evidence: %w",
@@ -460,13 +454,7 @@ func prepareCommitOperation(
 				))
 			}
 			if from, to, reason, evidence, hasTransition := prepared.Transition(); hasTransition {
-				payload, encodeErr := json.Marshal(event.StateEvidencePayloadV1{
-					Version:    1,
-					Source:     string(evidence.Source),
-					Event:      evidence.Event,
-					Confidence: evidence.Confidence,
-					DeliveryID: evidence.DeliveryID,
-				})
+				payload, encodeErr := encodeStateEvidence(evidence)
 				if encodeErr != nil {
 					return nil, nil, time.Time{}, fmt.Errorf(
 						"session: encode decision state evidence: %w",
@@ -500,6 +488,28 @@ func prepareCommitOperation(
 			operation,
 		)
 	}
+}
+
+func encodeStateEvidence(evidence agent.Evidence) ([]byte, error) {
+	payload := event.StateEvidencePayloadV1{
+		Version:    1,
+		Source:     string(evidence.Source),
+		Event:      evidence.Event,
+		Confidence: evidence.Confidence,
+		DeliveryID: evidence.DeliveryID,
+	}
+	if evidence.Source == agent.EvidenceNotify {
+		payload.Version = 2
+		versioned := event.StateEvidencePayloadV2(payload)
+		if err := versioned.Validate(); err != nil {
+			return nil, err
+		}
+		return json.Marshal(versioned)
+	}
+	if err := payload.Validate(); err != nil {
+		return nil, err
+	}
+	return json.Marshal(payload)
 }
 
 func eventRow(ev event.Event) store.EventRow {

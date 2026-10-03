@@ -234,18 +234,29 @@ func (p *recoveryProjector) applySignal(row store.EventRow) error {
 	if version.Version == 0 {
 		return projectionError(row, "signal payload version is required")
 	}
-	if version.Version != 1 {
+	switch version.Version {
+	case 1:
+		var payload event.SignalPayloadV1
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return projectionWrapError(row, "decode signal payload", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return projectionWrapError(row, "validate signal payload", err)
+		}
+		return nil
+	case 2:
+		var payload event.SignalPayloadV2
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return projectionWrapError(row, "decode signal payload", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return projectionWrapError(row, "validate signal payload", err)
+		}
+		return nil
+	default:
 		p.report.UnknownSignalPayloadVersions++
 		return nil
 	}
-	var payload event.SignalPayloadV1
-	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
-		return projectionWrapError(row, "decode signal payload", err)
-	}
-	if err := payload.Validate(); err != nil {
-		return projectionWrapError(row, "validate signal payload", err)
-	}
-	return nil
 }
 
 func parseStateEvidence(row store.EventRow) (*agent.Evidence, bool, error) {
@@ -261,21 +272,54 @@ func parseStateEvidence(row store.EventRow) (*agent.Evidence, bool, error) {
 	if version.Version == 0 {
 		return nil, false, projectionError(row, "state evidence version is required")
 	}
-	if version.Version != 1 {
+	switch version.Version {
+	case 1:
+		var payload event.StateEvidencePayloadV1
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return nil, false, projectionWrapError(row, "decode state evidence", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return nil, false, projectionWrapError(row, "validate state evidence", err)
+		}
+		return agentEvidence(
+			payload.Source,
+			payload.Event,
+			payload.Confidence,
+			payload.DeliveryID,
+			row,
+		)
+	case 2:
+		var payload event.StateEvidencePayloadV2
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return nil, false, projectionWrapError(row, "decode state evidence", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return nil, false, projectionWrapError(row, "validate state evidence", err)
+		}
+		return agentEvidence(
+			payload.Source,
+			payload.Event,
+			payload.Confidence,
+			payload.DeliveryID,
+			row,
+		)
+	default:
 		return nil, false, nil
 	}
-	var payload event.StateEvidencePayloadV1
-	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
-		return nil, false, projectionWrapError(row, "decode state evidence", err)
-	}
-	if err := payload.Validate(); err != nil {
-		return nil, false, projectionWrapError(row, "validate state evidence", err)
-	}
+}
+
+func agentEvidence(
+	source string,
+	eventName string,
+	confidence float64,
+	deliveryID string,
+	row store.EventRow,
+) (*agent.Evidence, bool, error) {
 	evidence := &agent.Evidence{
-		Source:     agent.EvidenceSource(payload.Source),
-		Event:      payload.Event,
-		Confidence: payload.Confidence,
-		DeliveryID: payload.DeliveryID,
+		Source:     agent.EvidenceSource(source),
+		Event:      eventName,
+		Confidence: confidence,
+		DeliveryID: deliveryID,
 	}
 	if err := evidence.Validate(); err != nil {
 		return nil, false, projectionWrapError(row, "validate agent evidence", err)

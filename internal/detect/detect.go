@@ -31,6 +31,7 @@ type Source string
 const (
 	SourceProcess   Source = "process"
 	SourceHook      Source = "hook"
+	SourceNotify    Source = "notify"
 	SourceHeuristic Source = "heuristic"
 	SourceTimer     Source = "timer"
 )
@@ -136,6 +137,18 @@ func NewHookSignal(signal Signal) (Signal, error) {
 	return cloneSignal(signal), nil
 }
 
+// NewNotifySignal validates a non-authoritative vendor notification.
+func NewNotifySignal(signal Signal) (Signal, error) {
+	signal.Version = signalVersion
+	signal.Source = SourceNotify
+	signal.Process = nil
+	signal.TimerGeneration = 0
+	if err := signal.validate(); err != nil {
+		return Signal{}, err
+	}
+	return cloneSignal(signal), nil
+}
+
 // NewHeuristicSignal validates and copies a terminal heuristic signal.
 func NewHeuristicSignal(signal Signal) (Signal, error) {
 	signal.Version = signalVersion
@@ -222,6 +235,23 @@ func (s Signal) validate() error {
 		if s.Process != nil || s.TimerGeneration != 0 {
 			return errors.New("detect: hook signal contains non-hook metadata")
 		}
+	case SourceNotify:
+		if s.Vendor == "" {
+			return errors.New("detect: notify signal vendor is required")
+		}
+		if !canonicalUUID(s.DeliveryID) {
+			return errors.New("detect: notify delivery ID must be a canonical UUID")
+		}
+		if s.Scope != ScopeRoot || s.Kind != KindTurnStopped {
+			return fmt.Errorf(
+				"detect: notify source cannot report %q at scope %q",
+				s.Kind,
+				s.Scope,
+			)
+		}
+		if s.Process != nil || s.TimerGeneration != 0 {
+			return errors.New("detect: notify signal contains foreign metadata")
+		}
 	case SourceHeuristic:
 		if s.DeliveryID != "" || s.Process != nil || s.TimerGeneration != 0 {
 			return errors.New("detect: heuristic signal contains foreign metadata")
@@ -289,7 +319,7 @@ func (p ProcessFact) validate(kind Kind) error {
 
 func validSource(source Source) bool {
 	switch source {
-	case SourceProcess, SourceHook, SourceHeuristic, SourceTimer:
+	case SourceProcess, SourceHook, SourceNotify, SourceHeuristic, SourceTimer:
 		return true
 	default:
 		return false
@@ -717,6 +747,8 @@ func (d *Detector) Decide(
 		switch observation.signal.Source {
 		case SourceHook:
 			return d.decideHook(state, current, observation.signal)
+		case SourceNotify:
+			return d.decideNotify(state, current, observation.signal)
 		case SourceHeuristic:
 			return d.decideHeuristic(state, current, observation.signal)
 		case SourceProcess:
@@ -749,6 +781,55 @@ func (d *Detector) Decide(
 	default:
 		return Decision{}, errors.New("detect: invalid observation")
 	}
+}
+
+func (d *Detector) decideNotify(
+	state Snapshot,
+	current agent.Snapshot,
+	signal Signal,
+) (Decision, error) {
+	if state.data.policy == agent.HooksOff {
+		return Decision{}, ErrHooksDisabled
+	}
+	if outcome, duplicate := state.data.deliveries[signal.DeliveryID]; duplicate {
+		return Decision{
+			owner:            state.owner,
+			expectedRevision: state.data.revision,
+			signal:           cloneSignal(signal),
+			outcome:          outcome,
+			duplicate:        true,
+			timer:            TimerPlan{Action: TimerKeep},
+		}, nil
+	}
+
+	decision := newDecision(state, signal, OutcomeObserved)
+	switch {
+	case state.data.terminal:
+		decision.outcome = OutcomeTerminal
+	case state.data.policy == agent.HooksRequired,
+		state.data.status == HookAwaiting,
+		state.data.status == HookActive:
+		decision.outcome = OutcomeSuppressed
+	case state.data.status == HookFallback:
+		if current.State == agent.StateWorking || current.State == agent.StateBlocked {
+			armTimer(
+				&decision,
+				timerHookIdle,
+				signal.ReceivedAt.Add(d.config.StopConfirmation),
+				signal,
+			)
+			decision.outcome = OutcomeCandidate
+		}
+	default:
+		decision.outcome = OutcomeSuppressed
+	}
+	rememberDelivery(
+		&decision.next,
+		signal.DeliveryID,
+		decision.outcome,
+		d.config.DeliveryRememberCount,
+	)
+	return decision, nil
 }
 
 func (d *Detector) decideHook(
@@ -832,6 +913,10 @@ func (d *Detector) decideHeuristic(
 	if !fallbackEnabled(state.data) {
 		decision.outcome = OutcomeSuppressed
 		return decision, nil
+	}
+	if decision.next.timerKind == timerHookIdle &&
+		decision.next.timerCandidate.Source == SourceNotify {
+		cancelTimer(&decision)
 	}
 
 	if signal.Kind == KindHeuristicBlocked {
@@ -1013,14 +1098,26 @@ func (d *Detector) decideTimer(
 			"",
 		)
 	case timerHookIdle:
+		candidate := cloneSignal(state.data.timerCandidate)
 		cancelTimer(&decision)
-		transition(
-			&decision,
-			current,
-			agent.StateIdle,
-			"hook idle confirmed",
-			"",
-		)
+		if candidate.Source == SourceNotify {
+			transitionWithEvidence(
+				&decision,
+				current,
+				agent.StateIdle,
+				"notify idle confirmed",
+				"",
+				evidence(candidate),
+			)
+		} else {
+			transition(
+				&decision,
+				current,
+				agent.StateIdle,
+				"hook idle confirmed",
+				"",
+			)
+		}
 	case timerHeuristicBlocked:
 		cancelTimer(&decision)
 		transition(
@@ -1068,9 +1165,27 @@ func transition(
 	reason string,
 	errorMessage string,
 ) {
+	transitionWithEvidence(
+		decision,
+		current,
+		target,
+		reason,
+		errorMessage,
+		evidence(decision.signal),
+	)
+}
+
+func transitionWithEvidence(
+	decision *Decision,
+	current agent.Snapshot,
+	target agent.State,
+	reason string,
+	errorMessage string,
+	transitionEvidence agent.Evidence,
+) {
 	if current.State == target {
 		if errorMessage != "" {
-			decision.change = agent.RecordError(errorMessage, evidence(decision.signal))
+			decision.change = agent.RecordError(errorMessage, transitionEvidence)
 			decision.hasChange = true
 		}
 		return
@@ -1083,10 +1198,10 @@ func transition(
 			target,
 			reason,
 			errorMessage,
-			evidence(decision.signal),
+			transitionEvidence,
 		)
 	} else {
-		decision.change = agent.MoveTo(target, reason, evidence(decision.signal))
+		decision.change = agent.MoveTo(target, reason, transitionEvidence)
 	}
 	decision.hasChange = true
 	if decision.outcome != OutcomeTerminal {

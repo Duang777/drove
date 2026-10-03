@@ -64,6 +64,7 @@ const (
 	EvidenceSession   EvidenceSource = "session"
 	EvidenceProcess   EvidenceSource = "process"
 	EvidenceHook      EvidenceSource = "hook"
+	EvidenceNotify    EvidenceSource = "notify"
 	EvidenceHeuristic EvidenceSource = "heuristic"
 	EvidenceTimer     EvidenceSource = "timer"
 	EvidenceRecovery  EvidenceSource = "recovery"
@@ -83,6 +84,7 @@ func (e Evidence) Validate() error {
 	case EvidenceSession,
 		EvidenceProcess,
 		EvidenceHook,
+		EvidenceNotify,
 		EvidenceHeuristic,
 		EvidenceTimer,
 		EvidenceRecovery:
@@ -96,13 +98,15 @@ func (e Evidence) Validate() error {
 		e.Confidence < 0 || e.Confidence > 1 {
 		return fmt.Errorf("agent: invalid evidence confidence %v", e.Confidence)
 	}
-	if e.Source == EvidenceHook {
+	if e.Source == EvidenceHook || e.Source == EvidenceNotify {
 		parsed, err := uuid.Parse(e.DeliveryID)
 		if err != nil || parsed.String() != e.DeliveryID {
-			return errors.New("agent: hook evidence delivery ID must be a canonical UUID")
+			return errors.New(
+				"agent: delivered evidence ID must be a canonical UUID",
+			)
 		}
 	} else if e.DeliveryID != "" {
-		return errors.New("agent: only hook evidence may contain a delivery ID")
+		return errors.New("agent: only delivered evidence may contain a delivery ID")
 	}
 	return nil
 }

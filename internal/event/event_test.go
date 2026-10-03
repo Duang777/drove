@@ -124,6 +124,38 @@ func TestSignalPayloadV1Validation(t *testing.T) {
 	}
 }
 
+func TestSignalPayloadV2ValidatesNotifyOnly(t *testing.T) {
+	payload := SignalPayloadV2{
+		Version:         2,
+		Source:          "notify",
+		Kind:            "turn_stopped",
+		Vendor:          "codex",
+		VendorEvent:     "agent-turn-complete",
+		Scope:           "root",
+		VendorSessionID: "thread-1",
+		VendorTurnID:    "turn-1",
+		Confidence:      1,
+		ReceivedAt:      time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
+		Outcome:         "candidate",
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate notify payload: %v", err)
+	}
+
+	invalidKind := payload
+	invalidKind.Kind = "turn_started"
+	if err := invalidKind.Validate(); err == nil {
+		t.Fatal("notify payload accepted turn_started")
+	}
+
+	legacy := SignalPayloadV1(payload)
+	legacy.Version = 1
+	if err := legacy.Validate(); err == nil {
+		t.Fatal("version 1 payload accepted notify source")
+	}
+}
+
 func TestStateEvidencePayloadV1Validation(t *testing.T) {
 	evidence := StateEvidencePayloadV1{
 		Version:    1,
@@ -138,6 +170,19 @@ func TestStateEvidencePayloadV1Validation(t *testing.T) {
 	evidence.DeliveryID = "550e8400-e29b-41d4-a716-446655440000"
 	if err := evidence.Validate(); err == nil {
 		t.Fatal("validation accepted a non-hook delivery ID")
+	}
+}
+
+func TestStateEvidencePayloadV2ValidatesNotify(t *testing.T) {
+	evidence := StateEvidencePayloadV2{
+		Version:    2,
+		Source:     "notify",
+		Event:      "agent-turn-complete",
+		Confidence: 1,
+		DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
+	}
+	if err := evidence.Validate(); err != nil {
+		t.Fatalf("validate notify evidence: %v", err)
 	}
 }
 

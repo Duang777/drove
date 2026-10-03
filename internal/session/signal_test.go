@@ -591,6 +591,124 @@ func TestUnknownHookEventDoesNotActivatePolicy(t *testing.T) {
 	})
 }
 
+func TestIgnoredCodexNotifyWritesNoEventAndDoesNotActivateHooks(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	manager.detectConfig.HookActivation = 20 * time.Millisecond
+	status, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "codex",
+		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	before, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay before notify: %v", err)
+	}
+
+	err = deliverTestHook(
+		manager,
+		context.Background(),
+		id,
+		"Bearer "+attachedSignalToken(t, manager, id),
+		"codex",
+		testDeliveryID("ignored-title"),
+		[]byte(`{
+			"type":"agent-turn-complete",
+			"thread-id":"title-thread",
+			"turn-id":"title-turn",
+			"input-messages":[
+				"Generate a concise, single-line task title for this work"
+			]
+		}`),
+	)
+	if err != nil {
+		t.Fatalf("deliver ignored notify: %v", err)
+	}
+	after, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay after notify: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("events before=%d after=%d, want unchanged", len(before), len(after))
+	}
+	waitForHookStatus(t, manager, id, detect.HookFallback)
+}
+
+func TestCodexNotifyPersistsVersionTwoAndConfirmsFallbackIdle(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	manager.detectConfig.HookActivation = 20 * time.Millisecond
+	manager.detectConfig.StopConfirmation = 20 * time.Millisecond
+	status, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "codex",
+		Command: "/bin/cat",
+		Hooks:   agent.HooksAuto,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	waitForHookStatus(t, manager, id, detect.HookFallback)
+
+	err = deliverTestHook(
+		manager,
+		context.Background(),
+		id,
+		"Bearer "+attachedSignalToken(t, manager, id),
+		"codex",
+		testDeliveryID("notify-idle"),
+		[]byte(`{
+			"type":"agent-turn-complete",
+			"thread-id":"thread-1",
+			"turn-id":"turn-1",
+			"input-messages":["private prompt"],
+			"last-assistant-message":"private response"
+		}`),
+	)
+	if err != nil {
+		t.Fatalf("deliver notify: %v", err)
+	}
+	waitForState(t, manager, id, agent.StateIdle)
+
+	rows, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var (
+		foundSignal bool
+		foundState  bool
+	)
+	for _, row := range rows {
+		switch {
+		case row.Type == string(event.TypeAgentSignal) &&
+			strings.Contains(row.Payload, `"source":"notify"`):
+			foundSignal = strings.Contains(row.Payload, `"version":2`) &&
+				!strings.Contains(row.Payload, "private")
+		case row.Type == string(event.TypeStateChanged) &&
+			row.To == string(agent.StateIdle):
+			foundState = strings.Contains(row.Payload, `"version":2`) &&
+				strings.Contains(row.Payload, `"source":"notify"`)
+		}
+	}
+	if !foundSignal || !foundState {
+		t.Fatalf(
+			"notify signal=%t state=%t rows=%+v",
+			foundSignal,
+			foundState,
+			rows,
+		)
+	}
+	current, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	if current.HookStatus != detect.HookFallback {
+		t.Fatalf("hook status = %s, want fallback", current.HookStatus)
+	}
+}
+
 func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 	manager, _ := newSignalTestManager(
 		t,

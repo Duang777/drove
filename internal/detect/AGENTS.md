@@ -9,6 +9,8 @@ Observation 计算不可变 Decision；goroutine、队列和真实计时器由 s
 
 - hook 只有在当前会话持久化首个合法信号并应用 Decision 后才成为权威。
 - `auto` 在 hook 激活前使用启发式，`off` 只使用启发式，`required` 只使用 hook。
+- Codex legacy notify 是非权威来源：不激活 hook、不满足 `required`，只在
+  `fallback` 中生成可取消的 Idle 候选；`awaiting_hook` 与 `hook_active` 会抑制它。
 - Detector State 持有 delivery ID 去重、候选、timer generation、Blocked 输出恢复
   和 hook 状态；只有已提交 Decision 可以修改它。
 - Detector 不修改 Agent、不运行 goroutine，也不写 Store。session actor 负责串行

@@ -96,7 +96,8 @@
 - [x] Notify never changes hook status.
 - [x] Notify never satisfies required.
 - [x] Active native hooks suppress notify decisions.
-- [x] Awaiting and fallback sessions can use notify for turn stop.
+- [x] Awaiting sessions suppress notify without replacing activation timeout.
+- [x] Fallback sessions can use notify for turn stop.
 - [x] Notify can only confirm Idle.
 - [x] Notify cannot infer Working, Blocked, Done, or process terminal state.
 - [x] Existing confirmation and timer-generation rules are reused.

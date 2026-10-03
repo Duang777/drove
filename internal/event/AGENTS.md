@@ -11,7 +11,8 @@
 - `AgentInput` 只记录脱敏审计元数据，不记录用户输入正文。
 - `Hub` 内部用注册表 + buffered channel 扇出；订阅者需在注册时声明 buffer 大小，Hub 不阻塞发布者（慢订阅者被丢弃并计数，见 `Dropped`）。
 - `Hub.PublishBatch` 先校验整个连续批次，再向订阅者发布；全局序号由 `internal/session` 的 Committer 独占分配。
-- `agent.signal` 与新 `state_changed` payload 使用版本化、可校验的脱敏元数据；恢复层跳过未知审计版本。
+- `agent.signal` 与新 `state_changed` payload 使用版本化、可校验的脱敏元数据；
+  v1 覆盖 Phase 1A 来源，v2 增加非权威 notify 来源，恢复层跳过未知审计版本。
 - 事件带 `Seq` 全局递增序号与 `Timestamp`，是回放（`internal/session`）的排序依据。
 
 ## 约束

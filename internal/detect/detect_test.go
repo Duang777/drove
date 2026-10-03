@@ -84,6 +84,119 @@ func TestHookActivationPermanentlySuppressesHeuristics(t *testing.T) {
 	}
 }
 
+func TestNotifyIsNonAuthoritativeAndConfirmsFallbackIdle(t *testing.T) {
+	detector := newTestDetector(t)
+	state := NewState(agent.HooksAuto)
+	target := newTestAgent(t, agent.StateStarting, agent.RunModeInteractive)
+
+	started := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		processObservation(t, KindProcessStarted, &ProcessFact{HookAvailable: true}),
+	)
+	activationTimer := started.Timer()
+
+	awaiting := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, notifySignal(t, "awaiting", testTime.Add(time.Second))),
+	)
+	_, outcome, ok := awaiting.Signal()
+	if !ok || outcome != OutcomeSuppressed ||
+		awaiting.Timer().Generation != activationTimer.Generation ||
+		state.Snapshot().HookStatus() != HookAwaiting {
+		t.Fatalf(
+			"awaiting notify outcome=%s timer=%+v hook=%s",
+			outcome,
+			awaiting.Timer(),
+			state.Snapshot().HookStatus(),
+		)
+	}
+
+	decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, activationTimer.Generation, activationTimer.Deadline),
+	)
+	if state.Snapshot().HookStatus() != HookFallback {
+		t.Fatalf("hook status = %s, want fallback", state.Snapshot().HookStatus())
+	}
+
+	notified := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, notifySignal(t, "fallback", testTime.Add(6*time.Second))),
+	)
+	notifyTimer := notified.Timer()
+	_, outcome, _ = notified.Signal()
+	if outcome != OutcomeCandidate ||
+		notifyTimer.Action != TimerArm ||
+		notifyTimer.Deadline.Sub(testTime) != 7*time.Second ||
+		state.Snapshot().HookStatus() != HookFallback {
+		t.Fatalf(
+			"fallback notify outcome=%s timer=%+v hook=%s",
+			outcome,
+			notifyTimer,
+			state.Snapshot().HookStatus(),
+		)
+	}
+
+	decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, notifyTimer.Generation, notifyTimer.Deadline),
+	)
+	evidence := target.LastTransition()
+	if target.State() != agent.StateIdle ||
+		evidence == nil ||
+		evidence.Source != agent.EvidenceNotify ||
+		evidence.Event != "agent-turn-complete" {
+		t.Fatalf("state=%s evidence=%+v", target.State(), evidence)
+	}
+}
+
+func TestActiveHookAndRequiredPolicySuppressNotify(t *testing.T) {
+	for _, policy := range []agent.HookPolicy{agent.HooksAuto, agent.HooksRequired} {
+		t.Run(string(policy), func(t *testing.T) {
+			detector := newTestDetector(t)
+			state := NewState(policy)
+			target := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+			if policy == agent.HooksAuto {
+				activateHook(t, detector, &state, target)
+			}
+
+			decision := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, notifySignal(t, string(policy), testTime)),
+			)
+			_, outcome, _ := decision.Signal()
+			if outcome != OutcomeSuppressed ||
+				decision.Timer().Action != TimerKeep ||
+				target.State() != agent.StateWorking {
+				t.Fatalf(
+					"notify outcome=%s timer=%+v state=%s",
+					outcome,
+					decision.Timer(),
+					target.State(),
+				)
+			}
+		})
+	}
+}
+
 func TestHookPermissionAndIdleTimersAreCancelable(t *testing.T) {
 	detector := newTestDetector(t)
 	state := NewState(agent.HooksAuto)
@@ -498,6 +611,26 @@ func hookSignal(
 	})
 	if err != nil {
 		t.Fatalf("new hook signal: %v", err)
+	}
+	return signal
+}
+
+func notifySignal(t *testing.T, label string, at time.Time) Signal {
+	t.Helper()
+	signal, err := NewNotifySignal(Signal{
+		Kind:            KindTurnStopped,
+		Vendor:          "codex",
+		VendorEvent:     "agent-turn-complete",
+		Scope:           ScopeRoot,
+		VendorSessionID: "thread-1",
+		VendorTurnID:    "turn-1",
+		Evidence:        "turn stopped",
+		Confidence:      1,
+		ReceivedAt:      at,
+		DeliveryID:      uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String(),
+	})
+	if err != nil {
+		t.Fatalf("new notify signal: %v", err)
 	}
 	return signal
 }

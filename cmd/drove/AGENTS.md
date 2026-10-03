@@ -12,9 +12,10 @@
   切换为单次执行，`--hooks` 选择 `off|auto|required`；未知厂商名仍视为
   generic 命令。
 - `drove send <id> <text>` 向运行中的 agent 发送一行输入；`--stdin` 保留标准输入的原始换行。
-- `drove hook --vendor <vendor>` 从 stdin 读取一个 hook JSON 文档，并使用
-  三个继承的 session 环境变量静默转发到 daemon；不得自动拉起 daemon，
-  且投递失败只能写脱敏 stderr 并返回成功。
+- `drove hook --vendor <vendor>` 默认从 stdin 读取一个 hook JSON 文档；
+  `--payload-argv` 改为读取唯一位置参数，`--managed-by drove/v1` 只作受管命令标记。
+  两种模式都使用三个继承的 session 环境变量静默转发到 daemon；不得自动拉起
+  daemon，且投递失败只能写脱敏 stderr 并返回成功。
 - `drove ps` 列出全部会话；`drove log <id>` 回放事件流；`drove stop <id>` 停止（幂等）。
 - 每次命令从 DataDir 读取控制令牌后调用 `client.EnsureDaemon`；仅网络不可达时后台拉起 `droved`，认证失败直接返回。
 - `version` 子命令输出 `internal/version` 注入信息。

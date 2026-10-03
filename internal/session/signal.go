@@ -305,6 +305,9 @@ func (m *Manager) DeliverHook(
 		Payload:    append(json.RawMessage(nil), delivery.Payload...),
 	})
 	if err != nil {
+		if errors.Is(err, adapter.ErrIgnoredHookPayload) {
+			return nil
+		}
 		if errors.Is(err, adapter.ErrUnsupportedHook) {
 			return fmt.Errorf("%w: %v", ErrHookUnsupported, err)
 		}

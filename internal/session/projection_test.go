@@ -322,7 +322,7 @@ func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
 			Type:      string(event.TypeAgentSignal),
 			SessionID: "agent-1",
 			AgentID:   "agent-1",
-			Payload:   `{"version":2}`,
+			Payload:   `{"version":3}`,
 		},
 		{
 			Seq:       3,
@@ -332,7 +332,7 @@ func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
 			AgentID:   "agent-1",
 			From:      "pending",
 			To:        "stopped",
-			Payload:   `{"version":2}`,
+			Payload:   `{"version":3}`,
 		},
 	} {
 		if err := projector.Apply(row); err != nil {
@@ -346,6 +346,68 @@ func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
 	if plan.Report.UnknownSignalPayloadVersions != 1 ||
 		plan.Report.UnknownStateEvidenceVersions != 1 {
 		t.Fatalf("report = %+v", plan.Report)
+	}
+}
+
+func TestRecoveryProjectorAcceptsNotifyAuditPayloads(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"codex"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Payload: `{"version":2,"source":"notify","kind":"turn_stopped",` +
+				`"vendor":"codex","vendor_event":"agent-turn-complete",` +
+				`"scope":"root","confidence":1,` +
+				`"received_at":"2026-10-03T05:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000",` +
+				`"outcome":"candidate"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+			Reason:    "notify idle confirmed",
+			Payload: `{"version":2,"source":"notify",` +
+				`"event":"agent-turn-complete","confidence":1,` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000"}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if plan.Report.UnknownSignalPayloadVersions != 0 ||
+		plan.Report.UnknownStateEvidenceVersions != 0 {
+		t.Fatalf("report = %+v", plan.Report)
+	}
+	snapshot := plan.Snapshots[0]
+	if snapshot.LastTransition == nil ||
+		snapshot.LastTransition.Source != agent.EvidenceNotify ||
+		snapshot.LastTransition.Event != "agent-turn-complete" {
+		t.Fatalf("snapshot = %+v", snapshot)
 	}
 }
 

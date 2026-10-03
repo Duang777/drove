@@ -169,18 +169,20 @@ func TestHookPolicyAndEvidenceValidation(t *testing.T) {
 		t.Fatal("invalid hook policy was accepted")
 	}
 
-	evidence := Evidence{
-		Source:     EvidenceHook,
-		Event:      "PostToolUse",
-		Confidence: 1,
-		DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
-	}
-	if err := evidence.Validate(); err != nil {
-		t.Fatalf("validate evidence: %v", err)
-	}
-	evidence.DeliveryID = "delivery-1"
-	if err := evidence.Validate(); err == nil {
-		t.Fatal("non-canonical delivery ID was accepted")
+	for _, source := range []EvidenceSource{EvidenceHook, EvidenceNotify} {
+		evidence := Evidence{
+			Source:     source,
+			Event:      "PostToolUse",
+			Confidence: 1,
+			DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
+		}
+		if err := evidence.Validate(); err != nil {
+			t.Fatalf("validate %s evidence: %v", source, err)
+		}
+		evidence.DeliveryID = "delivery-1"
+		if err := evidence.Validate(); err == nil {
+			t.Fatalf("%s accepted a non-canonical delivery ID", source)
+		}
 	}
 }
 

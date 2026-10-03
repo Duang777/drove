@@ -11,6 +11,8 @@
   置信度和脱敏证据，不返回 Agent 状态。
 - Claude/Codex 私有 normalizer 把厂商 hook JSON 压缩成 `detect.Signal`；未知事件拒绝，
   prompt、tool input、transcript 和原始 JSON 不得越过本包。
+- Codex legacy notify 只保留 thread/turn ID 和枚举证据；内部任务标题 turn
+  返回可忽略结果，不得激活 hook 或写审计事件。
 - `Entry.Classify` 在调用厂商 Heuristic 前移除常见 CSI、OSC、控制字符串和单字符 ESC 序列；原始输出不在本包修改。
 - `Registry` 按厂商标识注册实现；`For(vendor)` 返回实现，未知厂商回退 `generic`（即用户命令直接跑在 PTY 里，无启发式）。
 - 内置厂商：`claude`（claude CLI）、`codex`（codex CLI）、`generic`。ACP 厂商作为预留条目（`acp` 尚未启用）。
