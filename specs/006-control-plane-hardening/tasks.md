@@ -50,10 +50,10 @@
 
 ## Commit 6: terminal sanitization
 
-- [ ] Add tests for SGR, CSI cursor/erase, OSC, and single-character escapes.
-- [ ] Sanitize only the adapter classification view.
-- [ ] Prove persisted and streamed output stays byte-for-byte compatible.
-- [ ] Commit, push, and comment on #5.
+- [x] Add tests for SGR, CSI cursor/erase, OSC, and single-character escapes.
+- [x] Sanitize only the adapter classification view.
+- [x] Prove persisted and streamed output stays byte-for-byte compatible.
+- [x] Commit, push, and comment on #5.
 
 ## Commit 7: Detector and hook relay
 

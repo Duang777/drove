@@ -1143,6 +1143,57 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 	}
 }
 
+func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("ansi-agent")
+	a := agent.New(
+		id,
+		agent.WithName("ansi-agent"),
+		agent.WithVendor("claude"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.mu.Unlock()
+	if err := manager.transitionAgent(context.Background(), a, agent.StateStarting, "test start"); err != nil {
+		t.Fatalf("transition starting: %v", err)
+	}
+	if err := manager.transitionAgent(context.Background(), a, agent.StateWorking, "test working"); err != nil {
+		t.Fatalf("transition working: %v", err)
+	}
+
+	subscription := manager.hub.Subscribe(4)
+	defer manager.hub.Unsubscribe(subscription)
+	raw := "Waiting \x1b[2K\x1b[1Gfor your input"
+	manager.onOutput(id, raw, manager.reg.For("claude"))
+
+	if got := a.State(); got != agent.StateBlocked {
+		t.Fatalf("state = %s, want blocked from sanitized heuristic text", got)
+	}
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var persistedOutput string
+	for _, row := range rows {
+		if row.Type == string(event.TypeOutput) {
+			persistedOutput = row.Payload
+		}
+	}
+	if persistedOutput != raw {
+		t.Fatalf("persisted output = %q, want raw %q", persistedOutput, raw)
+	}
+
+	select {
+	case streamed := <-subscription.C():
+		if streamed.Type != event.TypeOutput || streamed.Payload != raw {
+			t.Fatalf("streamed event = %+v, want raw output", streamed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for streamed output")
+	}
+}
+
 func TestStopCauseAndExitClaimHaveOneWinner(t *testing.T) {
 	t.Run("stop first", func(t *testing.T) {
 		manager, _ := newTestManager(t)

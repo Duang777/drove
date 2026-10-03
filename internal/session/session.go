@@ -513,10 +513,7 @@ func (m *Manager) onOutput(id agent.ID, line string, entry adapter.Entry) {
 		return
 	}
 
-	if entry.Heuristic == nil {
-		return
-	}
-	hint, ok := entry.Heuristic.Classify(line)
+	hint, ok := entry.Classify(line)
 	if !ok {
 		return
 	}

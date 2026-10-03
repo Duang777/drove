@@ -40,6 +40,14 @@ type Entry struct {
 	Heuristic Heuristic
 }
 
+// Classify sanitizes terminal control sequences before invoking the vendor heuristic.
+func (e Entry) Classify(line string) (StateHint, bool) {
+	if e.Heuristic == nil {
+		return StateHint{}, false
+	}
+	return e.Heuristic.Classify(sanitizeTerminalText(line))
+}
+
 // Registry 按厂商标识注册与查找适配器。
 type Registry struct {
 	mu      sync.RWMutex
