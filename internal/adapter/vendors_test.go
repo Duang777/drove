@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 )
 
 func TestRegistryDefaults(t *testing.T) {
@@ -32,13 +33,13 @@ func TestRegistryDefaults(t *testing.T) {
 func TestClaudeHeuristic(t *testing.T) {
 	h := claudeHeuristic{}
 	cases := []struct {
-		line  string
-		state agent.State
-		ok    bool
+		line string
+		kind detect.Kind
+		ok   bool
 	}{
-		{"Waiting for your input…", agent.StateBlocked, true},
-		{"Error: something failed", agent.StateBlocked, true},
-		{"Task complete!", agent.StateDone, true},
+		{"Waiting for your input…", detect.KindHeuristicBlocked, true},
+		{"Error: something failed", detect.KindHeuristicBlocked, true},
+		{"Task complete!", detect.KindTaskCompleted, true},
 		{"Processing file foo.go", "", false},
 	}
 	for _, c := range cases {
@@ -47,15 +48,16 @@ func TestClaudeHeuristic(t *testing.T) {
 			t.Errorf("Classify(%q) ok = %v, want %v", c.line, ok, c.ok)
 			continue
 		}
-		if ok && got.State != c.state {
-			t.Errorf("Classify(%q) state = %s, want %s", c.line, got.State, c.state)
+		if ok && got.Kind != c.kind {
+			t.Errorf("Classify(%q) kind = %s, want %s", c.line, got.Kind, c.kind)
 		}
 	}
 }
 
 func TestCodexHeuristic(t *testing.T) {
 	h := codexHeuristic{}
-	if got, ok := h.Classify("Waiting for user input"); !ok || got.State != agent.StateBlocked {
+	if got, ok := h.Classify("Waiting for user input"); !ok ||
+		got.Kind != detect.KindHeuristicBlocked {
 		t.Errorf("codex blocked hint failed: %+v, %v", got, ok)
 	}
 	if _, ok := h.Classify("Running tests…"); ok {

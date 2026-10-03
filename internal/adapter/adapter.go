@@ -4,21 +4,23 @@
 package adapter
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 )
 
-// StateHint 是适配器对某行输出给出的状态提示。
-type StateHint struct {
-	// State 建议的目标状态；agent.StateStarting 表示"无结论"。
-	State agent.State
+// OutputHint is the bounded classification of one sanitized terminal line.
+type OutputHint struct {
+	// Kind is heuristic evidence, not a direct Agent state.
+	Kind detect.Kind
 	// Confidence 置信度 0~1（供上层结合其它信号决策）。
 	Confidence float64
-	// Reason 供审计。
-	Reason string
+	// Evidence is a redacted explanation suitable for audit.
+	Evidence string
 }
 
 // Runner 描述如何拉起某厂商的 agent。
@@ -32,39 +34,47 @@ type Runner interface {
 // Heuristic 从输出行推断状态信号。
 type Heuristic interface {
 	// Classify 返回状态提示；ok=false 表示该行无可信信号。
-	Classify(line string) (StateHint, bool)
+	Classify(line string) (OutputHint, bool)
+}
+
+// HookInput is the transport-neutral input to a vendor hook normalizer.
+type HookInput struct {
+	DeliveryID string
+	ReceivedAt time.Time
+	Payload    json.RawMessage
+}
+
+// HookNormalizer converts allowlisted vendor JSON into a redacted signal.
+type HookNormalizer interface {
+	NormalizeHook(HookInput) (detect.Signal, error)
 }
 
 // Entry 是注册表中的一个实现。
 type Entry struct {
-	Runner    Runner
-	Heuristic Heuristic
-	decoder   hookDecoder
+	Runner         Runner
+	Heuristic      Heuristic
+	HookNormalizer HookNormalizer
 }
 
 // Classify sanitizes terminal control sequences before invoking the vendor heuristic.
-func (e Entry) Classify(line string) (StateHint, bool) {
+func (e Entry) Classify(line string) (OutputHint, bool) {
 	if e.Heuristic == nil {
-		return StateHint{}, false
+		return OutputHint{}, false
 	}
 	return e.Heuristic.Classify(sanitizeTerminalText(line))
 }
 
 // SupportsHooks reports whether this vendor can decode command-hook payloads.
 func (e Entry) SupportsHooks() bool {
-	return e.decoder != nil
+	return e.HookNormalizer != nil
 }
 
-// DecodeHook normalizes one vendor hook payload without retaining the raw JSON.
-func (e Entry) DecodeHook(
-	raw []byte,
-	deliveryID string,
-	receivedAt time.Time,
-) (Signal, error) {
-	if e.decoder == nil {
-		return Signal{}, ErrUnsupportedHook
+// NormalizeHook normalizes one vendor hook payload without retaining the raw JSON.
+func (e Entry) NormalizeHook(input HookInput) (detect.Signal, error) {
+	if e.HookNormalizer == nil {
+		return detect.Signal{}, ErrUnsupportedHook
 	}
-	return e.decoder.Decode(raw, deliveryID, receivedAt)
+	return e.HookNormalizer.NormalizeHook(input)
 }
 
 // Registry 按厂商标识注册与查找适配器。
@@ -84,12 +94,20 @@ func NewRegistry() *Registry {
 }
 
 // register 注册一个实现（panic 防重复注册，属开发期错误）。
-func (r *Registry) register(runner Runner, heur Heuristic, decoder hookDecoder) {
+func (r *Registry) register(
+	runner Runner,
+	heuristic Heuristic,
+	normalizer HookNormalizer,
+) {
 	v := runner.Vendor()
 	if _, dup := r.entries[v]; dup {
 		panic(fmt.Sprintf("adapter: duplicate vendor %q", v))
 	}
-	r.entries[v] = Entry{Runner: runner, Heuristic: heur, decoder: decoder}
+	r.entries[v] = Entry{
+		Runner:         runner,
+		Heuristic:      heuristic,
+		HookNormalizer: normalizer,
+	}
 }
 
 // For 返回指定厂商的实现；未知厂商回退 generic（无启发式）。
@@ -100,6 +118,20 @@ func (r *Registry) For(vendor string) Entry {
 		return e
 	}
 	return r.generic
+}
+
+// Lookup returns only an exact registered vendor.
+func (r *Registry) Lookup(vendor string) (Entry, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	entry, ok := r.entries[vendor]
+	if ok {
+		return entry, true
+	}
+	if vendor == "generic" {
+		return r.generic, true
+	}
+	return Entry{}, false
 }
 
 // Vendors 返回全部已注册厂商标识（含 generic 兜底）。

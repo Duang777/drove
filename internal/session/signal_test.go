@@ -19,7 +19,7 @@ import (
 )
 
 func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
-	manager, _ := newSignalTestManager(t, detect.PolicyAuto, "http://127.0.0.1:7373")
+	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Name:    "hook-env",
@@ -80,7 +80,7 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 }
 
 func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
-	manager, _ := newSignalTestManager(t, detect.PolicyAuto, "http://127.0.0.1:7373")
+	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
@@ -120,9 +120,9 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		{id: "delivery-start", event: "SessionStart", raw: claudeHook("SessionStart")},
 		{
 			id:    "delivery-blocked",
-			event: "PermissionRequest",
+			event: "Elicitation",
 			raw: []byte(`{
-				"hook_event_name":"PermissionRequest",
+				"hook_event_name":"Elicitation",
 				"session_id":"vendor-session",
 				"tool_input":{"secret":"never persist"}
 			}`),
@@ -153,7 +153,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		"Bearer "+token,
 		"claude",
 		testDeliveryID("delivery-blocked"),
-		claudeHook("PermissionRequest"),
+		claudeHook("Elicitation"),
 	); err != nil {
 		t.Fatalf("accept duplicate: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 				t.Fatalf("signal/state batch is not consecutive: %+v %+v", row, rows[i+1])
 			}
 		}
-		var audit signalAuditPayload
+		var audit event.SignalPayloadV1
 		if err := json.Unmarshal([]byte(row.Payload), &audit); err != nil {
 			t.Fatalf("decode audit: %v", err)
 		}
@@ -211,7 +211,8 @@ func TestAcceptSignalAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 }
 
 func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
-	manager, _ := newSignalTestManager(t, detect.PolicyAuto, "")
+	manager, _ := newSignalTestManager(t, agent.HooksAuto, "")
+	manager.detectConfig.HeuristicConfirmation = 5 * time.Millisecond
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
@@ -227,9 +228,7 @@ func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
 		t.Fatalf("low-confidence hint changed state to %s", got.State)
 	}
 	manager.onOutput(id, "Waiting for your input", entry, "")
-	if got, _ := manager.Status(id); got.State != agent.StateBlocked {
-		t.Fatalf("blocked hint left state at %s", got.State)
-	}
+	waitForState(t, manager, id, agent.StateBlocked)
 	manager.onOutput(id, "resuming first line", entry, "")
 	if got, _ := manager.Status(id); got.State != agent.StateBlocked {
 		t.Fatalf("one activity line changed state to %s", got.State)
@@ -241,7 +240,7 @@ func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
 }
 
 func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
-	manager, _ := newSignalTestManager(t, detect.PolicyAuto, "http://127.0.0.1:7373")
+	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
@@ -269,8 +268,8 @@ func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
 }
 
 func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
-	manager, _ := newSignalTestManager(t, detect.PolicyAuto, "http://127.0.0.1:7373")
-	manager.detectorIdleDelay = 5 * time.Millisecond
+	manager, _ := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
+	manager.detectConfig.StopConfirmation = 5 * time.Millisecond
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
@@ -287,7 +286,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 		"Bearer "+token,
 		"claude",
 		testDeliveryID("delivery-block"),
-		claudeHook("PermissionRequest"),
+		claudeHook("Elicitation"),
 	); err != nil {
 		t.Fatalf("block: %v", err)
 	}
@@ -318,7 +317,7 @@ func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 
 func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) {
 	t.Run("unsupported vendor", func(t *testing.T) {
-		manager, st := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
+		manager, st := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
 		_, err := manager.Start(context.Background(), StartRequest{
 			Vendor:  "generic",
 			Command: "/bin/cat",
@@ -336,8 +335,8 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 
 	t.Run("activation timeout", func(t *testing.T) {
-		manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
-		manager.hookActivationTimeout = 10 * time.Millisecond
+		manager, _ := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager.detectConfig.HookActivation = 10 * time.Millisecond
 		_, err := manager.Start(context.Background(), StartRequest{
 			Vendor:  "claude",
 			Command: "/bin/cat",
@@ -354,8 +353,8 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 
 	t.Run("short lived oneshot remains stopped without activation", func(t *testing.T) {
-		manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
-		manager.hookActivationTimeout = 10 * time.Millisecond
+		manager, _ := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager.detectConfig.HookActivation = 10 * time.Millisecond
 		_, err := manager.Start(context.Background(), StartRequest{
 			Vendor:  "claude",
 			Command: "/usr/bin/true",
@@ -371,8 +370,8 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 
 	t.Run("observed activation", func(t *testing.T) {
-		manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
-		manager.hookActivationTimeout = time.Second
+		manager, _ := newSignalTestManager(t, agent.HooksRequired, "http://127.0.0.1:7373")
+		manager.detectConfig.HookActivation = time.Second
 		result := make(chan struct {
 			status *Status
 			err    error
@@ -412,35 +411,32 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 	})
 }
 
-func TestAcceptSignalWhileSessionIsStarting(t *testing.T) {
-	manager, _ := newSignalTestManager(t, detect.PolicyRequired, "http://127.0.0.1:7373")
+func TestAcceptSignalWaitsForProcessStartCommit(t *testing.T) {
+	manager, _ := newSignalTestManager(
+		t,
+		agent.HooksRequired,
+		"http://127.0.0.1:7373",
+	)
 	a := agent.New(
 		"starting-agent",
 		agent.WithName("starting-agent"),
 		agent.WithVendor("claude"),
 		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksRequired),
 	)
-	if _, err := manager.committer.CommitAgent(
-		context.Background(),
-		a,
-		agent.MoveTo(agent.StateStarting, "test setup", agent.Evidence{
-			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
-		}),
-		nil,
-	); err != nil {
-		t.Fatalf("commit starting state: %v", err)
-	}
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	running, _, err := manager.prepareRuntime(a, manager.reg.For("claude"))
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}
+	running.process = &fakeProcessSession{}
 	manager.mu.Lock()
 	manager.agents[a.ID()] = a
-	manager.signals[a.ID()] = running
+	manager.sessions[a.ID()] = running
 	manager.mu.Unlock()
 	t.Cleanup(func() {
-		manager.detachSignal(a.ID(), running)
-		running.detector.Close()
+		manager.detach(a.ID(), running)
+		running.observer.Close()
 	})
 
 	result := make(chan error, 1)
@@ -455,23 +451,35 @@ func TestAcceptSignalWhileSessionIsStarting(t *testing.T) {
 		)
 	}()
 	select {
-	case err := <-result:
-		t.Fatalf("starting signal returned before readiness: %v", err)
+	case signalErr := <-result:
+		t.Fatalf("starting signal returned before readiness: %v", signalErr)
 	case <-time.After(10 * time.Millisecond):
+	}
+
+	started, err := processObservation(
+		detect.KindProcessStarted,
+		manager.clock.Now(),
+		&detect.ProcessFact{HookAvailable: true},
+	)
+	if err != nil {
+		t.Fatalf("process observation: %v", err)
+	}
+	if err := running.observer.Deliver(context.Background(), started); err != nil {
+		t.Fatalf("commit process start: %v", err)
 	}
 	close(running.signalReady)
 	if err := <-result; err != nil {
 		t.Fatalf("accept starting signal: %v", err)
 	}
 	select {
-	case <-running.detector.Active():
+	case <-running.observer.Active():
 	default:
-		t.Fatal("starting session signal did not activate detector")
+		t.Fatal("starting signal did not activate hooks")
 	}
 }
 
 func TestStartRejectsRemoteSignalBaseURLBeforePersisting(t *testing.T) {
-	manager, st := newSignalTestManager(t, detect.PolicyAuto, "http://example.com:7373")
+	manager, st := newSignalTestManager(t, agent.HooksAuto, "http://example.com:7373")
 	_, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
@@ -489,7 +497,7 @@ func TestStartRejectsRemoteSignalBaseURLBeforePersisting(t *testing.T) {
 }
 
 func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
-	manager, st := newSignalTestManager(t, detect.PolicyAuto, "http://127.0.0.1:7373")
+	manager, st := newSignalTestManager(t, agent.HooksAuto, "http://127.0.0.1:7373")
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Command: "/bin/cat",
@@ -532,7 +540,7 @@ func TestSignalCommitFailureLeavesStateAndHubUnchanged(t *testing.T) {
 
 func newSignalTestManager(
 	t *testing.T,
-	policy detect.Policy,
+	policy agent.HookPolicy,
 	signalBaseURL string,
 ) (*Manager, *store.Store) {
 	t.Helper()

@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Duang777/drove/internal/agent"
+	"github.com/google/uuid"
+
+	"github.com/Duang777/drove/internal/detect"
 )
 
 func TestClaudeHookFixture(t *testing.T) {
@@ -17,16 +19,20 @@ func TestClaudeHookFixture(t *testing.T) {
 		t.Fatalf("read fixture: %v", err)
 	}
 	receivedAt := time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC)
-	signal, err := NewRegistry().For("claude").DecodeHook(raw, "delivery-1", receivedAt)
+	signal, err := NewRegistry().For("claude").NormalizeHook(HookInput{
+		Payload:    raw,
+		DeliveryID: deliveryID("claude-fixture"),
+		ReceivedAt: receivedAt,
+	})
 	if err != nil {
-		t.Fatalf("decode fixture: %v", err)
+		t.Fatalf("normalize fixture: %v", err)
 	}
-	if signal.Source != SignalSourceHook ||
-		signal.Kind != SignalObserved ||
+	if signal.Source != detect.SourceHook ||
+		signal.Kind != detect.KindSessionStarted ||
 		signal.Vendor != "claude" ||
 		signal.VendorEvent != "SessionStart" ||
-		signal.Scope != SignalScopeRoot ||
-		signal.SessionRef != "claude-session-1" ||
+		signal.Scope != detect.ScopeRoot ||
+		signal.VendorSessionID != "claude-session-1" ||
 		signal.Confidence != 1 ||
 		!signal.ReceivedAt.Equal(receivedAt) {
 		t.Fatalf("signal = %+v", signal)
@@ -38,18 +44,18 @@ func TestCodexHookFixture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
-	signal, err := NewRegistry().For("codex").DecodeHook(
-		raw,
-		"delivery-2",
-		time.Now().UTC(),
-	)
+	signal, err := NewRegistry().For("codex").NormalizeHook(HookInput{
+		Payload:    raw,
+		DeliveryID: deliveryID("codex-fixture"),
+		ReceivedAt: time.Now().UTC(),
+	})
 	if err != nil {
-		t.Fatalf("decode fixture: %v", err)
+		t.Fatalf("normalize fixture: %v", err)
 	}
-	if signal.Kind != SignalWorking ||
+	if signal.Kind != detect.KindTurnStarted ||
 		signal.Vendor != "codex" ||
-		signal.SessionRef != "codex-thread-1" ||
-		signal.TurnRef != "codex-turn-1" {
+		signal.VendorSessionID != "codex-thread-1" ||
+		signal.VendorTurnID != "codex-turn-1" {
 		t.Fatalf("signal = %+v", signal)
 	}
 }
@@ -59,42 +65,54 @@ func TestClaudeHookEventMapping(t *testing.T) {
 		event        string
 		notification string
 		agentID      string
-		wantKind     SignalKind
-		wantScope    SignalScope
+		wantKind     detect.Kind
+		wantScope    detect.Scope
+		wantNotice   string
 	}{
-		{event: "SessionStart", wantKind: SignalObserved, wantScope: SignalScopeRoot},
-		{event: "UserPromptSubmit", wantKind: SignalWorking, wantScope: SignalScopeRoot},
-		{event: "PreToolUse", wantKind: SignalWorking, wantScope: SignalScopeRoot},
-		{event: "PostToolUseFailure", wantKind: SignalWorking, wantScope: SignalScopeRoot},
-		{event: "PermissionRequest", wantKind: SignalBlocked, wantScope: SignalScopeRoot},
-		{event: "Elicitation", wantKind: SignalBlocked, wantScope: SignalScopeRoot},
-		{event: "ElicitationResult", wantKind: SignalWorking, wantScope: SignalScopeRoot},
-		{event: "Stop", wantKind: SignalIdle, wantScope: SignalScopeRoot},
-		{event: "StopFailure", wantKind: SignalIdle, wantScope: SignalScopeRoot},
-		{event: "TaskCompleted", wantKind: SignalObserved, wantScope: SignalScopeRoot},
+		{event: "SessionStart", wantKind: detect.KindSessionStarted, wantScope: detect.ScopeRoot},
+		{event: "UserPromptSubmit", wantKind: detect.KindTurnStarted, wantScope: detect.ScopeRoot},
+		{event: "PreToolUse", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
+		{event: "PostToolUseFailure", wantKind: detect.KindToolActivity, wantScope: detect.ScopeRoot},
+		{event: "PermissionRequest", wantKind: detect.KindPermissionRequested, wantScope: detect.ScopeRoot},
+		{event: "PermissionDenied", wantKind: detect.KindPermissionResolved, wantScope: detect.ScopeRoot},
+		{event: "Elicitation", wantKind: detect.KindHumanInputRequired, wantScope: detect.ScopeRoot},
+		{event: "ElicitationResult", wantKind: detect.KindHumanInputResolved, wantScope: detect.ScopeRoot},
+		{event: "Stop", wantKind: detect.KindTurnStopped, wantScope: detect.ScopeRoot},
+		{event: "StopFailure", wantKind: detect.KindTurnFailed, wantScope: detect.ScopeRoot},
+		{event: "TaskCompleted", wantKind: detect.KindTaskCompleted, wantScope: detect.ScopeRoot},
 		{
 			event:     "SubagentStop",
 			agentID:   "subagent-1",
-			wantKind:  SignalWorking,
-			wantScope: SignalScopeSubagent,
+			wantKind:  detect.KindSubagentStopped,
+			wantScope: detect.ScopeSubagent,
 		},
 		{
 			event:        "Notification",
 			notification: "agent_needs_input",
-			wantKind:     SignalBlocked,
-			wantScope:    SignalScopeRoot,
+			wantKind:     detect.KindHumanInputRequired,
+			wantScope:    detect.ScopeRoot,
+			wantNotice:   "agent_needs_input",
 		},
 		{
 			event:        "Notification",
 			notification: "idle_prompt",
-			wantKind:     SignalIdle,
-			wantScope:    SignalScopeRoot,
+			wantKind:     detect.KindIdlePrompt,
+			wantScope:    detect.ScopeRoot,
+			wantNotice:   "idle_prompt",
 		},
 		{
 			event:        "Notification",
 			notification: "agent_completed",
-			wantKind:     SignalObserved,
-			wantScope:    SignalScopeRoot,
+			wantKind:     detect.KindTaskCompleted,
+			wantScope:    detect.ScopeRoot,
+			wantNotice:   "agent_completed",
+		},
+		{
+			event:        "Notification",
+			notification: "future_notification",
+			wantKind:     detect.KindObserved,
+			wantScope:    detect.ScopeRoot,
+			wantNotice:   "other",
 		},
 	}
 
@@ -110,12 +128,24 @@ func TestClaudeHookEventMapping(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode hook: %v", err)
 			}
-			signal, err := entry.DecodeHook(raw, "delivery-"+test.event, time.Now().UTC())
+			signal, err := entry.NormalizeHook(HookInput{
+				Payload:    raw,
+				DeliveryID: deliveryID(test.event + test.notification),
+				ReceivedAt: time.Now().UTC(),
+			})
 			if err != nil {
-				t.Fatalf("decode hook: %v", err)
+				t.Fatalf("normalize hook: %v", err)
 			}
-			if signal.Kind != test.wantKind || signal.Scope != test.wantScope {
-				t.Fatalf("signal = %+v, want kind=%s scope=%s", signal, test.wantKind, test.wantScope)
+			if signal.Kind != test.wantKind ||
+				signal.Scope != test.wantScope ||
+				signal.Notification != test.wantNotice {
+				t.Fatalf(
+					"signal = %+v, want kind=%s scope=%s notification=%q",
+					signal,
+					test.wantKind,
+					test.wantScope,
+					test.wantNotice,
+				)
 			}
 		})
 	}
@@ -125,17 +155,17 @@ func TestCodexHookEventMapping(t *testing.T) {
 	tests := []struct {
 		event    string
 		agentID  string
-		wantKind SignalKind
+		wantKind detect.Kind
 	}{
-		{event: "SessionStart", wantKind: SignalObserved},
-		{event: "UserPromptSubmit", wantKind: SignalWorking},
-		{event: "PreToolUse", wantKind: SignalWorking},
-		{event: "PostToolUse", wantKind: SignalWorking},
-		{event: "PermissionRequest", wantKind: SignalBlocked},
-		{event: "Stop", wantKind: SignalIdle},
-		{event: "Interrupt", wantKind: SignalIdle},
-		{event: "SessionEnd", wantKind: SignalObserved},
-		{event: "SubagentStop", agentID: "subagent-1", wantKind: SignalWorking},
+		{event: "SessionStart", wantKind: detect.KindSessionStarted},
+		{event: "UserPromptSubmit", wantKind: detect.KindTurnStarted},
+		{event: "PreToolUse", wantKind: detect.KindToolActivity},
+		{event: "PostToolUse", wantKind: detect.KindToolActivity},
+		{event: "PermissionRequest", wantKind: detect.KindPermissionRequested},
+		{event: "Stop", wantKind: detect.KindTurnStopped},
+		{event: "Interrupt", wantKind: detect.KindInterrupted},
+		{event: "SessionEnd", wantKind: detect.KindSessionEnded},
+		{event: "SubagentStop", agentID: "subagent-1", wantKind: detect.KindSubagentStopped},
 	}
 
 	entry := NewRegistry().For("codex")
@@ -149,9 +179,13 @@ func TestCodexHookEventMapping(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encode hook: %v", err)
 			}
-			signal, err := entry.DecodeHook(raw, "delivery-"+test.event, time.Now().UTC())
+			signal, err := entry.NormalizeHook(HookInput{
+				Payload:    raw,
+				DeliveryID: deliveryID(test.event),
+				ReceivedAt: time.Now().UTC(),
+			})
 			if err != nil {
-				t.Fatalf("decode hook: %v", err)
+				t.Fatalf("normalize hook: %v", err)
 			}
 			if signal.Kind != test.wantKind {
 				t.Fatalf("signal kind = %s, want %s", signal.Kind, test.wantKind)
@@ -160,7 +194,7 @@ func TestCodexHookEventMapping(t *testing.T) {
 	}
 }
 
-func TestHookDecoderRejectsUnknownAndInvalidPayloads(t *testing.T) {
+func TestHookNormalizerRejectsUnknownAndInvalidPayloads(t *testing.T) {
 	tests := []struct {
 		name     string
 		vendor   string
@@ -172,28 +206,21 @@ func TestHookDecoderRejectsUnknownAndInvalidPayloads(t *testing.T) {
 			name:     "unsupported vendor",
 			vendor:   "generic",
 			raw:      `{"hook_event_name":"SessionStart","session_id":"s1"}`,
-			delivery: "delivery-1",
+			delivery: deliveryID("unsupported"),
 			wantErr:  ErrUnsupportedHook,
 		},
 		{
 			name:     "unknown claude event",
 			vendor:   "claude",
 			raw:      `{"hook_event_name":"FutureEvent","session_id":"s1"}`,
-			delivery: "delivery-1",
-			wantErr:  ErrUnknownHookEvent,
-		},
-		{
-			name:     "unknown notification",
-			vendor:   "claude",
-			raw:      `{"hook_event_name":"Notification","session_id":"s1","notification_type":"future"}`,
-			delivery: "delivery-1",
+			delivery: deliveryID("unknown"),
 			wantErr:  ErrUnknownHookEvent,
 		},
 		{
 			name:     "missing session",
 			vendor:   "codex",
 			raw:      `{"hook_event_name":"Stop"}`,
-			delivery: "delivery-1",
+			delivery: deliveryID("missing-session"),
 			wantErr:  ErrInvalidHookPayload,
 		},
 		{
@@ -206,7 +233,7 @@ func TestHookDecoderRejectsUnknownAndInvalidPayloads(t *testing.T) {
 			name:     "malformed JSON",
 			vendor:   "claude",
 			raw:      `{`,
-			delivery: "delivery-1",
+			delivery: deliveryID("malformed"),
 			wantErr:  ErrInvalidHookPayload,
 		},
 	}
@@ -214,13 +241,14 @@ func TestHookDecoderRejectsUnknownAndInvalidPayloads(t *testing.T) {
 	registry := NewRegistry()
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := registry.For(test.vendor).DecodeHook(
-				[]byte(test.raw),
-				test.delivery,
-				time.Now().UTC(),
-			)
+			entry := registry.For(test.vendor)
+			_, err := entry.NormalizeHook(HookInput{
+				Payload:    []byte(test.raw),
+				DeliveryID: test.delivery,
+				ReceivedAt: time.Now().UTC(),
+			})
 			if !errors.Is(err, test.wantErr) {
-				t.Fatalf("decode error = %v, want %v", err, test.wantErr)
+				t.Fatalf("normalize error = %v, want %v", err, test.wantErr)
 			}
 		})
 	}
@@ -234,13 +262,13 @@ func TestHookSignalNeverRetainsSensitiveFields(t *testing.T) {
 		"tool_input":{"secret":"do not retain"},
 		"transcript_path":"/private/transcript"
 	}`)
-	signal, err := NewRegistry().For("claude").DecodeHook(
-		raw,
-		"delivery-1",
-		time.Now().UTC(),
-	)
+	signal, err := NewRegistry().For("claude").NormalizeHook(HookInput{
+		Payload:    raw,
+		DeliveryID: deliveryID("redaction"),
+		ReceivedAt: time.Now().UTC(),
+	})
 	if err != nil {
-		t.Fatalf("decode hook: %v", err)
+		t.Fatalf("normalize hook: %v", err)
 	}
 	encoded, err := json.Marshal(signal)
 	if err != nil {
@@ -253,19 +281,6 @@ func TestHookSignalNeverRetainsSensitiveFields(t *testing.T) {
 	}
 }
 
-func TestNewHeuristicSignalMapsStateAndConfidence(t *testing.T) {
-	at := time.Now().UTC()
-	signal := NewHeuristicSignal("claude", StateHint{
-		State:      agent.StateBlocked,
-		Confidence: 0.9,
-		Reason:     "claude awaiting input",
-	}, at)
-	if signal.Source != SignalSourceHeuristic ||
-		signal.Kind != SignalBlocked ||
-		signal.Vendor != "claude" ||
-		signal.Evidence != "claude awaiting input" ||
-		signal.Confidence != 0.9 ||
-		!signal.ReceivedAt.Equal(at) {
-		t.Fatalf("signal = %+v", signal)
-	}
+func deliveryID(label string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String()
 }

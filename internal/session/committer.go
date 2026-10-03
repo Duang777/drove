@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -43,6 +44,15 @@ type agentOperation struct {
 
 func (agentOperation) isCommitOperation() {}
 
+type decisionOperation struct {
+	agent    *agent.Agent
+	state    *detect.State
+	decision detect.Decision
+	drafts   []event.Draft
+}
+
+func (decisionOperation) isCommitOperation() {}
+
 type commitRequest struct {
 	operation commitOperation
 	result    chan commitResult
@@ -71,6 +81,20 @@ func newAgentOperation(
 		agent:  target,
 		change: change,
 		drafts: append([]event.Draft(nil), drafts...),
+	}
+}
+
+func newDecisionOperation(
+	target *agent.Agent,
+	state *detect.State,
+	decision detect.Decision,
+	drafts []event.Draft,
+) decisionOperation {
+	return decisionOperation{
+		agent:    target,
+		state:    state,
+		decision: decision,
+		drafts:   append([]event.Draft(nil), drafts...),
 	}
 }
 
@@ -125,6 +149,28 @@ func (c *committer) CommitAgent(
 		return commitReceipt{}, errors.New("session: agent commit requires an Agent")
 	}
 	result, err := c.submit(ctx, newAgentOperation(target, change, drafts))
+	return result.receipt, err
+}
+
+func (c *committer) CommitDecision(
+	ctx context.Context,
+	target *agent.Agent,
+	state *detect.State,
+	decision detect.Decision,
+	drafts []event.Draft,
+) (commitReceipt, error) {
+	if target == nil || state == nil {
+		return commitReceipt{}, errors.New(
+			"session: decision commit requires Agent and Detector state",
+		)
+	}
+	if decision.Duplicate() {
+		return commitReceipt{}, errors.New("session: duplicate decision cannot be committed")
+	}
+	result, err := c.submit(
+		ctx,
+		newDecisionOperation(target, state, decision, drafts),
+	)
 	return result.receipt, err
 }
 
@@ -391,6 +437,63 @@ func prepareCommitOperation(
 		return drafts, func([]event.Event) error {
 			return typed.agent.ApplyCommitted(prepared)
 		}, prepared.Timestamp(), nil
+	case decisionOperation:
+		signal, _, ok := typed.decision.Signal()
+		if !ok {
+			return nil, nil, time.Time{}, errors.New(
+				"session: decision operation requires a signal",
+			)
+		}
+		drafts = append([]event.Draft(nil), typed.drafts...)
+		var prepared agent.PreparedChange
+		change, hasChange := typed.decision.Change()
+		if hasChange {
+			prepared, err = typed.agent.Prepare(change)
+			if err != nil {
+				return nil, nil, time.Time{}, err
+			}
+			if message, hasError := prepared.ErrorMessage(); hasError {
+				drafts = append(drafts, event.NewErrorDraft(
+					string(typed.agent.ID()),
+					string(typed.agent.ID()),
+					message,
+				))
+			}
+			if from, to, reason, evidence, hasTransition := prepared.Transition(); hasTransition {
+				payload, encodeErr := json.Marshal(event.StateEvidencePayloadV1{
+					Version:    1,
+					Source:     string(evidence.Source),
+					Event:      evidence.Event,
+					Confidence: evidence.Confidence,
+					DeliveryID: evidence.DeliveryID,
+				})
+				if encodeErr != nil {
+					return nil, nil, time.Time{}, fmt.Errorf(
+						"session: encode decision state evidence: %w",
+						encodeErr,
+					)
+				}
+				drafts = append(drafts, event.NewStateChangedDraft(
+					string(typed.agent.ID()),
+					string(typed.agent.ID()),
+					string(from),
+					string(to),
+					reason,
+					string(payload),
+				))
+			}
+		}
+		if len(drafts) == 0 {
+			return nil, nil, time.Time{}, errors.New("session: empty decision operation")
+		}
+		return drafts, func([]event.Event) error {
+			if hasChange {
+				if applyErr := typed.agent.ApplyCommitted(prepared); applyErr != nil {
+					return applyErr
+				}
+			}
+			return typed.state.ApplyCommitted(typed.decision)
+		}, signal.ReceivedAt, nil
 	default:
 		return nil, nil, time.Time{}, fmt.Errorf(
 			"session: unknown commit operation %T",

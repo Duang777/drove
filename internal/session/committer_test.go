@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -101,6 +102,184 @@ func TestTypedCommitterStoreFailureLeavesAgentUnchanged(t *testing.T) {
 	}
 	if snapshot := a.Snapshot(); snapshot.State != agent.StatePending || snapshot.Revision != 0 {
 		t.Fatalf("agent changed after failed append: %+v", snapshot)
+	}
+}
+
+func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
+	a, err := agent.Restore(agent.RestoreSnapshot{
+		ID:         "agent-1",
+		Name:       "test",
+		Vendor:     "claude",
+		RunMode:    agent.RunModeInteractive,
+		HookPolicy: agent.HooksAuto,
+		State:      agent.StateWorking,
+		CreatedAt:  time.Now().Add(-time.Minute),
+		UpdatedAt:  time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("restore Agent: %v", err)
+	}
+	detector, err := detect.New(detect.Config{})
+	if err != nil {
+		t.Fatalf("new Detector: %v", err)
+	}
+	detectorState := detect.NewState(agent.HooksAuto)
+	signal, err := detect.NewHookSignal(detect.Signal{
+		Kind:            detect.KindHumanInputRequired,
+		Vendor:          "claude",
+		VendorEvent:     "Elicitation",
+		Scope:           detect.ScopeRoot,
+		VendorSessionID: "vendor-session",
+		Confidence:      1,
+		ReceivedAt:      time.Now().UTC(),
+		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
+	})
+	if err != nil {
+		t.Fatalf("new signal: %v", err)
+	}
+	observation, err := detect.ObserveSignal(signal)
+	if err != nil {
+		t.Fatalf("observe signal: %v", err)
+	}
+	decision, err := detector.Decide(
+		detectorState.Snapshot(),
+		a.Snapshot(),
+		observation,
+	)
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	st := &memoryCommitStore{}
+	st.onAppend = func() {
+		if a.State() != agent.StateWorking ||
+			detectorState.Snapshot().HookStatus() != detect.HookAwaiting {
+			t.Errorf(
+				"projections changed before append: Agent=%s Detector=%s",
+				a.State(),
+				detectorState.Snapshot().HookStatus(),
+			)
+		}
+	}
+	hub := event.NewHub(0)
+	subscription := hub.Subscribe(2)
+	defer hub.Unsubscribe(subscription)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	receipt, err := committer.CommitDecision(
+		context.Background(),
+		a,
+		&detectorState,
+		decision,
+		[]event.Draft{
+			event.NewAgentSignalDraft("agent-1", "agent-1", `{"version":1}`),
+		},
+	)
+	if err != nil {
+		t.Fatalf("commit decision: %v", err)
+	}
+	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 2}) {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if a.State() != agent.StateBlocked ||
+		detectorState.Snapshot().HookStatus() != detect.HookActive {
+		t.Fatalf(
+			"projections after commit: Agent=%s Detector=%s",
+			a.State(),
+			detectorState.Snapshot().HookStatus(),
+		)
+	}
+	for want := uint64(1); want <= 2; want++ {
+		select {
+		case published := <-subscription.C():
+			if published.Seq != want ||
+				a.State() != agent.StateBlocked ||
+				detectorState.Snapshot().HookStatus() != detect.HookActive {
+				t.Fatalf(
+					"published=%+v Agent=%s Detector=%s",
+					published,
+					a.State(),
+					detectorState.Snapshot().HookStatus(),
+				)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sequence %d", want)
+		}
+	}
+}
+
+func TestDecisionCommitStoreFailureLeavesBothProjectionsUnchanged(t *testing.T) {
+	a, err := agent.Restore(agent.RestoreSnapshot{
+		ID:         "agent-1",
+		Name:       "test",
+		Vendor:     "claude",
+		RunMode:    agent.RunModeInteractive,
+		HookPolicy: agent.HooksAuto,
+		State:      agent.StateWorking,
+		CreatedAt:  time.Now().Add(-time.Minute),
+		UpdatedAt:  time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("restore Agent: %v", err)
+	}
+	detector, err := detect.New(detect.Config{})
+	if err != nil {
+		t.Fatalf("new Detector: %v", err)
+	}
+	detectorState := detect.NewState(agent.HooksAuto)
+	signal, err := detect.NewHookSignal(detect.Signal{
+		Kind:            detect.KindHumanInputRequired,
+		Vendor:          "claude",
+		VendorEvent:     "Elicitation",
+		Scope:           detect.ScopeRoot,
+		VendorSessionID: "vendor-session",
+		Confidence:      1,
+		ReceivedAt:      time.Now().UTC(),
+		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
+	})
+	if err != nil {
+		t.Fatalf("new signal: %v", err)
+	}
+	observation, err := detect.ObserveSignal(signal)
+	if err != nil {
+		t.Fatalf("observe signal: %v", err)
+	}
+	decision, err := detector.Decide(
+		detectorState.Snapshot(),
+		a.Snapshot(),
+		observation,
+	)
+	if err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+
+	storageErr := errors.New("disk unavailable")
+	committer := newCommitter(
+		0,
+		&memoryCommitStore{appendErr: storageErr},
+		event.NewHub(0),
+	)
+	defer committer.Close()
+	_, err = committer.CommitDecision(
+		context.Background(),
+		a,
+		&detectorState,
+		decision,
+		[]event.Draft{
+			event.NewAgentSignalDraft("agent-1", "agent-1", `{"version":1}`),
+		},
+	)
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("commit error = %v, want storage error", err)
+	}
+	if a.State() != agent.StateWorking ||
+		detectorState.Snapshot().HookStatus() != detect.HookAwaiting {
+		t.Fatalf(
+			"projections changed after append failure: Agent=%s Detector=%s",
+			a.State(),
+			detectorState.Snapshot().HookStatus(),
+		)
 	}
 }
 

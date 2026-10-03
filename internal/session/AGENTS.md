@@ -6,10 +6,11 @@
 
 ## 关键设计
 
-- `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、
-  `signals`（ID→可接收 hook 的启动中/运行中会话）、event Hub、store、adapter Registry。
-- 每个运行中会话持有一个 Detector 和一个内存 signal token；token 只授权该
+- `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
+- 每个运行中会话持有一个 observation actor、Detector State 和一个内存 signal token；token 只授权该
   Agent 的 signal endpoint，并随会话 detach 失效。
+- observation actor 独占容量 64 的 inbox 和真实计时器，一次只提交一个 Decision；
+  Detector 本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。
@@ -24,8 +25,8 @@
   清洗分类视图交给 Detector；回放和订阅 payload 不受 ANSI 清洗影响。
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input`，但该审计事件不创建会话、不改变状态或时间戳。
-- 状态决策：进程退出决定终态；激活后的 hook 决定 turn 状态；未激活 hook
-  时才使用达到阈值的启发式。signal 与对应状态迁移必须同批提交。
+- 状态决策：进程退出决定终态；激活后的 hook 决定 turn 状态；只有进入
+  fallback 后才使用达到阈值的启发式。signal 与对应状态迁移必须同批提交。
 
 ## 约束
 

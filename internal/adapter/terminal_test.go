@@ -3,7 +3,7 @@ package adapter
 import (
 	"testing"
 
-	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 )
 
 func TestSanitizeTerminalText(t *testing.T) {
@@ -76,7 +76,7 @@ func TestEntryClassifyUsesSanitizedTerminalText(t *testing.T) {
 		t.Fatal("raw ANSI-decorated text unexpectedly matched")
 	}
 	hint, ok := entry.Classify(raw)
-	if !ok || hint.State != agent.StateBlocked {
+	if !ok || hint.Kind != detect.KindHeuristicBlocked {
 		t.Fatalf("sanitized hint = %+v, %t; want blocked", hint, ok)
 	}
 }

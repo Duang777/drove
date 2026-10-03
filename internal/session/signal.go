@@ -5,18 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
-	"github.com/Duang777/drove/internal/event"
 )
 
 const (
@@ -31,8 +28,7 @@ const (
 	// SignalVendorEnv contains the selected adapter vendor.
 	SignalVendorEnv = "DROVE_SIGNAL_VENDOR"
 
-	signalTokenBytes             = 32
-	defaultHookActivationTimeout = 2 * time.Second
+	signalTokenBytes = 32
 )
 
 var (
@@ -59,39 +55,24 @@ func WithSignalBaseURL(baseURL string) ManagerOption {
 }
 
 // WithHookPolicy configures hook authority for newly started sessions.
-func WithHookPolicy(policy detect.Policy) ManagerOption {
+func WithHookPolicy(policy agent.HookPolicy) ManagerOption {
 	return func(manager *Manager) {
 		manager.hookPolicy = policy
 	}
-}
-
-type signalAuditPayload struct {
-	Version      int                  `json:"version"`
-	Source       adapter.SignalSource `json:"source"`
-	Vendor       string               `json:"vendor,omitempty"`
-	VendorEvent  string               `json:"vendor_event"`
-	Scope        adapter.SignalScope  `json:"scope"`
-	SessionRef   string               `json:"vendor_session_id,omitempty"`
-	TurnRef      string               `json:"vendor_turn_id,omitempty"`
-	Notification string               `json:"notification_type,omitempty"`
-	Evidence     string               `json:"evidence"`
-	Confidence   float64              `json:"confidence"`
-	DeliveryID   string               `json:"delivery_id,omitempty"`
-	OccurredAt   string               `json:"occurred_at,omitempty"`
-	ReceivedAt   string               `json:"received_at"`
 }
 
 func (m *Manager) prepareRuntime(
 	a *agent.Agent,
 	entry adapter.Entry,
 ) (*runningSession, []string, error) {
-	if !detect.ValidPolicy(m.hookPolicy) {
-		return nil, nil, fmt.Errorf("session: invalid hook policy %q", m.hookPolicy)
+	policy := a.HookPolicy()
+	if !agent.ValidHookPolicy(policy) {
+		return nil, nil, fmt.Errorf("session: invalid hook policy %q", policy)
 	}
 	canProvision := entry.SupportsHooks() &&
-		m.hookPolicy != detect.PolicyOff &&
+		policy != agent.HooksOff &&
 		m.signalBaseURL != ""
-	if m.hookPolicy == detect.PolicyRequired && !canProvision {
+	if policy == agent.HooksRequired && !canProvision {
 		return nil, nil, fmt.Errorf(
 			"%w: vendor=%q callback=%t",
 			ErrHookUnavailable,
@@ -100,38 +81,34 @@ func (m *Manager) prepareRuntime(
 		)
 	}
 
-	running := &runningSession{
-		ready:       make(chan struct{}),
-		signalReady: make(chan struct{}),
-		vendor:      a.Vendor(),
-	}
-	detector, err := detect.New(detect.Options{
-		Policy:  m.hookPolicy,
-		RunMode: a.RunMode(),
-		State:   a.State,
-		Apply: func(ctx context.Context, decision detect.Decision) error {
-			return m.commitDetection(ctx, a, decision)
-		},
-		IdleDelay:      m.detectorIdleDelay,
-		ActivityWindow: m.detectorActivityWindow,
-		ActivityCount:  m.detectorActivityCount,
-	})
+	observer, err := newObservationActor(
+		a,
+		m.committer,
+		policy,
+		m.detectConfig,
+		m.clock,
+	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("session: create detector: %w", err)
+		return nil, nil, err
 	}
-	running.detector = detector
+	running := &runningSession{
+		observer:       observer,
+		callbacksReady: make(chan struct{}),
+		signalReady:    make(chan struct{}),
+		vendor:         a.Vendor(),
+	}
 	if !canProvision {
 		return running, nil, nil
 	}
 
 	token, err := newSignalToken()
 	if err != nil {
-		detector.Close()
+		observer.Close()
 		return nil, nil, err
 	}
 	signalURL, err := m.signalURL(a.ID())
 	if err != nil {
-		detector.Close()
+		observer.Close()
 		return nil, nil, err
 	}
 	running.signalToken = token
@@ -150,13 +127,19 @@ func (m *Manager) signalURL(id agent.ID) (string, error) {
 	}
 	if parsed.Scheme != "http" || parsed.Host == "" ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("session: invalid loopback signal base URL %q", m.signalBaseURL)
+		return "", fmt.Errorf(
+			"session: invalid loopback signal base URL %q",
+			m.signalBaseURL,
+		)
 	}
 	host := parsed.Hostname()
 	if !strings.EqualFold(host, "localhost") {
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() {
-			return "", fmt.Errorf("session: signal base URL host %q must be loopback", host)
+			return "", fmt.Errorf(
+				"session: signal base URL host %q must be loopback",
+				host,
+			)
 		}
 	}
 	parsed.Path = "/api/v1/agents/" + url.PathEscape(string(id)) + "/signal"
@@ -171,23 +154,20 @@ func newSignalToken() (string, error) {
 	return hex.EncodeToString(raw), nil
 }
 
-func (m *Manager) waitForRequiredHook(ctx context.Context, running *runningSession) error {
-	if m.hookPolicy != detect.PolicyRequired {
+func (m *Manager) waitForRequiredHook(
+	ctx context.Context,
+	running *runningSession,
+) error {
+	if m.hookPolicy != agent.HooksRequired {
 		return nil
 	}
-	timer := time.NewTimer(m.hookActivationTimeout)
-	defer timer.Stop()
 	select {
-	case <-running.detector.Active():
+	case <-running.observer.Active():
 		return nil
+	case <-running.observer.RequiredFailed():
+		return fmt.Errorf("%w: no valid signal arrived", ErrHookUnavailable)
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %v", ErrHookUnavailable, ctx.Err())
-	case <-timer.C:
-		return fmt.Errorf(
-			"%w: no valid signal arrived within %s",
-			ErrHookUnavailable,
-			m.hookActivationTimeout,
-		)
 	}
 }
 
@@ -202,8 +182,8 @@ func (m *Manager) AcceptSignal(
 ) error {
 	m.mu.RLock()
 	closed := m.closed
-	_, known := m.agents[id]
-	running, provisioned := m.signals[id]
+	a, known := m.agents[id]
+	running, attached := m.sessions[id]
 	m.mu.RUnlock()
 	if closed {
 		return ErrManagerClosed
@@ -211,8 +191,11 @@ func (m *Manager) AcceptSignal(
 	if !known {
 		return fmt.Errorf("%w: %q", ErrUnknownAgent, id)
 	}
-	if !provisioned || running.detector == nil {
+	if !attached || running.observer == nil {
 		return fmt.Errorf("%w: %q", ErrNotAttached, id)
+	}
+	if a.HookPolicy() == agent.HooksOff {
+		return ErrSignalDisabled
 	}
 	if !verifySignalAuthorization(running.signalToken, authorization) {
 		return ErrSignalUnauthorized
@@ -225,6 +208,10 @@ func (m *Manager) AcceptSignal(
 			running.vendor,
 		)
 	}
+	entry, supported := m.reg.Lookup(vendor)
+	if !supported || !entry.SupportsHooks() {
+		return fmt.Errorf("%w: %q", adapter.ErrUnsupportedHook, vendor)
+	}
 
 	select {
 	case <-running.signalReady:
@@ -233,24 +220,40 @@ func (m *Manager) AcceptSignal(
 	}
 
 	m.mu.RLock()
-	current, stillProvisioned := m.signals[id]
+	current, stillAttached := m.sessions[id]
 	closed = m.closed
 	exitClaimed := running.exitClaimed
 	m.mu.RUnlock()
 	if closed {
 		return ErrManagerClosed
 	}
-	if !stillProvisioned || current != running || exitClaimed {
+	if !stillAttached || current != running || exitClaimed {
 		return fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
-	signal, err := m.reg.For(running.vendor).DecodeHook(raw, deliveryID, time.Now().UTC())
+	signal, err := entry.NormalizeHook(adapter.HookInput{
+		DeliveryID: deliveryID,
+		ReceivedAt: m.clock.Now(),
+		Payload:    append([]byte(nil), raw...),
+	})
 	if err != nil {
-		return fmt.Errorf("%w: decode %s hook: %v", ErrSignalInvalid, running.vendor, err)
+		return fmt.Errorf(
+			"%w: normalize %s hook: %v",
+			ErrSignalInvalid,
+			running.vendor,
+			err,
+		)
 	}
-	if err := running.detector.Submit(ctx, signal); err != nil {
+	observation, err := detect.ObserveSignal(signal)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrSignalInvalid, err)
+	}
+	if err := running.observer.Deliver(ctx, observation); err != nil {
 		if errors.Is(err, detect.ErrHooksDisabled) {
 			return ErrSignalDisabled
+		}
+		if errors.Is(err, errObservationActorClosed) {
+			return fmt.Errorf("%w: %q", ErrNotAttached, id)
 		}
 		return fmt.Errorf("session: process hook signal: %w", err)
 	}
@@ -266,70 +269,4 @@ func verifySignalAuthorization(token, authorization string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(token), []byte(presented)) == 1
-}
-
-func (m *Manager) commitDetection(
-	ctx context.Context,
-	a *agent.Agent,
-	decision detect.Decision,
-) error {
-	payload, err := encodeSignalAudit(decision.Signal)
-	if err != nil {
-		return err
-	}
-	signalDraft := event.NewAgentSignalDraft(
-		string(a.ID()),
-		string(a.ID()),
-		string(payload),
-	)
-	if decision.Target == "" ||
-		decision.Target == a.State() ||
-		!agent.CanTransition(a.State(), decision.Target) {
-		_, err := m.committer.CommitEvents(ctx, []event.Draft{signalDraft})
-		return err
-	}
-
-	evidence := agent.Evidence{
-		Source:     agent.EvidenceSource(decision.Signal.Source),
-		Event:      decision.Signal.VendorEvent,
-		Confidence: decision.Signal.Confidence,
-		DeliveryID: decision.Signal.DeliveryID,
-	}
-	_, err = m.committer.CommitAgent(
-		ctx,
-		a,
-		agent.MoveTo(decision.Target, decision.Reason, evidence),
-		[]event.Draft{signalDraft},
-	)
-	return err
-}
-
-func encodeSignalAudit(signal adapter.Signal) ([]byte, error) {
-	occurredAt := ""
-	if !signal.OccurredAt.IsZero() {
-		occurredAt = signal.OccurredAt.UTC().Format(time.RFC3339Nano)
-	}
-	receivedAt := signal.ReceivedAt
-	if receivedAt.IsZero() {
-		receivedAt = time.Now().UTC()
-	}
-	payload, err := json.Marshal(signalAuditPayload{
-		Version:      1,
-		Source:       signal.Source,
-		Vendor:       signal.Vendor,
-		VendorEvent:  signal.VendorEvent,
-		Scope:        signal.Scope,
-		SessionRef:   signal.SessionRef,
-		TurnRef:      signal.TurnRef,
-		Notification: signal.Notification,
-		Evidence:     signal.Evidence,
-		Confidence:   signal.Confidence,
-		DeliveryID:   signal.DeliveryID,
-		OccurredAt:   occurredAt,
-		ReceivedAt:   receivedAt.UTC().Format(time.RFC3339Nano),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("session: encode signal audit: %w", err)
-	}
-	return payload, nil
 }

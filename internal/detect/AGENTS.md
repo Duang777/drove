@@ -2,21 +2,23 @@
 
 ## 职责
 
-每个运行中会话的状态信号融合器。Detector 用一个 goroutine 串行处理 hook、
-终端启发式和计时器信号，并输出零个或一个状态迁移建议。
+无副作用的状态信号决策包。Detector 根据 Agent 快照、Detector 快照和一个
+Observation 计算不可变 Decision；goroutine、队列和真实计时器由 session 持有。
 
 ## 关键设计
 
-- hook 只有在当前会话收到并持久化首个合法信号后才成为权威。
+- hook 只有在当前会话持久化首个合法信号并应用 Decision 后才成为权威。
 - `auto` 在 hook 激活前使用启发式，`off` 只使用启发式，`required` 只使用 hook。
-- Detector 独占 delivery ID 去重、置信度阈值、Blocked 输出恢复和 Idle 确认窗口。
-- Detector 不修改 Agent，也不写 Store。调用方负责把脱敏 signal 和状态事件作为
-  一个提交批次持久化。
-- 进程退出由 session 生命周期处理，并在提交终态前关闭 Detector。
+- Detector State 持有 delivery ID 去重、候选、timer generation、Blocked 输出恢复
+  和 hook 状态；只有已提交 Decision 可以修改它。
+- Detector 不修改 Agent、不运行 goroutine，也不写 Store。session actor 负责串行
+  提交 signal、可选 error 和可选 state_changed。
+- 进程启动、失败和退出也是 Observation，并拥有高于 hook 和启发式的优先级。
 
 ## 约束
 
 - 禁止解析 Claude 或 Codex JSON；厂商字段只允许存在于 `internal/adapter`。
-- 禁止依赖 HTTP、PTY、Store 或 event Hub。
-- 所有计时器必须可注入，以便竞态测试不依赖真实等待。
-- 导出类型：`Detector`、`Options`、`Policy`、`Decision`。
+- 禁止依赖 adapter、HTTP、PTY、Store 或 event Hub。
+- Detector 只返回 deadline 和 generation，不创建真实计时器。
+- 导出类型以 `Detector`、`State`、`Snapshot`、`Observation`、`Decision`、
+  `Signal`、`Config` 和 `Clock` 为核心。

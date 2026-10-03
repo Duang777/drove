@@ -103,15 +103,15 @@ type processSession interface {
 }
 
 type runningSession struct {
-	inputMu     sync.Mutex
-	process     processSession
-	detector    *detect.Detector
-	ready       chan struct{}
-	signalReady chan struct{}
-	signalToken string
-	vendor      string
-	stopCause   stopCause
-	exitClaimed bool
+	inputMu        sync.Mutex
+	process        processSession
+	observer       *observationActor
+	callbacksReady chan struct{}
+	signalReady    chan struct{}
+	signalToken    string
+	vendor         string
+	stopCause      stopCause
+	exitClaimed    bool
 }
 
 // InputResult 描述一次输入操作已经写入 PTY 的字节数。
@@ -126,17 +126,14 @@ type Manager struct {
 	store     *store.Store
 	committer *committer
 
-	hookPolicy             detect.Policy
-	signalBaseURL          string
-	hookActivationTimeout  time.Duration
-	detectorIdleDelay      time.Duration
-	detectorActivityWindow time.Duration
-	detectorActivityCount  int
+	hookPolicy    agent.HookPolicy
+	signalBaseURL string
+	detectConfig  detect.Config
+	clock         observationClock
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent
 	sessions map[agent.ID]*runningSession
-	signals  map[agent.ID]*runningSession
 	closed   bool
 
 	starts    sync.WaitGroup
@@ -160,15 +157,15 @@ func NewManager(
 	options ...ManagerOption,
 ) *Manager {
 	manager := &Manager{
-		reg:                   reg,
-		hub:                   hub,
-		store:                 st,
-		committer:             newCommitter(initialSeq, st, hub),
-		agents:                make(map[agent.ID]*agent.Agent),
-		sessions:              make(map[agent.ID]*runningSession),
-		signals:               make(map[agent.ID]*runningSession),
-		hookPolicy:            detect.PolicyAuto,
-		hookActivationTimeout: defaultHookActivationTimeout,
+		reg:          reg,
+		hub:          hub,
+		store:        st,
+		committer:    newCommitter(initialSeq, st, hub),
+		agents:       make(map[agent.ID]*agent.Agent),
+		sessions:     make(map[agent.ID]*runningSession),
+		hookPolicy:   agent.HooksAuto,
+		detectConfig: detect.DefaultConfig(),
+		clock:        systemObservationClock{},
 	}
 	for _, option := range options {
 		option(manager)
@@ -253,14 +250,16 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
 		agent.WithRunMode(req.Mode),
-		agent.WithHookPolicy(agent.HookPolicy(m.hookPolicy)),
+		agent.WithHookPolicy(m.hookPolicy),
 	)
 	persistedMode := req.Mode
+	persistedPolicy := m.hookPolicy
 	payload, err := json.Marshal(createdPayload{
-		Version: 1,
-		Name:    req.Name,
-		Vendor:  req.Vendor,
-		Mode:    &persistedMode,
+		Version:    2,
+		Name:       req.Name,
+		Vendor:     req.Vendor,
+		Mode:       &persistedMode,
+		HookPolicy: &persistedPolicy,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("session: encode creation metadata: %w", err)
@@ -284,87 +283,80 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			string(payload),
 		)},
 	); err != nil {
-		running.detector.Close()
+		running.observer.Close()
 		return nil, fmt.Errorf("session: persist creation: %w", err)
 	}
 
 	m.mu.Lock()
 	m.agents[id] = a
+	m.sessions[id] = running
 	m.mu.Unlock()
 
 	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
-	m.mu.Lock()
-	m.signals[id] = running
-	m.mu.Unlock()
 	sess, err := pty.Start(pty.Config{
 		Command: cmdName,
 		Args:    cmdArgs,
 		Env:     processEnv,
 		Dir:     req.Dir,
 		OnOutput: func(line string) {
-			<-running.ready
+			<-running.callbacksReady
 			m.onOutput(id, line, entry, running.signalToken)
 		},
 		OnExit: func(info pty.ExitInfo) {
-			<-running.ready
+			<-running.callbacksReady
 			m.onExit(id, running, info)
 		},
 	})
 	if err != nil {
-		m.detachSignal(id, running)
-		close(running.signalReady)
-		running.detector.Close()
 		startErr := fmt.Errorf("session: start pty: %w", err)
-		_, commitErr := m.committer.CommitAgent(
-			context.Background(),
-			a,
-			agent.FailTo(
-				agent.StateStopped,
-				"startup failed",
-				startErr.Error(),
-				agent.Evidence{
-					Source:     agent.EvidenceProcess,
-					Event:      "process_start_failed",
-					Confidence: 1,
-				},
-			),
-			nil,
+		observation, observationErr := processObservation(
+			detect.KindProcessStartFailed,
+			m.clock.Now(),
+			&detect.ProcessFact{
+				ExitKind:     detect.ExitStartupFailed,
+				ErrorMessage: startErr.Error(),
+			},
 		)
+		commitErr := observationErr
+		if observationErr == nil {
+			commitErr = running.observer.Terminate(observation)
+		}
+		close(running.signalReady)
+		close(running.callbacksReady)
+		m.detach(id, running)
+		running.observer.Close()
 		return nil, errors.Join(startErr, commitErr)
 	}
 
-	running.process = sess
 	m.mu.Lock()
-	m.sessions[id] = running
+	running.process = sess
 	m.mu.Unlock()
 
 	// 4. 状态推进：进程活着 -> Working。
-	if _, err := m.committer.CommitAgent(
-		context.Background(),
-		a,
-		agent.MoveTo(agent.StateWorking, "process started", agent.Evidence{
-			Source:     agent.EvidenceProcess,
-			Event:      "process_started",
-			Confidence: 1,
-		}),
-		nil,
-	); err != nil {
+	started, err := processObservation(
+		detect.KindProcessStarted,
+		m.clock.Now(),
+		&detect.ProcessFact{HookAvailable: running.signalToken != ""},
+	)
+	if err == nil {
+		err = running.observer.Deliver(context.Background(), started)
+	}
+	if err != nil {
 		m.requestStop(id, running, stopCauseShutdown)
-		m.detachSignal(id, running)
 		close(running.signalReady)
-		close(running.ready)
+		close(running.callbacksReady)
 		_ = sess.Close()
+		running.observer.Close()
 		return nil, err
 	}
 	close(running.signalReady)
 	if err := m.waitForRequiredHook(ctx, running); err != nil {
 		m.requestStop(id, running, stopCauseShutdown)
-		m.detachSignal(id, running)
-		close(running.ready)
+		close(running.callbacksReady)
 		closeErr := sess.Close()
 		return nil, errors.Join(err, closeErr)
 	}
-	close(running.ready)
+	close(running.callbacksReady)
 
 	return m.Status(id)
 }
@@ -403,8 +395,8 @@ func (m *Manager) Close() error {
 					fmt.Errorf("session: close agent %q: %w", item.id, err),
 				)
 			}
-			if item.session.detector != nil {
-				item.session.detector.Close()
+			if item.session.observer != nil {
+				item.session.observer.Close()
 			}
 		}
 
@@ -412,9 +404,6 @@ func (m *Manager) Close() error {
 		for _, item := range attached {
 			if m.sessions[item.id] == item.session {
 				delete(m.sessions, item.id)
-			}
-			if m.signals[item.id] == item.session {
-				delete(m.signals, item.id)
 			}
 		}
 		m.mu.Unlock()
@@ -433,6 +422,10 @@ func (m *Manager) Stop(id agent.ID) error {
 
 	m.mu.RLock()
 	sess, attached := m.sessions[id]
+	var process processSession
+	if attached {
+		process = sess.process
+	}
 	m.mu.RUnlock()
 	if !attached {
 		if state := a.State(); state == agent.StateDone || state == agent.StateStopped {
@@ -440,8 +433,11 @@ func (m *Manager) Stop(id agent.ID) error {
 		}
 		return fmt.Errorf("session: agent %q is %s without a PTY", id, a.State())
 	}
+	if process == nil {
+		return fmt.Errorf("session: agent %q is starting without a PTY", id)
+	}
 	m.requestStop(id, sess, stopCauseUser)
-	if err := sess.process.Close(); err != nil && !errors.Is(err, pty.ErrClosed) {
+	if err := process.Close(); err != nil && !errors.Is(err, pty.ErrClosed) {
 		return fmt.Errorf("session: stop agent %q: %w", id, err)
 	}
 	return nil
@@ -455,6 +451,10 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	}
 	m.mu.RLock()
 	sess, _ := m.sessions[id]
+	var process processSession
+	if sess != nil {
+		process = sess.process
+	}
 	m.mu.RUnlock()
 
 	st := &Status{
@@ -467,8 +467,8 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		UpdatedAt: a.UpdatedAt(),
 		LastError: a.LastError(),
 	}
-	if sess != nil {
-		st.PID = sess.process.PID()
+	if process != nil {
+		st.PID = process.PID()
 	}
 	return st, nil
 }
@@ -523,6 +523,10 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	closed := m.closed
 	_, known := m.agents[id]
 	running, attached := m.sessions[id]
+	var process processSession
+	if attached {
+		process = running.process
+	}
 	m.mu.RUnlock()
 	if closed {
 		return InputResult{}, ErrManagerClosed
@@ -530,7 +534,7 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	if !known {
 		return InputResult{}, fmt.Errorf("%w: %q", ErrUnknownAgent, id)
 	}
-	if !attached {
+	if !attached || process == nil {
 		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
@@ -549,7 +553,7 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
-	written, err := running.process.Write(data)
+	written, err := process.Write(data)
 	result := InputResult{BytesWritten: written}
 	if err != nil {
 		if errors.Is(err, pty.ErrClosed) {
@@ -603,9 +607,6 @@ func (m *Manager) onOutput(
 		return
 	}
 
-	m.mu.RLock()
-	running := m.sessions[id]
-	m.mu.RUnlock()
 	if _, err := m.committer.CommitEvents(
 		context.Background(),
 		[]event.Draft{event.NewOutputDraft(string(id), string(id), line)},
@@ -613,23 +614,45 @@ func (m *Manager) onOutput(
 		return
 	}
 
-	if running == nil || running.detector == nil {
+	m.mu.RLock()
+	running := m.sessions[id]
+	exitClaimed := running != nil && running.exitClaimed
+	m.mu.RUnlock()
+	if running == nil || running.observer == nil || exitClaimed {
 		return
 	}
 
+	observedAt := m.clock.Now()
 	hint, ok := entry.Classify(line)
 	if ok {
 		a, exists := m.agent(id)
 		if !exists {
 			return
 		}
-		_ = running.detector.Submit(
-			context.Background(),
-			adapter.NewHeuristicSignal(a.Vendor(), hint, time.Now().UTC()),
-		)
+		signal, err := detect.NewHeuristicSignal(detect.Signal{
+			Kind:        hint.Kind,
+			Vendor:      a.Vendor(),
+			VendorEvent: "terminal_hint",
+			Scope:       detect.ScopeRoot,
+			Evidence:    hint.Evidence,
+			Confidence:  hint.Confidence,
+			ReceivedAt:  observedAt,
+		})
+		if err != nil {
+			return
+		}
+		observation, err := detect.ObserveSignal(signal)
+		if err != nil {
+			return
+		}
+		_ = running.observer.Deliver(context.Background(), observation)
 		return
 	}
-	_ = running.detector.ObserveOutput(context.Background(), time.Now().UTC())
+	observation, err := detect.ObserveOutput(aVendor(m, id), observedAt)
+	if err != nil {
+		return
+	}
+	_ = running.observer.Deliver(context.Background(), observation)
 }
 
 func redactSignalToken(line, token string) string {
@@ -637,34 +660,6 @@ func redactSignalToken(line, token string) string {
 		return line
 	}
 	return strings.ReplaceAll(line, token, "[REDACTED]")
-}
-
-type exitDecision struct {
-	target       agent.State
-	reason       string
-	errorMessage string
-}
-
-func decideExit(mode agent.RunMode, cause stopCause, info pty.ExitInfo) exitDecision {
-	switch cause {
-	case stopCauseUser:
-		return exitDecision{target: agent.StateStopped, reason: "user stop"}
-	case stopCauseShutdown:
-		return exitDecision{target: agent.StateStopped, reason: "manager shutdown"}
-	}
-
-	reason := fmt.Sprintf("process exited code=%d", info.Code)
-	if mode == agent.RunModeOneshot && info.Code == 0 && info.Err == nil {
-		return exitDecision{target: agent.StateDone, reason: reason}
-	}
-
-	decision := exitDecision{target: agent.StateStopped, reason: reason}
-	if info.Err != nil {
-		decision.errorMessage = info.Err.Error()
-	} else if info.Code != 0 {
-		decision.errorMessage = reason
-	}
-	return decision
 }
 
 // onExit 根据运行模式和停止原因记录终态，再移除 PTY。
@@ -677,44 +672,71 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 		return
 	}
 	defer m.detach(id, running)
-	if running.detector != nil {
-		running.detector.Close()
-	}
-
-	a, ok := m.agent(id)
-	if !ok {
+	if running.observer == nil {
 		return
 	}
+	defer running.observer.Close()
 
-	decision := decideExit(a.RunMode(), cause, info)
-	_ = m.commitExit(context.Background(), a, decision)
+	exitKind := detect.ExitFailure
+	reason := ""
+	errorMessage := ""
+	switch {
+	case cause == stopCauseUser:
+		exitKind = detect.ExitStopped
+		reason = "user stop"
+	case cause == stopCauseShutdown:
+		exitKind = detect.ExitStopped
+		reason = "manager shutdown"
+	case info.Code == 0 && info.Err == nil:
+		exitKind = detect.ExitSuccess
+	case info.Err != nil:
+		errorMessage = info.Err.Error()
+	default:
+		errorMessage = fmt.Sprintf("process exited code=%d", info.Code)
+	}
+	exitCode := info.Code
+	observation, err := processObservation(
+		detect.KindProcessExited,
+		m.clock.Now(),
+		&detect.ProcessFact{
+			ExitCode:     &exitCode,
+			ExitKind:     exitKind,
+			Reason:       reason,
+			ErrorMessage: errorMessage,
+		},
+	)
+	if err != nil {
+		return
+	}
+	_ = running.observer.Terminate(observation)
 }
 
-func (m *Manager) commitExit(ctx context.Context, a *agent.Agent, decision exitDecision) error {
-	if a.State() == decision.target && decision.errorMessage == "" {
-		return nil
+func processObservation(
+	kind detect.Kind,
+	at time.Time,
+	fact *detect.ProcessFact,
+) (detect.Observation, error) {
+	signal, err := detect.NewProcessSignal(detect.Signal{
+		Kind:        kind,
+		VendorEvent: string(kind),
+		Scope:       detect.ScopeRoot,
+		Evidence:    string(kind),
+		Confidence:  1,
+		ReceivedAt:  at,
+		Process:     fact,
+	})
+	if err != nil {
+		return detect.Observation{}, err
 	}
-	evidence := agent.Evidence{
-		Source:     agent.EvidenceProcess,
-		Event:      "process_exited",
-		Confidence: 1,
+	return detect.ObserveSignal(signal)
+}
+
+func aVendor(m *Manager, id agent.ID) string {
+	a, ok := m.agent(id)
+	if !ok {
+		return ""
 	}
-	var change agent.Change
-	switch {
-	case a.State() == decision.target:
-		change = agent.RecordError(decision.errorMessage, evidence)
-	case decision.errorMessage != "":
-		change = agent.FailTo(
-			decision.target,
-			decision.reason,
-			decision.errorMessage,
-			evidence,
-		)
-	default:
-		change = agent.MoveTo(decision.target, decision.reason, evidence)
-	}
-	_, err := m.committer.CommitAgent(ctx, a, change, nil)
-	return err
+	return a.Vendor()
 }
 
 // Fatal 返回运行时持久化或投影失败通知。
@@ -771,17 +793,6 @@ func (m *Manager) detach(id agent.ID, running *runningSession) {
 	defer m.mu.Unlock()
 	if m.sessions[id] == running {
 		delete(m.sessions, id)
-	}
-	if m.signals[id] == running {
-		delete(m.signals, id)
-	}
-}
-
-func (m *Manager) detachSignal(id agent.ID, running *runningSession) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.signals[id] == running {
-		delete(m.signals, id)
 	}
 }
 

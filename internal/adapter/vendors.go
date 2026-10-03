@@ -1,6 +1,9 @@
 package adapter
 
-import "github.com/Duang777/drove/internal/agent"
+import (
+	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
+)
 
 // claudeRunner 适配 Anthropic Claude Code CLI。
 type claudeRunner struct{}
@@ -16,16 +19,28 @@ func (claudeRunner) Command(mode agent.RunMode) (string, []string) {
 // claudeHeuristic 从 claude 输出中识别状态信号。
 type claudeHeuristic struct{}
 
-func (claudeHeuristic) Classify(line string) (StateHint, bool) {
+func (claudeHeuristic) Classify(line string) (OutputHint, bool) {
 	switch {
 	case containsAny(line, "Waiting for your input", "Waiting for response", "Choose an option"):
-		return StateHint{State: agent.StateBlocked, Confidence: 0.9, Reason: "claude awaiting input"}, true
+		return OutputHint{
+			Kind:       detect.KindHeuristicBlocked,
+			Confidence: 0.9,
+			Evidence:   "claude awaiting input",
+		}, true
 	case containsAny(line, "Error", "error:", "✖", "Failed"):
-		return StateHint{State: agent.StateBlocked, Confidence: 0.6, Reason: "claude reported error"}, true
+		return OutputHint{
+			Kind:       detect.KindHeuristicBlocked,
+			Confidence: 0.6,
+			Evidence:   "claude reported error",
+		}, true
 	case containsAny(line, "Task complete", "Done!", "Completed"):
-		return StateHint{State: agent.StateDone, Confidence: 0.8, Reason: "claude finished task"}, true
+		return OutputHint{
+			Kind:       detect.KindTaskCompleted,
+			Confidence: 0.8,
+			Evidence:   "claude reported task completion",
+		}, true
 	default:
-		return StateHint{}, false
+		return OutputHint{}, false
 	}
 }
 
@@ -43,14 +58,22 @@ func (codexRunner) Command(mode agent.RunMode) (string, []string) {
 // codexHeuristic 从 codex 输出中识别状态信号。
 type codexHeuristic struct{}
 
-func (codexHeuristic) Classify(line string) (StateHint, bool) {
+func (codexHeuristic) Classify(line string) (OutputHint, bool) {
 	switch {
 	case containsAny(line, "Waiting for user", "Please choose", "Select an option"):
-		return StateHint{State: agent.StateBlocked, Confidence: 0.9, Reason: "codex awaiting input"}, true
+		return OutputHint{
+			Kind:       detect.KindHeuristicBlocked,
+			Confidence: 0.9,
+			Evidence:   "codex awaiting input",
+		}, true
 	case containsAny(line, "❌", "Error", "error:"):
-		return StateHint{State: agent.StateBlocked, Confidence: 0.6, Reason: "codex reported error"}, true
+		return OutputHint{
+			Kind:       detect.KindHeuristicBlocked,
+			Confidence: 0.6,
+			Evidence:   "codex reported error",
+		}, true
 	default:
-		return StateHint{}, false
+		return OutputHint{}, false
 	}
 }
 

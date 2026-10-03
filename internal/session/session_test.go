@@ -14,7 +14,6 @@ import (
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
-	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
 )
 
@@ -407,12 +406,13 @@ func TestStartCancellationAfterCreationKeepsProjectionConsistent(t *testing.T) {
 	if replayErr != nil {
 		t.Fatalf("replay session: %v", replayErr)
 	}
-	if len(rows) != 3 ||
+	if len(rows) != 4 ||
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[1].From != string(agent.StatePending) ||
 		rows[1].To != string(agent.StateStarting) ||
-		rows[2].From != string(agent.StateStarting) ||
-		rows[2].To != string(agent.StateWorking) {
+		rows[2].Type != string(event.TypeAgentSignal) ||
+		rows[3].From != string(agent.StateStarting) ||
+		rows[3].To != string(agent.StateWorking) {
 		t.Fatalf("session history = %+v", rows)
 	}
 }
@@ -489,14 +489,14 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan events: %v", err)
 	}
-	if len(rows) != 4 {
-		t.Fatalf("event count = %d, want 4: %+v", len(rows), rows)
+	if len(rows) != 5 {
+		t.Fatalf("event count = %d, want 5: %+v", len(rows), rows)
 	}
 	if rows[0].Seq != 1 ||
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
 		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":1,"name":"broken-agent","vendor":"generic","mode":"interactive"}` {
+		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"auto"}` {
 		t.Fatalf("creation event = %+v", rows[0])
 	}
 	if rows[1].Seq != 2 ||
@@ -505,14 +505,17 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 		rows[1].To != "starting" {
 		t.Fatalf("starting event = %+v", rows[1])
 	}
-	if rows[2].Seq != 3 || rows[2].Type != string(event.TypeError) || rows[2].Payload == "" {
-		t.Fatalf("startup error event = %+v", rows[2])
+	if rows[2].Seq != 3 || rows[2].Type != string(event.TypeAgentSignal) {
+		t.Fatalf("startup signal event = %+v", rows[2])
 	}
-	if rows[3].Seq != 4 ||
-		rows[3].Type != string(event.TypeStateChanged) ||
-		rows[3].From != "starting" ||
-		rows[3].To != "stopped" {
-		t.Fatalf("stopped event = %+v", rows[3])
+	if rows[3].Seq != 4 || rows[3].Type != string(event.TypeError) || rows[3].Payload == "" {
+		t.Fatalf("startup error event = %+v", rows[3])
+	}
+	if rows[4].Seq != 5 ||
+		rows[4].Type != string(event.TypeStateChanged) ||
+		rows[4].From != "starting" ||
+		rows[4].To != "stopped" {
+		t.Fatalf("stopped event = %+v", rows[4])
 	}
 
 	failedStatus, err := manager.Status(agent.ID(rows[0].SessionID))
@@ -522,8 +525,8 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	if failedStatus.State != agent.StateStopped {
 		t.Fatalf("failed session state = %s, want stopped", failedStatus.State)
 	}
-	if failedStatus.LastError == "" || failedStatus.LastError != rows[2].Payload {
-		t.Fatalf("failed session error = %q, event payload = %q", failedStatus.LastError, rows[2].Payload)
+	if failedStatus.LastError == "" || failedStatus.LastError != rows[3].Payload {
+		t.Fatalf("failed session error = %q, event payload = %q", failedStatus.LastError, rows[3].Payload)
 	}
 }
 
@@ -1005,68 +1008,6 @@ func TestSendInputReportsDeliveredButUnaudited(t *testing.T) {
 	}
 }
 
-func TestDecideExit(t *testing.T) {
-	exitErr := errors.New("exit status 7")
-	tests := []struct {
-		name      string
-		mode      agent.RunMode
-		cause     stopCause
-		info      pty.ExitInfo
-		wantState agent.State
-		wantError string
-	}{
-		{
-			name:      "natural interactive success",
-			mode:      agent.RunModeInteractive,
-			info:      pty.ExitInfo{Code: 0},
-			wantState: agent.StateStopped,
-		},
-		{
-			name:      "natural oneshot success",
-			mode:      agent.RunModeOneshot,
-			info:      pty.ExitInfo{Code: 0},
-			wantState: agent.StateDone,
-		},
-		{
-			name:      "natural interactive failure",
-			mode:      agent.RunModeInteractive,
-			info:      pty.ExitInfo{Code: 7, Err: exitErr},
-			wantState: agent.StateStopped,
-			wantError: exitErr.Error(),
-		},
-		{
-			name:      "natural oneshot failure",
-			mode:      agent.RunModeOneshot,
-			info:      pty.ExitInfo{Code: 7, Err: exitErr},
-			wantState: agent.StateStopped,
-			wantError: exitErr.Error(),
-		},
-		{
-			name:      "user stop suppresses process error",
-			mode:      agent.RunModeOneshot,
-			cause:     stopCauseUser,
-			info:      pty.ExitInfo{Code: -1, Err: errors.New("signal: killed")},
-			wantState: agent.StateStopped,
-		},
-		{
-			name:      "shutdown suppresses process error",
-			mode:      agent.RunModeOneshot,
-			cause:     stopCauseShutdown,
-			info:      pty.ExitInfo{Code: -1, Err: errors.New("signal: killed")},
-			wantState: agent.StateStopped,
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			got := decideExit(test.mode, test.cause, test.info)
-			if got.target != test.wantState || got.errorMessage != test.wantError {
-				t.Fatalf("decision = %+v, want state=%s error=%q", got, test.wantState, test.wantError)
-			}
-		})
-	}
-}
-
 func TestOneshotNaturalSuccessEndsDoneAndDetaches(t *testing.T) {
 	manager, _ := newTestManager(t)
 
@@ -1189,6 +1130,7 @@ func TestInteractiveIgnoresDoneHint(t *testing.T) {
 
 func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	manager, _ := newTestManager(t)
+	manager.detectConfig.HeuristicConfirmation = 5 * time.Millisecond
 	id := agent.ID("ansi-agent")
 	a := agent.New(
 		id,
@@ -1208,9 +1150,7 @@ func TestOnOutputSanitizesOnlyHeuristicView(t *testing.T) {
 	raw := "Waiting \x1b[2K\x1b[1Gfor your input"
 	manager.onOutput(id, raw, manager.reg.For("claude"), "")
 
-	if got := a.State(); got != agent.StateBlocked {
-		t.Fatalf("state = %s, want blocked from sanitized heuristic text", got)
-	}
+	waitForState(t, manager, id, agent.StateBlocked)
 	rows, err := manager.Replay(string(id))
 	if err != nil {
 		t.Fatalf("replay: %v", err)
@@ -1397,7 +1337,8 @@ func attachTestRuntime(
 		t.Fatalf("prepare runtime: %v", err)
 	}
 	running.process = &fakeProcessSession{}
-	close(running.ready)
+	close(running.signalReady)
+	close(running.callbacksReady)
 	manager.mu.Lock()
 	manager.sessions[a.ID()] = running
 	manager.mu.Unlock()

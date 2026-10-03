@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/Duang777/drove/internal/adapter"
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/api"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
-	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
@@ -57,9 +57,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	}()
 
 	// 2. 在 API 对外可见前恢复会话投影。
-	hookPolicy := detect.Policy(d.cfg.HookPolicy)
+	hookPolicy := agent.HookPolicy(d.cfg.HookPolicy)
 	if hookPolicy == "" {
-		hookPolicy = detect.PolicyAuto
+		hookPolicy = agent.HooksAuto
 	}
 	recovered, err := bootstrapSessions(
 		ctx,

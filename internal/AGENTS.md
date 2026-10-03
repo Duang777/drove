@@ -11,7 +11,7 @@ cmd/* ──▶ internal/client ──▶ internal/session
                                   │
     ┌──────────┬────────┬────────┼────────┬─────────┬─────────┐
     ▼          ▼        ▼        ▼        ▼         ▼
-  agent      event    store     pty    adapter    detect
+  agent      event    store     pty    adapter ──▶ detect
  (状态机)  (事件Hub) (SQLite) (PTY管理) (跨厂商) (信号融合)
 ```
 
@@ -19,7 +19,8 @@ cmd/* ──▶ internal/client ──▶ internal/session
 - `daemon` 装配 session/api/config/store/hub（composition root）。
 - `api` 只依赖 `session` 与 `event` 的公开接口。
 - `client` 只做 JSON 透传（HTTP 客户端），不解析领域类型。
-- `agent / event / store / pty / adapter / config / version` 之间无相互依赖（adapter 依赖 agent 的 State 类型除外）。
+- `adapter` 依赖 `detect` 的标准信号类型和 `agent` 的运行模式；`detect` 只依赖
+  `agent` 快照与 Change。其余叶子包不得反向依赖 `session`。
 
 ## 约束
 
