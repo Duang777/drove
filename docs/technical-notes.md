@@ -28,8 +28,10 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - 两个可编译的 Go 二进制：`drove` 和 `droved`。
 - Agent 状态机及合法迁移表。
 - Claude、Codex 和 generic 三类 adapter。
-- PTY 子进程启动、按行读取、写入和关闭。
+- PTY 子进程启动、带 offset 的原始字节块读取、写入和关闭。
 - SQLite 追加式事件日志及按 session 回放。
+- `output.chunk` envelope 与可过期 BLOB 附件原子写入；旧 `output` 行事件仍可读取。
+- CLI 支持原始终端字节和 `--plain` 清洗回放，输出附件默认保留 30 天。
 - daemon 启动时从 SQLite 事件流恢复历史会话，并从提交后的最大序号继续分配。
 - 无法重连 PTY 的历史会话会追加恢复事件并收口为 `stopped`。
 - 新会话会先持久化名称、厂商和运行模式，再进入状态机。
@@ -46,7 +48,7 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 ### 尚未形成完整产品闭环
 
 - 没有可用的交互式 TUI。代码使用 Cobra，不包含 Bubble Tea 依赖。
-- WebSocket 没有输入控制协议，API 也没有终端 resize 端点。
+- WebSocket 输入控制已接通；终端 attach 和 resize 端点尚未实现。
 - Web 控制台没有接入样式系统，现有 Tailwind 类不会生成 CSS。
 - Web 控制台没有可达的回放入口。
 - ACP 仍是文档中的预留项。
@@ -403,3 +405,56 @@ interactive，`drove up --oneshot` 保留旧的单次执行方式。adapter 负�
 - 真实三次启动回归确认状态可查询、PID 不恢复、reconciliation 不重复且新事件序号继续增长。
 
 进程重连和运行期持久化失败传播仍是后续任务。事件投影恢复不会重新连接或控制旧进程。
+
+## 8. 原始 PTY 输出与保留验证
+
+Issue #13 将输出传输从按行读取改为原始字节块。新 `output.chunk` event envelope
+只保存版本、offset 和长度，原始 BLOB 存在 `output_chunks`。保留清理只删除
+附件，不修改 `events`。旧 `output` 行事件继续可读。
+
+发布顺序采用 reader-first：
+
+1. `d11f6c3` 先加入 schema v2、所有 reader 和兼容回放，是最低回滚版本。
+2. `ea404e8` 启用 32 KiB PTY writer、跨块 token 脱敏和派生行。
+3. `0c28281` 增加 30 天默认保留、启动及每日清理和私有存储路径。
+
+### 隔离字节流回归
+
+临时 HOME 和 Drove 数据目录的权限为 `0700`，新 SQLite 文件和控制 token 为
+`0600`。确定性夹具输出无换行提示、ANSI、中文 UTF-8、无效字节 `ff` 和最终
+残缺 UTF-8 `e2 82`，并把 43 字节 signal token 拆成两次写入。
+
+- 直接 PTY 首块延迟为 4.078 ms；Drove Hub 在 `working` 后 4.252 ms 收到首个
+  无换行块，低于 50 ms 验收上限。
+- 107 字节归一化输出的 SHA-256 为
+  `ca222c0956c30ac24d2d0c7747c6f62528e2f6718c64c2f75d1c5307fb117d49`。
+  直接 PTY、REST 解码、Hub chunks 和 `drove log` 拼接结果逐字节一致。
+- `drove log --plain` 只移除控制序列，UTF-8、无效字节和最终残缺字节保持。
+- 实际 signal token 在 SQLite、WAL、daemon log、Hub capture、REST replay、
+  raw replay 和 plain replay 中均不存在。
+- daemon 重启扫描 41 条历史事件并从序号 43 恢复；下一会话从序号 44 开始，
+  最终全局序号为 59，`drove ps` 保留全部会话投影。
+
+### 真实厂商启动流
+
+隔离配置中记录了以下真实 TUI 启动流，hooks 注入关闭，测试前后的用户持久
+Claude/Codex 配置哈希一致：
+
+| CLI | 字节数 | SHA-256 | 与直接 PTY 比较 |
+| --- | ---: | --- | --- |
+| Claude Code `2.1.181` | 3101 | `5cd0025f5bc01165f71d16a0d83ef0e267a27a629b92ae48bc48dae767befb4c` | 相同 |
+| Codex CLI `0.159.2` | 152 | `cbbdd0a2584e34c44ee281413707430d8848c5970a0f30dd6aa66414d93e5d33` | 相同 |
+
+Codex 的 `ESC[6n` 位于偏移 28，`OSC 10;?` 位于偏移 32，整段没有换行。
+Drove 现在能立即记录这些查询，但不会应答；终端仿真和查询应答仍属于
+[Issue #14](https://github.com/Duang777/drove/issues/14)。
+
+### 保留夹具
+
+注入截止时间的 fixture 同时包含过期和保留的输出附件，以及 lifecycle、
+signal、state、error、input audit 和旧 `output` event。20 轮 race 验证确认：
+
+- 只删除一个过期附件，所有九个 envelope 和最大序号 9 不变；
+- 过期回放保留 metadata，截止时间及更新附件仍可读取；
+- `secure_delete=ON`，零删除和实际删除都完成 WAL truncate checkpoint；
+- 清理后投影可恢复，下一会话从恢复后的全局序号继续。

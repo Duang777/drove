@@ -28,6 +28,35 @@ printf '继续\n' | ./bin/drove send <id> --stdin
 输入审计只记录字节数，不保存输入正文。daemon 只监听 loopback。它在数据目录
 生成 `0600` 控制令牌，并要求 REST 与 WebSocket 客户端使用该令牌。
 
+## 输出回放与保留
+
+新会话把 PTY 输出保存为带字节偏移的 `output.chunk` 事件。旧数据库中的
+`output` 行事件仍可读取，回放时会为每行补一个换行。
+
+```bash
+./bin/drove log <id>          # 原始终端字节，保留 ANSI 和无效字节
+./bin/drove log <id> --plain  # 流式移除终端控制序列
+```
+
+原始输出默认保留 30 天。`drove init` 生成以下配置。设为 `0` 表示永久保留：
+
+```json
+{
+  "storage": {
+    "output_retention_days": 30
+  }
+}
+```
+
+清理只删除 `output.chunk` 的字节附件，事件序号、时间、offset 和长度 metadata
+保持不变，因此状态投影和全局序号仍可恢复。过期字节不会在 `drove log` 中生成
+占位文本。清理启用 SQLite `secure_delete` 并截断 WAL，但不执行 `VACUUM`，
+所以数据库文件已经分配的大小可能不变。
+
+终端屏幕仿真、查询应答和屏幕状态规则仍由
+[Issue #14](https://github.com/Duang777/drove/issues/14) 跟踪。数据库一旦包含
+`output.chunk`，可回滚的最低版本是 reader-first 提交 `d11f6c3`。
+
 ## 接入状态 hooks
 
 Drove 默认只为自己启动的进程注入状态上报，不修改用户或项目配置：

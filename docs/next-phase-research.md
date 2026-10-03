@@ -4,6 +4,7 @@
 - Drove 实现基线：[`88d3148`](https://github.com/Duang777/drove/commit/88d3148b0f9caf52ddef327f56872c1384030ad2)
 - Phase 1A 交付基线：[`2717927`](https://github.com/Duang777/drove/commit/271792720012b072a087e53839823898800fe05d)
 - Phase 1B 会话注入基线：[`48d68bd`](https://github.com/Duang777/drove/commit/48d68bdb9dd6bdf761983d4e3724209010d0ab60)
+- 原始输出与保留基线：[`0c28281`](https://github.com/Duang777/drove/commit/0c282811c5f4b6271624c43a2f268cc2b8c53480)
 - Claude Code 文档读取日期：2026-10-03
 - Codex 源码快照：[`44dd77b`](https://github.com/openai/codex/commit/44dd77b71e88c78295736bffd3dc3b684c13be6d)
 - 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2)、[#3](https://github.com/Duang777/drove/issues/3) 与 [#15](https://github.com/Duang777/drove/issues/15)
@@ -43,6 +44,7 @@ Phase 1A 编码前必须固定五项协议：
 | WebSocket 输入 | 已完成 | v1 input、ack 和 error 消息已实现，连接内 request ID 去重上限为 4096。 |
 | hooks / Detector | 已完成 | 每个 live session 持有一个 Detector。hook 权威、启发式 fallback、置信度、去重、Blocked 恢复和 Idle 确认均有 race 测试。 |
 | 会话信号注入 | 已完成 | Claude 使用临时 `--settings`，Codex 使用进程级 `notify`。两种方式都不修改厂商持久配置。 |
+| 原始 PTY 输出 | 已完成 | `output.chunk` 保存带 offset 的原始字节附件；CLI 支持 raw 和 plain 回放，附件默认保留 30 天。 |
 
 Issue [#2](https://github.com/Duang777/drove/issues/2)、
 [#3](https://github.com/Duang777/drove/issues/3) 和
@@ -439,9 +441,11 @@ session 和过期 token。relay 若重试，必须复用同一个 `delivery_id`�
 - Phase 1A 本身不包含 WebSocket 输入。该能力后来由独立变更完成，Issue #4
   已关闭。
 
-Codex TUI 会在绘制首屏前查询终端能力。当前 PTY 桥接器按行交付输出，不能
-完成该终端查询握手。真实 notify 因此通过 oneshot 路径验证。TUI 屏幕处理和
-OSC 解析继续由 Issue #14 跟踪。
+Issue #13 完成后，PTY 桥接器会立即交付原始字节块，不再等待换行。隔离回归中，
+Claude Code `2.1.181` 的 3101 字节启动流、Codex CLI `0.159.2` 的 152 字节
+启动流都与直接 PTY 抓取逐字节一致。Codex 的 `ESC[6n` 位于偏移 28，整段没有
+换行，现已能进入事件流，但 Drove 仍不生成查询应答，因此 TUI 继续停在握手
+边界。终端仿真、DSR 和 OSC 应答以及屏幕规则仍由 Issue #14 跟踪。
 
 ## 一手来源
 
@@ -453,6 +457,8 @@ OSC 解析继续由 Issue #14 跟踪。
 - [Issue #2：hook 状态识别](https://github.com/Duang777/drove/issues/2)
 - [Issue #3：Blocked 恢复](https://github.com/Duang777/drove/issues/3)
 - [Issue #4：输入注入](https://github.com/Duang777/drove/issues/4)
+- [Issue #13：原始 PTY 输出块与保留](https://github.com/Duang777/drove/issues/13)
+- [Issue #14：终端屏幕模型与查询应答](https://github.com/Duang777/drove/issues/14)
 - [Issue #15：会话信号注入](https://github.com/Duang777/drove/issues/15)
 
 ### Claude Code

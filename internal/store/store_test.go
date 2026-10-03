@@ -806,6 +806,23 @@ func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T
 			AgentID:   "s1",
 			Payload:   `{"version":1,"bytes":4}`,
 		},
+		{
+			Seq:       8,
+			Timestamp: cutoff.Add(-72 * time.Hour),
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"kept","vendor":"generic"}`,
+		},
+		{
+			Seq:       9,
+			Timestamp: cutoff.Add(-72 * time.Hour),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1,"source":"hook","kind":"observed"}`,
+		},
 	}
 	if _, err := s.AppendEvents(context.Background(), 0, rows); err != nil {
 		t.Fatalf("append fixture: %v", err)
@@ -833,7 +850,7 @@ func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T
 	if err != nil {
 		t.Fatalf("last seq after prune: %v", err)
 	}
-	if afterLastSeq != beforeLastSeq || afterLastSeq != 7 {
+	if afterLastSeq != beforeLastSeq || afterLastSeq != 9 {
 		t.Fatalf("last seq changed from %d to %d", beforeLastSeq, afterLastSeq)
 	}
 
@@ -857,7 +874,9 @@ func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T
 	if replayed[3].Payload != "legacy" ||
 		replayed[4].Type != string(event.TypeStateChanged) ||
 		replayed[5].Payload != "kept error" ||
-		replayed[6].Type != string(event.TypeAgentInput) {
+		replayed[6].Type != string(event.TypeAgentInput) ||
+		replayed[7].Type != string(event.TypeSessionLifecycle) ||
+		replayed[8].Type != string(event.TypeAgentSignal) {
 		t.Fatalf("non-output history changed: %+v", replayed[3:])
 	}
 
@@ -869,7 +888,7 @@ func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T
 	if err != nil {
 		t.Fatalf("scan after prune: %v", err)
 	}
-	if scanned != len(rows) || lastSeq != 7 {
+	if scanned != len(rows) || lastSeq != 9 {
 		t.Fatalf("scan after prune = (%d rows, seq %d)", scanned, lastSeq)
 	}
 }

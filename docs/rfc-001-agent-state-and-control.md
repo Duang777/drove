@@ -4,8 +4,9 @@
 - 日期：2026-10-03
 - Phase 1A 实现基线：`2717927`
 - Phase 1B 实现基线：`48d68bd`
+- 原始输出实现基线：`0c28281`
 - 作者：DD
-- 相关 Issue：[#1](https://github.com/Duang777/drove/issues/1)（runner 交互模式）、[#2](https://github.com/Duang777/drove/issues/2)（hooks 状态权威）、[#3](https://github.com/Duang777/drove/issues/3)（Blocked 恢复）、[#4](https://github.com/Duang777/drove/issues/4)（输入注入）、[#14](https://github.com/Duang777/drove/issues/14)（终端屏幕模型）、[#15](https://github.com/Duang777/drove/issues/15)（会话信号注入）
+- 相关 Issue：[#1](https://github.com/Duang777/drove/issues/1)（runner 交互模式）、[#2](https://github.com/Duang777/drove/issues/2)（hooks 状态权威）、[#3](https://github.com/Duang777/drove/issues/3)（Blocked 恢复）、[#4](https://github.com/Duang777/drove/issues/4)（输入注入）、[#13](https://github.com/Duang777/drove/issues/13)（原始输出块与保留）、[#14](https://github.com/Duang777/drove/issues/14)（终端屏幕模型）、[#15](https://github.com/Duang777/drove/issues/15)（会话信号注入）
 - 调研依据：[Phase 1 hooks 与 Detector 资料调研](next-phase-research.md)
 
 ## 1. 背景与动机
@@ -20,6 +21,7 @@ Drove 的定位是"跨厂商 Agent 指挥台"：同时运行、观察、回放�
 3. 全局提交器按一个顺序写入 SQLite、更新投影并发布到 Hub。
 4. REST、CLI 和 WebSocket 输入均已接通。
 5. Claude command hooks 和 Codex notify 默认按会话注入，不修改厂商持久配置。
+6. PTY 输出按原始字节块提交，并从可过期附件回放。
 
 本 RFC 给出 #1 至 #4 的统一方向，并记录 #15 的会话信号注入设计。
 
@@ -199,6 +201,25 @@ DROVE_SIGNAL_TOKEN=<per-session random token>
 `Store.AppendEvents` 写入连续 batch，提交成功后更新内存投影，最后按序发布到
 Hub。持久化失败时不得更新内存或发布未持久化事件。
 
+### 4.7 原始输出与保留（对应 #13）
+
+- PTY 使用 32 KiB 缓冲区立即交付带源 offset 的字节块，不再等待换行；正常块
+  不拆分有效 UTF-8，EOF 仍保留无效或不完整尾部字节。
+- 新 writer 只产生 `output.chunk`。事件 envelope 保存版本、offset 和长度，
+  原始 BLOB 保存在 `output_chunks` 附件表；旧 `output` 行事件保持可读。
+- signal token 在流式处理器中跨块等长脱敏。Store 成功后，输出才进入 Hub 和
+  Detector 的派生文本路径。
+- `drove log` 默认回放原始终端字节，`--plain` 使用共享流式清洗器移除控制序列。
+- `storage.output_retention_days` 默认 30，`0` 表示永久保留。清理只删除到期
+  附件，所有 event envelope、投影事实和全局序号保持不变。
+- 清理启用 SQLite `secure_delete` 并执行 WAL truncate checkpoint，不执行
+  `VACUUM`，因此数据库文件已分配的大小可能不变。
+- `d11f6c3` 是 reader-first 回滚下限。一旦 writer 写入 `output.chunk`，不能
+  回滚到不识别该事件的更早版本。
+
+该阶段不实现终端屏幕、查询应答或基于屏幕的状态规则，这些能力仍由
+[Issue #14](https://github.com/Duang777/drove/issues/14) 负责。
+
 ## 5. 分阶段实施
 
 - **Phase 0，已完成**（#1）：runner `mode` 字段、`--oneshot` 和 interactive 默认值。
@@ -212,6 +233,8 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - **Phase 2，已完成**（#4）：REST、CLI 和 WebSocket 输入已完成。
 - **Phase 3，已完成**：ANSI 分类视图清洗（#5）和 daemon 会话投影恢复（#6）
   已完成。
+- **Phase 4，部分完成**：原始 PTY 字节块、回放和输出保留（#13）已完成；
+  终端仿真、查询应答与屏幕规则（#14）待实现。
 
 ## 6. 安全考虑
 
@@ -224,6 +247,8 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - Claude 临时目录使用 `0700`，settings 文件使用 `0600`。token 只进入继承的
   进程环境，不进入参数、临时文件、事件或日志。
 - signal 持久化必须脱敏，不保存 prompt、tool input、transcript 或 assistant message。
+- 原始输出可能包含源码和凭据，因此默认只保留 30 天；附件到期后，事件
+  metadata 仍用于审计和序号恢复。
 
 ## 7. 已定参数与剩余限制
 
@@ -235,6 +260,8 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
    `required` 在启动后 5 秒内没有收到合法原生 hook 时停止会话。Codex notify
    只在 fallback 中确认 Idle。
 4. `creack/pty` 不支持 Windows。本 RFC 的 interactive 模式只支持 Unix。
+5. 当前能立即记录终端查询字节，但不会生成 DSR、OSC 颜色或设备属性应答；
+   Codex TUI 仍可能在首屏握手处等待，见 Issue #14。
 
 ## 附录 A：hook 与 notify 状态映射
 

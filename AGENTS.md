@@ -27,6 +27,7 @@
 | `internal/auth` | 本地控制令牌生成、持久化与校验 |
 | `internal/detect` | 每会话状态信号融合、去重与计时确认 |
 | `internal/pty` | PTY 生命周期管理与字节流桥接 |
+| `internal/term` | 流式终端控制序列清洗（不做屏幕仿真或查询应答） |
 | `internal/event` | 事件模型、Hub 扇出、订阅 |
 | `internal/session` | 会话编排：agent 创建、快照、回放 |
 | `internal/store` | 持久化（SQLite，只追加事件日志） |
