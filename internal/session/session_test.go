@@ -1292,6 +1292,49 @@ func TestNaturalExitRacingStopRecordsOneTerminalTransition(t *testing.T) {
 	}
 }
 
+func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
+	manager, _ := newTestManager(t)
+	started, err := manager.Start(context.Background(), StartRequest{
+		Name:    "trailing-output",
+		Command: "/bin/cat",
+		Mode:    agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(started.AgentID)
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	waitForDetachedState(t, manager, id, agent.StateStopped)
+
+	manager.onOutput(id, "final output", adapter.NewRegistry().For("generic"), "")
+
+	rows, err := manager.Replay(started.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	stoppedIndex := -1
+	outputIndex := -1
+	for index, row := range rows {
+		if row.Type == string(event.TypeStateChanged) &&
+			row.To == string(agent.StateStopped) {
+			stoppedIndex = index
+		}
+		if row.Type == string(event.TypeOutput) && row.Payload == "final output" {
+			outputIndex = index
+		}
+	}
+	if stoppedIndex < 0 || outputIndex <= stoppedIndex {
+		t.Fatalf(
+			"stopped index = %d, output index = %d; rows=%+v",
+			stoppedIndex,
+			outputIndex,
+			rows,
+		)
+	}
+}
+
 func waitForDetachedState(t *testing.T, manager *Manager, id agent.ID, want agent.State) *Status {
 	t.Helper()
 
