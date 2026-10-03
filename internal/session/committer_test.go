@@ -9,9 +9,101 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
+
+func TestTypedCommitterSealsDraftsAndAppliesAgentAfterStore(t *testing.T) {
+	a := agent.New(
+		"agent-1",
+		agent.WithRunMode(agent.RunModeOneshot),
+		agent.WithHookPolicy(agent.HooksAuto),
+	)
+	st := &memoryCommitStore{}
+	st.onAppend = func() {
+		if a.State() != agent.StatePending {
+			t.Errorf("agent state changed before SQLite append: %s", a.State())
+		}
+	}
+	hub := event.NewHub(0)
+	subscription := hub.Subscribe(4)
+	defer hub.Unsubscribe(subscription)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	receipt, err := committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "session_start",
+			Confidence: 1,
+		}),
+		[]event.Draft{
+			event.NewSessionLifecycleDraft(
+				"agent-1",
+				"agent-1",
+				"created",
+				`{"version":2}`,
+			),
+		},
+	)
+	if err != nil {
+		t.Fatalf("commit agent: %v", err)
+	}
+	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 2}) {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if a.State() != agent.StateStarting ||
+		a.LastTransition() == nil ||
+		a.LastTransition().Event != "session_start" {
+		t.Fatalf("agent projection = state %s evidence %+v", a.State(), a.LastTransition())
+	}
+	rows := st.Rows()
+	if len(rows) != 2 ||
+		rows[0].Type != string(event.TypeSessionLifecycle) ||
+		rows[1].Type != string(event.TypeStateChanged) ||
+		rows[1].Payload == "" {
+		t.Fatalf("stored rows = %+v", rows)
+	}
+	for want := uint64(1); want <= 2; want++ {
+		select {
+		case published := <-subscription.C():
+			if published.Seq != want || a.State() != agent.StateStarting {
+				t.Fatalf("published event = %+v, agent state = %s", published, a.State())
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for sequence %d", want)
+		}
+	}
+}
+
+func TestTypedCommitterStoreFailureLeavesAgentUnchanged(t *testing.T) {
+	storageErr := errors.New("disk unavailable")
+	st := &memoryCommitStore{appendErr: storageErr}
+	hub := event.NewHub(0)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+	a := agent.New("agent-1")
+
+	_, err := committer.CommitAgent(
+		context.Background(),
+		a,
+		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "session_start",
+			Confidence: 1,
+		}),
+		nil,
+	)
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("commit error = %v, want storage error", err)
+	}
+	if snapshot := a.Snapshot(); snapshot.State != agent.StatePending || snapshot.Revision != 0 {
+		t.Fatalf("agent changed after failed append: %+v", snapshot)
+	}
+}
 
 func TestCommitterSerializesConcurrentProducers(t *testing.T) {
 	const producerCount = 100
@@ -181,6 +273,7 @@ type memoryCommitStore struct {
 	lastSeq   uint64
 	rows      []store.EventRow
 	appendErr error
+	onAppend  func()
 }
 
 func (s *memoryCommitStore) AppendEvents(
@@ -195,6 +288,9 @@ func (s *memoryCommitStore) AppendEvents(
 	}
 	if expectedLastSeq != s.lastSeq {
 		return s.lastSeq, fmt.Errorf("stale boundary %d, want %d", expectedLastSeq, s.lastSeq)
+	}
+	if s.onAppend != nil {
+		s.onAppend()
 	}
 	for i, row := range rows {
 		wantSeq := s.lastSeq + uint64(i) + 1

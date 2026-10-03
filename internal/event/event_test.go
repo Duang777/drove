@@ -53,6 +53,29 @@ func TestNewAgentSignalCarriesNormalizedPayload(t *testing.T) {
 	}
 }
 
+func TestCommitSealsDraft(t *testing.T) {
+	at := time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC)
+	committed, err := Commit(
+		7,
+		at,
+		NewStateChangedDraft("agent-1", "agent-1", "working", "blocked", "waiting", `{"version":1}`),
+	)
+	if err != nil {
+		t.Fatalf("commit draft: %v", err)
+	}
+	if committed.Seq != 7 ||
+		!committed.Timestamp.Equal(at) ||
+		committed.Type != TypeStateChanged ||
+		committed.From != "working" ||
+		committed.To != "blocked" ||
+		committed.Payload != `{"version":1}` {
+		t.Fatalf("committed event = %+v", committed)
+	}
+	if _, err := Commit(0, at, NewOutputDraft("agent-1", "agent-1", "line")); !errors.Is(err, ErrUncommittedEvent) {
+		t.Fatalf("zero-sequence commit error = %v", err)
+	}
+}
+
 func TestSignalPayloadV1Validation(t *testing.T) {
 	payload := SignalPayloadV1{
 		Version:     1,
@@ -174,6 +197,35 @@ func TestPublishWithPresetSeq(t *testing.T) {
 	}
 	if got := h.LastSeq(); got != 42 {
 		t.Fatalf("last seq = %d, want 42", got)
+	}
+}
+
+func TestPublishBatchValidatesBeforeDelivery(t *testing.T) {
+	h := NewHub(4)
+	sub := h.Subscribe(4)
+	defer h.Unsubscribe(sub)
+
+	err := h.PublishBatch([]Event{
+		NewOutput(5, "s", "s", "five"),
+		NewOutput(7, "s", "s", "seven"),
+	})
+	if !errors.Is(err, ErrSequenceOrder) {
+		t.Fatalf("publish batch error = %v, want ErrSequenceOrder", err)
+	}
+	if got := h.LastSeq(); got != 4 {
+		t.Fatalf("last seq = %d, want 4", got)
+	}
+	select {
+	case delivered := <-sub.C():
+		t.Fatalf("invalid batch partially delivered %+v", delivered)
+	default:
+	}
+
+	if err := h.PublishBatch([]Event{
+		NewOutput(5, "s", "s", "five"),
+		NewOutput(6, "s", "s", "six"),
+	}); err != nil {
+		t.Fatalf("publish valid batch: %v", err)
 	}
 }
 

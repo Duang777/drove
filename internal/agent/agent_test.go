@@ -275,6 +275,90 @@ func TestTransitionPlanRejectsStaleAndForeignApply(t *testing.T) {
 	}
 }
 
+func TestPreparedChangeAppliesStateAndErrorAtomically(t *testing.T) {
+	a := New(
+		"a1",
+		WithRunMode(RunModeOneshot),
+		WithHookPolicy(HooksAuto),
+	)
+	prepared, err := a.Prepare(FailTo(
+		StateStopped,
+		"startup failed",
+		"executable not found",
+		Evidence{
+			Source:     EvidenceProcess,
+			Event:      "process_start_failed",
+			Confidence: 1,
+		},
+	))
+	if err != nil {
+		t.Fatalf("prepare change: %v", err)
+	}
+	if snapshot := a.Snapshot(); snapshot.State != StatePending || snapshot.Revision != 0 {
+		t.Fatalf("prepare mutated agent: %+v", snapshot)
+	}
+	from, to, reason, evidence, ok := prepared.Transition()
+	if !ok ||
+		from != StatePending ||
+		to != StateStopped ||
+		reason != "startup failed" ||
+		evidence.Event != "process_start_failed" {
+		t.Fatalf("prepared transition = %s -> %s %q %+v, ok=%t", from, to, reason, evidence, ok)
+	}
+	if message, ok := prepared.ErrorMessage(); !ok || message != "executable not found" {
+		t.Fatalf("prepared error = %q, ok=%t", message, ok)
+	}
+
+	if err := a.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply committed: %v", err)
+	}
+	if a.State() != StateStopped ||
+		a.LastError() != "executable not found" ||
+		a.LastTransition() == nil ||
+		a.LastTransition().Event != "process_start_failed" ||
+		!a.UpdatedAt().Equal(prepared.Timestamp()) ||
+		a.Snapshot().Revision != 1 {
+		t.Fatalf("applied agent state is inconsistent")
+	}
+	if err := a.ApplyCommitted(prepared); !errors.Is(err, ErrStaleTransitionPlan) {
+		t.Fatalf("reapply error = %v, want ErrStaleTransitionPlan", err)
+	}
+}
+
+func TestPreparedChangeRestrictsDoneToProcessExit(t *testing.T) {
+	a := New("a1", WithRunMode(RunModeOneshot))
+	starting, err := a.Prepare(MoveTo(StateStarting, "start", Evidence{
+		Source: EvidenceSession, Event: "session_start", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare starting: %v", err)
+	}
+	if err := a.ApplyCommitted(starting); err != nil {
+		t.Fatalf("apply starting: %v", err)
+	}
+	working, err := a.Prepare(MoveTo(StateWorking, "working", Evidence{
+		Source: EvidenceProcess, Event: "process_started", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare working: %v", err)
+	}
+	if err := a.ApplyCommitted(working); err != nil {
+		t.Fatalf("apply working: %v", err)
+	}
+
+	if _, err := a.Prepare(MoveTo(StateDone, "hook completed", Evidence{
+		Source: EvidenceHook, Event: "TaskCompleted", Confidence: 1,
+		DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
+	})); err == nil {
+		t.Fatal("hook evidence was allowed to produce Done")
+	}
+	if _, err := a.Prepare(MoveTo(StateDone, "process exited", Evidence{
+		Source: EvidenceProcess, Event: "process_exited", Confidence: 1,
+	})); err != nil {
+		t.Fatalf("natural oneshot exit was rejected: %v", err)
+	}
+}
+
 func TestSetError(t *testing.T) {
 	a := New("a1")
 	a.SetError("boom")

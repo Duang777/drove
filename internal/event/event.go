@@ -49,6 +49,121 @@ type Event struct {
 	Payload string `json:"payload,omitempty"`
 }
 
+// Draft is an unsequenced event value. Its fields stay private so callers
+// cannot forge a committed event.
+type Draft struct {
+	typ       Type
+	agentID   string
+	sessionID string
+	from      string
+	to        string
+	reason    string
+	payload   string
+}
+
+// NewStateChangedDraft constructs an uncommitted state transition.
+func NewStateChangedDraft(sessionID, agentID, from, to, reason, payload string) Draft {
+	return Draft{
+		typ:       TypeStateChanged,
+		sessionID: sessionID,
+		agentID:   agentID,
+		from:      from,
+		to:        to,
+		reason:    reason,
+		payload:   payload,
+	}
+}
+
+// NewOutputDraft constructs an uncommitted output event.
+func NewOutputDraft(sessionID, agentID, line string) Draft {
+	return Draft{
+		typ:       TypeOutput,
+		sessionID: sessionID,
+		agentID:   agentID,
+		payload:   line,
+	}
+}
+
+// NewErrorDraft constructs an uncommitted error event.
+func NewErrorDraft(sessionID, agentID, message string) Draft {
+	return Draft{
+		typ:       TypeError,
+		sessionID: sessionID,
+		agentID:   agentID,
+		payload:   message,
+	}
+}
+
+// NewSessionLifecycleDraft constructs an uncommitted lifecycle event.
+func NewSessionLifecycleDraft(sessionID, agentID, reason, payload string) Draft {
+	return Draft{
+		typ:       TypeSessionLifecycle,
+		sessionID: sessionID,
+		agentID:   agentID,
+		reason:    reason,
+		payload:   payload,
+	}
+}
+
+// NewAgentInputDraft constructs an uncommitted input audit event.
+func NewAgentInputDraft(sessionID, agentID, payload string) Draft {
+	return Draft{
+		typ:       TypeAgentInput,
+		sessionID: sessionID,
+		agentID:   agentID,
+		reason:    "accepted",
+		payload:   payload,
+	}
+}
+
+// NewAgentSignalDraft constructs an uncommitted signal audit event.
+func NewAgentSignalDraft(sessionID, agentID, payload string) Draft {
+	return Draft{
+		typ:       TypeAgentSignal,
+		sessionID: sessionID,
+		agentID:   agentID,
+		reason:    "observed",
+		payload:   payload,
+	}
+}
+
+// Commit seals a copied draft with its durable sequence and timestamp.
+func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
+	if seq == 0 {
+		return Event{}, ErrUncommittedEvent
+	}
+	if at.IsZero() {
+		return Event{}, errors.New("event: commit timestamp is required")
+	}
+	switch draft.typ {
+	case TypeStateChanged,
+		TypeOutput,
+		TypeError,
+		TypeSessionLifecycle,
+		TypeAgentInput,
+		TypeAgentSignal:
+	default:
+		return Event{}, fmt.Errorf("event: invalid draft type %q", draft.typ)
+	}
+	if draft.sessionID == "" || draft.agentID == "" {
+		return Event{}, errors.New("event: draft session and agent IDs are required")
+	}
+	if draft.sessionID != draft.agentID {
+		return Event{}, errors.New("event: draft session and agent IDs must match")
+	}
+	return Event{
+		Seq:       seq,
+		Timestamp: at,
+		Type:      draft.typ,
+		AgentID:   draft.agentID,
+		SessionID: draft.sessionID,
+		From:      draft.from,
+		To:        draft.to,
+		Reason:    draft.reason,
+		Payload:   draft.payload,
+	}, nil
+}
+
 // SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.
 type SignalPayloadV1 struct {
 	Version         int     `json:"version"`
@@ -354,30 +469,47 @@ func (h *Hub) Unsubscribe(s *Subscription) {
 	close(s.ch)
 }
 
-// Publish 广播一个已提交事件。序号分配由持久化提交器负责。
-func (h *Hub) Publish(ev Event) error {
-	if ev.Seq == 0 {
-		return ErrUncommittedEvent
-	}
-
+// PublishBatch atomically validates and broadcasts one committed batch.
+func (h *Hub) PublishBatch(events []Event) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed {
 		return ErrHubClosed
 	}
-	if ev.Seq != h.lastSeq+1 {
-		return fmt.Errorf("%w: got %d after %d", ErrSequenceOrder, ev.Seq, h.lastSeq)
+	nextSeq := h.lastSeq + 1
+	for i := range events {
+		if events[i].Seq == 0 {
+			return ErrUncommittedEvent
+		}
+		if events[i].Seq != nextSeq+uint64(i) {
+			return fmt.Errorf(
+				"%w: got %d, want %d",
+				ErrSequenceOrder,
+				events[i].Seq,
+				nextSeq+uint64(i),
+			)
+		}
 	}
-	h.lastSeq = ev.Seq
+	if len(events) == 0 {
+		return nil
+	}
+	h.lastSeq = events[len(events)-1].Seq
 
 	for _, s := range h.subs {
-		select {
-		case s.ch <- ev:
-		default:
-			atomic.AddUint64(&s.dropped, 1)
+		for _, committed := range events {
+			select {
+			case s.ch <- committed:
+			default:
+				atomic.AddUint64(&s.dropped, 1)
+			}
 		}
 	}
 	return nil
+}
+
+// Publish broadcasts one committed event.
+func (h *Hub) Publish(ev Event) error {
+	return h.PublishBatch([]Event{ev})
 }
 
 // LastSeq 返回 Hub 最后接受的已提交事件序号。

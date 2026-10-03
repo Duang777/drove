@@ -201,6 +201,74 @@ type TransitionPlan struct {
 	Reason   string
 }
 
+// Snapshot is an immutable view used by decision code.
+type Snapshot struct {
+	ID       ID
+	State    State
+	RunMode  RunMode
+	Revision uint64
+}
+
+// Change describes one state and/or error update before it is prepared.
+type Change struct {
+	target       State
+	reason       string
+	errorMessage string
+	evidence     Evidence
+	at           time.Time
+	hasState     bool
+	hasError     bool
+}
+
+// PreparedChange is bound to one Agent revision and can only be applied once.
+type PreparedChange struct {
+	owner        *Agent
+	agentID      ID
+	revision     uint64
+	from         State
+	to           State
+	reason       string
+	errorMessage string
+	evidence     Evidence
+	at           time.Time
+	hasState     bool
+	hasError     bool
+}
+
+// MoveTo constructs a state-only change.
+func MoveTo(to State, reason string, evidence Evidence) Change {
+	return Change{
+		target:   to,
+		reason:   reason,
+		evidence: evidence,
+		at:       time.Now().UTC(),
+		hasState: true,
+	}
+}
+
+// FailTo constructs an atomic error and state change.
+func FailTo(to State, reason, message string, evidence Evidence) Change {
+	return Change{
+		target:       to,
+		reason:       reason,
+		errorMessage: message,
+		evidence:     evidence,
+		at:           time.Now().UTC(),
+		hasState:     true,
+		hasError:     true,
+	}
+}
+
+// RecordError constructs an error-only change.
+func RecordError(message string, evidence Evidence) Change {
+	return Change{
+		errorMessage: message,
+		evidence:     evidence,
+		at:           time.Now().UTC(),
+		hasError:     true,
+	}
+}
+
 // Agent 是一个受控的 agent 实例。
 // 它只描述状态与元数据，不持有进程/PTY/事件实现。
 type Agent struct {
@@ -394,6 +462,124 @@ func (a *Agent) LastTransition() *Evidence {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return cloneEvidence(a.lastTransition)
+}
+
+// Snapshot returns the state fields used to prepare a deterministic decision.
+func (a *Agent) Snapshot() Snapshot {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return Snapshot{
+		ID:       a.id,
+		State:    a.state,
+		RunMode:  a.runMode,
+		Revision: a.revision,
+	}
+}
+
+// Prepare validates a change without mutating the Agent.
+func (a *Agent) Prepare(change Change) (PreparedChange, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	if !change.hasState && !change.hasError {
+		return PreparedChange{}, errors.New("agent: empty change")
+	}
+	if change.at.IsZero() {
+		return PreparedChange{}, errors.New("agent: change timestamp is required")
+	}
+	if err := change.evidence.Validate(); err != nil {
+		return PreparedChange{}, fmt.Errorf("agent: change evidence: %w", err)
+	}
+	if change.hasError && strings.TrimSpace(change.errorMessage) == "" {
+		return PreparedChange{}, errors.New("agent: error message is required")
+	}
+	if change.hasState {
+		if strings.TrimSpace(change.reason) == "" {
+			return PreparedChange{}, errors.New("agent: transition reason is required")
+		}
+		if !CanTransition(a.state, change.target) {
+			return PreparedChange{}, fmt.Errorf(
+				"%w: %s -> %s",
+				ErrInvalidTransition,
+				a.state,
+				change.target,
+			)
+		}
+		if change.target == StateDone &&
+			(a.runMode != RunModeOneshot ||
+				change.evidence.Source != EvidenceProcess ||
+				change.evidence.Event != "process_exited") {
+			return PreparedChange{}, errors.New(
+				"agent: done requires a successful natural oneshot process exit",
+			)
+		}
+	}
+	return PreparedChange{
+		owner:        a,
+		agentID:      a.id,
+		revision:     a.revision,
+		from:         a.state,
+		to:           change.target,
+		reason:       change.reason,
+		errorMessage: change.errorMessage,
+		evidence:     change.evidence,
+		at:           change.at,
+		hasState:     change.hasState,
+		hasError:     change.hasError,
+	}, nil
+}
+
+// ApplyCommitted applies a previously prepared change after durable commit.
+func (a *Agent) ApplyCommitted(prepared PreparedChange) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if prepared.owner != a ||
+		prepared.agentID != a.id ||
+		prepared.revision != a.revision ||
+		prepared.from != a.state {
+		return fmt.Errorf(
+			"%w: agent=%q revision=%d state=%s",
+			ErrStaleTransitionPlan,
+			a.id,
+			a.revision,
+			a.state,
+		)
+	}
+	if prepared.hasState && !CanTransition(prepared.from, prepared.to) {
+		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, prepared.from, prepared.to)
+	}
+	if prepared.hasError {
+		a.lastError = prepared.errorMessage
+	}
+	if prepared.hasState {
+		a.state = prepared.to
+		evidence := prepared.evidence
+		a.lastTransition = &evidence
+	}
+	a.updatedAt = prepared.at
+	a.revision++
+	return nil
+}
+
+// Transition exposes the prepared state transition data.
+func (p PreparedChange) Transition() (
+	from State,
+	to State,
+	reason string,
+	evidence Evidence,
+	ok bool,
+) {
+	return p.from, p.to, p.reason, p.evidence, p.hasState
+}
+
+// ErrorMessage returns the prepared error update when present.
+func (p PreparedChange) ErrorMessage() (string, bool) {
+	return p.errorMessage, p.hasError
+}
+
+// Timestamp returns the timestamp shared by the durable events and projection.
+func (p PreparedChange) Timestamp() time.Time {
+	return p.at
 }
 
 // PlanTransition 验证并生成不会立即改变状态的迁移计划。
