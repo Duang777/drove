@@ -11,6 +11,7 @@
 - reply pump 必须在首次 `Write` 前就绪；sink 失败后继续排空，直至 `Close`。
 - `Snapshot` 只复制可见 cell 的内容与宽度，不包含样式、链接、标题或 scrollback。
 - 对外快照视图最多返回底部 12 行、每行 160 cells 和 4 KiB UTF-8 数据。
+- 快照调用方只能依赖上游的 signal token 打码；本包不做通用密钥扫描。
 - `Stripper` 只服务 `drove log --plain` 等纯文本回放调用方；screen classifier
   不使用它。
 - `Stripper` 跨 `Feed` 保留不完整的 ESC、CSI、OSC、DCS、SOS、PM 和 APC 状态。

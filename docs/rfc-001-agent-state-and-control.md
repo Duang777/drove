@@ -1,10 +1,13 @@
 # RFC-001：Agent 状态识别与交互控制架构
 
-- 状态：已采纳，Phase 1B 已完成；持久安装器延期
-- 日期：2026-10-03
+- 状态：已采纳，Phase 4 已完成；持久安装器延期
+- 日期：2026-10-04
 - Phase 1A 实现基线：`2717927`
 - Phase 1B 实现基线：`48d68bd`
 - 原始输出实现基线：`0c28281`
+- 终端屏幕实现基线：`b202e70`
+- 状态解释实现基线：`3290778`
+- 终端验收基线：`a47daaf`
 - 作者：DD
 - 相关 Issue：[#1](https://github.com/Duang777/drove/issues/1)（runner 交互模式）、[#2](https://github.com/Duang777/drove/issues/2)（hooks 状态权威）、[#3](https://github.com/Duang777/drove/issues/3)（Blocked 恢复）、[#4](https://github.com/Duang777/drove/issues/4)（输入注入）、[#13](https://github.com/Duang777/drove/issues/13)（原始输出块与保留）、[#14](https://github.com/Duang777/drove/issues/14)（终端屏幕模型）、[#15](https://github.com/Duang777/drove/issues/15)（会话信号注入）
 - 调研依据：[Phase 1 hooks 与 Detector 资料调研](next-phase-research.md)
@@ -22,8 +25,9 @@ Drove 的定位是"跨厂商 Agent 指挥台"：同时运行、观察、回放�
 4. REST、CLI 和 WebSocket 输入均已接通。
 5. Claude command hooks 和 Codex notify 默认按会话注入，不修改厂商持久配置。
 6. PTY 输出按原始字节块提交，并从可过期附件回放。
+7. terminal actor 应答终端查询、维护私有屏幕，并把稳定屏幕边沿交给 Detector。
 
-本 RFC 给出 #1 至 #4 的统一方向，并记录 #15 的会话信号注入设计。
+本 RFC 记录 Issues #1 至 #4、#13 至 #15 的统一设计和当前实现。
 
 ## 2. 目标 / 非目标
 
@@ -103,7 +107,10 @@ L4  超时推断                 （最低优先级，仅生成 Idle 候选）
 
 - 进程事实决定终态。hooks 不得把仍存活的 interactive 进程标记为 Done 或 Stopped。
 - hook 必须由当前会话收到合法 signal 后才算激活。配置存在不代表 hook 可执行。
-- hook 激活后，启发式只保留证据，不再写状态。hook 不可用时，启发式信号必须经过去抖并达到置信度阈值。
+- hook 激活后，Detector 仍持久化屏幕边沿，但只允许两个 Spec 006 例外改变状态。
+  审批框消失可以把 Blocked 改为 Working。Claude 中断结果可以把 Working 改为
+  Idle。Detector 把其他屏幕边沿标记为 `suppressed`。
+- hook 不可用时，屏幕信号必须经过去抖并达到置信度阈值。
 - notify 不改变 hook 状态。`awaiting_hook`、`hook_active` 和 `required` 会话只
   记录 notify，不让它驱动状态迁移。
 - 同一会话只有一个 Detector 提出状态迁移。hooks、PTY 和 timer 回调都只向 Detector 投递信号。
@@ -217,8 +224,59 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - `d11f6c3` 是 reader-first 回滚下限。一旦 writer 写入 `output.chunk`，不能
   回滚到不识别该事件的更早版本。
 
-该阶段不实现终端屏幕、查询应答或基于屏幕的状态规则，这些能力仍由
-[Issue #14](https://github.com/Duang777/drove/issues/14) 负责。
+### 4.8 终端屏幕、查询应答与状态解释（对应 #14）
+
+每个 attached 会话持有一个 terminal actor。该 actor 独占 x/vt controller、
+厂商 screen classifier、容量 64 的 inbox、100 ms 固定采样计时器和当前不可变
+snapshot。observation actor 继续独占 Detector 和状态确认 timer。终端解析不会
+阻塞 hook 或进程事实。
+
+输出处理顺序固定为：
+
+1. 全局 Committer 把 `output.chunk` 写入 SQLite。
+2. Committer 更新投影并发布到 Hub。
+3. 输出处理器用提交 receipt 构造 `term.CommittedChunk`。
+4. terminal actor 按 offset 顺序把已提交字节写入 x/vt。
+5. 首个 dirty chunk 启动一个不滑动的 100 ms 采样窗口。
+6. classifier 只在规则 presence 变化时向 observation actor 发送边沿。
+
+x/vt reply pump 在第一次 controller write 前就绪。DSR、OSC 10/11、DA1 和
+Kitty keyboard reply 以完整帧直接调用 `pty.Session.Write`。reply 与用户输入
+共用 PTY 写锁，但不经过 `Manager.SendInput`，不产生 `agent.input`，也不进入
+输出、Hub、回放、snapshot 或 explain。子进程显式回显 reply 时，回显属于新的
+PTY 输出。
+
+screen signal 和 state evidence 使用 version 3 payload。持久字段只有稳定规则
+名、`present` 或 `cleared` 边沿、区域、静态 evidence、已提交 output offset 和
+最终 output sequence。私有 matcher、屏幕文字和屏幕 hash 不进入事件日志。
+Detector 持久化 `candidate`、`suppressed`、`transitioned`、`stale` 和
+`terminal` 结果，因此 `drove explain` 能说明状态为什么变化或没有变化。
+
+`GET /api/v1/agents/{id}/explain` 和 `drove explain <id>` 默认返回最近 50 条
+signal 和 state 事件，`--limit` 的上限是 200，`--json` 返回类型化响应。只有
+同一个仍 attached 的 terminal actor 可以提供 live snapshot。snapshot 最多取
+底部 12 行，每行最多 160 个 cells，编码后最多 4 KiB。detach 后只返回持久化
+决策。
+
+snapshot 使用已经完成 signal token 等长打码的 committed output，但没有通用
+密钥扫描。调用方必须把它视为可能包含源码、prompt 或凭据的临时数据。原始输出
+保留策略不变。
+
+实现固定 `github.com/charmbracelet/x/vt` 于
+`v0.0.0-20261004011457-ad85c59fdf4e`，并把源码构建下限提高到 Go 1.24.2。
+CI 在 Ubuntu 上分别运行精确的 Go 1.24.2 和当前 stable。数据库采用
+reader-first 发布：`f361ab5` 先加入 version 3 reader，`b202e70` 后启用 writer。
+数据库写入 version 3 后，`f361ab5` 是最低回滚版本。
+
+32 个 terminal actor 的实测平均耗时是 1.026781392 s/op，聚合吞吐是
+31.19 MiB/s。每轮每个 actor 接收 1 MiB committed bytes，峰值 goroutine 为
+99，最大 inbox 深度为 1，未触发 backpressure。完整硬件、分配和 race 数据见
+[技术笔记](technical-notes.md#9-terminal-actor-32-session-benchmark)。
+
+public resize、WebSocket 终端流和 attach 不在本阶段。终端流由
+[#19](https://github.com/Duang777/drove/issues/19) 跟踪，Web attach 与终端 UI
+由 [#20](https://github.com/Duang777/drove/issues/20) 跟踪。可选持久 hook
+安装器仍由 [#24](https://github.com/Duang777/drove/issues/24) 跟踪。
 
 ## 5. 分阶段实施
 
@@ -233,8 +291,8 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - **Phase 2，已完成**（#4）：REST、CLI 和 WebSocket 输入已完成。
 - **Phase 3，已完成**：ANSI 分类视图清洗（#5）和 daemon 会话投影恢复（#6）
   已完成。
-- **Phase 4，部分完成**：原始 PTY 字节块、回放和输出保留（#13）已完成；
-  终端仿真、查询应答与屏幕规则（#14）待实现。
+- **Phase 4，已完成**：原始 PTY 字节块、回放和输出保留（#13），以及终端
+  仿真、查询应答、屏幕规则和状态解释（#14）均已完成。
 
 ## 6. 安全考虑
 
@@ -249,6 +307,8 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
 - signal 持久化必须脱敏，不保存 prompt、tool input、transcript 或 assistant message。
 - 原始输出可能包含源码和凭据，因此默认只保留 30 天；附件到期后，事件
   metadata 仍用于审计和序号恢复。
+- version 3 screen evidence 不保存屏幕文字或 hash。attached snapshot 没有
+  通用密钥扫描，API 客户端不得持久化它。
 
 ## 7. 已定参数与剩余限制
 
@@ -260,8 +320,10 @@ Hub。持久化失败时不得更新内存或发布未持久化事件。
    `required` 在启动后 5 秒内没有收到合法原生 hook 时停止会话。Codex notify
    只在 fallback 中确认 Idle。
 4. `creack/pty` 不支持 Windows。本 RFC 的 interactive 模式只支持 Unix。
-5. 当前能立即记录终端查询字节，但不会生成 DSR、OSC 颜色或设备属性应答；
-   Codex TUI 仍可能在首屏握手处等待，见 Issue #14。
+5. 当前只使用固定的 40x120 初始尺寸。public resize、WebSocket 终端流和
+   attach 分别由 Issues #19 和 #20 跟踪。
+6. live snapshot 只有底部受限视图，不包含 scrollback、标题、样式、链接或
+   clipboard 数据，也不承诺通用密钥识别。
 
 ## 附录 A：hook 与 notify 状态映射
 

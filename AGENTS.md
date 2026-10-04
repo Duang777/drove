@@ -10,7 +10,7 @@
 
 ## 2. 核心架构原则（不可违反）
 
-1. **每 Agent = 一个 goroutine + 一个 PTY**：Agent 必须运行在真实终端（PTY）中，Drove 只做包装、观察、注入，不替代 agent 本体。
+1. **每 Agent = 一个真实 PTY**：Agent 必须运行在真实终端中，Drove 只做包装、观察、注入，不替代 agent 本体。每个 attached 会话分别用 terminal actor 和 observation actor 串行处理屏幕与状态决策。
 2. **事件驱动一切**：所有状态变化、输出增量、错误都以不可变事件（`internal/event`）表达，经 Hub 扇出到订阅者（daemon API / CLI）。
 3. **事件溯源优先**：会话是可回放的事件流，不是可变状态快照。状态由事件派生（projection），存储层只追加。
 4. **适配器单一职责**：跨厂商差异全部收敛在 `internal/adapter`，上层不得出现厂商专属逻辑（不得 import claude/codex SDK 到其他包）。
@@ -21,7 +21,7 @@
 
 | 目录 | 职责 |
 |---|---|
-| `cmd/drove` | CLI 主程序（bubbletea TUI）入口 |
+| `cmd/drove` | Cobra CLI 主程序入口 |
 | `cmd/droved` | 常驻 daemon 入口（可选运行模式） |
 | `internal/agent` | Agent 抽象、状态机（唯一的状态权威） |
 | `internal/auth` | 本地控制令牌生成、持久化与校验 |
@@ -42,6 +42,8 @@
 ## 4. 工程规范
 
 - **语言**：Go 1.24.2+。并发一律 goroutine + channel；禁止裸 `sync.Mutex` 保护大段业务逻辑（用 channel 或局部临界区）。
+- **终端依赖**：`github.com/charmbracelet/x/vt` 固定为 `v0.0.0-20261004011457-ad85c59fdf4e`，只允许 `internal/term` 暴露稳定包装类型。
+- **CI 版本**：保留精确的 Go 1.24.2 lane 和当前 stable lane，不加隐式选择更高编译器的 `toolchain` directive。
 - **错误处理**：错误必须 wrap（`fmt.Errorf("...: %w", err)`），禁止吞错；库代码返回 error，不 log.Fatal。
 - **日志**：使用 `log/slog`；daemon 输出结构化日志，CLI 输出用户可读文本。
 - **命名**：导出符号需注释；缩写遵循 Go 惯例（`ID`、`API`、`PTY`）。

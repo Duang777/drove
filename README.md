@@ -33,14 +33,14 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | 能力 | 状态 | 在哪里 |
 | --- | --- | --- |
 | 每个 agent 一个 PTY，由 `droved` 持有 | 已落地 | `internal/pty` |
-| `init` `up` `ps` `log` `stop` `send` `hook` `version` | 已落地 | `cmd/drove` |
+| `init` `up` `ps` `log` `explain` `stop` `send` `hook` `version` | 已落地 | `cmd/drove` |
 | Claude / Codex 按会话注入状态上报 | 已落地 | [#15](https://github.com/Duang777/drove/issues/15) |
 | 原始终端字节，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` 回放字节，`--plain` 去掉控制序列 | 已落地 | |
 | 只监听 loopback，REST / WebSocket 使用本地令牌 | 已落地 | |
 | WebSocket 事件流，以及带 `request_id` 的输入 | 已落地 | |
 | Web 开发骨架：列表、启动、停止、实时事件 | 已落地 | `web/` |
-| 终端屏幕仿真和屏幕规则 | 进行中 | [#14](https://github.com/Duang777/drove/issues/14)，[spec 010](specs/010-terminal-screen-detection/spec.md) |
+| 终端屏幕仿真、查询应答、屏幕规则和 `drove explain` | 已落地 | [#14](https://github.com/Duang777/drove/issues/14)，[spec 010](specs/010-terminal-screen-detection/spec.md) |
 | 回放时间线 | 规划中 | [#25](https://github.com/Duang777/drove/issues/25) |
 | 塔台网格 | 规划中 | [#26](https://github.com/Duang777/drove/issues/26) |
 | 推送通知 | 规划中 | [#27](https://github.com/Duang777/drove/issues/27) |
@@ -61,6 +61,10 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 
 CLI 是短命令。`droved` 被自动拉起后一直持有 PTY。状态和输出先写入 SQLite，再经 Hub 推给 WebSocket 订阅者。厂商差异只在 `internal/adapter`。
 
+每个 attached 会话还有一个 terminal actor。它只接收已经写入 SQLite 并发布到
+Hub 的输出块，再更新私有终端屏幕。终端查询应答直接写回同一个 PTY，不进入输出
+事件或用户输入审计。
+
 ## 快速开始
 
 需要 Go 1.24.2 或更高版本。PTY 依赖 `github.com/creack/pty`，在 Linux 和 macOS 上构建；Windows 不在支持范围内。CI 在 Ubuntu 上跑 Go 1.24.2 和当前 stable。仓库还没有 release，请从源码构建。`drove` 和 `droved` 必须放在同一目录：CLI 在旁边找 daemon，daemon 在旁边找 hook relay。
@@ -77,6 +81,7 @@ drove ps
 drove send <agent-id> 'hello'
 drove log <agent-id>
 drove log <agent-id> --plain
+drove explain <agent-id>
 drove stop <agent-id>
 drove version
 ```
@@ -100,6 +105,7 @@ drove up claude --hooks required
 | `drove ps` | 打印 AGENT ID、NAME、VENDOR、MODE、STATE、PID。没有会话时打印 `no agents running` |
 | `drove log <agent-id>` | 只把终端字节写到 stdout。不打印状态事件 |
 | `drove log <agent-id> --plain` | 用流式清洗器去掉控制序列 |
+| `drove explain <agent-id>` | 打印最近的状态决策和 attached 会话的临时受限屏幕 |
 | `drove send <agent-id> <text>` | 发送这一行并自动加上换行。stdout 打印字节数 |
 | `drove send <agent-id> --stdin` | 原样读取标准输入，不追加换行 |
 | `drove stop <agent-id>` | 停止该会话 |
@@ -121,9 +127,40 @@ drove up claude --hooks required
 1. **进程。** 启动失败和退出覆盖其他信号。交互会话结束为 `stopped`。`--oneshot` 成功退出为 `done`。
 2. **Claude command hook。** 第一个合法 hook 信号提交后，该会话进入 hook 权威。进入 Working、Blocked 或 Idle 候选由事件种类决定。Idle 有 1 秒确认窗口，后续活动可以取消它。
 3. **Codex notify。** 不进入 hook 权威，也不满足 `--hooks required`。只在 fallback 里作为可取消的 Idle 候选。
-4. **屏幕规则，进行中。** hook 还没激活时，fallback 使用屏幕规则。hook 已经激活时，实现里只放行两类屏幕写入：审批框消失（Blocked → Working），以及 Claude 中断（Working → Idle）。[#14](https://github.com/Duang777/drove/issues/14) 仍打开：还没有 `drove explain`，也还没有验收夹具和性能证明。
+4. **屏幕规则。** hook 还没激活时，fallback 使用 Claude 和 Codex 的稳定屏幕规则。hook 已经激活时，只允许两类屏幕信号改变状态：审批框消失（Blocked → Working），以及 Claude 中断（Working → Idle）。其他屏幕边沿仍写入事件日志，但结果是 `suppressed`。
 
 `--hooks auto` 是 Claude 和 Codex 的默认值，等待 5 秒。没有合法原生 hook 就进入 fallback。fallback 里，输出静默 60 秒可以成为 Idle 候选。`--hooks off` 不注入上报。`--hooks required` 在 5 秒内没有合法原生 hook 时把会话停为 `stopped`。generic 不能选 `required`。
+
+### 终端屏幕与解释
+
+每个 attached 会话有一个 terminal actor。它独占固定版本的
+`github.com/charmbracelet/x/vt`、厂商分类器、100 ms 固定采样计时器和当前不可变
+快照。输出必须先写入 SQLite，再更新内存投影并发布到 Hub。只有这次提交返回的
+offset、最终事件序号和提交时间才能随字节进入 terminal actor。
+
+x/vt 生成的 DSR、OSC 10/11、DA1 和 Kitty keyboard 查询应答直接调用
+`pty.Session.Write`。这个调用与用户输入共用 PTY 的完整帧写锁，但不经过
+`Manager.SendInput`，因此不会产生 `agent.input`。reply 也不会进入输出事件、
+回放、快照或 explain。子进程自己回显 reply 时，那份回显才是普通 PTY 输出。
+
+屏幕事件只保存稳定规则名、边沿、区域、静态 evidence、输出 offset 和最终输出
+序号。事件不保存匹配文本、屏幕行或屏幕 hash。用以下命令查看这些决策：
+
+```bash
+drove explain <agent-id>
+drove explain <agent-id> --limit 20
+drove explain <agent-id> --json
+```
+
+attached 会话最多返回底部 12 行，每行最多 160 个 cells，编码后最多 4 KiB。
+输出处理器会等长打码当前会话的 signal token，但快照没有通用密钥扫描。屏幕可能
+包含源码、prompt 或凭据，只在当前进程 attached 时临时返回。进程 detach 后，
+`explain` 只返回持久化的脱敏决策。
+
+当前没有公开的 attach 或 resize API。WebSocket 终端流由
+[#19](https://github.com/Duang777/drove/issues/19) 跟踪，Web attach 和终端 UI
+由 [#20](https://github.com/Duang777/drove/issues/20) 跟踪。32 会话实测结果见
+[技术笔记](docs/technical-notes.md#9-terminal-actor-32-session-benchmark)。
 
 ### 会话级注入
 
@@ -215,14 +252,13 @@ npm run dev
 
 已批准的 MVP 是 [Epic #31：黑匣子 + 塔台](https://github.com/Duang777/drove/issues/31)。
 
-1. [#14](https://github.com/Duang777/drove/issues/14) 屏幕模型收尾，包括 `drove explain`
-2. [#19](https://github.com/Duang777/drove/issues/19) WebSocket 终端流
-3. [#25](https://github.com/Duang777/drove/issues/25) 回放时间线
-4. [#20](https://github.com/Duang777/drove/issues/20) Web 实时终端与回放
-5. [#26](https://github.com/Duang777/drove/issues/26) 塔台网格
-6. [#21](https://github.com/Duang777/drove/issues/21) unix socket、Host 校验、cookie、令牌轮换
-7. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准 / 拒绝 / 回复
-8. [#16](https://github.com/Duang777/drove/issues/16) 原生 resume 与更温和的停止
+1. [#19](https://github.com/Duang777/drove/issues/19) WebSocket 终端流
+2. [#25](https://github.com/Duang777/drove/issues/25) 回放时间线
+3. [#20](https://github.com/Duang777/drove/issues/20) Web 实时终端与回放
+4. [#26](https://github.com/Duang777/drove/issues/26) 塔台网格
+5. [#21](https://github.com/Duang777/drove/issues/21) unix socket、Host 校验、cookie、令牌轮换
+6. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准 / 拒绝 / 回复
+7. [#16](https://github.com/Duang777/drove/issues/16) 原生 resume 与更温和的停止
 
 MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18) 的 shim，然后是 [#29](https://github.com/Duang777/drove/issues/29) 离开简报、[#30](https://github.com/Duang777/drove/issues/30) 全文搜索、[#23](https://github.com/Duang777/drove/issues/23) worktree。[#22](https://github.com/Duang777/drove/issues/22) 结构化状态源和 [#24](https://github.com/Duang777/drove/issues/24) 持久 hook 安装器推迟。
 
@@ -243,6 +279,7 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 - 同一 OS 用户能读到令牌文件。令牌不防本机上的其他进程，也不防 agent 自己。
 - 输入审计不保存正文。原始输出可能含有源码和密钥，默认 30 天后删除附件。
 - 输出流里的 signal token 会按等长方式打码。
+- `drove explain` 的 live screen 没有通用密钥扫描，只在会话 attached 时返回。
 - 没有自动批准。手机上的批准动作在 [#28](https://github.com/Duang777/drove/issues/28)，默认也不会自动同意。
 
 设计说明在 [RFC-001 的安全考虑](docs/rfc-001-agent-state-and-control.md)。仓库没有单独的威胁模型文件。
@@ -256,7 +293,7 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 | [spec 006](specs/006-hook-backed-state-detection/spec.md) | hook 状态检测 |
 | [spec 008](specs/008-session-signal-injection/spec.md) | 按会话注入 |
 | [spec 009](specs/009-raw-output-chunks/spec.md) | 原始字节与保留期 |
-| [spec 010](specs/010-terminal-screen-detection/spec.md) | 屏幕检测，实现进行中 |
+| [spec 010](specs/010-terminal-screen-detection/spec.md) | 屏幕检测、查询应答和解释命令 |
 | [技术笔记](docs/technical-notes.md) | 阶段性阅读笔记。文首说明前六节不代表当前主干 |
 | [AGENTS.md](AGENTS.md) | 目录职责和工程约束 |
 
