@@ -118,23 +118,23 @@
 
 ## Web experience
 
-- [ ] `/?agent=<id>` opens the detail view without a new router.
-- [ ] Browser Back returns to the fleet without a full reload.
-- [ ] Selecting a fleet row opens its detail view.
+- [x] `/?agent=<id>` opens the detail view without a new router.
+- [x] Browser Back returns to the fleet without a full reload.
+- [x] Selecting a fleet row opens its detail view.
 - [ ] The detail header shows identity, state, working directory, and
   connection status.
-- [ ] The terminal is the primary visual area.
-- [ ] The playback rail shows state spans and Blocked markers.
-- [ ] Controls cover live, replay, seek, play, pause, speed, retry, and
+- [x] The terminal is the primary visual area.
+- [x] The playback rail shows state spans and Blocked markers.
+- [x] Controls cover live, replay, seek, play, pause, speed, retry, and
   go-live actions.
-- [ ] Loading, reconnecting, preview, expired, local-limit, and error states
+- [x] Loading, reconnecting, preview, expired, local-limit, and error states
   are visible.
-- [ ] Icon buttons use Lucide icons and have accessible names.
-- [ ] Focus is visible and controls remain at least 40 px.
-- [ ] Reduced-motion preferences disable nonessential transitions.
-- [ ] Desktop, 375 px, and 320 px layouts contain all text and controls.
-- [ ] The page has no horizontal overflow.
-- [ ] A wide replay terminal scrolls inside its own viewport.
+- [x] Icon buttons use Lucide icons and have accessible names.
+- [x] Focus is visible and controls remain at least 40 px.
+- [x] Reduced-motion preferences disable nonessential transitions.
+- [x] Desktop, 375 px, and 320 px layouts contain all text and controls.
+- [x] The page has no horizontal overflow.
+- [x] A wide replay terminal scrolls inside its own viewport.
 
 ## Privacy and compatibility
 
@@ -155,8 +155,8 @@
 - [x] A pseudo-terminal attach acceptance test passes.
 - [x] `SessionTape` property and limit tests pass.
 - [x] Controller fake-clock, reconnect, seek, and disposal tests pass.
-- [ ] Browser tests pass for desktop, 375 px, and 320 px viewports.
-- [ ] A real daemon and PTY pass live, input, resize, reconnect, and replay
+- [x] Browser tests pass for desktop, 375 px, and 320 px viewports.
+- [x] A real daemon and PTY pass live, input, resize, reconnect, and replay
   acceptance.
 - [x] Focused packages pass 20 race-enabled repetitions.
 - [x] `go test ./... -race -count=1` passes.

@@ -46,6 +46,7 @@ describe('TerminalSessionController', () => {
 
     write.resolve()
     await delivered
+    await firstStream.emit(caughtUpMessage('raw', 3n, 2n))
     firstStream.fail(new Error('connection lost'))
 
     await vi.waitFor(() => {
@@ -61,7 +62,7 @@ describe('TerminalSessionController', () => {
         viewport: { rows: 40, columns: 120 },
         start: {
           kind: 'cursor',
-          cursor: { seq: decimalString(2n), next_offset: decimalString(2n) },
+          cursor: { seq: decimalString(3n), next_offset: decimalString(2n) },
         },
       },
       {
@@ -77,6 +78,18 @@ describe('TerminalSessionController', () => {
 
     await firstStream.emit(outputMessage(3n, 2n, [0x21]))
     expect(live.writes).toHaveLength(1)
+  })
+
+  it('rejects a raw caught_up cursor that skips unapplied output', async () => {
+    const fixture = controllerFixture()
+    await fixture.controller.start()
+    const stream = fixture.streams[0]
+    if (stream === undefined) throw new Error('expected initial stream')
+
+    await stream.emit(outputMessage(2n, 0n, [0x68, 0x69]))
+    await expect(
+      stream.emit(caughtUpMessage('raw', 3n, 3n)),
+    ).rejects.toThrow('does not match locally applied output')
   })
 
   it('enables serialized UTF-8 input only after raw caught_up and applies resize only from durable records', async () => {

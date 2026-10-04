@@ -491,7 +491,10 @@ export class TerminalSessionController implements TerminalControllerStore {
       }
       case 'caught_up':
         if (message.mode === 'raw') {
-          requireCursorMatch(this.rawCursor, message.cursor, 'raw')
+          this.rawCursor = advanceRawCaughtUpCursor(
+            this.rawCursor,
+            message.cursor,
+          )
           this.rawCaughtUp = true
           this.update({
             connection: 'live',
@@ -1108,7 +1111,7 @@ function laterTransportCursor(
 function requireCursorMatch(
   applied: TerminalCursor,
   caughtUp: TerminalCursor,
-  mode: 'raw' | 'events',
+  mode: 'events',
 ): void {
   if (
     applied.seq !== caughtUp.seq ||
@@ -1118,6 +1121,21 @@ function requireCursorMatch(
       `Terminal ${mode} caught_up cursor does not match locally applied messages`,
     )
   }
+}
+
+function advanceRawCaughtUpCursor(
+  applied: TerminalCursor,
+  caughtUp: TerminalCursor,
+): TerminalCursor {
+  if (
+    BigInt(caughtUp.seq) < BigInt(applied.seq) ||
+    caughtUp.next_offset !== applied.next_offset
+  ) {
+    throw new Error(
+      'Terminal raw caught_up cursor does not match locally applied output',
+    )
+  }
+  return cloneTransportCursor(caughtUp)
 }
 
 function requireTapeAcceptance(result: TapeRecordResult): void {
