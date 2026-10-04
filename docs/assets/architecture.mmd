@@ -1,0 +1,20 @@
+flowchart LR
+  cli["drove CLI"]
+  web["web/ 开发骨架"]
+  daemon["droved"]
+  session["session"]
+  detect["detect"]
+  store["SQLite 事件日志"]
+  pty["PTY"]
+  agent["claude / codex / 可执行文件"]
+  hook["drove hook"]
+
+  cli -->|"REST + Bearer"| daemon
+  web -->|"Vite 代理 /api 与 /ws"| daemon
+  daemon --> session
+  session --> detect
+  session --> store
+  session --> pty
+  pty --> agent
+  agent -->|"DROVE_SIGNAL_*"| hook
+  hook -->|"loopback + 会话 token"| daemon

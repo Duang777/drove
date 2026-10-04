@@ -52,28 +52,12 @@ The recorder works today: `drove log` replays bytes. The tower grid, scrubbable 
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  cli["drove CLI"]
-  web["web/ dev skeleton"]
-  daemon["droved"]
-  session["session"]
-  detect["detect"]
-  store["SQLite event log"]
-  pty["PTY"]
-  agent["claude / codex / executable"]
-  hook["drove hook"]
-
-  cli -->|"REST + Bearer"| daemon
-  web -->|"Vite proxy for /api and /ws"| daemon
-  daemon --> session
-  session --> detect
-  session --> store
-  session --> pty
-  pty --> agent
-  agent -->|"DROVE_SIGNAL_*"| hook
-  hook -->|"loopback + session token"| daemon
-```
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture.en-dark.png">
+    <img alt="Architecture. drove CLI connects to droved over REST with a bearer token, and the web skeleton connects through the Vite proxy. droved owns the session. The session connects to detect, the SQLite event log, and the PTY. The PTY runs claude, codex, or another executable. The agent reaches drove hook through DROVE_SIGNAL variables, and the hook calls back to droved on loopback with the session token." src="docs/assets/architecture.en.png" width="720">
+  </picture>
+</p>
 
 The CLI is a short-lived client. Once started, `droved` owns the PTY. State and output are written to SQLite before they are published to WebSocket subscribers. Vendor-specific behavior stays in `internal/adapter`.
 
