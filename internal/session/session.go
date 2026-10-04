@@ -18,6 +18,7 @@ import (
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
 )
@@ -147,6 +148,7 @@ type Manager struct {
 	hub       *event.Hub
 	store     *store.Store
 	committer *committer
+	archive   *recording.Archive
 
 	signalOrigin     string
 	originConfigured bool
@@ -199,6 +201,7 @@ func NewManager(
 	for _, option := range options {
 		option(manager)
 	}
+	manager.archive = recording.NewArchive(st, manager.committer)
 	return manager
 }
 
@@ -354,10 +357,12 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			string(payload),
 		)},
 	); err != nil {
+		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
 		return nil, errors.Join(
 			fmt.Errorf("session: persist creation: %w", err),
+			outputErr,
 			cleanupErr,
 		)
 	}
@@ -381,6 +386,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		OnOutputEnd: func(offset uint64) {
 			<-running.callbacksReady
 			_ = running.output.End(offset)
+			_ = running.output.Close()
 			if running.terminal != nil {
 				_ = running.terminal.Close()
 			}
@@ -407,9 +413,10 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		m.detach(id, running)
 		close(running.signalReady)
 		close(running.callbacksReady)
+		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-		return nil, errors.Join(startErr, commitErr, cleanupErr)
+		return nil, errors.Join(startErr, commitErr, outputErr, cleanupErr)
 	}
 
 	m.mu.Lock()
@@ -442,13 +449,19 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			commitErr = running.observer.Terminate(observation)
 		}
 		m.detach(id, running)
-		running.output.failed = true
+		outputErr := running.output.Close()
 		close(running.signalReady)
 		close(running.callbacksReady)
 		closeErr := sess.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-		return nil, errors.Join(startErr, commitErr, closeErr, cleanupErr)
+		return nil, errors.Join(
+			startErr,
+			commitErr,
+			outputErr,
+			closeErr,
+			cleanupErr,
+		)
 	}
 	m.mu.Lock()
 	running.terminal = terminalActor
@@ -524,6 +537,18 @@ func (m *Manager) Close() error {
 					closeErrors,
 					fmt.Errorf("session: close agent %q: %w", item.id, err),
 				)
+			}
+			if item.session.output != nil {
+				if err := item.session.output.Close(); err != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf(
+							"session: close recording for agent %q: %w",
+							item.id,
+							err,
+						),
+					)
+				}
 			}
 			if item.session.terminal != nil {
 				if err := item.session.terminal.Close(); err != nil {
@@ -685,20 +710,92 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 	return rows, nil
 }
 
+// TailRaw opens an independently cancelable durable output and resize stream.
+func (m *Manager) TailRaw(
+	ctx context.Context,
+	sessionID string,
+	selector *recording.Selector,
+) (*recording.RawTail, error) {
+	tail, err := m.archive.TailRaw(
+		ctx,
+		sessionID,
+		selector,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("session: open raw recording tail: %w", err)
+	}
+	return tail, nil
+}
+
+// TailEvents opens an independently cancelable durable event stream.
+func (m *Manager) TailEvents(
+	ctx context.Context,
+	sessionID string,
+	selector *recording.Selector,
+) (*recording.EventTail, error) {
+	tail, err := m.archive.TailEvents(
+		ctx,
+		sessionID,
+		selector,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("session: open event recording tail: %w", err)
+	}
+	return tail, nil
+}
+
+// Timeline returns a captured state and output-retention projection.
+func (m *Manager) Timeline(
+	ctx context.Context,
+	sessionID string,
+) (recording.Timeline, error) {
+	timeline, err := m.archive.Timeline(ctx, sessionID)
+	if err != nil {
+		return recording.Timeline{}, fmt.Errorf(
+			"session: read recording timeline: %w",
+			err,
+		)
+	}
+	return timeline, nil
+}
+
+// BlockedOccurrence returns one one-based Blocked interval and lead-in cursor.
+func (m *Manager) BlockedOccurrence(
+	ctx context.Context,
+	sessionID string,
+	number int,
+) (recording.BlockedOccurrence, error) {
+	occurrence, err := m.archive.Blocked(ctx, sessionID, number)
+	if err != nil {
+		return recording.BlockedOccurrence{}, fmt.Errorf(
+			"session: read Blocked occurrence: %w",
+			err,
+		)
+	}
+	return occurrence, nil
+}
+
+// Frame reconstructs one exact bounded terminal frame from recording origin.
+func (m *Manager) Frame(
+	ctx context.Context,
+	sessionID string,
+	selector recording.Selector,
+) (recording.Frame, error) {
+	frame, err := m.archive.Frame(ctx, sessionID, &selector)
+	if err != nil {
+		return recording.Frame{}, fmt.Errorf(
+			"session: replay terminal frame: %w",
+			err,
+		)
+	}
+	return frame, nil
+}
+
 // SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。
 func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
-	if len(data) == 0 {
-		return InputResult{}, ErrInputEmpty
-	}
-	if len(data) > MaxInputBytes {
-		return InputResult{}, fmt.Errorf("%w: %d bytes", ErrInputTooLarge, len(data))
-	}
-	if !utf8.Valid(data) {
-		return InputResult{}, ErrInputNotUTF8
-	}
-	payload, err := json.Marshal(inputAuditPayload{Version: 1, Bytes: len(data)})
+	payload, err := validateInput(data)
 	if err != nil {
-		return InputResult{}, fmt.Errorf("session: encode input audit: %w", err)
+		return InputResult{}, err
 	}
 
 	m.mu.RLock()
@@ -761,7 +858,7 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	}
 	if _, err := m.committer.CommitEvents(
 		context.Background(),
-		[]event.Draft{event.NewAgentInputDraft(string(id), string(id), string(payload))},
+		[]event.Draft{event.NewAgentInputDraft(string(id), string(id), payload)},
 	); err != nil {
 		return result, fmt.Errorf(
 			"%w: agent %q received %d bytes; do not retry: %w",
@@ -774,16 +871,35 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	return result, nil
 }
 
+func validateInput(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "", ErrInputEmpty
+	}
+	if len(data) > MaxInputBytes {
+		return "", fmt.Errorf("%w: %d bytes", ErrInputTooLarge, len(data))
+	}
+	if !utf8.Valid(data) {
+		return "", ErrInputNotUTF8
+	}
+	payload, err := json.Marshal(inputAuditPayload{Version: 1, Bytes: len(data)})
+	if err != nil {
+		return "", fmt.Errorf("session: encode input audit: %w", err)
+	}
+	return string(payload), nil
+}
+
 // -- 内部回调 --
 
 // onExit 根据运行模式和停止原因记录终态，再移除 PTY。
 func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo) {
 	running.inputMu.Lock()
-	defer running.inputMu.Unlock()
-
 	cause, ok := m.claimExit(id, running)
+	running.inputMu.Unlock()
 	if !ok {
 		return
+	}
+	if running.output != nil {
+		_ = running.output.DetachAll()
 	}
 	if running.processExited != nil {
 		defer close(running.processExited)

@@ -95,6 +95,8 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 		return validateAgentID(row)
 	case event.TypeAgentSignal:
 		return p.applySignal(row)
+	case event.TypeAgentResized:
+		return p.applyResize(row)
 	case event.TypeOutput, event.TypeOutputChunk:
 		if row.SessionID == "" {
 			return nil
@@ -107,6 +109,20 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 	default:
 		return projectionError(row, "unknown event type %q", row.Type)
 	}
+}
+
+func (p *recoveryProjector) applyResize(row store.EventRow) error {
+	if row.SessionID == "" {
+		return projectionError(row, "resize event has empty session ID")
+	}
+	if err := validateAgentID(row); err != nil {
+		return err
+	}
+	if _, err := event.DecodeAgentResizedPayload(row.Payload); err != nil {
+		return projectionWrapError(row, "validate resize payload", err)
+	}
+	p.draft(row)
+	return nil
 }
 
 func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {

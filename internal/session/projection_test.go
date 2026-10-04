@@ -726,6 +726,42 @@ func TestRecoveryProjectorOrdersReconciliationByFirstEvent(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorAcceptsValidatedResizeWithoutChangingState(t *testing.T) {
+	projector := newRecoveryProjector()
+	base := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"generic"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentResized),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1,"rows":50,"columns":160,"output_offset":12}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	draft := projector.sessions["s1"]
+	if draft == nil || draft.state != agent.StatePending || draft.updatedAt != base {
+		t.Fatalf("resize changed recovered state: %+v", draft)
+	}
+	if projector.lastSeq != 2 || projector.report.ScannedEvents != 2 {
+		t.Fatalf("projector position = (%d, %d)", projector.lastSeq, projector.report.ScannedEvents)
+	}
+}
+
 func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	created := func(seq uint64) store.EventRow {
@@ -783,6 +819,11 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "empty session ID",
 		},
 		{
+			name:    "empty resize session",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentResized)}},
+			wantErr: "empty session ID",
+		},
+		{
 			name:    "mismatched agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeOutput), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
@@ -796,6 +837,23 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			name:    "mismatched signal agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentSignal), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
+		},
+		{
+			name:    "mismatched resize agent",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentResized), SessionID: "s1", AgentID: "a2"}},
+			wantErr: "does not match",
+		},
+		{
+			name: "malformed resize payload",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeAgentResized),
+				SessionID: "s1",
+				AgentID:   "s1",
+				Payload:   `{"version":1,"rows":0,"columns":120}`,
+			}},
+			wantErr: "validate resize payload",
 		},
 		{
 			name: "malformed known signal payload",

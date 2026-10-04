@@ -3,7 +3,7 @@
 ## 职责
 
 **CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log /
-explain / stop / version），所有会话操作都经 `internal/client` 与常驻 daemon
+timeline / explain / stop / version），所有会话操作都经 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
 
 ## 关键设计
@@ -25,6 +25,8 @@ explain / stop / version），所有会话操作都经 `internal/client` 与常�
 - `drove explain <id>` 按时间顺序打印类型化决策；`--limit` 限制最近事件数，
   `--json` 保持 stdout 仅含响应 JSON。只有 attached snapshot 存在时才打印
   `ephemeral redacted current screen` 标签和受限行视图。
+- `drove timeline <id>` 打印状态区间和一基 Blocked 跳转列表；`--json` 原样输出
+  类型化 timeline 响应。CLI 在本阶段不执行终端播放。
 - 每次命令从 DataDir 读取控制令牌后调用 `client.EnsureDaemon`；仅网络不可达时后台拉起 `droved`，认证失败直接返回。
 - `version` 子命令输出 `internal/version` 注入信息。
 

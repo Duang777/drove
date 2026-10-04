@@ -199,7 +199,7 @@ func TestSessionChildObservesInitialSize(t *testing.T) {
 }
 
 func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
-	outputs := make(chan outputRecord, 4)
+	outputs := make(chan outputRecord)
 	outputEnds := make(chan uint64, 2)
 	exits := make(chan ExitInfo, 2)
 

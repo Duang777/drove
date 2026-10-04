@@ -666,6 +666,112 @@ func TestCommitterRejectsInvalidAgentChangeWithoutFailing(t *testing.T) {
 	}
 }
 
+func TestCommitterClockAdvancesOnlyAfterDurableAppend(t *testing.T) {
+	st := &blockingCommitStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	committer := newCommitter(0, st, event.NewHub(0))
+	defer committer.Close()
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := committer.CommitEvents(
+			context.Background(),
+			[]event.Draft{event.NewOutputDraft("session", "session", "durable")},
+		)
+		result <- err
+	}()
+
+	select {
+	case <-st.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for append")
+	}
+	if high := committer.HighWatermark(); high != 0 {
+		t.Fatalf("high watermark before append commit = %d, want 0", high)
+	}
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := committer.WaitForCommit(waitCtx, 0); !errors.Is(
+		err,
+		context.DeadlineExceeded,
+	) {
+		t.Fatalf("wait before durable append error = %v, want deadline", err)
+	}
+
+	close(st.release)
+	if err := <-result; err != nil {
+		t.Fatalf("commit events: %v", err)
+	}
+	high, err := committer.WaitForCommit(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("wait after durable append: %v", err)
+	}
+	if high != 1 || committer.HighWatermark() != 1 {
+		t.Fatalf("clock high watermark = %d / %d, want 1", high, committer.HighWatermark())
+	}
+}
+
+func TestCommitClockDoesNotMissRegistrationRace(t *testing.T) {
+	for iteration := 0; iteration < 200; iteration++ {
+		clock := newCommitClock(0)
+		result := make(chan error, 1)
+		go func() {
+			high, err := clock.Wait(context.Background(), 0)
+			if err == nil && high != 1 {
+				err = fmt.Errorf("high watermark = %d, want 1", high)
+			}
+			result <- err
+		}()
+		clock.advance(1)
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("iteration %d: %v", iteration, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d missed commit wakeup", iteration)
+		}
+	}
+}
+
+func TestCommitterClockClosesWaitersOnCloseAndFailure(t *testing.T) {
+	t.Run("close", func(t *testing.T) {
+		committer := newCommitter(7, &memoryCommitStore{lastSeq: 7}, event.NewHub(0))
+		result := make(chan error, 1)
+		go func() {
+			_, err := committer.WaitForCommit(context.Background(), 7)
+			result <- err
+		}()
+		committer.Close()
+		if err := <-result; !errors.Is(err, errCommitterClosed) {
+			t.Fatalf("close waiter error = %v, want errCommitterClosed", err)
+		}
+	})
+
+	t.Run("failure", func(t *testing.T) {
+		st := &memoryCommitStore{appendErr: errors.New("disk unavailable")}
+		committer := newCommitter(0, st, event.NewHub(0))
+		defer committer.Close()
+		result := make(chan error, 1)
+		go func() {
+			_, err := committer.WaitForCommit(context.Background(), 0)
+			result <- err
+		}()
+		if _, err := committer.CommitEvents(
+			context.Background(),
+			[]event.Draft{event.NewOutputDraft("session", "session", "failed")},
+		); err == nil {
+			t.Fatal("commit unexpectedly succeeded")
+		}
+		if err := <-result; !errors.Is(err, errCommitterFailed) {
+			t.Fatalf("failure waiter error = %v, want errCommitterFailed", err)
+		}
+	})
+}
+
 type memoryCommitStore struct {
 	mu        sync.Mutex
 	lastSeq   uint64
