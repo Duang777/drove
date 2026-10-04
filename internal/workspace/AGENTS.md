@@ -23,7 +23,11 @@
   `force` 可显式放宽这些检查。删除前必须先原子持久化带 operation ID 的 removal
   intent。物理删除完成后保留 sidecar，直到 session tombstone durable 后由
   `AcknowledgeRemoval` 校验 token 并删除。`ReconcileRemovals` 在重启时收敛 path 与
-  Git registration 的四种组合。清理始终保留分支。
+  Git registration 的四种组合。非强制 intent 每次继续前都重新检查；路径存在但
+  registration 丢失，或路径丢失但 registration 为 detached 时保留 intent 并
+  fail-stop。清理始终保留分支。
+- Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
+  因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。未注册残留目录通过已验证的 `os.Root` 相对操作删除，任一中间
   symlink 或目录替换都会使回滚失败。

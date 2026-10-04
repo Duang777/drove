@@ -228,6 +228,28 @@ func TestBootstrapRejectsWorkspaceInitializationFailure(t *testing.T) {
 	}
 }
 
+func TestBootstrapWithoutManagedWorkspacesDoesNotRequireGit(t *testing.T) {
+	st := newTestStore(t)
+	dataDir := t.TempDir()
+	t.Setenv("PATH", t.TempDir())
+
+	recovered, err := Bootstrap(
+		context.Background(),
+		adapter.NewRegistry(),
+		st,
+		WithWorkspaces(dataDir),
+	)
+	if err != nil {
+		t.Fatalf("bootstrap without Git: %v", err)
+	}
+	if recovered == nil || recovered.Manager == nil {
+		t.Fatalf("bootstrap result = %+v", recovered)
+	}
+	if err := recovered.Manager.Close(); err != nil {
+		t.Fatalf("close recovered manager: %v", err)
+	}
+}
+
 func TestStartReservesWorkspaceBeforePrepareCompletes(t *testing.T) {
 	manager, _ := newTestManager(t)
 	prepareStarted := make(chan struct{})
@@ -338,9 +360,46 @@ func TestCleanupWorkspacePreventsConcurrentResume(t *testing.T) {
 	) {
 		t.Fatalf("resume during cleanup error = %v, want ErrResumeConflict", err)
 	}
+	status, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status during cleanup: %v", err)
+	}
+	if status.Resumable {
+		t.Fatalf("status during cleanup = %+v, want non-resumable", status)
+	}
 	close(releaseCleanup)
 	if err := <-result; err != nil {
 		t.Fatalf("cleanup workspace: %v", err)
+	}
+}
+
+func TestCleanupWorkspaceAcceptsCompletedRemovalWithCommandError(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := "11111111-1111-4111-8111-111111111111"
+	commandErr := errors.New("git exited after removing the worktree")
+	workspaces := &fakeWorkspaceLifecycle{
+		cleanupState: workspace.RemovalComplete,
+		cleanupErr:   commandErr,
+		cleanupResult: workspace.Workspace{
+			AgentID: id,
+			Path:    "/tmp/removed-worktree",
+			Branch:  "feature/cleanup",
+		},
+	}
+	manager.workspaces = workspaces
+
+	removed, err := manager.CleanupWorkspace(context.Background(), id, false)
+	if err != nil {
+		t.Fatalf("cleanup completed workspace: %v", err)
+	}
+	if removed.Path != workspaces.cleanupResult.Path {
+		t.Fatalf("removed workspace = %+v", removed)
+	}
+	if workspaces.acknowledgeCount != 1 {
+		t.Fatalf(
+			"completed removal acknowledgement count = %d, want 1",
+			workspaces.acknowledgeCount,
+		)
 	}
 }
 

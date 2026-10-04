@@ -1014,6 +1014,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	m.mu.RLock()
 	sess, _ := m.sessions[id]
 	_, reserved := m.resuming[id]
+	_, cleaning := m.cleaning[id]
 	var process processSession
 	hookStatus := detect.HookDetached
 	if sess != nil {
@@ -1029,6 +1030,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	resumable := state == agent.StateStopped &&
 		sess == nil &&
 		!reserved &&
+		!cleaning &&
 		!workspaceState.removalPending &&
 		!workspaceState.removed &&
 		ref != "" &&

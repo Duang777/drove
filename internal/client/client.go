@@ -46,14 +46,34 @@ func (e *responseError) Error() string {
 // IsUserError reports whether the daemon rejected a user-correctable request.
 func IsUserError(err error) bool {
 	var responseErr *responseError
-	if !errors.As(err, &responseErr) {
+	if errors.As(err, &responseErr) {
+		switch responseErr.statusCode {
+		case http.StatusBadRequest,
+			http.StatusNotFound,
+			http.StatusConflict,
+			http.StatusRequestEntityTooLarge:
+			return true
+		}
+	}
+
+	var terminalErr *TerminalStreamError
+	if !errors.As(err, &terminalErr) {
 		return false
 	}
-	switch responseErr.statusCode {
-	case http.StatusBadRequest,
-		http.StatusNotFound,
-		http.StatusConflict,
-		http.StatusRequestEntityTooLarge:
+	switch terminalErr.Code {
+	case "unknown_agent",
+		"invalid_cursor",
+		"output_expired",
+		"not_attached",
+		"attachment_closed",
+		"not_writable",
+		"empty_input",
+		"input_too_large",
+		"invalid_utf8",
+		"input_backpressure",
+		"not_subscribed",
+		"duplicate_subscription",
+		"request_limit":
 		return true
 	default:
 		return false

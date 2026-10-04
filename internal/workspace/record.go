@@ -103,6 +103,13 @@ func (m *Manager) installWorkspaceRecord(
 	if err != nil {
 		return fmt.Errorf("workspace: encode record: %w", err)
 	}
+	if len(raw) > maxWorkspaceRecordSize {
+		return fmt.Errorf(
+			"workspace: encoded record %q exceeds %d bytes",
+			recordPath,
+			maxWorkspaceRecordSize,
+		)
+	}
 
 	directory := filepath.Dir(recordPath)
 	file, err := os.CreateTemp(

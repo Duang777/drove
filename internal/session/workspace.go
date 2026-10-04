@@ -167,6 +167,7 @@ func (m *Manager) CleanupWorkspace(
 			removalErr,
 		)
 	case workspace.RemovalComplete:
+		removalErr = nil
 	default:
 		return workspace.Workspace{}, fmt.Errorf(
 			"session: cleanup workspace returned invalid removal state %d",

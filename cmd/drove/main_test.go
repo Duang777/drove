@@ -223,6 +223,29 @@ func TestDaemonBadRequestIsUsageError(t *testing.T) {
 	}
 }
 
+func TestTerminalStreamRequestErrorIsUsageError(t *testing.T) {
+	err := fmt.Errorf(
+		"attach failed: %w",
+		&client.TerminalStreamError{
+			Code:    "unknown_agent",
+			Message: "agent does not exist",
+		},
+	)
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestTerminalStreamInternalErrorUsesRuntimeExitCode(t *testing.T) {
+	err := &client.TerminalStreamError{
+		Code:    "internal_error",
+		Message: "terminal failed",
+	}
+	if got := commandExitCode(err); got != exitErr {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitErr, err)
+	}
+}
+
 func TestRuntimeFailureUsesRuntimeExitCode(t *testing.T) {
 	err := errors.New("daemon unavailable")
 	if got := commandExitCode(err); got != exitErr {

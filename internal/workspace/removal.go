@@ -81,7 +81,7 @@ func (m *Manager) remove(
 	removal := Removal{Workspace: record.workspace()}
 	if record.Removal != nil {
 		removal.operationID = record.Removal.OperationID
-		state, removalErr := m.completeRemoval(ctx, record)
+		state, removalErr := m.resumePendingRemoval(ctx, record)
 		return RemovalResult{Removal: removal, State: state}, removalErr
 	}
 
@@ -147,27 +147,10 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 		if record.Removal == nil {
 			continue
 		}
-		facts, err := m.removalFacts(ctx, record)
-		if err != nil {
-			return nil, err
+		state, err := m.resumePendingRemoval(ctx, record)
+		if state == RemovalUnchanged && errors.Is(err, ErrDirty) {
+			continue
 		}
-		if facts.pathExists && facts.registered && !record.Removal.Force {
-			if err := m.validateRemovalSafety(ctx, record, facts); err != nil {
-				if !errors.Is(err, ErrDirty) {
-					return nil, fmt.Errorf(
-						"workspace: revalidate pending removal for agent %q: %w",
-						record.AgentID,
-						err,
-					)
-				}
-				record.Removal = nil
-				if replaceErr := m.replaceWorkspaceRecord(record); replaceErr != nil {
-					return nil, errors.Join(err, replaceErr)
-				}
-				continue
-			}
-		}
-		state, err := m.completeRemoval(ctx, record)
 		if state != RemovalComplete {
 			if err != nil {
 				return nil, err
@@ -226,8 +209,9 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 }
 
 type removalFacts struct {
-	pathExists bool
-	registered bool
+	pathExists   bool
+	registered   bool
+	registration registeredWorktree
 }
 
 func (m *Manager) removalFacts(
@@ -250,11 +234,19 @@ func (m *Manager) removalFacts(
 			record.Path,
 		)
 	}
-	registered, err := m.worktreeRegistered(ctx, record.Repository, record.Path)
+	registration, registered, err := m.worktreeRegistration(
+		ctx,
+		record.Repository,
+		record.Path,
+	)
 	if err != nil {
 		return removalFacts{}, err
 	}
-	return removalFacts{pathExists: pathExists, registered: registered}, nil
+	return removalFacts{
+		pathExists:   pathExists,
+		registered:   registered,
+		registration: registration,
+	}, nil
 }
 
 func (m *Manager) validateRemovalSafety(
@@ -262,6 +254,9 @@ func (m *Manager) validateRemovalSafety(
 	record workspaceRecord,
 	facts removalFacts,
 ) error {
+	if !facts.pathExists && !facts.registered {
+		return nil
+	}
 	if !record.ProtectionKnown {
 		return fmt.Errorf(
 			"%w: workspace protection provenance is unknown",
@@ -272,6 +267,13 @@ func (m *Manager) validateRemovalSafety(
 		return fmt.Errorf(
 			"%w: workspace path is no longer registered",
 			ErrDirty,
+		)
+	}
+	if facts.registered && facts.registration.detached {
+		return fmt.Errorf(
+			"%w: detached HEAD requires force for %s",
+			ErrDirty,
+			record.Path,
 		)
 	}
 	if !facts.pathExists {
@@ -301,6 +303,15 @@ func (m *Manager) completeRemoval(
 	facts, err := m.removalFacts(ctx, record)
 	if err != nil {
 		return RemovalPending, err
+	}
+	if !record.Removal.Force {
+		if err := m.validateRemovalSafety(ctx, record, facts); err != nil {
+			return RemovalPending, fmt.Errorf(
+				"workspace: revalidate pending removal for agent %q: %w",
+				record.AgentID,
+				err,
+			)
+		}
 	}
 	switch {
 	case !facts.pathExists && !facts.registered:
@@ -356,6 +367,53 @@ func (m *Manager) completeRemoval(
 		)
 	}
 	return RemovalComplete, nil
+}
+
+func (m *Manager) resumePendingRemoval(
+	ctx context.Context,
+	record workspaceRecord,
+) (RemovalState, error) {
+	facts, err := m.removalFacts(ctx, record)
+	if err != nil {
+		return RemovalPending, err
+	}
+	if !record.Removal.Force {
+		if safetyErr := m.validateRemovalSafety(ctx, record, facts); safetyErr != nil {
+			return m.rejectPendingRemoval(record, facts, safetyErr)
+		}
+	}
+	state, removalErr := m.completeRemoval(ctx, record)
+	if state != RemovalPending || !errors.Is(removalErr, ErrDirty) {
+		return state, removalErr
+	}
+	current, factsErr := m.removalFacts(ctx, record)
+	if factsErr != nil {
+		return RemovalPending, errors.Join(removalErr, factsErr)
+	}
+	state, safetyErr := m.rejectPendingRemoval(record, current, removalErr)
+	return state, safetyErr
+}
+
+func (m *Manager) rejectPendingRemoval(
+	record workspaceRecord,
+	facts removalFacts,
+	safetyErr error,
+) (RemovalState, error) {
+	wrapped := fmt.Errorf(
+		"workspace: revalidate pending removal for agent %q: %w",
+		record.AgentID,
+		safetyErr,
+	)
+	if !errors.Is(safetyErr, ErrDirty) ||
+		!facts.pathExists ||
+		!facts.registered {
+		return RemovalPending, wrapped
+	}
+	record.Removal = nil
+	if err := m.replaceWorkspaceRecord(record); err != nil {
+		return RemovalPending, errors.Join(wrapped, err)
+	}
+	return RemovalUnchanged, wrapped
 }
 
 func (m *Manager) classifyRemovalFailure(

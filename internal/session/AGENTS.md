@@ -48,8 +48,9 @@
   后将 reservation 与 Agent/PTY 登记原子交接。durable 后的发布失败保留 reservation
   直到 daemon fail-stop，防止清理已由事件拥有的目录。
 - `CleanupWorkspace` 只接受终态或无会话的 Agent，并在执行 Git 清理期间登记
-  reservation 与 completion channel。`Resume` 必须拒绝同一 Agent，避免恢复进程
-  与目录删除并发。
+  reservation 与 completion channel。`Resume` 必须拒绝同一 Agent，且
+  `Status.Resumable` 在 reservation 存续期间必须为 false，避免恢复进程与目录删除
+  并发。
 - workspace 先持久化 removal intent，再执行物理删除。已登记 Agent 通过 typed
   Committer 提交 `session_lifecycle(workspace_removed)`。Store durable 后，
   `AcknowledgeRemoval` 才删除 sidecar。物理删除 pending 时，运行时立即关闭 Resume。

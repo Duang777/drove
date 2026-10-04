@@ -70,13 +70,9 @@ func New(dataDir string) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspace: resolve data directory %q: %w", dataDir, err)
 	}
-	git, err := exec.LookPath("git")
-	if err != nil {
-		return nil, fmt.Errorf("workspace: find git: %w", err)
-	}
 	return &Manager{
 		root: filepath.Join(filepath.Clean(absolute), worktreeDirectory),
-		git:  git,
+		git:  "git",
 	}, nil
 }
 
@@ -617,10 +613,17 @@ func (m *Manager) repositoryRoot(
 	return resolved, nil
 }
 
-func (m *Manager) registeredWorktreePaths(
+type registeredWorktree struct {
+	path     string
+	head     string
+	branch   string
+	detached bool
+}
+
+func (m *Manager) registeredWorktrees(
 	ctx context.Context,
 	repository string,
-) ([]string, error) {
+) ([]registeredWorktree, error) {
 	output, err := m.run(
 		ctx,
 		"-C",
@@ -633,22 +636,73 @@ func (m *Manager) registeredWorktreePaths(
 	if err != nil {
 		return nil, fmt.Errorf("workspace: list Git worktrees: %w", err)
 	}
-	var paths []string
+	var (
+		worktrees []registeredWorktree
+		current   *registeredWorktree
+	)
 	for _, field := range strings.Split(string(output), "\x00") {
-		const prefix = "worktree "
-		if !strings.HasPrefix(field, prefix) {
+		if field == "" {
+			if current != nil {
+				worktrees = append(worktrees, *current)
+				current = nil
+			}
 			continue
 		}
-		path, err := resolvePath(strings.TrimPrefix(field, prefix))
-		if err != nil {
-			return nil, fmt.Errorf(
-				"workspace: resolve registered worktree path: %w",
-				err,
+		switch {
+		case strings.HasPrefix(field, "worktree "):
+			if current != nil {
+				return nil, errors.New(
+					"workspace: malformed Git worktree listing",
+				)
+			}
+			path, err := resolvePath(strings.TrimPrefix(field, "worktree "))
+			if err != nil {
+				return nil, fmt.Errorf(
+					"workspace: resolve registered worktree path: %w",
+					err,
+				)
+			}
+			current = &registeredWorktree{path: path}
+		case current == nil:
+			return nil, errors.New(
+				"workspace: malformed Git worktree listing",
 			)
+		case strings.HasPrefix(field, "HEAD "):
+			current.head = strings.TrimPrefix(field, "HEAD ")
+		case strings.HasPrefix(field, "branch "):
+			current.branch = strings.TrimPrefix(field, "branch ")
+		case field == "detached":
+			current.detached = true
 		}
-		paths = append(paths, path)
 	}
-	return paths, nil
+	if current != nil {
+		worktrees = append(worktrees, *current)
+	}
+	return worktrees, nil
+}
+
+func (m *Manager) worktreeRegistration(
+	ctx context.Context,
+	repository string,
+	path string,
+) (registeredWorktree, bool, error) {
+	worktrees, err := m.registeredWorktrees(ctx, repository)
+	if err != nil {
+		return registeredWorktree{}, false, err
+	}
+	path, err = resolvePath(path)
+	if err != nil {
+		return registeredWorktree{}, false, fmt.Errorf(
+			"workspace: resolve worktree path: %w",
+			err,
+		)
+	}
+	for _, registered := range worktrees {
+		if registered.path == path {
+			return registered, true, nil
+		}
+	}
+	return registeredWorktree{}, false, nil
 }
 
 func (m *Manager) worktreeRegistered(
@@ -656,20 +710,8 @@ func (m *Manager) worktreeRegistered(
 	repository string,
 	path string,
 ) (bool, error) {
-	paths, err := m.registeredWorktreePaths(ctx, repository)
-	if err != nil {
-		return false, err
-	}
-	path, err = resolvePath(path)
-	if err != nil {
-		return false, fmt.Errorf("workspace: resolve worktree path: %w", err)
-	}
-	for _, registered := range paths {
-		if registered == path {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, registered, err := m.worktreeRegistration(ctx, repository, path)
+	return registered, err
 }
 
 func (m *Manager) branchExists(

@@ -30,7 +30,9 @@
 - 自动拉起日志与控制令牌使用同一个 DataDir；缺失目录以 `0700` 创建，新日志文件使用
   `0600`，既有目录模式不自动修改。
 - 网络错误转换为 `ErrDaemonUnreachable`；daemon 返回的 400、404、409、413 由
-  `IsUserError` 识别为用户可纠正的请求错误，CLI 据此选择退出码。
+  `IsUserError` 识别为用户可纠正的请求错误。terminal stream 中 unknown agent、
+  not attached、invalid cursor 等可纠正 code 使用相同分类；internal/protocol
+  错误不降级。CLI 据此选择退出码。
 
 ## 约束
 

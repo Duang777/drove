@@ -15,6 +15,39 @@ import (
 const testAgentID = "11111111-1111-4111-8111-111111111111"
 const secondTestAgentID = "22222222-2222-4222-8222-222222222222"
 
+func TestInstallWorkspaceRecordRejectsOversizedEncoding(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	path := filepath.Join(
+		manager.root,
+		repositoryHash(repository),
+		testAgentID,
+	)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create record directory: %v", err)
+	}
+	record := newWorkspaceRecord(Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path:       path,
+		Branch:     strings.Repeat("b", maxWorkspaceRecordSize),
+	}, nil)
+
+	err = manager.installWorkspaceRecord(record, true)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("install oversized record error = %v", err)
+	}
+	if _, statErr := os.Lstat(workspaceRecordPath(path)); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("oversized record exists or inspect failed: %v", statErr)
+	}
+}
+
 func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	repository := newTestRepository(t)
 	if err := os.WriteFile(
@@ -722,6 +755,54 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
+func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "99999999-9999-4999-8999-999999999999",
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "tracked.txt"),
+		[]byte("changed after intent\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("dirty worktree: %v", err)
+	}
+
+	result, err := manager.Remove(context.Background(), prepared.AgentID, false)
+	if !errors.Is(err, ErrDirty) || result.State != RemovalUnchanged {
+		t.Fatalf("resume non-force removal = %+v, %v", result, err)
+	}
+	record, exists, err = manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal != nil {
+		t.Fatalf("record after rejected removal = %+v, exists=%v err=%v", record, exists, err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, "tracked.txt"),
+		"changed after intent\n",
+	)
+}
+
 func TestReconcileRemovalDeletesPresentUnregisteredPath(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
@@ -769,6 +850,158 @@ func TestReconcileRemovalDeletesPresentUnregisteredPath(t *testing.T) {
 	}
 	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
 		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
+func TestReconcileNonForceRemovalPreservesPresentUnregisteredPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+	saved := filepath.Join(t.TempDir(), "saved-worktree")
+	if err := os.Rename(prepared.Path, saved); err != nil {
+		t.Fatalf("move worktree path: %v", err)
+	}
+	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
+	if err := os.Rename(saved, prepared.Path); err != nil {
+		t.Fatalf("restore unregistered worktree path: %v", err)
+	}
+	marker := filepath.Join(prepared.Path, "new-local-data")
+	if err := os.WriteFile(marker, []byte("preserve\n"), 0o600); err != nil {
+		t.Fatalf("write replacement data: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(context.Background()); !errors.Is(
+		err,
+		ErrDirty,
+	) {
+		t.Fatalf("reconcile non-force unregistered path error = %v, want ErrDirty", err)
+	}
+	assertFileContents(t, marker, "preserve\n")
+	record, exists, err = manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal == nil {
+		t.Fatalf("record after failed reconciliation = %+v, exists=%v err=%v", record, exists, err)
+	}
+}
+
+func TestReconcileNonForceRemovalPreservesMissingDetachedRegistration(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	runGit(t, prepared.Path, "checkout", "--detach")
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "detached-only.txt"),
+		[]byte("last commit\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write detached commit: %v", err)
+	}
+	runGit(t, prepared.Path, "add", "detached-only.txt")
+	runGit(t, prepared.Path, "commit", "-m", "detached only")
+	detachedHead := strings.TrimSpace(runGit(t, prepared.Path, "rev-parse", "HEAD"))
+
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+	if err := os.RemoveAll(prepared.Path); err != nil {
+		t.Fatalf("remove detached worktree path: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(context.Background()); !errors.Is(
+		err,
+		ErrDirty,
+	) {
+		t.Fatalf("reconcile missing detached worktree error = %v, want ErrDirty", err)
+	}
+	porcelain := runGit(t, repository, "worktree", "list", "--porcelain")
+	if !strings.Contains(porcelain, prepared.Path) ||
+		!strings.Contains(porcelain, detachedHead) ||
+		!strings.Contains(porcelain, "detached") {
+		t.Fatalf("detached registration was not preserved:\n%s", porcelain)
+	}
+	record, exists, err = manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal == nil {
+		t.Fatalf("record after failed reconciliation = %+v, exists=%v err=%v", record, exists, err)
+	}
+}
+
+func TestReconcilePendingRemovalRequiresGit(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+		Force:       true,
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+
+	t.Setenv("PATH", t.TempDir())
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager without Git: %v", err)
+	}
+	if _, err := restarted.ReconcileRemovals(context.Background()); err == nil {
+		t.Fatal("pending removal reconciled without Git")
+	}
+	record, exists, err = restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal == nil {
+		t.Fatalf("pending record after failed reconciliation = %+v, exists=%v err=%v", record, exists, err)
 	}
 }
 
