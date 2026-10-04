@@ -18,6 +18,7 @@ import (
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
 )
@@ -705,6 +706,40 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 		rows[i].OutputAttachment = nil
 	}
 	return rows, nil
+}
+
+// TailRaw opens an independently cancelable durable output and resize stream.
+func (m *Manager) TailRaw(
+	ctx context.Context,
+	sessionID string,
+	selector *recording.Selector,
+) (*recording.RawTail, error) {
+	tail, err := recording.NewArchive(m.store, m.committer).TailRaw(
+		ctx,
+		sessionID,
+		selector,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("session: open raw recording tail: %w", err)
+	}
+	return tail, nil
+}
+
+// TailEvents opens an independently cancelable durable event stream.
+func (m *Manager) TailEvents(
+	ctx context.Context,
+	sessionID string,
+	selector *recording.Selector,
+) (*recording.EventTail, error) {
+	tail, err := recording.NewArchive(m.store, m.committer).TailEvents(
+		ctx,
+		sessionID,
+		selector,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("session: open event recording tail: %w", err)
+	}
+	return tail, nil
 }
 
 // SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。

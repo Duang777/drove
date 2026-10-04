@@ -13,6 +13,10 @@
 - sequence 是全局序号，在单个会话内允许稀疏；output offset 是会话局部且使用
   exclusive next-offset 语义。
 - range/tail 读取必须有行数和附件字节上限，不能跨网络等待持有数据库游标。
+- raw tail 只发持久化 `output.chunk` 字节和 `agent.resized`；event tail 发完整
+  envelope。两者固定初始 durable head，发出 caught-up 后再跟随 commit clock。
+- 缺失输出附件必须先返回类型化 `OutputExpiredError` 并终止该 tail，禁止跳过缺口
+  继续发送后续字节。
 - timeline 只依赖事件 envelope；输出附件过期后仍可读取。
 - frame 始终从 40x120 原点精确回放；可见 snapshot 不得充当可恢复 checkpoint。
 

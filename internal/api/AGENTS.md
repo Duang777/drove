@@ -21,6 +21,10 @@
   不接受控制面 token；请求 envelope 必须严格校验，只有已提交或重复的 delivery
   返回 204。
 - 每个 WebSocket 连接只有一个读协程和一个写协程；写协程独占事件、ack/error、ping/pong 和 close 帧。
+- 无子协议继续使用 v1；只有精确协商 `drove.v2` 才启用按 Agent 的 raw、events 和
+  snapshot 订阅。其它显式子协议在 upgrade 前拒绝。
+- v2 的普通出站帧共享 8 MiB 字节预算；溢出会取消该连接的全部订阅、丢弃未写帧，
+  通过保留控制槽发送各订阅最后成功写出的 cursor，并以 1013 关闭。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload
   含 Base64 正文，过期回放只含 offset/len 元数据。
 - 输入消息必须携带版本、连接内唯一 `request_id` 和 Agent ID；响应以同一 `request_id` 返回稳定 ack/error。

@@ -38,6 +38,8 @@
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
 - `Replay(sessionID)`：从 store 读取事件流供回放；仍保留的 `output.chunk` 附件被编码进
   Base64 payload，已过期的附件只返回 offset/len metadata。
+- `TailRaw` / `TailEvents` 只组合 recording archive 与全局 commit clock；每个调用
+  拥有独立取消域，不经过 Hub，也不把 Store 行暴露给 API。
 - `Explain(ctx, id, options)`：读取最多 200 条 `agent.signal` / `state_changed`
   envelope，解码为不透传原始 payload 的类型化摘要；仅同一 attached terminal actor
   可提供带采样时间的临时受限 screen view，退出认领或 detach 后不再返回 screen。

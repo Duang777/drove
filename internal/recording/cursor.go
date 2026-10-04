@@ -2,9 +2,11 @@
 package recording
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"time"
 )
@@ -94,8 +96,13 @@ func (c *Cursor) UnmarshalJSON(data []byte) error {
 	}
 	type cursorJSON Cursor
 	var decoded cursorJSON
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
 		return fmt.Errorf("recording: decode cursor: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("recording: cursor must contain one JSON object")
 	}
 	cursor := Cursor(decoded)
 	if err := cursor.Validate(); err != nil {
