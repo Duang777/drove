@@ -114,7 +114,39 @@ Commit:
 feat: observe committed codex approvals
 ```
 
-## Commit 4: documentation and acceptance
+## Commit 4: pre-persistence notification privacy
+
+Files:
+
+- `internal/term/osc9_sanitizer.go`
+- `internal/adapter/codex_notifications.go`
+- `internal/session/output.go`
+- `internal/session/signal.go`
+- related tests and `AGENTS.md` files
+
+Work:
+
+- Add a generic, length-preserving streaming OSC 9 body sanitizer.
+- Keep the three safe Codex prefixes in the adapter.
+- Enable sanitization only with the complete injected notification plan.
+- Prove body absence in Store attachments, Hub, replay, raw tail, explain,
+  logs, and errors.
+
+Verification:
+
+```bash
+go test -race ./internal/term ./internal/adapter ./internal/session
+go vet ./internal/term ./internal/adapter ./internal/session
+git diff --check
+```
+
+Commit:
+
+```text
+fix: redact codex terminal notification bodies
+```
+
+## Commit 5: documentation and acceptance
 
 Files:
 

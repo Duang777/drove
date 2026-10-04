@@ -33,7 +33,8 @@ For Codex sessions whose complete Drove injection plan is active:
 
 1. Inject the existing legacy `notify` command and an approval-only OSC 9
    configuration.
-2. Parse OSC 9 frames only after their output bytes are durable.
+2. Redact free-form OSC 9 bodies before persistence, then parse frames only
+   after the sanitized output bytes are durable.
 3. Normalize recognized approval messages into a fixed, redacted notify
    signal.
 4. Reuse the existing permission confirmation candidate to enter Blocked.
@@ -69,14 +70,34 @@ base arguments or request arguments set any owned key through `-c`,
 `ErrSignalInjectionConflict`. Session records the existing
 `skipped/argument_conflict` result and leaves all caller arguments unchanged.
 
-Only a complete applied plan enables terminal notification decoding. Claude,
-generic, configured-off, relay-unavailable, and conflict paths do not scan
-OSC 9.
+Only a complete applied plan enables terminal notification sanitization and
+decoding. Claude, generic, configured-off, relay-unavailable, and conflict
+paths do not scan or rewrite OSC 9.
+
+## Pre-persistence privacy
+
+`internal/term` provides a vendor-neutral streaming sanitizer for the same
+direct and tmux framing as the scanner. `internal/adapter` supplies the three
+Codex safe prefixes and constructs one sanitizer per injected session.
+`internal/session` applies it after signal-token redaction and before creating
+any `output.chunk`.
+
+The sanitizer:
+
+- preserves framing, non-OSC bytes, byte count, and output offsets;
+- preserves one complete allowlisted prefix, including its trailing space;
+- replaces every following body byte with `*`;
+- replaces every byte of an unknown OSC 9 body with `*`;
+- carries partial framing and prefixes across callbacks;
+- masks any unresolved body when the output stream ends.
+
+Original free-form OSC 9 bytes never enter a Store attachment, hydrated Hub
+payload, replay, raw tail, terminal snapshot, error, log, or explanation.
 
 ## Terminal framing
 
-`internal/term` owns a bounded stateful scanner over `CommittedChunk`. It
-accepts:
+`internal/term` owns a bounded stateful scanner over sanitized
+`CommittedChunk`. It accepts:
 
 - direct `ESC ] 9 ; <body> BEL`;
 - direct `ESC ] 9 ; <body> ESC \`;
@@ -87,7 +108,7 @@ Every byte boundary may split a frame. The scanner ignores non-OSC-9 control
 strings. Oversized, malformed, and incomplete frames produce no result and no
 error containing frame content. Reset discards an incomplete frame.
 
-Each accepted frame carries a copied private body plus committed provenance:
+Each accepted frame carries a copied redacted body plus committed provenance:
 
 - exclusive output offset at the frame terminator;
 - final committed output sequence for the containing callback batch;
@@ -175,7 +196,9 @@ Blocked transition.
 The output path is:
 
 ```text
-persist output.chunk batch
+redact signal token
+    -> sanitize OSC 9 free-form body when enabled
+    -> persist output.chunk batch
     -> feed the committed bytes to the terminal actor
     -> receive normalized terminal observations
     -> deliver pending output activity

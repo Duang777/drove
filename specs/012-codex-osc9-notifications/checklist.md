@@ -80,9 +80,13 @@
 
 ## Privacy
 
+- [x] Sanitization occurs before Store persistence and Hub publication.
+- [x] Sanitization preserves framing, byte count, and output offsets.
+- [x] Only adapter-provided fixed prefixes remain readable.
+- [x] Unknown and incomplete OSC 9 bodies are masked.
 - [x] OSC body is absent from signal and state payloads.
 - [x] OSC body is absent from errors and logs.
-- [x] OSC body is absent from replay and explain summaries.
+- [x] OSC body is absent from Store attachments, Hub, replay, raw tail, and explain.
 - [x] Terminal attribution is typed and bounded.
 - [x] No prompt, response, path, command, or server name is retained.
 

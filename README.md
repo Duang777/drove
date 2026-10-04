@@ -18,7 +18,7 @@
   <a href="LICENSE"><img alt="Apache-2.0" src="https://img.shields.io/github/license/Duang777/drove"></a>
 </p>
 
-Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、Codex，或任何一个可执行文件，把原始终端字节追加进 SQLite，并用同一套状态看它们。
+Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、Codex，或任何一个可执行文件，把终端字节追加进 SQLite，并用同一套状态看它们。
 
 黑匣子是已经能用的部分：`drove log` 回放字节，`drove timeline` 查看状态区间和 Blocked 跳转点。塔台网格、时间线拖动、推送和手机审批在 [Epic #31](https://github.com/Duang777/drove/issues/31)，还没有界面。仓库没有发布包，也没有 TUI。
 
@@ -35,12 +35,13 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | 每个 agent 一个 PTY，由 `droved` 持有 | 已落地 | `internal/pty` |
 | `init` `up` `resume` `ps` `log` `timeline` `explain` `stop` `send` `hook` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
 | Claude / Codex 按会话注入状态上报 | 已落地 | [#15](https://github.com/Duang777/drove/issues/15) |
-| 原始终端字节，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
+| 终端字节记录，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` 回放字节，`--plain` 去掉控制序列 | 已落地 | |
 | Unix 本地控制面、Host / Origin 防护、cookie 登录和令牌轮换 | 已落地 | [#21](https://github.com/Duang777/drove/issues/21) |
 | WebSocket v1 事件流与 v2 按会话终端流、输入、resize | 已落地 | [#19](https://github.com/Duang777/drove/issues/19) |
 | Web 开发骨架：列表、启动、停止、实时事件 | 已落地 | `web/` |
 | 终端屏幕仿真、查询应答、屏幕规则和 `drove explain` | 已落地 | [#14](https://github.com/Duang777/drove/issues/14)，[spec 010](specs/010-terminal-screen-detection/spec.md) |
+| Codex approval-only OSC 9 Blocked 候选 | 已落地 | [#40](https://github.com/Duang777/drove/issues/40)，[spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | 状态时间线、Blocked 跳转和精确终端帧 | 已落地 | [#25](https://github.com/Duang777/drove/issues/25) |
 | 塔台网格 | 规划中 | [#26](https://github.com/Duang777/drove/issues/26) |
 | 推送通知 | 规划中 | [#27](https://github.com/Duang777/drove/issues/27) |
@@ -132,7 +133,7 @@ drove up claude --hooks required
 
 1. **进程。** 启动失败和退出覆盖其他信号。交互会话结束为 `stopped`。`--oneshot` 成功退出为 `done`。
 2. **Claude command hook。** 第一个合法 hook 信号提交后，该会话进入 hook 权威。进入 Working、Blocked 或 Idle 候选由事件种类决定。Idle 有 1 秒确认窗口，后续活动可以取消它。
-3. **Codex notify。** 不进入 hook 权威，也不满足 `--hooks required`。只在 fallback 里作为可取消的 Idle 候选。
+3. **Codex notify 与 OSC 9。** legacy notify 只在 fallback 里作为可取消的 Idle 候选；approval-only OSC 9 只在 fallback 中作为需要 750 ms 确认的 Blocked 候选。两者都不进入 hook 权威，也不满足 `--hooks required`。
 4. **屏幕规则。** hook 还没激活时，fallback 使用 Claude 和 Codex 的稳定屏幕规则。hook 已经激活时，只允许两类屏幕信号改变状态：审批框消失（Blocked → Working），以及 Claude 中断（Working → Idle）。其他屏幕边沿仍写入事件日志，但结果是 `suppressed`。
 
 `--hooks auto` 是 Claude 和 Codex 的默认值，等待 5 秒。没有合法原生 hook 就进入 fallback。fallback 里，输出静默 60 秒可以成为 Idle 候选。`--hooks off` 不注入上报。`--hooks required` 在 5 秒内没有合法原生 hook 时把会话停为 `stopped`。generic 不能选 `required`。
@@ -194,15 +195,15 @@ snapshot 是 live-only 预览，每个 attachment 最多每 500 ms 一帧。未�
 默认只改 Drove 启动的那个进程，不改 `~/.claude`、`~/.codex` 或项目配置，也不代替你接受 workspace trust 或 hook trust。
 
 - Claude Code：在 `<data_dir>/sessions/<agent-id>/claude-settings.json` 写入仅含 hooks 的临时文件，权限 `0600`，目录 `0700`，用 `--settings` 加载。进程退出后删除该目录。
-- Codex：追加 `-c notify=[...]`，不写配置文件。notify 只表示一轮结束。
+- Codex：原子追加 legacy `notify` 与 approval-only OSC 9 的四个 `-c` 配置，不写配置文件。notify 只表示一轮结束；OSC 9 只提供等待审批的 Blocked 候选。
 
 两者都继承 `DROVE_AGENT_ID`、`DROVE_SIGNAL_URL`、`DROVE_SIGNAL_TOKEN`。signal 端点只接受 loopback 和这个会话 token。事件日志不保存原始 payload、prompt、tool input、transcript 或 token。
 
-调用方自己带了 Claude `--bare`、`--settings`，或 Codex 的 `notify` 时，Drove 不覆盖，并把这次注入记为跳过。找不到 `drove` relay 时，`auto` 仍会启动。手工配置见 [状态 hook 配置指南](docs/hooks.md)。持久安装器在 [#24](https://github.com/Duang777/drove/issues/24)，尚未实现。Codex OSC 9 通知也还没有注入。
+调用方自己带了 Claude `--bare`、`--settings`，或 Codex 的 `notify`、`tui.notifications`、`tui.notification_method`、`tui.notification_condition` 时，Drove 不覆盖，并把整组 Codex 注入记为跳过。找不到 `drove` relay 时，`auto` 仍会启动。手工配置见 [状态 hook 配置指南](docs/hooks.md)。持久安装器在 [#24](https://github.com/Duang777/drove/issues/24)，尚未实现。
 
 ### 记录
 
-新会话把 PTY 输出写成带字节偏移的 `output.chunk`。旧库里的 `output` 行事件仍可读，回放时每行补一个换行。`drove log` 默认保留 ANSI 和无效字节。过期附件不打印占位文本。
+新会话把 PTY 输出写成带字节偏移的 `output.chunk`。旧库里的 `output` 行事件仍可读，回放时每行补一个换行。`drove log` 默认保留 ANSI 和无效字节。唯一的协议级例外是 Drove 完整注入的 Codex OSC 9：分类前缀保留，command、path、server name 等自由文本在持久化前等长替换为 `*`。过期附件不打印占位文本。
 
 `GET /api/v1/agents/{id}/timeline` 从事件 envelope 投影半开状态区间、输出保留
 范围和 Blocked 次数。`GET /api/v1/agents/{id}/timeline/blocked/{number}` 返回
@@ -250,7 +251,7 @@ Claude / Codex 的合法原生信号会保存一个私有恢复引用。停止�
 | 启动 | 交互模式 | `--oneshot` | 状态信号 |
 | --- | --- | --- | --- |
 | `drove up claude` | `claude` | `claude --print` | 会话级 command hooks |
-| `drove up codex` | `codex` | `codex exec` | 进程级 notify，只在 fallback 确认 Idle |
+| `drove up codex` | `codex` | `codex exec` | legacy notify 提供 Idle 候选；approval-only OSC 9 提供 Blocked 候选 |
 | `drove up <可执行文件>` | 直接执行该文件，没有额外参数 | 成功退出为 `done` | 无 hook，屏幕分类器为空，不能 `--hooks required` |
 
 ACP 没有注册。`drove up acp` 会去执行一个名叫 `acp` 的程序，而不是 ACP 适配器。
@@ -342,7 +343,7 @@ MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https:/
 
 Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供的是本地事件日志、字节回放，以及 Claude 与 Codex 共用的状态命令。它不提供 git worktree、diff 审阅或 PR 流程。
 
-[herdr](https://herdr.dev/) 以 TUI 为中心，公开定位是关掉客户端后由后台 server 继续持有终端。Drove 把原始字节和状态事件留在本机 SQLite 里。daemon 退出后进程仍在，不是 Drove 今天的行为。单厂商的后台会话、手机审批和官方 App，各自只覆盖自己的 agent。
+[herdr](https://herdr.dev/) 以 TUI 为中心，公开定位是关掉客户端后由后台 server 继续持有终端。Drove 把终端字节和状态事件留在本机 SQLite 里。daemon 退出后进程仍在，不是 Drove 今天的行为。单厂商的后台会话、手机审批和官方 App，各自只覆盖自己的 agent。
 
 ## 安全
 
@@ -361,6 +362,7 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 - 同一 OS 用户能读到令牌文件。令牌不防本机上的其他进程，也不防 agent 自己。
 - 输入审计不保存正文。原始输出可能含有源码和密钥，默认 30 天后删除附件。
 - 输出流里的 signal token 会按等长方式打码。
+- 完整注入的 Codex OSC 9 只保留固定审批分类前缀，所有自由文本在 Store、Hub、回放和 raw tail 之前等长打码。
 - `drove explain` 的 live screen 没有通用密钥扫描，只在会话 attached 时返回。
 - 没有自动批准。手机上的批准动作在 [#28](https://github.com/Duang777/drove/issues/28)，默认也不会自动同意。
 
@@ -377,6 +379,7 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 | [spec 009](specs/009-raw-output-chunks/spec.md) | 原始字节与保留期 |
 | [spec 010](specs/010-terminal-screen-detection/spec.md) | 屏幕检测、查询应答和解释命令 |
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | 终端流、cursor、时间线和精确帧 |
+| [spec 012](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 检测与正文打码 |
 | [技术笔记](docs/technical-notes.md) | 阶段性阅读笔记。文首说明前六节不代表当前主干 |
 | [AGENTS.md](AGENTS.md) | 目录职责和工程约束 |
 

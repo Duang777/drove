@@ -1,6 +1,7 @@
 # Phase 1 hooks 与 Detector 资料调研
 
 - 调研日期：2026-10-03
+- OSC 9 更新日期：2026-10-05
 - Drove 实现基线：[`88d3148`](https://github.com/Duang777/drove/commit/88d3148b0f9caf52ddef327f56872c1384030ad2)
 - Phase 1A 交付基线：[`2717927`](https://github.com/Duang777/drove/commit/271792720012b072a087e53839823898800fe05d)
 - Phase 1B 会话注入基线：[`48d68bd`](https://github.com/Duang777/drove/commit/48d68bdb9dd6bdf761983d4e3724209010d0ab60)
@@ -10,7 +11,9 @@
 - 终端验收基线：[`a47daaf`](https://github.com/Duang777/drove/commit/a47daaf)
 - Claude Code 文档读取日期：2026-10-03
 - Codex 源码快照：[`44dd77b`](https://github.com/openai/codex/commit/44dd77b71e88c78295736bffd3dc3b684c13be6d)
-- 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2)、[#3](https://github.com/Duang777/drove/issues/3) 与 [#15](https://github.com/Duang777/drove/issues/15)
+- Codex OSC 9 源码快照：[`a956835`](https://github.com/openai/codex/commit/a956835d020762cb2b570053af06f643a11c0ecc)，tag `rust-v0.160.0`
+- Codex OSC 9 隐私实现基线：[`9ef5e80`](https://github.com/Duang777/drove/commit/9ef5e80)
+- 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2)、[#3](https://github.com/Duang777/drove/issues/3)、[#15](https://github.com/Duang777/drove/issues/15) 与 [#40](https://github.com/Duang777/drove/issues/40)
 - 可选持久安装调研：[hook 管理调研](phase-1b-hook-management-research.md)
 
 ## 结论
@@ -46,9 +49,10 @@ Phase 1A 编码前必须固定五项协议：
 | CLI 输入 | 已完成 | `drove send <id> [text]` 与 `--stdin` 均已实现。 |
 | WebSocket 输入 | 已完成 | v1 input、ack 和 error 消息已实现，连接内 request ID 去重上限为 4096。 |
 | hooks / Detector | 已完成 | 每个 live session 持有一个 Detector。hook 权威、启发式 fallback、置信度、去重、Blocked 恢复和 Idle 确认均有 race 测试。 |
-| 会话信号注入 | 已完成 | Claude 使用临时 `--settings`，Codex 使用进程级 `notify`。两种方式都不修改厂商持久配置。 |
-| 原始 PTY 输出 | 已完成 | `output.chunk` 保存带 offset 的原始字节附件；CLI 支持 raw 和 plain 回放，附件默认保留 30 天。 |
+| 会话信号注入 | 已完成 | Claude 使用临时 `--settings`；Codex 原子注入进程级 `notify` 与 approval-only OSC 9。两种方式都不修改厂商持久配置。 |
+| PTY 输出记录 | 已完成 | `output.chunk` 保存带 offset 的字节附件；完整注入的 Codex OSC 9 自由文本先等长打码。CLI 支持 raw 和 plain 回放，附件默认保留 30 天。 |
 | 终端屏幕检测 | 已完成 | terminal actor 只读取 committed output，x/vt 应答启动查询，adapter 产生稳定屏幕边沿，Detector 决定状态权威。 |
+| Codex OSC 9 | 已完成 | committed scanner 识别 direct/tmux approval 通知；自由文本在持久化前等长打码，fallback 中经 750 ms 确认 Blocked。 |
 | 状态解释 | 已完成 | `drove explain` 和 explain API 返回受限决策尾部；只有 attached 会话返回临时受限屏幕。 |
 
 Issue [#2](https://github.com/Duang777/drove/issues/2)、
@@ -64,8 +68,9 @@ Phase 1A 只提供 relay、signal endpoint 和手工 hook 配置。Issue #15 在
 
 - Claude adapter 生成只含 17 组 hooks 的 settings 文件。session 层以 `0600`
   权限写入该文件，并通过 `--settings` 加载。
-- Codex adapter 通过顶层 `-c notify=[...]` 传入 relay argv。Codex 将
-  `agent-turn-complete` JSON 作为最后一个参数传给 relay。
+- Codex adapter 通过顶层 `-c notify=[...]` 传入 relay argv，并同时注入
+  approval-only OSC 9 配置。Codex 将 `agent-turn-complete` JSON 作为最后一个
+  参数传给 relay。
 - `internal/adapter` 只规划厂商参数和临时文件。`internal/session` 负责私有
   目录、原子写入、进程生命周期和清理。
 - `signal_injection` 与 hook 策略分开。`auto` 尝试注入，`off` 保留原命令。
@@ -76,7 +81,8 @@ Codex notify 不是原生 hook。它只在 Detector 已进入 fallback 后生成
 激活后，Detector 只记录 notify，不让它驱动状态迁移。
 
 Drove 不注入 Codex trust hash，不使用 trust bypass，也不写用户或项目配置。
-后续实现用终端屏幕补齐 fallback 权威，但没有注入 Codex OSC 9。持久安装器仍由
+终端屏幕与 approval-only OSC 9 共同补齐 fallback：屏幕提供稳定边沿，OSC 9
+提供等待审批候选。持久安装器仍由
 [Issue #24](https://github.com/Duang777/drove/issues/24) 跟踪。
 
 ## Claude Code 的当前 hook 模型
@@ -499,6 +505,30 @@ public resize、WebSocket 终端流和 attach 不属于 Issue #14。后续范围
 [Issue #19](https://github.com/Duang777/drove/issues/19) 和
 [Issue #20](https://github.com/Duang777/drove/issues/20)。
 
+## Issue #40 的 Codex OSC 9 结果
+
+Codex CLI `rust-v0.160.0` 的 `PostNotification::write_ansi` 明确定义 direct
+`ESC ] 9 ; body BEL` 和单层 tmux DCS passthrough。Drove 的 Codex adapter
+原子注入 legacy `notify`、`tui.notifications=["approval-requested"]`、
+`tui.notification_method="osc9"` 与 `tui.notification_condition="always"`。
+任一 managed key 已由调用方设置时，整组注入跳过，不覆盖用户参数。
+
+完整注入成功后，recording actor 在 Store 边界前执行流式等长脱敏。只有
+`Approval requested: `、`Codex wants to edit ` 和
+`Approval requested by ` 三个分类前缀可以保留；其后 command、path、server
+name 以及未知 OSC 9 body 全部替换为 `*`。因此 Store attachment、Hub、
+公开 replay、raw tail、explain、错误和日志都不含自由文本，同时 byte offset
+与终端 framing 保持稳定。
+
+脱敏后的 committed bytes 才进入 terminal actor。scanner 识别 direct BEL、
+direct ST 和 tmux 形状，adapter 输出 version 4 typed terminal attribution，
+Detector 在 fallback 中复用 750 ms permission candidate。OSC 9 不激活 hook、
+不满足 `required`，也不推断 Idle 或 Done。审批屏幕消失会取消尚未确认的
+permission candidate。
+
+仓库 fixture 来自上述 tag 的源码格式与 notification 文案，正文使用合成
+redacted 值。这些 fixture 是源码派生测试向量，不是现场终端录制。
+
 ## 一手来源
 
 ### Drove
@@ -512,6 +542,7 @@ public resize、WebSocket 终端流和 attach 不属于 Issue #14。后续范围
 - [Issue #13：原始 PTY 输出块与保留](https://github.com/Duang777/drove/issues/13)
 - [Issue #14：终端屏幕模型与查询应答](https://github.com/Duang777/drove/issues/14)
 - [Issue #15：会话信号注入](https://github.com/Duang777/drove/issues/15)
+- [Issue #40：Codex OSC 9 approval 通知](https://github.com/Duang777/drove/issues/40)
 
 ### Claude Code
 
@@ -525,6 +556,8 @@ public resize、WebSocket 终端流和 attach 不属于 Issue #14。后续范围
 - [Hooks](https://developers.openai.com/codex/hooks)
 - [Advanced configuration](https://developers.openai.com/codex/config-advanced#hooks)
 - [Configuration reference](https://developers.openai.com/codex/config-reference)
+- [`rust-v0.160.0` OSC 9 writer](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/tui/src/notifications/osc9.rs)
+- [`rust-v0.160.0` notification messages](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/tui/src/chatwidget/notifications.rs)
 - [`HookEventsToml` 与 handler schema，固定源码快照](https://github.com/openai/codex/blob/44dd77b71e88c78295736bffd3dc3b684c13be6d/codex-rs/config/src/hook_config.rs#L35-L200)
 - [handler discovery、执行支持与 trust hash，固定源码快照](https://github.com/openai/codex/blob/44dd77b71e88c78295736bffd3dc3b684c13be6d/codex-rs/hooks/src/engine/discovery.rs#L505-L823)
 - [启动时 hook trust 确认，固定源码快照](https://github.com/openai/codex/blob/44dd77b71e88c78295736bffd3dc3b684c13be6d/codex-rs/tui/src/startup_hooks_review.rs#L227-L287)

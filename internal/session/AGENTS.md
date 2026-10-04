@@ -19,8 +19,10 @@
   首次失败、部分写、busy 或 timeout 后记录错误并丢弃后续 reply，controller close
   后 join。reply 不经过 `SendInput`，不产生 `agent.input`；只有子进程显式回显的
   reply 才作为新输出提交。
-- 完整 Codex signal injection 成功时，terminal actor 还独占一个 OSC 9 scanner；
-  它只读取 committed bytes 并把 adapter 已脱敏的 observations 返回 recording actor。
+- 完整 Codex signal injection 成功时，recording actor 在持久化前先用 adapter
+  提供的策略等长打码 OSC 9 自由文本；terminal actor 再独占一个 OSC 9 scanner，
+  只读取 committed sanitized bytes，并把 adapter 已脱敏的 observations 返回
+  recording actor。
 - observation actor 独占容量 64 的 inbox 和一个真实计时器，一次只提交一个
   Decision；每次提交后按 Detector 返回的最早 timer ref 重置计时器，Detector
   本身不持有 goroutine 或回调。
@@ -63,10 +65,12 @@
   PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。busy 或
   timeout 返回 `ErrInputBackpressure`；任何部分送达同时返回 `ErrInputWrite` 和
   `do not retry`，且不提交成功审计。
-- recording actor 校验 PTY 源偏移，跨回调等长替换 signal token，并把不超过 32 KiB 的
-  `output.chunk` 作为一个回调批次提交；Store 成功且 Hub 发布后，才用 receipt 中的
-  output offset、最终 sequence 和 commit time 构造 `term.CommittedChunk` 并喂给
-  terminal actor。之后先提交无文本 output activity，再提交同批 OSC observations。
+- recording actor 校验 PTY 源偏移，跨回调等长替换 signal token；完整 Codex
+  notification 注入还会等长打码未知 OSC 9 body 和安全前缀后的自由文本。处理后的
+  不超过 32 KiB `output.chunk` 作为一个回调批次提交；Store 成功且 Hub 发布后，
+  才用 receipt 中的 output offset、最终 sequence 和 commit time 构造
+  `term.CommittedChunk` 并喂给 terminal actor。之后先提交无文本 output
+  activity，再提交同批 OSC observations。
 - writable attachment 采用 `latest` 尺寸策略：首个 writer 初始持有尺寸，非 owner
   只更新 proposal，成功输入在写入前应用 proposal 并在写入后晋升，owner detach
   按 actor activity ticket 选择回退。attached input 在提交 output actor 前获取同一
