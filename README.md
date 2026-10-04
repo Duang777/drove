@@ -33,7 +33,7 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | 能力 | 状态 | 在哪里 |
 | --- | --- | --- |
 | 每个 agent 一个 PTY，由 `droved` 持有 | 已落地 | `internal/pty` |
-| `init` `up` `resume` `ps` `log` `timeline` `explain` `stop` `send` `hook` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
+| `init` `up` `resume` `ps` `log` `timeline` `explain` `stop` `send` `hook` `worktree` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
 | Claude / Codex 按会话注入状态上报 | 已落地 | [#15](https://github.com/Duang777/drove/issues/15) |
 | 终端字节记录，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` 回放字节，`--plain` 去掉控制序列 | 已落地 | |
@@ -47,9 +47,10 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | 推送通知 | 规划中 | [#27](https://github.com/Duang777/drove/issues/27) |
 | 手机上批准、拒绝或回一句 | 规划中 | [#28](https://github.com/Duang777/drove/issues/28) |
 | 原生 resume，停止按进程组 SIGTERM 后宽限再 SIGKILL | 已落地 | [#16](https://github.com/Duang777/drove/issues/16) |
+| 每个 agent 使用独立 Git worktree | 已落地 | [#23](https://github.com/Duang777/drove/issues/23) |
 | daemon 退出后 agent 进程仍在 | 规划中 | [#17](https://github.com/Duang777/drove/issues/17)、[#18](https://github.com/Duang777/drove/issues/18) |
 | `drove attach`、终端 UI、xterm.js | 规划中 | [#20](https://github.com/Duang777/drove/issues/20) |
-| 离开简报、跨会话搜索、git worktree | 规划中 | [#29](https://github.com/Duang777/drove/issues/29)、[#30](https://github.com/Duang777/drove/issues/30)、[#23](https://github.com/Duang777/drove/issues/23) |
+| 离开简报、跨会话搜索 | 规划中 | [#29](https://github.com/Duang777/drove/issues/29)、[#30](https://github.com/Duang777/drove/issues/30) |
 
 ## 架构
 
@@ -97,6 +98,7 @@ drove version
 drove up claude --name api --dir "$PWD"
 drove up codex --oneshot
 drove up claude --hooks required
+drove up claude --worktree --branch feature/api
 ```
 
 ### 命令
@@ -115,15 +117,34 @@ drove up claude --hooks required
 | `drove send <agent-id> --stdin` | 原样读取标准输入，不追加换行 |
 | `drove stop <agent-id>` | 停止该会话 |
 | `drove hook --vendor claude\|codex` | 给被注入的 agent 子进程用。从 stdin 读一份 JSON，失败也返回 0 |
+| `drove worktree ls` | 列出 Drove 创建的 worktree、分支和 dirty 状态 |
+| `drove worktree rm <agent-id>` | 删除 clean worktree，保留分支。`--force` 允许丢弃未提交更改 |
 | `drove web` | 经 Unix socket 签发一次性登录码并打开内嵌 Web 控制台 |
 | `drove token rotate` | 原子轮换控制令牌，不打印令牌值 |
 | `drove version` | 打印版本。`make build` 用 `git describe` 填版本号；commit 和构建时间未注入时是 `unknown` |
 
-`drove up` 的标志：`--name`、`--dir`、`--oneshot`、`--hooks off|auto|required`。
+`drove up` 的标志：`--name`、`--dir`、`--oneshot`、
+`--hooks off|auto|required`、`--worktree`、`--branch`。
 
 `drove send` 只接受合法 UTF-8，单次最多 64 KiB。审计事件只记字节数，不记正文。`drove hook` 的单份 JSON 上限是 1 MiB。它不读取控制令牌，也不会拉起 daemon。
 
 ## 工作原理
+
+### Git worktree
+
+`drove up <vendor> --worktree` 从 `--dir` 指定的仓库创建独立分支和 worktree。
+没有 `--dir` 时使用调用 CLI 时的当前目录；没有 `--branch` 时分支名是
+`drove/<agent-id>`。worktree 位于
+`<data_dir>/worktrees/<repo-hash>/<agent-id>`，Agent 进程直接在这个目录启动。
+
+仓库根目录存在 `.worktreeinclude` 时，Drove 按 gitignore 语义把匹配的未跟踪文件
+复制到新 worktree，例如 `.env` 或本地证书。没有匹配的未跟踪文件不会复制。创建
+事件在 SQLite 中私有记录仓库、worktree 路径和分支；REST、WebSocket 和公开回放
+会删除这些字段。
+
+会话退出后 worktree 不会自动删除。`drove worktree rm` 默认拒绝 dirty worktree；
+`--force` 只允许删除含未提交更改的目录。两种方式都保留分支，Drove 不自动 merge、
+rebase、push 或删除分支。
 
 ### 状态
 
@@ -337,11 +358,11 @@ npm run dev
 3. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准 / 拒绝 / 回复
 4. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
 
-MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18) 的 shim，然后是 [#29](https://github.com/Duang777/drove/issues/29) 离开简报、[#30](https://github.com/Duang777/drove/issues/30) 全文搜索、[#23](https://github.com/Duang777/drove/issues/23) worktree。[#22](https://github.com/Duang777/drove/issues/22) 结构化状态源和 [#24](https://github.com/Duang777/drove/issues/24) 持久 hook 安装器推迟。
+MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18) 的 shim，然后是 [#29](https://github.com/Duang777/drove/issues/29) 离开简报和 [#30](https://github.com/Duang777/drove/issues/30) 全文搜索。[#22](https://github.com/Duang777/drove/issues/22) 结构化状态源和 [#24](https://github.com/Duang777/drove/issues/24) 持久 hook 安装器推迟。
 
 ## 和其他工具的差别
 
-Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供的是本地事件日志、字节回放，以及 Claude 与 Codex 共用的状态命令。它不提供 git worktree、diff 审阅或 PR 流程。
+Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供本地事件日志、字节回放、独立 Git worktree，以及 Claude 与 Codex 共用的状态命令。它不提供 diff 审阅或 PR 流程，也不自动合并 worktree 分支。
 
 [herdr](https://herdr.dev/) 以 TUI 为中心，公开定位是关掉客户端后由后台 server 继续持有终端。Drove 把终端字节和状态事件留在本机 SQLite 里。daemon 退出后进程仍在，不是 Drove 今天的行为。单厂商的后台会话、手机审批和官方 App，各自只覆盖自己的 agent。
 

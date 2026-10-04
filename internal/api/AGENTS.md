@@ -50,6 +50,8 @@
 - 输入消息必须携带版本、连接内唯一 `request_id` 和 Agent ID；响应以同一 `request_id` 返回稳定 ack/error。
 - 输入背压统一映射为 REST 503；WebSocket v1/v2 使用稳定错误码
   `input_backpressure`。部分送达错误保留 `do not retry` 提示。
+- worktree 仓库或分支准备失败映射为 400；daemon 没有可用 workspace manager
+  时映射为 503。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。
 - WebSocket 发送带 write deadline + ping/pong 保活，防止死连接。

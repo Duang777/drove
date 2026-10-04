@@ -566,7 +566,7 @@ func PublicPayload(typ Type, reason, raw string) (string, error) {
 		if raw == "" {
 			return "", nil
 		}
-		return removePayloadFields(raw, "working_dir")
+		return removePayloadFields(raw, "working_dir", "workspace")
 	default:
 		return raw, nil
 	}

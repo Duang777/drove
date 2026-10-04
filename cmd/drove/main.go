@@ -30,6 +30,7 @@ import (
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
 	"github.com/Duang777/drove/internal/version"
+	"github.com/Duang777/drove/internal/workspace"
 )
 
 // exitCodes 语义化退出码。
@@ -70,6 +71,7 @@ func newRootCmd() *cobra.Command {
 		newSendCmd(),
 		newHookCmd(),
 		newStopCmd(),
+		newWorktreeCmd(),
 		newTokenCmd(),
 		newWebCmd(),
 		newVersionCmd(),
@@ -119,6 +121,8 @@ func newUpCmd() *cobra.Command {
 	var dir string
 	var oneshot bool
 	var hooks string
+	var useWorktree bool
+	var branch string
 	cmd := &cobra.Command{
 		Use:   "up <vendor|command>",
 		Short: "启动一个 Agent 会话（自动拉起 daemon）",
@@ -128,6 +132,16 @@ func newUpCmd() *cobra.Command {
 			if hookPolicy != "" && !agent.ValidHookPolicy(hookPolicy) {
 				return fmt.Errorf("%w: %q", session.ErrInvalidHookPolicy, hooks)
 			}
+			if branch != "" && !useWorktree {
+				return errors.New("--branch requires --worktree")
+			}
+			if useWorktree {
+				var err error
+				dir, err = resolveWorktreeSource(dir)
+				if err != nil {
+					return err
+				}
+			}
 			ctx := context.Background()
 			c, err := newClient(ctx)
 			if err != nil {
@@ -135,7 +149,15 @@ func newUpCmd() *cobra.Command {
 			}
 			st, err := c.Start(
 				ctx,
-				sessionStartRequest(args[0], name, dir, oneshot, hookPolicy),
+				sessionStartRequest(
+					args[0],
+					name,
+					dir,
+					oneshot,
+					hookPolicy,
+					useWorktree,
+					branch,
+				),
 			)
 			if err != nil {
 				return err
@@ -149,6 +171,8 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dir, "dir", "", "agent 工作目录")
 	cmd.Flags().BoolVar(&oneshot, "oneshot", false, "以单次执行模式启动 agent")
 	cmd.Flags().StringVar(&hooks, "hooks", "", "hook 策略（off、auto 或 required）")
+	cmd.Flags().BoolVar(&useWorktree, "worktree", false, "在独立 Git worktree 中启动 agent")
+	cmd.Flags().StringVar(&branch, "branch", "", "worktree 使用的本地分支")
 	return cmd
 }
 
@@ -547,6 +571,107 @@ func newStopCmd() *cobra.Command {
 	}
 }
 
+func newWorktreeCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "worktree",
+		Short: "管理 Drove 创建的 Git worktree",
+	}
+	command.AddCommand(newWorktreeListCmd(), newWorktreeRemoveCmd())
+	return command
+}
+
+func newWorktreeListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls",
+		Short: "列出 Drove 创建的 Git worktree",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			manager, err := newWorkspaceManager()
+			if err != nil {
+				return err
+			}
+			worktrees, err := manager.List(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return writeWorktrees(cmd.OutOrStdout(), worktrees)
+		},
+	}
+}
+
+func newWorktreeRemoveCmd() *cobra.Command {
+	var force bool
+	command := &cobra.Command{
+		Use:   "rm <agent-id>",
+		Short: "删除一个 Drove worktree，保留其分支",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			manager, err := newWorkspaceManager()
+			if err != nil {
+				return err
+			}
+			removed, err := manager.Cleanup(cmd.Context(), args[0], force)
+			if errors.Is(err, workspace.ErrDirty) {
+				return fmt.Errorf("%w; rerun with --force to discard changes", err)
+			}
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"removed worktree %s (branch=%s preserved)\n",
+				removed.AgentID,
+				removed.Branch,
+			)
+			return err
+		},
+	}
+	command.Flags().BoolVar(&force, "force", false, "删除有未提交更改的 worktree")
+	return command
+}
+
+func newWorkspaceManager() (*workspace.Manager, error) {
+	cfg, err := config.Load("")
+	if err != nil {
+		return nil, err
+	}
+	return workspace.New(cfg.DataDir)
+}
+
+func writeWorktrees(w io.Writer, worktrees []workspace.Workspace) error {
+	if len(worktrees) == 0 {
+		_, err := fmt.Fprintln(w, "no managed worktrees")
+		return err
+	}
+	if _, err := fmt.Fprintf(
+		w,
+		"%-38s %-30s %-5s %s\n",
+		"AGENT ID",
+		"BRANCH",
+		"DIRTY",
+		"PATH",
+	); err != nil {
+		return fmt.Errorf("write worktree header: %w", err)
+	}
+	for _, current := range worktrees {
+		if _, err := fmt.Fprintf(
+			w,
+			"%-38s %-30s %-5t %s\n",
+			current.AgentID,
+			truncate(current.Branch, 30),
+			current.Dirty,
+			current.Path,
+		); err != nil {
+			return fmt.Errorf(
+				"write worktree for agent %q: %w",
+				current.AgentID,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
 func newTokenCmd() *cobra.Command {
 	token := &cobra.Command{
 		Use:   "token",
@@ -830,6 +955,8 @@ func sessionStartRequest(
 	dir string,
 	oneshot bool,
 	hooks agent.HookPolicy,
+	useWorktree bool,
+	branch string,
 ) session.StartRequest {
 	vendor := arg
 	cmdName := ""
@@ -840,7 +967,7 @@ func sessionStartRequest(
 	if oneshot {
 		mode = agent.RunModeOneshot
 	}
-	return session.StartRequest{
+	request := session.StartRequest{
 		Vendor:  vendor,
 		Name:    name,
 		Command: cmdName,
@@ -848,6 +975,25 @@ func sessionStartRequest(
 		Mode:    mode,
 		Hooks:   hooks,
 	}
+	if useWorktree {
+		request.Worktree = &session.WorktreeRequest{Branch: branch}
+	}
+	return request
+}
+
+func resolveWorktreeSource(dir string) (string, error) {
+	if dir == "" {
+		current, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve current directory for worktree: %w", err)
+		}
+		dir = current
+	}
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree source %q: %w", dir, err)
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func isKnownVendor(s string) bool {

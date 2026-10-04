@@ -97,6 +97,65 @@ func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	runGit(t, repository, "show-ref", "--verify", "refs/heads/"+prepared.Branch)
 }
 
+func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	first, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare first worktree: %v", err)
+	}
+	second, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		secondTestAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare second worktree: %v", err)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(first.Path, "tracked.txt"),
+		[]byte("first agent\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write first worktree: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(second.Path, "tracked.txt"),
+		[]byte("second agent\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write second worktree: %v", err)
+	}
+
+	assertFileContents(t, filepath.Join(repository, "tracked.txt"), "tracked\n")
+	assertFileContents(t, filepath.Join(first.Path, "tracked.txt"), "first agent\n")
+	assertFileContents(t, filepath.Join(second.Path, "tracked.txt"), "second agent\n")
+	if _, err := manager.Cleanup(
+		context.Background(),
+		first.AgentID,
+		true,
+	); err != nil {
+		t.Fatalf("cleanup first worktree: %v", err)
+	}
+	if _, err := manager.Cleanup(
+		context.Background(),
+		second.AgentID,
+		true,
+	); err != nil {
+		t.Fatalf("cleanup second worktree: %v", err)
+	}
+}
+
 func TestDiscardRollsBackNewBranch(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

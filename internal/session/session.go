@@ -62,6 +62,8 @@ type StartRequest struct {
 	Mode agent.RunMode `json:"mode,omitempty"`
 	// Hooks controls hook authority; empty selects a capability-based default.
 	Hooks agent.HookPolicy `json:"hooks,omitempty"`
+	// Worktree requests a managed Git worktree rooted at Dir.
+	Worktree *WorktreeRequest `json:"worktree,omitempty"`
 }
 
 type createdPayload struct {
@@ -74,6 +76,7 @@ type createdPayload struct {
 	SignalInjectionStatus *agent.SignalInjectionStatus `json:"signal_injection_status,omitempty"`
 	SignalInjectionReason *agent.SignalInjectionReason `json:"signal_injection_reason,omitempty"`
 	WorkingDir            string                       `json:"working_dir,omitempty"`
+	Workspace             *workspaceMetadata           `json:"workspace,omitempty"`
 }
 
 type inputAuditPayload struct {
@@ -181,6 +184,8 @@ type Manager struct {
 	injectionModes   map[string]agent.SignalInjectionMode
 	injectionFS      signalInjectionFS
 	signalSocketPath string
+	workspaces       workspaceLifecycle
+	workspaceErr     error
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*managedAgent
@@ -290,7 +295,10 @@ func Bootstrap(
 }
 
 // Start 启动一个 agent 会话。
-func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) {
+func (m *Manager) Start(
+	ctx context.Context,
+	req StartRequest,
+) (status *Status, resultErr error) {
 	if beginErr := m.beginStart(); beginErr != nil {
 		return nil, fmt.Errorf("session: start: %w", beginErr)
 	}
@@ -336,6 +344,25 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 
 	// 2. 生成会话专属配置，再持久化会话元数据。
 	id := agent.ID(uuid.NewString())
+	preparedWorkspace, err := m.prepareWorkspace(
+		ctx,
+		string(id),
+		req.Worktree,
+		req.Dir,
+	)
+	if err != nil {
+		return nil, err
+	}
+	workspaceCommitted := false
+	defer func() {
+		if resultErr == nil || workspaceCommitted {
+			return
+		}
+		resultErr = errors.Join(resultErr, m.discardWorkspace(preparedWorkspace))
+	}()
+	if preparedWorkspace != nil {
+		req.Dir = preparedWorkspace.Path
+	}
 	if req.Name == "" {
 		req.Name = req.Vendor + "-" + string(id)[:8]
 	}
@@ -379,6 +406,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		SignalInjectionStatus: &persistedInjectionStatus,
 		SignalInjectionReason: &persistedInjectionReason,
 		WorkingDir:            req.Dir,
+		Workspace:             metadataForWorkspace(preparedWorkspace),
 	}
 	storedPayload, err := json.Marshal(metadata)
 	if err != nil {
@@ -389,6 +417,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		)
 	}
 	metadata.WorkingDir = ""
+	metadata.Workspace = nil
 	publicPayload, err := json.Marshal(metadata)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
@@ -432,6 +461,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			cleanupErr,
 		)
 	}
+	workspaceCommitted = true
 
 	m.mu.Lock()
 	m.agents[id] = managed

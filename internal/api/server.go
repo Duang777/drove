@@ -182,12 +182,14 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, session.ErrInvalidMode),
 			errors.Is(err, session.ErrInvalidHookPolicy),
-			errors.Is(err, session.ErrHookUnsupported):
+			errors.Is(err, session.ErrHookUnsupported),
+			errors.Is(err, session.ErrWorkspacePrepare):
 			writeErr(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, session.ErrHookRequired),
 			errors.Is(err, session.ErrManagerClosed),
 			errors.Is(err, session.ErrEventCommitterUnavailable),
-			errors.Is(err, session.ErrSignalOriginUnavailable):
+			errors.Is(err, session.ErrSignalOriginUnavailable),
+			errors.Is(err, session.ErrWorkspaceUnavailable):
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
 		default:
 			writeErr(w, http.StatusInternalServerError, err.Error())

@@ -57,6 +57,12 @@ func TestHandleCreateMapsHookConfigurationErrors(t *testing.T) {
 			body:       `{"vendor":"claude","command":"/bin/true","hooks":"auto"}`,
 			wantStatus: http.StatusServiceUnavailable,
 		},
+		{
+			name:            "workspace manager unavailable",
+			configureOrigin: true,
+			body:            `{"vendor":"generic","command":"/bin/true","worktree":{}}`,
+			wantStatus:      http.StatusServiceUnavailable,
+		},
 	}
 
 	for _, test := range tests {
@@ -99,6 +105,51 @@ func TestHandleCreateRejectsInvalidModeWithoutHistory(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), session.ErrInvalidMode.Error()) {
 		t.Fatalf("body = %q, want invalid mode error", rec.Body.String())
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("manager retained %d agents, want 0", len(got))
+	}
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestHandleCreateMapsWorkspacePrepareError(t *testing.T) {
+	server, manager, st := newTestServerWithOptions(
+		t,
+		true,
+		auth.DefaultOptions(),
+		session.WithWorkspaces(t.TempDir()),
+	)
+	body, err := json.Marshal(session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Dir:      t.TempDir(),
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents",
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+
+	if rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), session.ErrWorkspacePrepare.Error()) {
+		t.Fatalf(
+			"response = %d %q, want workspace prepare 400",
+			rec.Code,
+			rec.Body.String(),
+		)
 	}
 	if got := manager.List(); len(got) != 0 {
 		t.Fatalf("manager retained %d agents, want 0", len(got))
@@ -1869,6 +1920,7 @@ func newTestServerWithOptions(
 	t *testing.T,
 	configureOrigin bool,
 	authOptions auth.Options,
+	managerOptions ...session.ManagerOption,
 ) (*Server, *session.Manager, *store.Store) {
 	t.Helper()
 
@@ -1882,6 +1934,7 @@ func newTestServerWithOptions(
 		hub,
 		st,
 		0,
+		managerOptions...,
 	)
 	if configureOrigin {
 		signalOrigin, err := url.Parse("http://127.0.0.1:7373")

@@ -267,6 +267,26 @@ func TestPrivateSessionLifecycleDraftSeparatesStoredPayload(t *testing.T) {
 	}
 }
 
+func TestPublicPayloadRemovesPrivateWorkspaceMetadata(t *testing.T) {
+	stored := `{"version":2,"name":"agent","working_dir":"/private/worktree",` +
+		`"workspace":{"repository":"/private/repository",` +
+		`"path":"/private/worktree","branch":"feature/private"}}`
+	public, err := PublicPayload(TypeSessionLifecycle, "created", stored)
+	if err != nil {
+		t.Fatalf("redact creation payload: %v", err)
+	}
+	if strings.Contains(public, "working_dir") ||
+		strings.Contains(public, "workspace") ||
+		strings.Contains(public, "/private") ||
+		strings.Contains(public, "feature/private") {
+		t.Fatalf("public creation payload exposed workspace metadata: %s", public)
+	}
+	if !strings.Contains(public, `"version":2`) ||
+		!strings.Contains(public, `"name":"agent"`) {
+		t.Fatalf("public creation payload lost public metadata: %s", public)
+	}
+}
+
 func TestOutputChunkDraftCopiesPrivateAttachment(t *testing.T) {
 	data := []byte("prompt\x00without newline")
 	draft, err := NewOutputChunkDraft("agent-1", "agent-1", 17, data)

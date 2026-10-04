@@ -229,6 +229,9 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 		}
 		draft.workingDir = metadata.WorkingDir
 	}
+	if err := validateWorkspaceMetadata(metadata.Workspace); err != nil {
+		return projectionWrapError(row, "validate workspace metadata", err)
+	}
 
 	draft.name = metadata.Name
 	draft.vendor = metadata.Vendor

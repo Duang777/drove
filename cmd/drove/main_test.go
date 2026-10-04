@@ -23,6 +23,7 @@ import (
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/workspace"
 )
 
 func TestSessionStartRequestMapsRunMode(t *testing.T) {
@@ -34,6 +35,8 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 		wantVendor  string
 		wantCommand string
 		wantMode    agent.RunMode
+		useWorktree bool
+		branch      string
 	}{
 		{
 			name:       "interactive vendor",
@@ -64,6 +67,14 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 			wantCommand: "/usr/local/bin/my-agent",
 			wantMode:    agent.RunModeOneshot,
 		},
+		{
+			name:        "worktree vendor",
+			arg:         "claude",
+			wantVendor:  "claude",
+			wantMode:    agent.RunModeInteractive,
+			useWorktree: true,
+			branch:      "feature/isolated",
+		},
 	}
 
 	for _, test := range tests {
@@ -74,6 +85,8 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 				"/tmp",
 				test.oneshot,
 				test.hooks,
+				test.useWorktree,
+				test.branch,
 			)
 			if req.Vendor != test.wantVendor ||
 				req.Command != test.wantCommand ||
@@ -82,6 +95,13 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 				req.Dir != "/tmp" ||
 				req.Hooks != test.hooks {
 				t.Fatalf("request = %+v", req)
+			}
+			if test.useWorktree {
+				if req.Worktree == nil || req.Worktree.Branch != test.branch {
+					t.Fatalf("worktree request = %+v", req.Worktree)
+				}
+			} else if req.Worktree != nil {
+				t.Fatalf("unexpected worktree request = %+v", req.Worktree)
 			}
 		})
 	}
@@ -133,6 +153,14 @@ func TestUpCommandExposesRunnerAndHookFlags(t *testing.T) {
 	if hooks == nil || hooks.DefValue != "" {
 		t.Fatalf("--hooks flag = %+v, want empty default", hooks)
 	}
+	worktree := flags.Lookup("worktree")
+	if worktree == nil || worktree.DefValue != "false" {
+		t.Fatalf("--worktree flag = %+v, want default false", worktree)
+	}
+	branch := flags.Lookup("branch")
+	if branch == nil || branch.DefValue != "" {
+		t.Fatalf("--branch flag = %+v, want empty default", branch)
+	}
 }
 
 func TestUpCommandRejectsInvalidHookPolicyBeforeClientSetup(t *testing.T) {
@@ -141,6 +169,52 @@ func TestUpCommandRejectsInvalidHookPolicyBeforeClientSetup(t *testing.T) {
 	err := command.Execute()
 	if !errors.Is(err, session.ErrInvalidHookPolicy) {
 		t.Fatalf("up error = %v, want ErrInvalidHookPolicy", err)
+	}
+}
+
+func TestUpCommandRejectsBranchWithoutWorktreeBeforeClientSetup(t *testing.T) {
+	command := newUpCmd()
+	command.SetArgs([]string{"claude", "--branch", "feature/isolated"})
+	err := command.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--branch requires --worktree") {
+		t.Fatalf("up error = %v, want branch dependency error", err)
+	}
+}
+
+func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
+	command, _, err := newRootCmd().Find([]string{"worktree", "rm"})
+	if err != nil {
+		t.Fatalf("find worktree remove command: %v", err)
+	}
+	if command.Name() != "rm" {
+		t.Fatalf("command = %q, want rm", command.Name())
+	}
+	force := command.Flags().Lookup("force")
+	if force == nil || force.DefValue != "false" {
+		t.Fatalf("--force flag = %+v, want default false", force)
+	}
+}
+
+func TestWriteWorktrees(t *testing.T) {
+	var output bytes.Buffer
+	err := writeWorktrees(&output, []workspace.Workspace{{
+		AgentID: "11111111-1111-4111-8111-111111111111",
+		Branch:  "feature/isolated",
+		Path:    "/tmp/drove/worktree",
+		Dirty:   true,
+	}})
+	if err != nil {
+		t.Fatalf("write worktrees: %v", err)
+	}
+	for _, want := range []string{
+		"AGENT ID",
+		"feature/isolated",
+		"true",
+		"/tmp/drove/worktree",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output = %q, want %q", output.String(), want)
+		}
 	}
 }
 

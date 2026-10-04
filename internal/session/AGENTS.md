@@ -37,6 +37,11 @@
   源偏移重新从 0 计数，持久 output offset 则从 Store 的 session boundary 继续。
 - Start 把清理后的绝对工作目录放进创建事件的私有持久载荷；Hub 与公开 replay
   删除该字段。恢复投影把目录放回 managed record，Resume 用它配置 PTY。
+- `StartRequest.Worktree` 存在时，Manager 在生成 Agent ID 后调用
+  `internal/workspace` 创建独立 worktree，并把 Agent 工作目录切到该路径。创建事件
+  提交前的失败会回滚 worktree 和本次新建的分支；事件已提交后由用户显式清理。
+- 创建事件的私有 `workspace` 元数据记录仓库、路径和分支；Hub 与公开 replay 删除
+  整个对象，恢复投影仍校验其中的绝对路径和分支。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
@@ -103,6 +108,7 @@
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
 - 临时注入路径必须二次校验并拒绝 symlink；adapter 不得直接操作文件系统。
 - 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`、
+  `WorktreeRequest`、
   `ExplainOptions`、`ExplainEvent`、`ExplainScreen`、`Explanation`、
   `AttachmentID`、`AttachmentMode`、`AttachmentOptions`、
   `TerminalAttachment`、`LiveSnapshot`。

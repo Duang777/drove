@@ -97,6 +97,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		session.WithTerminationGrace(
 			time.Duration(d.cfg.Session.TerminationGraceSeconds)*time.Second,
 		),
+		session.WithWorkspaces(d.cfg.DataDir),
 	)
 	if err != nil {
 		return err

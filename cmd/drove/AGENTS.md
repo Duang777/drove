@@ -3,7 +3,7 @@
 ## 职责
 
 **CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log /
-resume / timeline / explain / stop / token rotate / web / version），所有会话操作都经
+resume / timeline / explain / stop / worktree / token rotate / web / version），所有会话操作都经
 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
 
@@ -14,7 +14,10 @@ resume / timeline / explain / stop / token rotate / web / version），所有会
   `~/.drove/config.json`。
 - `drove up <vendor|command>` 启动一个 agent：默认 `interactive`，`--oneshot`
   切换为单次执行，`--hooks` 选择 `off|auto|required`；未知厂商名仍视为
-  generic 命令。
+  generic 命令。`--worktree` 把调用方目录解析为绝对仓库路径，`--branch` 只在
+  worktree 模式有效。
+- `drove worktree ls|rm` 直接调用 `internal/workspace`，不启动 daemon；`rm`
+  默认拒绝 dirty worktree，`--force` 允许删除目录但仍保留分支。
 - `drove send <id> <text>` 向运行中的 agent 发送一行输入；`--stdin` 保留标准输入的原始换行。
 - `drove hook --vendor <vendor>` 默认从 stdin 读取一个 hook JSON 文档；
   `--payload-argv` 改为读取唯一位置参数，`--managed-by drove/v1` 只作受管命令标记。
