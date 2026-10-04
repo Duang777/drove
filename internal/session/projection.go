@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -55,6 +56,7 @@ type sessionDraft struct {
 	firstSeq               uint64
 	lastStateGapGeneration uint64
 	vendorSessionRef       string
+	workingDir             string
 	hasCreated             bool
 	hasState               bool
 }
@@ -62,6 +64,7 @@ type sessionDraft struct {
 type recoveryPlan struct {
 	Snapshots         []agent.RestoreSnapshot
 	VendorSessionRefs map[string]string
+	WorkingDirs       map[string]string
 	ResumeOnStart     map[string]bool
 	Reconciliation    []store.EventRow
 	Report            RecoveryReport
@@ -215,6 +218,16 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 		draft.injectionReason = agent.InjectionReasonRecovered
 	default:
 		return projectionError(row, "unsupported creation metadata version %d", metadata.Version)
+	}
+	if metadata.WorkingDir != "" {
+		if !filepath.IsAbs(metadata.WorkingDir) ||
+			filepath.Clean(metadata.WorkingDir) != metadata.WorkingDir {
+			return projectionError(
+				row,
+				"creation metadata working directory is not a clean absolute path",
+			)
+		}
+		draft.workingDir = metadata.WorkingDir
 	}
 
 	draft.name = metadata.Name
@@ -518,6 +531,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 	plan := recoveryPlan{
 		Snapshots:         make([]agent.RestoreSnapshot, 0, len(drafts)),
 		VendorSessionRefs: make(map[string]string),
+		WorkingDirs:       make(map[string]string),
 		ResumeOnStart:     make(map[string]bool),
 		Report:            p.report,
 	}
@@ -539,6 +553,9 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			plan.VendorSessionRefs[draft.id] = draft.vendorSessionRef
 			plan.ResumeOnStart[draft.id] =
 				state != agent.StateDone && state != agent.StateStopped
+		}
+		if draft.workingDir != "" {
+			plan.WorkingDirs[draft.id] = draft.workingDir
 		}
 		lastError := draft.lastError
 		updatedAt := draft.updatedAt

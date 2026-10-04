@@ -180,6 +180,46 @@ func TestAgentResumedPayloadAndDraft(t *testing.T) {
 	}
 }
 
+func TestPrivateSessionLifecycleDraftSeparatesStoredPayload(t *testing.T) {
+	const (
+		publicPayload = `{"version":2,"name":"agent"}`
+		storedPayload = `{"version":2,"name":"agent","working_dir":"/private/project"}`
+	)
+	committed, err := Commit(
+		11,
+		time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC),
+		NewPrivateSessionLifecycleDraft(
+			"agent-1",
+			"agent-1",
+			"created",
+			publicPayload,
+			storedPayload,
+		),
+	)
+	if err != nil {
+		t.Fatalf("commit private lifecycle draft: %v", err)
+	}
+	if committed.Payload != publicPayload ||
+		committed.StoredPayload() != storedPayload {
+		t.Fatalf("committed lifecycle event = %+v", committed)
+	}
+
+	_, err = Commit(
+		12,
+		time.Date(2026, time.October, 4, 15, 0, 1, 0, time.UTC),
+		NewPrivateSessionLifecycleDraft(
+			"agent-1",
+			"agent-1",
+			"deleted",
+			publicPayload,
+			storedPayload,
+		),
+	)
+	if err == nil {
+		t.Fatal("private non-created lifecycle draft committed")
+	}
+}
+
 func TestOutputChunkDraftCopiesPrivateAttachment(t *testing.T) {
 	data := []byte("prompt\x00without newline")
 	draft, err := NewOutputChunkDraft("agent-1", "agent-1", 17, data)

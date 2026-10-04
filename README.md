@@ -236,7 +236,9 @@ reconnectable`。已经写下的字节还在，可以用 `drove log` 看。
 Claude / Codex 的合法原生信号会保存一个私有恢复引用。停止后 `drove ps` 的
 `RESUMABLE` 为 `true` 时，`drove resume <agent-id>` 分别执行
 `claude --resume` 或 `codex resume`，继续使用原 Agent ID 和追加式事件流。引用
-不会出现在 Status、公开 API 事件、CLI、日志或公开回放中。
+不会出现在 Status、公开 API 事件、CLI、日志或公开回放中。创建会话时的绝对工作
+目录同样只写入私有事件载荷；原生恢复从该目录启动，避免厂商 CLI 在 daemon
+工作目录变化后找不到原会话。
 
 `session.auto_resume_on_start` 默认关闭。开启后，daemon 会在 API 已开始接受连接后，
 按创建时间恢复重启前处于非终态且已有引用的会话；用户主动停止的会话不会自动恢复。

@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -589,9 +591,23 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	if rows[0].Seq != 1 ||
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
-		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"off","signal_injection":"off","signal_injection_status":"off","signal_injection_reason":"hook_policy_off"}` {
+		rows[0].SessionID != rows[0].AgentID {
 		t.Fatalf("creation event = %+v", rows[0])
+	}
+	var creation createdPayload
+	if err := json.Unmarshal([]byte(rows[0].Payload), &creation); err != nil {
+		t.Fatalf("decode creation event: %v", err)
+	}
+	if creation.Version != 2 ||
+		creation.Name != "broken-agent" ||
+		creation.Vendor != "generic" ||
+		creation.Mode == nil ||
+		*creation.Mode != agent.RunModeInteractive ||
+		creation.HookPolicy == nil ||
+		*creation.HookPolicy != agent.HooksOff ||
+		creation.WorkingDir == "" ||
+		!filepath.IsAbs(creation.WorkingDir) {
+		t.Fatalf("creation metadata = %+v", creation)
 	}
 	if rows[1].Seq != 2 ||
 		rows[1].Type != string(event.TypeStateChanged) ||
@@ -713,6 +729,80 @@ func TestResumeUsesNativeCommandAndKeepsAgentID(t *testing.T) {
 		rows[3].From != string(agent.StateStarting) ||
 		rows[3].To != string(agent.StateWorking) {
 		t.Fatalf("resume history = %+v", rows)
+	}
+}
+
+func TestBootstrapResumeUsesPersistedWorkingDirectory(t *testing.T) {
+	st := newTestStore(t)
+	base := time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC)
+	workingDir := t.TempDir()
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+				`"mode":"interactive","hook_policy":"auto",` +
+				`"working_dir":` + strconv.Quote(workingDir) + `}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "observed",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_ref":"vendor-ref",` +
+				`"confidence":1,"received_at":"2026-10-04T15:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+			Reason:    "test stopped",
+			Payload: `{"version":1,"source":"session","event":"session_stop",` +
+				`"confidence":1}`,
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+
+	result, err := Bootstrap(context.Background(), adapter.NewRegistry(), st)
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if err := result.Manager.ConfigureSignalOrigin(&url.URL{
+		Scheme: "http",
+		Host:   "127.0.0.1:7373",
+	}); err != nil {
+		t.Fatalf("configure signal origin: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := result.Manager.Close(); err != nil {
+			t.Errorf("close restored manager: %v", err)
+		}
+	})
+	var started pty.Config
+	result.Manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+
+	if _, err := result.Manager.Resume(context.Background(), "agent-1"); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if started.Dir != workingDir {
+		t.Fatalf("resumed directory = %q, want %q", started.Dir, workingDir)
 	}
 }
 
@@ -898,6 +988,56 @@ func TestStartPersistsAndReportsRunMode(t *testing.T) {
 	}
 	if metadata.Mode == nil || *metadata.Mode != agent.RunModeOneshot {
 		t.Fatalf("creation mode = %v, want %q", metadata.Mode, agent.RunModeOneshot)
+	}
+}
+
+func TestStartPersistsWorkingDirectoryPrivately(t *testing.T) {
+	manager, st := newTestManager(t)
+	workingDir := t.TempDir()
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	subscription := manager.hub.Subscribe(8)
+	defer manager.hub.Unsubscribe(subscription)
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Name:    "directory-agent",
+		Command: "/bin/cat",
+		Dir:     workingDir,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if started.Dir != workingDir {
+		t.Fatalf("started directory = %q, want %q", started.Dir, workingDir)
+	}
+
+	stored, err := st.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay stored events: %v", err)
+	}
+	if len(stored) == 0 || !strings.Contains(stored[0].Payload, workingDir) {
+		t.Fatalf("stored creation payload = %q, want private working directory", stored[0].Payload)
+	}
+
+	replayed, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("manager replay: %v", err)
+	}
+	if len(replayed) == 0 || strings.Contains(replayed[0].Payload, workingDir) {
+		t.Fatalf("public replay exposed working directory: %+v", replayed)
+	}
+
+	select {
+	case published := <-subscription.C():
+		if published.Type != event.TypeSessionLifecycle ||
+			strings.Contains(published.Payload, workingDir) {
+			t.Fatalf("published creation event exposed working directory: %+v", published)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for published creation event")
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -70,6 +72,7 @@ type createdPayload struct {
 	SignalInjection       *agent.SignalInjectionMode   `json:"signal_injection,omitempty"`
 	SignalInjectionStatus *agent.SignalInjectionStatus `json:"signal_injection_status,omitempty"`
 	SignalInjectionReason *agent.SignalInjectionReason `json:"signal_injection_reason,omitempty"`
+	WorkingDir            string                       `json:"working_dir,omitempty"`
 }
 
 type inputAuditPayload struct {
@@ -259,6 +262,7 @@ func Bootstrap(
 		}
 		managed := newManagedAgent(restored)
 		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
+		managed.workingDir = plan.WorkingDirs[string(snapshot.ID)]
 		managed.resumeOnStart = plan.ResumeOnStart[string(snapshot.ID)]
 		restoredAgents[snapshot.ID] = managed
 	}
@@ -299,6 +303,11 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, err
 	}
 	req.Hooks = hookPolicy
+	workingDir, err := resolveWorkingDirectory(req.Dir)
+	if err != nil {
+		return nil, err
+	}
+	req.Dir = workingDir
 
 	// 1. 在创建持久化会话前解析并校验命令。
 	cmdName, baseArgs := entry.Runner.Command(req.Mode)
@@ -347,12 +356,13 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		),
 	)
 	managed := newManagedAgent(a)
+	managed.workingDir = req.Dir
 	persistedMode := req.Mode
 	persistedPolicy := req.Hooks
 	persistedInjection := injection.mode
 	persistedInjectionStatus := injection.status
 	persistedInjectionReason := injection.reason
-	payload, err := json.Marshal(createdPayload{
+	metadata := createdPayload{
 		Version:               2,
 		Name:                  req.Name,
 		Vendor:                req.Vendor,
@@ -361,11 +371,22 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		SignalInjection:       &persistedInjection,
 		SignalInjectionStatus: &persistedInjectionStatus,
 		SignalInjectionReason: &persistedInjectionReason,
-	})
+		WorkingDir:            req.Dir,
+	}
+	storedPayload, err := json.Marshal(metadata)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(
 			fmt.Errorf("session: encode creation metadata: %w", err),
+			cleanupErr,
+		)
+	}
+	metadata.WorkingDir = ""
+	publicPayload, err := json.Marshal(metadata)
+	if err != nil {
+		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
+		return nil, errors.Join(
+			fmt.Errorf("session: encode public creation metadata: %w", err),
 			cleanupErr,
 		)
 	}
@@ -383,11 +404,12 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			Event:      "session_start",
 			Confidence: 1,
 		}),
-		[]event.Draft{event.NewSessionLifecycleDraft(
+		[]event.Draft{event.NewPrivateSessionLifecycleDraft(
 			string(id),
 			string(id),
 			"created",
-			string(payload),
+			string(publicPayload),
+			string(storedPayload),
 		)},
 	); err != nil {
 		outputErr := running.output.Close()
@@ -660,6 +682,7 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 		command:      command.Name,
 		args:         injection.args,
 		env:          processEnv,
+		dir:          managed.workingDir,
 		terminalSize: terminalSize,
 		ptySize:      initialPTYSize,
 	}); err != nil {
@@ -958,6 +981,19 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 		return nil, err
 	}
 	for i := range rows {
+		if rows[i].Type == string(event.TypeSessionLifecycle) &&
+			rows[i].Reason == "created" {
+			payload, err := redactCreationPayload(rows[i].Payload)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"session: redact creation payload at seq %d: %w",
+					rows[i].Seq,
+					err,
+				)
+			}
+			rows[i].Payload = payload
+			continue
+		}
 		if rows[i].Type == string(event.TypeAgentResumed) {
 			payload, err := event.RedactAgentResumedPayload(rows[i].Payload)
 			if err != nil {
@@ -997,6 +1033,37 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 		rows[i].OutputAttachment = nil
 	}
 	return rows, nil
+}
+
+func resolveWorkingDirectory(dir string) (string, error) {
+	if dir == "" {
+		current, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("session: resolve current working directory: %w", err)
+		}
+		dir = current
+	}
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("session: resolve working directory %q: %w", dir, err)
+	}
+	return filepath.Clean(absolute), nil
+}
+
+func redactCreationPayload(raw string) (string, error) {
+	var metadata createdPayload
+	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
+		return "", fmt.Errorf("decode creation metadata: %w", err)
+	}
+	if metadata.WorkingDir == "" {
+		return raw, nil
+	}
+	metadata.WorkingDir = ""
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return "", fmt.Errorf("encode public creation metadata: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // TailRaw opens an independently cancelable durable output and resize stream.

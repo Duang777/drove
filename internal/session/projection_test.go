@@ -1083,6 +1083,20 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "signal injection",
 		},
 		{
+			name: "relative working directory",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeSessionLifecycle),
+				SessionID: "s1",
+				Reason:    "created",
+				Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+					`"mode":"interactive","hook_policy":"auto",` +
+					`"working_dir":"relative/project"}`,
+			}},
+			wantErr: "working directory",
+		},
+		{
 			name: "empty metadata name",
 			rows: []store.EventRow{
 				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":1,"name":"","vendor":"generic"}`},
@@ -1301,6 +1315,7 @@ func TestCreationMetadataRemainsReadableByOldVersionTwoDecoder(t *testing.T) {
 		SignalInjection:       &injection,
 		SignalInjectionStatus: &injectionStatus,
 		SignalInjectionReason: &injectionReason,
+		WorkingDir:            "/private/project",
 	})
 	if err != nil {
 		t.Fatalf("marshal creation metadata: %v", err)

@@ -743,6 +743,11 @@ session 私有投影。失败的持久化不会让会话变成可恢复。
 同 Agent `agent.resumed` 的这条迁移。公开 Status 只返回派生的 `resumable`；
 Hub、WebSocket、REST replay、CLI、错误和日志都不返回 reference。
 
+创建事件的持久载荷还保存清理后的绝对工作目录，Hub 和公开 replay 使用不含目录的
+独立载荷。恢复投影把目录放回 session 私有 managed record，PTY 启动原生命令时复用
+该目录。这样 daemon 从不同目录重启时，Claude 仍能按 session ID 找到原会话；旧
+version 1/2 历史没有目录时继续继承 daemon 当前目录。
+
 `session.auto_resume_on_start=true` 只消费重启前非终态且已有 reference 的一次性
 候选。daemon 先绑定 listener 并进入 `Accept`，再按创建时间顺序恢复。用户主动
 停止的会话仍只支持手工恢复。

@@ -28,6 +28,8 @@
 - `Resume(ctx, id)` 在同一 Agent ID 下预留一次恢复，提交私有 `agent.resumed` 与 typed
   `Stopped -> Starting` 后复用 Start 的 PTY 激活路径；`Status.Resumable` 只由已停止、
   未连接、未预留、有已提交 ref 且 exact adapter 支持恢复的会话派生。
+- Start 把清理后的绝对工作目录放进创建事件的私有持久载荷；Hub 与公开 replay
+  删除该字段。恢复投影把目录放回 managed record，Resume 用它配置 PTY。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在

@@ -256,6 +256,25 @@ func NewSessionLifecycleDraft(sessionID, agentID, reason, payload string) Draft 
 	}
 }
 
+// NewPrivateSessionLifecycleDraft stores private lifecycle metadata separately
+// from the payload published to subscribers.
+func NewPrivateSessionLifecycleDraft(
+	sessionID,
+	agentID,
+	reason,
+	publicPayload,
+	storedPayload string,
+) Draft {
+	return Draft{
+		typ:           TypeSessionLifecycle,
+		sessionID:     sessionID,
+		agentID:       agentID,
+		reason:        reason,
+		payload:       publicPayload,
+		storedPayload: storedPayload,
+	}
+}
+
 // NewAgentInputDraft constructs an uncommitted input audit event.
 func NewAgentInputDraft(sessionID, agentID, payload string) Draft {
 	return Draft{
@@ -423,6 +442,18 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		}
 		if draft.payload != agentResumedPublicPayload {
 			return Event{}, errors.New("event: invalid public agent.resumed payload")
+		}
+		storedPayload = draft.storedPayload
+	} else if draft.typ == TypeSessionLifecycle && draft.storedPayload != "" {
+		if draft.reason != "created" {
+			return Event{}, errors.New(
+				"event: private lifecycle payload requires the created reason",
+			)
+		}
+		if draft.payload == "" {
+			return Event{}, errors.New(
+				"event: private lifecycle payload requires a public payload",
+			)
 		}
 		storedPayload = draft.storedPayload
 	} else if len(draft.outputAttachment) != 0 || draft.storedPayload != "" {

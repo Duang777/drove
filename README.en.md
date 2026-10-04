@@ -216,7 +216,9 @@ A valid native Claude or Codex signal stores one private resume reference. When
 `drove ps` shows `RESUMABLE=true` after a stop, `drove resume <agent-id>` runs
 `claude --resume` or `codex resume` under the same Agent ID and append-only
 event stream. The reference is absent from Status, public API events, CLI
-output, logs, and public replay.
+output, logs, and public replay. The absolute working directory from creation
+is also stored only in the private event payload. Native resume starts there
+so a changed daemon working directory cannot hide the vendor session.
 
 `session.auto_resume_on_start` is off by default. When enabled, the daemon
 waits until the API is accepting connections, then resumes sessions that were

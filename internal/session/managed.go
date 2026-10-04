@@ -9,6 +9,8 @@ import (
 type managedAgent struct {
 	agent *agent.Agent
 
+	workingDir string
+
 	refMu            sync.RWMutex
 	vendorSessionRef string
 	resumeOnStart    bool
