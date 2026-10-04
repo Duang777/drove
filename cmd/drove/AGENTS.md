@@ -2,8 +2,9 @@
 
 ## 职责
 
-**CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log /
-resume / timeline / explain / stop / worktree / token rotate / web / version），所有会话操作都经
+**CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / resume / ps /
+log / timeline / explain / attach / stop / worktree / token rotate / web / version），
+所有会话操作都经
 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
 
@@ -34,6 +35,9 @@ resume / timeline / explain / stop / worktree / token rotate / web / version）�
   `ephemeral redacted current screen` 标签和受限行视图。
 - `drove timeline <id>` 打印状态区间和一基 Blocked 跳转列表；`--json` 原样输出
   类型化 timeline 响应。CLI 在本阶段不执行终端播放。
+- `drove attach <id>` 把当前 TTY 交给 `internal/cliattach` 打开可写 v2 raw
+  attachment；`--read-only` 改为用户只读 access。Cobra 不持有 raw mode、pump、
+  signal 或 cleanup 逻辑。
 - 每次命令经 DataDir 下的 Unix socket 调用 daemon，并从同一目录读取控制令牌后调用
   `client.EnsureDaemon`；仅 socket 不可达时后台拉起 `droved`，认证失败直接返回。
 - `drove token rotate` 经 Unix socket 请求 daemon 原子轮换令牌；命令本身不读取或

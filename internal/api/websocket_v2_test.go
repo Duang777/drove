@@ -158,6 +158,101 @@ func TestWebSocketV2NegotiatesAndStreamsRawHistoryFromOffset(t *testing.T) {
 	if response["code"] != "not_writable" {
 		t.Fatalf("read-only input response = %#v", response)
 	}
+	rows, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay recording raw subscription: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type == string(event.TypeAgentAttachment) {
+			t.Fatalf("recording raw subscription wrote attachment audit: %+v", row)
+		}
+	}
+}
+
+func TestWebSocketV2ExplicitReadOnlyRawAuditsLifecycle(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "websocket-v2-read-only",
+		Command: "/bin/cat",
+		Mode:    agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start agent: %v", err)
+	}
+
+	httpServer := httptest.NewServer(server.mux)
+	defer httpServer.Close()
+	conn := dialTestWebSocketV2(t, httpServer.URL)
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "subscribe",
+		"request_id": "subscribe-read-only",
+		"agent_id":   status.AgentID,
+		"mode":       "raw",
+		"writable":   false,
+	}); err != nil {
+		t.Fatalf("subscribe read-only raw: %v", err)
+	}
+	_ = readWebSocketV2TextType(t, conn, "subscribed", time.Now().Add(3*time.Second))
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "input",
+		"request_id": "read-only-input",
+		"agent_id":   status.AgentID,
+		"data":       "private input",
+	}); err != nil {
+		t.Fatalf("write read-only input: %v", err)
+	}
+	response := readWebSocketV2TextType(
+		t,
+		conn,
+		"error",
+		time.Now().Add(3*time.Second),
+	)
+	if response["code"] != "not_writable" {
+		t.Fatalf("read-only input response = %#v", response)
+	}
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "unsubscribe",
+		"request_id": "unsubscribe-read-only",
+		"agent_id":   status.AgentID,
+		"mode":       "raw",
+	}); err != nil {
+		t.Fatalf("unsubscribe read-only raw: %v", err)
+	}
+	_ = readWebSocketV2TextType(t, conn, "unsubscribed", time.Now().Add(3*time.Second))
+
+	var audits []event.AttachmentAuditPayloadV1
+	rows, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay attachment audit: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type != string(event.TypeAgentAttachment) {
+			continue
+		}
+		if strings.Contains(row.Payload, "private input") ||
+			strings.Contains(row.Payload, "subscribe-read-only") {
+			t.Fatalf("attachment audit retained private data: %s", row.Payload)
+		}
+		payload, err := event.DecodeAttachmentAuditPayload(row.Payload)
+		if err != nil {
+			t.Fatalf("decode attachment audit: %v", err)
+		}
+		audits = append(audits, payload)
+	}
+	if len(audits) != 2 ||
+		audits[0].Action != event.AttachmentAttached ||
+		audits[0].Access != event.AttachmentReadOnly ||
+		audits[1].Action != event.AttachmentDetached ||
+		audits[1].Access != event.AttachmentReadOnly {
+		t.Fatalf("attachment audits = %+v", audits)
+	}
 }
 
 func TestWebSocketV2EventHistoryRedactsPrivateSessionMetadata(t *testing.T) {

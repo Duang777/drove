@@ -11,6 +11,20 @@ import type {
   TerminalResize,
   TerminalSnapshot,
 } from '../api/types'
+import {
+  formatUint64,
+  optionalString,
+  requireArray,
+  requireBoolean,
+  requireDecimalString,
+  requireKeys,
+  requireNonNegativeInteger,
+  requireRecord,
+  requireSize,
+  requireString,
+  requireTimestamp,
+  toError,
+} from '../api/parsing'
 
 const WS_PATH = '/ws'
 const PROTOCOL = 'drove.v2'
@@ -21,7 +35,6 @@ const RAW_OUTPUT_KIND = 1
 const HISTORICAL_FLAG = 1
 const MAX_ID_BYTES = 128
 const MAX_OUTPUT_BYTES = 32 * 1024
-const MAX_UINT64 = 18_446_744_073_709_551_615n
 
 export type TerminalStart =
   | { kind: 'cursor'; cursor: TerminalCursor }
@@ -52,7 +65,7 @@ export type TerminalSubscription =
       mode: 'snapshot'
     }
 
-interface Options {
+export interface TerminalStreamOptions {
   onMessage: (message: TerminalMessage) => void | Promise<void>
   onError?: (error: Error) => void
   onStateChange?: (state: ConnectionState) => void
@@ -87,7 +100,7 @@ interface ConnectPromise {
   reject: (error: Error) => void
 }
 
-type ParsedText =
+export type ParsedTerminalText =
   | { kind: 'hello' }
   | { kind: 'command'; request_id: string; result: CommandResult }
   | { kind: 'error'; error: TerminalProtocolError }
@@ -140,7 +153,7 @@ export class TerminalStream {
   private readonly onError?: (error: Error) => void
   private readonly onStateChange?: (state: ConnectionState) => void
 
-  constructor(options: Options) {
+  constructor(options: TerminalStreamOptions) {
     this.onMessage = options.onMessage
     this.onError = options.onError
     this.onStateChange = options.onStateChange
@@ -205,9 +218,9 @@ export class TerminalStream {
       agent_id: subscription.agent_id,
       mode: subscription.mode,
     }
-    if (subscription.mode === 'raw' && subscription.writable === true) {
-      command.writable = true
-      if (subscription.viewport !== undefined) {
+    if (subscription.mode === 'raw' && subscription.writable !== undefined) {
+      command.writable = subscription.writable
+      if (subscription.writable && subscription.viewport !== undefined) {
         command.rows = subscription.viewport.rows
         command.columns = subscription.viewport.columns
       }
@@ -236,9 +249,6 @@ export class TerminalStream {
       result.mode !== subscription.mode
     ) {
       throw new Error('Terminal subscribe response does not match the request')
-    }
-    if (result.cursor !== undefined) {
-      this.cursors.set(subscriptionKey(result.agent_id, result.mode), result.cursor)
     }
   }
 
@@ -327,17 +337,17 @@ export class TerminalStream {
 
   private receive(data: unknown): void {
     if (typeof data === 'string') {
-      this.receiveText(parseTextMessage(data))
+      this.receiveText(parseTerminalTextMessage(data))
       return
     }
     if (data instanceof ArrayBuffer) {
-      this.deliver(parseRawFrame(data))
+      this.deliver(parseTerminalRawFrame(data))
       return
     }
     throw new Error('Terminal WebSocket returned an unsupported frame body')
   }
 
-  private receiveText(parsed: ParsedText): void {
+  private receiveText(parsed: ParsedTerminalText): void {
     switch (parsed.kind) {
       case 'hello': {
         const connecting = this.connectPromise
@@ -433,17 +443,12 @@ export class TerminalStream {
 }
 
 export function decimalString(value: bigint): DecimalString {
-  if (value < 0n || value > MAX_UINT64) {
-    throw new Error('Decimal value is outside uint64 range')
-  }
-  const encoded = value.toString()
-  if (!isDecimalString(encoded)) {
-    throw new Error('Decimal value is not canonical')
-  }
-  return encoded
+  return formatUint64(value, 'decimal value')
 }
 
-function parseTextMessage(payload: string): ParsedText {
+export function parseTerminalTextMessage(
+  payload: string,
+): ParsedTerminalText {
   let value: unknown
   try {
     value = JSON.parse(payload)
@@ -521,7 +526,7 @@ function parseTextMessage(payload: string): ParsedText {
   }
 }
 
-function parseError(object: Record<string, unknown>): ParsedText {
+function parseError(object: Record<string, unknown>): ParsedTerminalText {
   requireKeys(object, ['version', 'type', 'code', 'message'], [
     'request_id',
     'agent_id',
@@ -589,7 +594,7 @@ function parseEvent(object: Record<string, unknown>): TerminalEvent {
   ])
   const event: TerminalEventEnvelope = {
     seq: requireDecimal(eventObject.seq, 'event seq'),
-    timestamp: requireString(eventObject.timestamp, 'event timestamp'),
+    timestamp: requireTimestamp(eventObject.timestamp, 'event timestamp'),
     type: requireString(eventObject.type, 'event type'),
   }
   assignOptionalString(event, 'agent_id', eventObject.agent_id)
@@ -670,7 +675,7 @@ function parseSnapshot(object: Record<string, unknown>): TerminalSnapshot {
     lines,
     truncated: requireBoolean(object.truncated, 'truncated'),
     restorable: false,
-    captured_at: requireString(object.captured_at, 'captured_at'),
+    captured_at: requireTimestamp(object.captured_at, 'captured_at'),
   }
 }
 
@@ -688,7 +693,7 @@ function parseCaughtUp(object: Record<string, unknown>): TerminalCaughtUp {
   }
 }
 
-function parseRawFrame(buffer: ArrayBuffer): TerminalOutput {
+export function parseTerminalRawFrame(buffer: ArrayBuffer): TerminalOutput {
   const bytes = new Uint8Array(buffer)
   if (bytes.byteLength <= RAW_HEADER_BYTES) {
     throw new Error('Terminal raw frame is truncated')
@@ -729,9 +734,6 @@ function parseRawFrame(buffer: ArrayBuffer): TerminalOutput {
   const sequence = view.getBigUint64(8, false)
   const offset = view.getBigUint64(16, false)
   const nextOffset = offset + BigInt(data.byteLength)
-  if (nextOffset > MAX_UINT64) {
-    throw new Error('Terminal raw frame cursor overflows')
-  }
   const seq = decimalString(sequence)
   const start = decimalString(offset)
   const cursor = { seq, next_offset: decimalString(nextOffset) }
@@ -814,76 +816,6 @@ function subscriptionKey(agentID: string, mode: TerminalMode): string {
   return `${agentID}\u0000${mode}`
 }
 
-function requireRecord(value: unknown, name: string): Record<string, unknown> {
-  if (!isRecord(value)) {
-    throw new Error(`${name} must be an object`)
-  }
-  return value
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function requireKeys(
-  value: Record<string, unknown>,
-  required: string[],
-  optional: string[] = [],
-): void {
-  const allowed = new Set([...required, ...optional])
-  for (const key of Object.keys(value)) {
-    if (!allowed.has(key)) {
-      throw new Error(`Unexpected field ${key}`)
-    }
-  }
-  for (const key of required) {
-    if (!(key in value)) {
-      throw new Error(`Missing field ${key}`)
-    }
-  }
-}
-
-function requireArray(value: unknown, name: string): unknown[] {
-  if (!Array.isArray(value)) {
-    throw new Error(`${name} must be an array`)
-  }
-  return value
-}
-
-function requireString(value: unknown, name: string): string {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`${name} must be a non-empty string`)
-  }
-  return value
-}
-
-function optionalString(value: unknown, name: string): string | undefined {
-  if (value === undefined) return undefined
-  return requireString(value, name)
-}
-
-function requireBoolean(value: unknown, name: string): boolean {
-  if (typeof value !== 'boolean') {
-    throw new Error(`${name} must be boolean`)
-  }
-  return value
-}
-
-function requireNonNegativeInteger(value: unknown, name: string): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
-    throw new Error(`${name} must be a non-negative integer`)
-  }
-  return value
-}
-
-function requireSize(value: unknown, name: string): number {
-  const size = requireNonNegativeInteger(value, name)
-  if (size === 0 || size > 65_535) {
-    throw new Error(`${name} must be in 1..65535`)
-  }
-  return size
-}
-
 function requireAgentID(value: unknown): string {
   const agentID = requireString(value, 'agent_id')
   validateAgentID(agentID)
@@ -917,21 +849,7 @@ function validateSize(rows: number, columns: number): void {
 }
 
 function requireDecimal(value: unknown, name: string): DecimalString {
-  if (!isDecimalString(value)) {
-    throw new Error(`${name} must be a canonical uint64 decimal string`)
-  }
-  return value
-}
-
-function isDecimalString(value: unknown): value is DecimalString {
-  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) {
-    return false
-  }
-  try {
-    return BigInt(value) <= MAX_UINT64
-  } catch {
-    return false
-  }
+  return requireDecimalString(value, name)
 }
 
 function assignOptionalString(
@@ -942,8 +860,4 @@ function assignOptionalString(
   if (value !== undefined) {
     target[key] = requireString(value, key)
   }
-}
-
-function toError(value: unknown): Error {
-  return value instanceof Error ? value : new Error(String(value))
 }

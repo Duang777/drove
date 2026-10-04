@@ -10,12 +10,14 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/pty"
 )
 
 func TestAttachmentLatestOwnershipLifecycle(t *testing.T) {
 	manager, id, running, process := newAttachmentTestRuntime(t)
 
 	first, err := manager.AttachTerminal(context.Background(), id, AttachmentOptions{
+		Purpose: AttachmentPurposeUser,
 		Mode:    AttachmentWritable,
 		Rows:    24,
 		Columns: 80,
@@ -25,6 +27,7 @@ func TestAttachmentLatestOwnershipLifecycle(t *testing.T) {
 	}
 	defer first.Close()
 	second, err := manager.AttachTerminal(context.Background(), id, AttachmentOptions{
+		Purpose: AttachmentPurposeUser,
 		Mode:    AttachmentWritable,
 		Rows:    30,
 		Columns: 100,
@@ -91,14 +94,19 @@ func TestAttachmentLatestOwnershipLifecycle(t *testing.T) {
 			recordingTypes = append(recordingTypes, event.TypeAgentResized)
 		case event.TypeAgentInput:
 			recordingTypes = append(recordingTypes, event.TypeAgentInput)
+		case event.TypeAgentAttachment:
+			recordingTypes = append(recordingTypes, event.TypeAgentAttachment)
 		}
 	}
 	if want := []event.Type{
 		event.TypeAgentResized,
+		event.TypeAgentAttachment,
+		event.TypeAgentAttachment,
 		event.TypeAgentResized,
 		event.TypeAgentResized,
 		event.TypeAgentInput,
 		event.TypeAgentResized,
+		event.TypeAgentAttachment,
 	}; !slices.Equal(recordingTypes, want) {
 		t.Fatalf("recording types = %v, want %v", recordingTypes, want)
 	}
@@ -122,6 +130,7 @@ func TestAttachmentFailedInputDoesNotPromoteOwner(t *testing.T) {
 	process.writeErr = errors.New("input rejected")
 
 	first, err := manager.AttachTerminal(context.Background(), id, AttachmentOptions{
+		Purpose: AttachmentPurposeUser,
 		Mode:    AttachmentWritable,
 		Rows:    24,
 		Columns: 80,
@@ -131,6 +140,7 @@ func TestAttachmentFailedInputDoesNotPromoteOwner(t *testing.T) {
 	}
 	defer first.Close()
 	second, err := manager.AttachTerminal(context.Background(), id, AttachmentOptions{
+		Purpose: AttachmentPurposeUser,
 		Mode:    AttachmentWritable,
 		Rows:    30,
 		Columns: 100,
@@ -164,6 +174,7 @@ func TestAttachmentInputRejectsConcurrentAdmission(t *testing.T) {
 		context.Background(),
 		id,
 		AttachmentOptions{
+			Purpose: AttachmentPurposeUser,
 			Mode:    AttachmentWritable,
 			Rows:    24,
 			Columns: 80,
@@ -191,7 +202,8 @@ func TestAttachmentInputRejectsConcurrentAdmission(t *testing.T) {
 func TestReadOnlyAttachmentCannotWriteOrOwnSize(t *testing.T) {
 	manager, id, running, process := newAttachmentTestRuntime(t)
 	readOnly, err := manager.AttachTerminal(context.Background(), id, AttachmentOptions{
-		Mode: AttachmentReadOnly,
+		Purpose: AttachmentPurposeUser,
+		Mode:    AttachmentReadOnly,
 	})
 	if err != nil {
 		t.Fatalf("attach read-only: %v", err)
@@ -224,7 +236,10 @@ func TestAttachmentDuplicateEffectiveSizeWritesNoEvent(t *testing.T) {
 	attachment, err := manager.AttachTerminal(
 		context.Background(),
 		id,
-		AttachmentOptions{Mode: AttachmentWritable},
+		AttachmentOptions{
+			Purpose: AttachmentPurposeUser,
+			Mode:    AttachmentWritable,
+		},
 	)
 	if err != nil {
 		t.Fatalf("attach writer: %v", err)
@@ -244,12 +259,207 @@ func TestAttachmentDuplicateEffectiveSizeWritesNoEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if len(rows) != 0 {
-		t.Fatalf("duplicate effective size persisted events: %+v", rows)
+	for _, row := range rows {
+		if row.Type == string(event.TypeAgentResized) {
+			t.Fatalf("duplicate effective size persisted resize: %+v", row)
+		}
 	}
 	if err := running.output.End(0); err != nil {
 		t.Fatalf("end output: %v", err)
 	}
+}
+
+func TestAttachmentRequiresExplicitCompatiblePurpose(t *testing.T) {
+	manager, id, _, _ := newAttachmentTestRuntime(t)
+	tests := []AttachmentOptions{
+		{Mode: AttachmentReadOnly},
+		{
+			Purpose: AttachmentPurposeRecording,
+			Mode:    AttachmentWritable,
+		},
+	}
+	for _, options := range tests {
+		if _, err := manager.AttachTerminal(
+			context.Background(),
+			id,
+			options,
+		); err == nil {
+			t.Fatalf("attachment options %+v were accepted", options)
+		}
+	}
+}
+
+func TestUserAttachmentCloseAuditsExactlyOnce(t *testing.T) {
+	manager, id, _, _ := newAttachmentTestRuntime(t)
+	attachment, err := manager.AttachTerminal(
+		context.Background(),
+		id,
+		AttachmentOptions{
+			Purpose: AttachmentPurposeUser,
+			Mode:    AttachmentReadOnly,
+		},
+	)
+	if err != nil {
+		t.Fatalf("attach reader: %v", err)
+	}
+	if err := attachment.Close(); err != nil {
+		t.Fatalf("close attachment: %v", err)
+	}
+	if err := attachment.Close(); err != nil {
+		t.Fatalf("close attachment again: %v", err)
+	}
+
+	audits := attachmentAudits(t, manager, id)
+	want := []event.AttachmentAuditPayloadV1{
+		{
+			Version: event.AttachmentAuditPayloadVersion,
+			Action:  event.AttachmentAttached,
+			Access:  event.AttachmentReadOnly,
+		},
+		{
+			Version: event.AttachmentAuditPayloadVersion,
+			Action:  event.AttachmentDetached,
+			Access:  event.AttachmentReadOnly,
+		},
+	}
+	if !slices.Equal(audits, want) {
+		t.Fatalf("attachment audits = %+v, want %+v", audits, want)
+	}
+}
+
+func TestForcedAttachmentRemovalAuditsUsersOnly(t *testing.T) {
+	tests := []struct {
+		name   string
+		remove func(*Manager, agent.ID, *runningSession) error
+	}{
+		{
+			name: "detach all",
+			remove: func(_ *Manager, _ agent.ID, running *runningSession) error {
+				return running.output.DetachAll()
+			},
+		},
+		{
+			name: "output close",
+			remove: func(_ *Manager, _ agent.ID, running *runningSession) error {
+				return running.output.Close()
+			},
+		},
+		{
+			name: "manager shutdown",
+			remove: func(manager *Manager, _ agent.ID, _ *runningSession) error {
+				return manager.Close()
+			},
+		},
+		{
+			name: "process exit",
+			remove: func(manager *Manager, id agent.ID, running *runningSession) error {
+				manager.onExit(id, running, pty.ExitInfo{Code: 0})
+				return running.output.Close()
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			manager, id, running, _ := newAttachmentTestRuntime(t)
+			user, err := manager.AttachTerminal(
+				context.Background(),
+				id,
+				AttachmentOptions{
+					Purpose: AttachmentPurposeUser,
+					Mode:    AttachmentWritable,
+				},
+			)
+			if err != nil {
+				t.Fatalf("attach user: %v", err)
+			}
+			recording, err := manager.AttachTerminal(
+				context.Background(),
+				id,
+				AttachmentOptions{
+					Purpose: AttachmentPurposeRecording,
+					Mode:    AttachmentReadOnly,
+				},
+			)
+			if err != nil {
+				t.Fatalf("attach recording reader: %v", err)
+			}
+			if err := test.remove(manager, id, running); err != nil {
+				t.Fatalf("remove attachments: %v", err)
+			}
+			if err := user.Close(); err != nil {
+				t.Fatalf("close removed user attachment: %v", err)
+			}
+			if err := recording.Close(); err != nil {
+				t.Fatalf("close removed recording attachment: %v", err)
+			}
+
+			audits := attachmentAudits(t, manager, id)
+			if len(audits) != 2 ||
+				audits[0].Action != event.AttachmentAttached ||
+				audits[0].Access != event.AttachmentReadWrite ||
+				audits[1].Action != event.AttachmentDetached ||
+				audits[1].Access != event.AttachmentReadWrite {
+				t.Fatalf("attachment audits = %+v", audits)
+			}
+		})
+	}
+}
+
+func TestFailedUserAttachmentSetupCleansLocalState(t *testing.T) {
+	manager, id, running, _ := newAttachmentTestRuntime(t)
+	manager.committer.Close()
+	appendErr := errors.New("attachment audit unavailable")
+	failingStore := &memoryCommitStore{appendErr: appendErr}
+	manager.committer = newCommitter(0, failingStore, manager.hub)
+
+	if _, err := manager.AttachTerminal(
+		context.Background(),
+		id,
+		AttachmentOptions{
+			Purpose: AttachmentPurposeUser,
+			Mode:    AttachmentReadOnly,
+		},
+	); !errors.Is(err, appendErr) {
+		t.Fatalf("attach error = %v, want append failure", err)
+	}
+	if err := running.output.DetachAll(); err != nil {
+		t.Fatalf("failed setup left an attachment to detach: %v", err)
+	}
+	if rows := failingStore.Rows(); len(rows) != 0 {
+		t.Fatalf("failed setup persisted rows: %+v", rows)
+	}
+	select {
+	case fatalErr := <-manager.Fatal():
+		if !errors.Is(fatalErr, appendErr) {
+			t.Fatalf("fatal error = %v, want append failure", fatalErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed attachment audit did not fail the committer")
+	}
+}
+
+func attachmentAudits(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+) []event.AttachmentAuditPayloadV1 {
+	t.Helper()
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay attachment audits: %v", err)
+	}
+	var audits []event.AttachmentAuditPayloadV1
+	for _, row := range rows {
+		if row.Type != string(event.TypeAgentAttachment) {
+			continue
+		}
+		payload, err := event.DecodeAttachmentAuditPayload(row.Payload)
+		if err != nil {
+			t.Fatalf("decode attachment audit: %v", err)
+		}
+		audits = append(audits, payload)
+	}
+	return audits
 }
 
 func newAttachmentTestRuntime(

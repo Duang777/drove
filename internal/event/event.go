@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strings"
 	"sync"
@@ -39,6 +40,8 @@ const (
 	TypeAgentSignal Type = "agent.signal"
 	// TypeAgentResized 表示已成功应用到 PTY 和终端模型的尺寸。
 	TypeAgentResized Type = "agent.resized"
+	// TypeAgentAttachment 表示用户终端 attachment 的脱敏生命周期审计。
+	TypeAgentAttachment Type = "agent.attachment"
 	// TypeAgentResumed marks an explicit native resume attempt.
 	TypeAgentResumed Type = "agent.resumed"
 )
@@ -371,6 +374,110 @@ func NewAgentResizedDraft(
 	}, nil
 }
 
+// AttachmentAction identifies one user attachment lifecycle transition.
+type AttachmentAction string
+
+const (
+	// AttachmentAttached records successful user attachment setup.
+	AttachmentAttached AttachmentAction = "attached"
+	// AttachmentDetached records completed local attachment cleanup.
+	AttachmentDetached AttachmentAction = "detached"
+)
+
+// AttachmentAccess identifies the capabilities granted to a user attachment.
+type AttachmentAccess string
+
+const (
+	// AttachmentReadOnly permits terminal output reads only.
+	AttachmentReadOnly AttachmentAccess = "read_only"
+	// AttachmentReadWrite permits terminal output, input, and resize.
+	AttachmentReadWrite AttachmentAccess = "read_write"
+)
+
+const (
+	// AttachmentAuditPayloadVersion is the current agent.attachment payload version.
+	AttachmentAuditPayloadVersion = 1
+)
+
+// AttachmentAuditPayloadV1 records one privacy-bounded attachment transition.
+type AttachmentAuditPayloadV1 struct {
+	Version int              `json:"version"`
+	Action  AttachmentAction `json:"action"`
+	Access  AttachmentAccess `json:"access"`
+}
+
+// Validate rejects malformed attachment audit metadata.
+func (p AttachmentAuditPayloadV1) Validate() error {
+	if p.Version != AttachmentAuditPayloadVersion {
+		return fmt.Errorf("event: attachment audit version %d is unsupported", p.Version)
+	}
+	switch p.Action {
+	case AttachmentAttached, AttachmentDetached:
+	default:
+		return fmt.Errorf("event: attachment audit action %q is invalid", p.Action)
+	}
+	switch p.Access {
+	case AttachmentReadOnly, AttachmentReadWrite:
+	default:
+		return fmt.Errorf("event: attachment audit access %q is invalid", p.Access)
+	}
+	return nil
+}
+
+// DecodeAttachmentAuditPayload decodes and validates an agent.attachment v1 payload.
+func DecodeAttachmentAuditPayload(payload string) (AttachmentAuditPayloadV1, error) {
+	var decoded AttachmentAuditPayloadV1
+	decoder := json.NewDecoder(strings.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return AttachmentAuditPayloadV1{}, fmt.Errorf(
+			"event: decode attachment audit payload: %w",
+			err,
+		)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return AttachmentAuditPayloadV1{}, fmt.Errorf(
+			"event: decode attachment audit payload: %w",
+			err,
+		)
+	}
+	if err := decoded.Validate(); err != nil {
+		return AttachmentAuditPayloadV1{}, err
+	}
+	return decoded, nil
+}
+
+// NewAgentAttachmentDraft constructs an uncommitted user attachment audit.
+func NewAgentAttachmentDraft(
+	sessionID string,
+	agentID string,
+	action AttachmentAction,
+	access AttachmentAccess,
+) (Draft, error) {
+	payload := AttachmentAuditPayloadV1{
+		Version: AttachmentAuditPayloadVersion,
+		Action:  action,
+		Access:  access,
+	}
+	if err := payload.Validate(); err != nil {
+		return Draft{}, err
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return Draft{}, fmt.Errorf("event: encode attachment audit payload: %w", err)
+	}
+	return Draft{
+		typ:       TypeAgentAttachment,
+		sessionID: sessionID,
+		agentID:   agentID,
+		payload:   string(encoded),
+	}, nil
+}
+
 // NewAgentResumedDraft stores the full payload but exposes only its version.
 func NewAgentResumedDraft(sessionID, agentID, payload string) Draft {
 	return Draft{
@@ -400,6 +507,7 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		TypeAgentInput,
 		TypeAgentSignal,
 		TypeAgentResized,
+		TypeAgentAttachment,
 		TypeAgentResumed:
 	default:
 		return Event{}, fmt.Errorf("event: invalid draft type %q", draft.typ)
@@ -476,6 +584,11 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	}
 	if draft.typ == TypeAgentResized {
 		if _, err := DecodeAgentResizedPayload(draft.payload); err != nil {
+			return Event{}, err
+		}
+	}
+	if draft.typ == TypeAgentAttachment {
+		if _, err := DecodeAttachmentAuditPayload(draft.payload); err != nil {
 			return Event{}, err
 		}
 	}

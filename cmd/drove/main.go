@@ -22,6 +22,7 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/cliattach"
 	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
@@ -69,6 +70,7 @@ func newRootCmd() *cobra.Command {
 		newTimelineCmd(),
 		newExplainCmd(),
 		newSendCmd(),
+		newAttachCmd(),
 		newHookCmd(),
 		newStopCmd(),
 		newWorktreeCmd(),
@@ -824,6 +826,45 @@ func newSendCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "从标准输入读取内容，不自动添加换行")
+	return cmd
+}
+
+type attachClientFactory func(context.Context) (*client.Client, error)
+
+type attachRunner func(
+	context.Context,
+	*client.Client,
+	string,
+	cliattach.Options,
+) error
+
+func newAttachCmd() *cobra.Command {
+	return newAttachCmdWith(newClient, cliattach.Run)
+}
+
+func newAttachCmdWith(
+	clientFactory attachClientFactory,
+	runner attachRunner,
+) *cobra.Command {
+	var readOnly bool
+	cmd := &cobra.Command{
+		Use:   "attach <agent-id>",
+		Short: "连接到 Agent 的实时终端",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			daemon, err := clientFactory(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return runner(
+				cmd.Context(),
+				daemon,
+				args[0],
+				cliattach.Options{ReadOnly: readOnly},
+			)
+		},
+	}
+	cmd.Flags().BoolVar(&readOnly, "read-only", false, "只读连接，不发送输入或尺寸")
 	return cmd
 }
 

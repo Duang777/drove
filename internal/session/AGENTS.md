@@ -35,8 +35,9 @@
   `Stopped -> Starting` 后复用 Start 的 PTY 激活路径；`Status.Resumable` 只由已停止、
   未连接、未预留、有已提交 ref 且 exact adapter 支持恢复的会话派生。恢复后的 PTY
   源偏移重新从 0 计数，持久 output offset 则从 Store 的 session boundary 继续。
-- Start 把清理后的绝对工作目录放进创建事件的私有持久载荷；Hub 与公开 replay
-  删除该字段。恢复投影把目录放回 managed record，Resume 用它配置 PTY。
+- `Start` 把清理后的绝对工作目录放进 Agent 和创建事件的私有持久载荷；Hub 与公开
+  replay 删除该字段。恢复投影把目录放回 Agent 与 managed record，Resume 用它配置
+  PTY，`Status.Dir` 对控制客户端返回该目录。
 - `StartRequest.Worktree` 存在时，Manager 在生成 Agent ID 后调用
   `internal/workspace` 创建独立 worktree，并把 Agent 工作目录切到该路径。创建事件
   持久化前的失败会回滚 worktree 和本次新建的分支；SQLite append 成功后，即使投影
@@ -84,6 +85,10 @@
   只更新 proposal，成功输入在写入前应用 proposal 并在写入后晋升，owner detach
   按 actor activity ticket 选择回退。attached input 在提交 output actor 前获取同一
   fail-fast input gate，attachment ID 不进入事件。
+- attachment 必须显式声明 `recording` 或 `user` purpose；recording 只读且不审计，
+  user 在本地建立成功后写 `attached`，在本地清理完成后写 `detached`。显式关闭、
+  进程退出、`DetachAll` 和 actor shutdown 都由 recording actor 收敛为同一个
+  exactly-once removal；强制清理期间 Committer 必须保持可用。
 - 有效 resize 先由 terminal actor 依次应用到 PTY 与 x/vt，再提交
   `agent.resized`；重复尺寸不写事件。应用后提交失败会触发 fail-stop。
 - live snapshot 仅存在内存中，每个 attachment 最多 2 Hz、channel 容量为 1，
@@ -93,8 +98,9 @@
   才 detach 并允许原生恢复，detach 后 snapshot 不可用。
 - 用户输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；用户调用者
   不在该锁后排队。PTY 输出和 terminal query reply 不参与该锁。
-- 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
-  `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。
+- 恢复投影显式识别 `agent.input`、`agent.attachment`、`agent.resumed` 和
+  `output.chunk`。input 与 attachment 不改变状态；`output.chunk` 与旧 `output`
+  只更新已有会话的事件事实。
 - 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
   只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。
 - 信号与状态证据 reader 同时接受 v1、v2、typed screen v3 和 typed terminal v4；v2 的 notify
@@ -113,5 +119,5 @@
 - 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`、
   `WorktreeRequest`、
   `ExplainOptions`、`ExplainEvent`、`ExplainScreen`、`Explanation`、
-  `AttachmentID`、`AttachmentMode`、`AttachmentOptions`、
+  `AttachmentID`、`AttachmentMode`、`AttachmentPurpose`、`AttachmentOptions`、
   `TerminalAttachment`、`LiveSnapshot`。
