@@ -30,13 +30,55 @@ export type HookStatus =
   | 'required_failed'
   | 'detached'
 
-/** 状态迁移的脱敏证据。 */
-export interface StateEvidence {
-  source: 'session' | 'process' | 'hook' | 'heuristic' | 'timer' | 'recovery'
+/** 会话级信号注入配置。 */
+export type SignalInjectionMode = 'auto' | 'off'
+
+/** 会话启动时的信号注入结果。 */
+export type SignalInjectionStatus = 'off' | 'injected' | 'skipped' | 'detached'
+
+/** 信号注入结果的稳定原因码。 */
+export type SignalInjectionReason =
+  | 'hook_policy_off'
+  | 'configured_off'
+  | 'unsupported'
+  | 'relay_unavailable'
+  | 'argument_conflict'
+  | 'session_config'
+  | 'recovered'
+
+/** screen 状态证据的有界归因。 */
+export interface ScreenAttribution {
+  rule: string
+  edge: 'present' | 'cleared'
+  region: string
+  output_offset: number
+  last_output_seq: number
+  evidence: string
+}
+
+interface StateEvidenceBase {
   event: string
   confidence: number
-  delivery_id?: string
 }
+
+/** 状态迁移的脱敏证据。 */
+export type StateEvidence =
+  | (StateEvidenceBase & {
+      source: 'hook' | 'notify'
+      delivery_id: string
+    })
+  | (StateEvidenceBase & {
+      source: 'screen'
+      screen: ScreenAttribution
+    })
+  | (StateEvidenceBase & {
+      source:
+        | 'session'
+        | 'process'
+        | 'heuristic'
+        | 'timer'
+        | 'recovery'
+    })
 
 /** 会话状态视图（Go: session.Status）。 */
 export interface AgentStatus {
@@ -49,8 +91,11 @@ export interface AgentStatus {
   created_at: string
   updated_at: string
   last_error?: string
-  hook_policy?: HookPolicy
-  hook_status?: HookStatus
+  hook_policy: HookPolicy
+  hook_status: HookStatus
+  signal_injection: SignalInjectionMode
+  signal_injection_status: SignalInjectionStatus
+  signal_injection_reason: SignalInjectionReason
   last_transition?: StateEvidence
 }
 
@@ -149,7 +194,7 @@ export type TerminalMode = 'raw' | 'events' | 'snapshot'
 /** v2 event 模式使用的十进制安全事件 envelope。 */
 export interface TerminalEventEnvelope {
   seq: DecimalString
-  timestamp: string
+  timestamp: Timestamp
   type: string
   agent_id?: string
   session_id?: string
@@ -201,7 +246,7 @@ export interface TerminalSnapshot {
   lines: string[]
   truncated: boolean
   restorable: false
-  captured_at: string
+  captured_at: Timestamp
 }
 
 /** v2 历史追平标记。 */
@@ -222,3 +267,80 @@ export type TerminalMessage =
 
 /** WebSocket 连接的连接状态。 */
 export type ConnectionState = 'connecting' | 'open' | 'closed'
+
+/** 已校验的 RFC3339 时间戳及其毫秒值。 */
+export interface Timestamp {
+  readonly iso: string
+  readonly epochMillis: number
+}
+
+/** 浏览器领域内的录制游标。 */
+export interface RecordingCursor {
+  readonly seq: bigint
+  readonly nextOffset: bigint
+}
+
+/** 半开终端输出字节范围。 */
+export interface OutputRange {
+  readonly start: bigint
+  readonly end: bigint
+}
+
+/** timeline 中由状态事件派生的半开区间。 */
+export interface TimelineStateSpan {
+  readonly state: AgentState
+  readonly start: RecordingCursor
+  readonly end?: RecordingCursor
+  readonly startAt: Timestamp
+  readonly endAt?: Timestamp
+  readonly durationMillis?: number
+  readonly source?: string
+  readonly rule?: string
+  readonly reason?: string
+}
+
+/** 一次进入 Blocked 状态的权威索引。 */
+export interface BlockedOccurrence {
+  readonly number: number
+  readonly span: TimelineStateSpan
+  readonly jump: RecordingCursor
+  readonly frameAvailable: boolean
+}
+
+/** timeline 报告的输出保留情况。 */
+export interface OutputCoverage {
+  readonly range: OutputRange
+  readonly retained: ReadonlyArray<OutputRange>
+  readonly missing: ReadonlyArray<OutputRange>
+}
+
+/** 从一个不可变会话前缀投影出的权威时间线。 */
+export interface TerminalTimeline {
+  readonly sessionID: string
+  readonly agentID: string
+  readonly captured: RecordingCursor
+  readonly capturedAt: Timestamp
+  readonly durationMillis: number
+  readonly output: OutputCoverage
+  readonly spans: ReadonlyArray<TimelineStateSpan>
+  readonly blocked: ReadonlyArray<BlockedOccurrence>
+}
+
+/** Frame 仅供可见预览，不能作为精确回放状态。 */
+export interface TerminalFramePreview {
+  readonly kind: 'frame_preview'
+  readonly sessionID: string
+  readonly cursor: RecordingCursor
+  readonly rows: number
+  readonly columns: number
+  readonly lines: ReadonlyArray<string>
+  readonly truncated: boolean
+  readonly fidelity: 'exact_origin_replay'
+  readonly restorable: false
+}
+
+/** Frame REST 查询只允许一个 selector。 */
+export type FrameSelector =
+  | { readonly kind: 'sequence'; readonly seq: bigint }
+  | { readonly kind: 'timestamp'; readonly at: Timestamp }
+  | { readonly kind: 'offset'; readonly offset: bigint }

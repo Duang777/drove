@@ -9,7 +9,11 @@
 | 模块 | 职责 |
 |---|---|
 | `src/api/types.ts` | 与 daemon JSON 契约对齐的类型（**契约唯一事实来源在 Go 端，改动需两侧同步**） |
-| `src/api/client.ts` | REST 客户端（list / start / stop / replay），纯 JSON 透传 |
+| `src/api/client.ts` | REST 客户端（list / start / stop / replay / timeline / frame） |
+| `src/api/parsing.ts` | REST 与 WebSocket 共用的严格边界解析原语 |
+| `src/api/replayParsing.ts` | timeline、frame 与 output expiry 契约解析 |
+| `src/terminal/recordingBoundary.ts` | terminal DTO 到 bigint 录制领域值的单向转换 |
+| `src/terminal/sessionTape.ts` | 浏览器内存中的精确 origin 前缀与时间戳关联 |
 | `src/ws/eventStream.ts` | WebSocket 事件流与输入 ack/error 关联：自动重连、超时、连接状态回调、幂等关闭 |
 | `src/ws/terminalStream.ts` | `drove.v2` terminal 客户端：严格解码 raw/event/resize/snapshot，消费成功后推进 cursor |
 | `src/hooks/useAgentEvents.ts` | React hook：订阅事件流 + 本地投影（`latestAgentState`） |
@@ -34,6 +38,9 @@
 - 事件流消费必须走 `EventStream` 类（含重连与清理）；不得在组件内手写裸 WebSocket。
 - 终端订阅必须走 `TerminalStream`；v2 sequence/offset 始终使用规范十进制字符串，
   不得转成 JavaScript `number`。
+- timeline/frame 响应必须从 `unknown` 严格解析；浏览器领域中的 sequence/offset
+  使用 `bigint`。
+- `Frame` 与 `Snapshot` 只能显示预览，不得写入 `SessionTape` 或充当 xterm 恢复状态。
 - 组件卸载必须清理订阅（`useAgentEvents` 已内置）。
 - 新增依赖需说明用途；样式使用单一全局 CSS，不引入 UI 框架。
 
@@ -42,6 +49,7 @@
 ```bash
 npm install        # 安装依赖
 npm run dev        # 本地开发（需 daemon 已运行）
+npm run test -- --run
 npm run typecheck  # TS 严格检查
 npm run build      # 更新 ../internal/webui/dist/
 ```

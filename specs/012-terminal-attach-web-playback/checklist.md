@@ -59,20 +59,20 @@
 
 ## Browser recording
 
-- [ ] REST and WebSocket boundaries parse untrusted JSON from `unknown`.
-- [ ] Canonical decimal strings become `bigint` domain values.
-- [ ] `SessionTape` accepts domain operations instead of transport messages.
-- [ ] Raw operations and event timestamps correlate by sequence.
-- [ ] The exact frontier advances only when both records exist.
-- [ ] Identical reconnect duplicates are accepted.
-- [ ] Conflicting duplicates and output gaps are rejected.
-- [ ] Recorded time cannot regress in sequence order.
-- [ ] Timeline spans and Blocked markers remain authoritative REST data.
-- [ ] The tape freezes before it exceeds the 64 MiB byte limit.
-- [ ] The tape never evicts the origin prefix.
+- [x] REST and WebSocket boundaries parse untrusted JSON from `unknown`.
+- [x] Canonical decimal strings become `bigint` domain values.
+- [x] `SessionTape` accepts domain operations instead of transport messages.
+- [x] Raw operations and event timestamps correlate by sequence.
+- [x] The exact frontier advances only when both records exist.
+- [x] Identical reconnect duplicates are accepted.
+- [x] Conflicting duplicates and output gaps are rejected.
+- [x] Recorded time cannot regress in sequence order.
+- [x] Timeline spans and Blocked markers remain authoritative REST data.
+- [x] The tape freezes before it exceeds the 64 MiB byte limit.
+- [x] The tape never evicts the origin prefix.
 - [ ] Live rendering continues after the local replay limit.
-- [ ] HTTP 410 becomes a typed `OutputExpiredError`.
-- [ ] Neither a `Frame` nor a `Snapshot` can seed exact replay.
+- [x] HTTP 410 becomes a typed `OutputExpiredError`.
+- [x] Neither a `Frame` nor a `Snapshot` can seed exact replay.
 
 ## Live terminal and reconnect
 
