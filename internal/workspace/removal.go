@@ -153,6 +153,13 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 		}
 		if facts.pathExists && facts.registered && !record.Removal.Force {
 			if err := m.validateRemovalSafety(ctx, record, facts); err != nil {
+				if !errors.Is(err, ErrDirty) {
+					return nil, fmt.Errorf(
+						"workspace: revalidate pending removal for agent %q: %w",
+						record.AgentID,
+						err,
+					)
+				}
 				record.Removal = nil
 				if replaceErr := m.replaceWorkspaceRecord(record); replaceErr != nil {
 					return nil, errors.Join(err, replaceErr)
@@ -161,10 +168,10 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 			}
 		}
 		state, err := m.completeRemoval(ctx, record)
-		if err != nil {
-			return nil, err
-		}
 		if state != RemovalComplete {
+			if err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf(
 				"workspace: removal for agent %q did not complete",
 				record.AgentID,

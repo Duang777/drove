@@ -29,7 +29,8 @@
 - `EnsureDaemon(ctx, configPath)`：先探测 `/api/v1/agents`（500ms 超时）；仅网络不可达时自动拉起，认证失败不得启动第二个 daemon。
 - 自动拉起日志与控制令牌使用同一个 DataDir；缺失目录以 `0700` 创建，新日志文件使用
   `0600`，既有目录模式不自动修改。
-- 所有错误转换为 `ErrDaemonUnreachable`（区别于业务错误），CLI 据此提示用户。
+- 网络错误转换为 `ErrDaemonUnreachable`；daemon 返回的 400、404、409、413 由
+  `IsUserError` 识别为用户可纠正的请求错误，CLI 据此选择退出码。
 
 ## 约束
 
@@ -38,4 +39,4 @@
 - 导出类型：`Client`、`HookRelay`、`HookRelayConfig`、
   `RemovedWorktree`、`TerminalStream`、`TerminalAccess`、`TerminalSubscription`、
   `TerminalMessage`、
-  `TerminalStreamError`、`ErrDaemonUnreachable`。
+  `TerminalStreamError`、`IsUserError`、`ErrDaemonUnreachable`。

@@ -295,6 +295,12 @@ func (m *Manager) reconcileWorkspaceRemovals(
 	ctx context.Context,
 	metadata map[string]workspaceMetadata,
 ) error {
+	if m.workspaceErr != nil {
+		return errors.Join(
+			ErrWorkspaceUnavailable,
+			fmt.Errorf("session: initialize workspace manager: %w", m.workspaceErr),
+		)
+	}
 	if m.workspaces == nil {
 		return nil
 	}

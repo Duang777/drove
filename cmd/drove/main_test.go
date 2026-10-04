@@ -183,6 +183,51 @@ func TestUpCommandRejectsBranchWithoutWorktreeBeforeClientSetup(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--branch requires --worktree") {
 		t.Fatalf("up error = %v, want branch dependency error", err)
 	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d", got, exitUsage)
+	}
+}
+
+func TestWorktreeRemoveMissingAgentIDIsUsageError(t *testing.T) {
+	command := newRootCmd()
+	command.SetArgs([]string{"worktree", "rm"})
+	err := command.Execute()
+	if err == nil {
+		t.Fatal("worktree remove succeeded without an Agent ID")
+	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestDaemonBadRequestIsUsageError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		http.Error(w, `{"error":"invalid Agent ID"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	daemonClient := client.New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := daemonClient.CleanupWorktree(
+		context.Background(),
+		"not-an-agent-id",
+		false,
+	)
+	if err == nil {
+		t.Fatal("cleanup succeeded after daemon bad request")
+	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestRuntimeFailureUsesRuntimeExitCode(t *testing.T) {
+	err := errors.New("daemon unavailable")
+	if got := commandExitCode(err); got != exitErr {
+		t.Fatalf("exit code = %d, want %d", got, exitErr)
+	}
 }
 
 func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
@@ -197,6 +242,15 @@ func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
 	if force == nil || force.DefValue != "false" {
 		t.Fatalf("--force flag = %+v, want default false", force)
 	}
+	for _, want := range []string{
+		"未提交更改",
+		"detached HEAD",
+		"旧版未知保护信息",
+	} {
+		if !strings.Contains(force.Usage, want) {
+			t.Fatalf("--force usage = %q, want %q", force.Usage, want)
+		}
+	}
 }
 
 func TestTruncatePreservesUTF8(t *testing.T) {
@@ -210,10 +264,11 @@ func TestTruncatePreservesUTF8(t *testing.T) {
 }
 
 func TestWriteWorktrees(t *testing.T) {
+	branch := "feature/isolated-worktree-with-a-long-name"
 	var output bytes.Buffer
 	err := writeWorktrees(&output, []workspace.Workspace{{
 		AgentID: "11111111-1111-4111-8111-111111111111",
-		Branch:  "feature/isolated",
+		Branch:  branch,
 		Path:    "/tmp/drove/worktree",
 		Dirty:   true,
 	}})
@@ -222,7 +277,7 @@ func TestWriteWorktrees(t *testing.T) {
 	}
 	for _, want := range []string{
 		"AGENT ID",
-		"feature/isolated",
+		branch,
 		"true",
 		"/tmp/drove/worktree",
 	} {

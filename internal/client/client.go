@@ -32,6 +32,34 @@ var (
 	ErrUnauthorized = errors.New("client: daemon rejected control token")
 )
 
+type responseError struct {
+	statusCode int
+	status     string
+	path       string
+	body       string
+}
+
+func (e *responseError) Error() string {
+	return fmt.Sprintf("client: %s %s: %s", e.status, e.path, e.body)
+}
+
+// IsUserError reports whether the daemon rejected a user-correctable request.
+func IsUserError(err error) bool {
+	var responseErr *responseError
+	if !errors.As(err, &responseErr) {
+		return false
+	}
+	switch responseErr.statusCode {
+	case http.StatusBadRequest,
+		http.StatusNotFound,
+		http.StatusConflict,
+		http.StatusRequestEntityTooLarge:
+		return true
+	default:
+		return false
+	}
+}
+
 // Client 封装对 daemon API 的调用。
 type Client struct {
 	baseURL        string
@@ -532,7 +560,12 @@ func (c *Client) responseError(resp *http.Response, path string) error {
 			}
 		}
 	}
-	return fmt.Errorf("client: %s %s: %s", resp.Status, path, string(msg))
+	return &responseError{
+		statusCode: resp.StatusCode,
+		status:     resp.Status,
+		path:       path,
+		body:       string(msg),
+	}
 }
 
 // findDaemonBin 优先使用 CLI 同目录的 droved，其次 PATH。

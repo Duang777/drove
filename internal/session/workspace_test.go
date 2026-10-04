@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
@@ -200,6 +201,30 @@ func TestStartRejectsWorkspaceWhenManagerIsUnavailable(t *testing.T) {
 	}
 	if status != nil {
 		t.Fatalf("status = %+v, want nil", status)
+	}
+}
+
+func TestBootstrapRejectsWorkspaceInitializationFailure(t *testing.T) {
+	st := newTestStore(t)
+	initializationErr := errors.New("workspace root unavailable")
+
+	recovered, err := Bootstrap(
+		context.Background(),
+		adapter.NewRegistry(),
+		st,
+		func(manager *Manager) {
+			manager.workspaceErr = initializationErr
+		},
+	)
+	if recovered != nil {
+		t.Fatalf("bootstrap result = %+v, want nil", recovered)
+	}
+	if !errors.Is(err, ErrWorkspaceUnavailable) ||
+		!errors.Is(err, initializationErr) {
+		t.Fatalf(
+			"bootstrap error = %v, want workspace initialization failure",
+			err,
+		)
 	}
 }
 
