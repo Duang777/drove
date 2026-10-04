@@ -44,10 +44,11 @@ type ServerOptions struct {
 
 // Server 是 HTTP/WS 服务。
 type Server struct {
-	opts           ServerOptions
-	http           *http.Server
-	mux            http.Handler
-	allowedOrigins map[string]struct{}
+	opts                   ServerOptions
+	http                   *http.Server
+	mux                    http.Handler
+	allowedOrigins         map[string]struct{}
+	webSocketV2QueueBudget int
 }
 
 // NewServer 创建 Server（路由已注册）。
@@ -56,7 +57,11 @@ func NewServer(opts ServerOptions) *Server {
 	for _, origin := range opts.AllowedOrigins {
 		allowedOrigins[origin] = struct{}{}
 	}
-	s := &Server{opts: opts, allowedOrigins: allowedOrigins}
+	s := &Server{
+		opts:                   opts,
+		allowedOrigins:         allowedOrigins,
+		webSocketV2QueueBudget: webSocketV2QueueBytes,
+	}
 	controlMux := http.NewServeMux()
 	s.routes(controlMux)
 	rootMux := http.NewServeMux()

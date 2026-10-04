@@ -28,6 +28,10 @@
   snapshot 订阅。其它显式子协议在 upgrade 前拒绝。
 - v2 的普通出站帧共享 8 MiB 字节预算；溢出会取消该连接的全部订阅、丢弃未写帧，
   通过保留控制槽发送各订阅最后成功写出的 cursor，并以 1013 关闭。
+- resume cursor 只在 writer 成功写完整帧后推进；history 和 live 必须使用同一
+  Store tail，订阅建立竞态不得通过 Hub 补洞。
+- v1 hello、事件和输入错误的逐帧字节形状由
+  `testdata/websocket_v1.golden` 锁定。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload
   含 Base64 正文，过期回放只含 offset/len 元数据。
 - frame 只接受一个 selector；缺失录制返回 404，selector 错误返回 400，需要的

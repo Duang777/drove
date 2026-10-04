@@ -5,6 +5,9 @@
 - Phase 1A 交付基线：[`2717927`](https://github.com/Duang777/drove/commit/271792720012b072a087e53839823898800fe05d)
 - Phase 1B 会话注入基线：[`48d68bd`](https://github.com/Duang777/drove/commit/48d68bdb9dd6bdf761983d4e3724209010d0ab60)
 - 原始输出与保留基线：[`0c28281`](https://github.com/Duang777/drove/commit/0c282811c5f4b6271624c43a2f268cc2b8c53480)
+- 终端屏幕实现基线：[`b202e70`](https://github.com/Duang777/drove/commit/b202e70)
+- 状态解释实现基线：[`3290778`](https://github.com/Duang777/drove/commit/3290778)
+- 终端验收基线：[`a47daaf`](https://github.com/Duang777/drove/commit/a47daaf)
 - Claude Code 文档读取日期：2026-10-03
 - Codex 源码快照：[`44dd77b`](https://github.com/openai/codex/commit/44dd77b71e88c78295736bffd3dc3b684c13be6d)
 - 目标范围：RFC-001 Phase 1，关联 Issue [#2](https://github.com/Duang777/drove/issues/2)、[#3](https://github.com/Duang777/drove/issues/3) 与 [#15](https://github.com/Duang777/drove/issues/15)
@@ -45,10 +48,14 @@ Phase 1A 编码前必须固定五项协议：
 | hooks / Detector | 已完成 | 每个 live session 持有一个 Detector。hook 权威、启发式 fallback、置信度、去重、Blocked 恢复和 Idle 确认均有 race 测试。 |
 | 会话信号注入 | 已完成 | Claude 使用临时 `--settings`，Codex 使用进程级 `notify`。两种方式都不修改厂商持久配置。 |
 | 原始 PTY 输出 | 已完成 | `output.chunk` 保存带 offset 的原始字节附件；CLI 支持 raw 和 plain 回放，附件默认保留 30 天。 |
+| 终端屏幕检测 | 已完成 | terminal actor 只读取 committed output，x/vt 应答启动查询，adapter 产生稳定屏幕边沿，Detector 决定状态权威。 |
+| 状态解释 | 已完成 | `drove explain` 和 explain API 返回受限决策尾部；只有 attached 会话返回临时受限屏幕。 |
 
 Issue [#2](https://github.com/Duang777/drove/issues/2)、
 [#3](https://github.com/Duang777/drove/issues/3) 和
 [#4](https://github.com/Duang777/drove/issues/4) 的实现条件已经满足。
+Issue [#14](https://github.com/Duang777/drove/issues/14) 的终端查询、屏幕检测、
+状态解释和验收条件也已经满足。
 
 ## Issue #15 的会话注入决策
 
@@ -69,7 +76,8 @@ Codex notify 不是原生 hook。它只在 Detector 已进入 fallback 后生成
 激活后，Detector 只记录 notify，不让它驱动状态迁移。
 
 Drove 不注入 Codex trust hash，不使用 trust bypass，也不写用户或项目配置。
-OSC 9 与终端屏幕权威留在 Issue #14。持久安装器保留为可选后续能力。
+后续实现用终端屏幕补齐 fallback 权威，但没有注入 Codex OSC 9。持久安装器仍由
+[Issue #24](https://github.com/Duang777/drove/issues/24) 跟踪。
 
 ## Claude Code 的当前 hook 模型
 
@@ -444,8 +452,52 @@ session 和过期 token。relay 若重试，必须复用同一个 `delivery_id`�
 Issue #13 完成后，PTY 桥接器会立即交付原始字节块，不再等待换行。隔离回归中，
 Claude Code `2.1.181` 的 3101 字节启动流、Codex CLI `0.159.2` 的 152 字节
 启动流都与直接 PTY 抓取逐字节一致。Codex 的 `ESC[6n` 位于偏移 28，整段没有
-换行，现已能进入事件流，但 Drove 仍不生成查询应答，因此 TUI 继续停在握手
-边界。终端仿真、DSR 和 OSC 应答以及屏幕规则仍由 Issue #14 跟踪。
+换行。该结果证明了 Issue #14 的原始输入边界，但不再代表当前主干。当前
+terminal actor 会应答 DSR、OSC 10/11、DA1 和 Kitty keyboard 查询。
+
+## Issue #14 的终端屏幕结果
+
+每个 attached 会话有一个 terminal actor 和一个 observation actor。terminal
+actor 独占 x/vt controller、厂商 classifier、固定 100 ms 采样计时器和当前
+snapshot。observation actor 独占 Detector。两个 actor 通过规范化 screen
+observation 连接，不读取对方内部状态。
+
+输出只有在 Store 提交成功、投影更新和 Hub 发布后，才以
+`term.CommittedChunk` 进入 x/vt。这个顺序保证 screen attribution 中的 offset
+和最终 output sequence 都指向已提交事实。进程退出先禁止新的 screen
+observation，PTY reader 仍可提交尾部输出和更新私有 emulator。
+
+x/vt reply pump 在首个 write 前启动。query reply 直接调用
+`pty.Session.Write`，与用户输入共用完整帧写锁，但不经过 `Manager.SendInput`。
+因此 reply 不产生输入审计，也不进入输出、Hub、回放、snapshot 或 explain。
+只有子进程显式回显的 reply 才成为新输出。
+
+adapter 只暴露稳定规则名、边沿、区域、静态 evidence 和确认时长。私有 matcher
+留在 `internal/adapter`。Detector 在 fallback 中使用屏幕规则。hook 激活后，
+Detector 只允许审批框消失和 Claude 中断两个 Spec 006 例外改变状态，并把其他
+screen edge 持久化为 `suppressed`。
+
+screen signal 和 state evidence 使用 version 3。持久数据没有屏幕文字或屏幕
+hash。`drove explain` 默认读取最近 50 条脱敏 signal 和 state 事件，上限为
+200。attached snapshot 最多取底部 12 行、每行 160 个 cells 和 4 KiB。snapshot
+经过 signal token 打码，但没有通用密钥扫描。detach 和 daemon 重启后只返回
+持久化决策。
+
+发布继续采用 reader-first。`f361ab5` 先加入 version 3 reader，`b202e70` 才
+启用 writer。写入 version 3 后，数据库不能回滚到 `f361ab5` 之前。
+
+构建下限是 Go 1.24.2。CI 保留精确的 Go 1.24.2 lane 和当前 stable lane。x/vt
+固定为 `v0.0.0-20261004011457-ad85c59fdf4e`。
+
+32 会话基准在 Apple M5 Pro、Go 1.24.13、darwin/arm64 上得到
+1.026781392 s/op 和 31.19 MiB/s 聚合吞吐。每轮共处理 32 MiB committed
+output，峰值 goroutine 为 99，actor inbox 最大深度为 1，没有触发
+backpressure。race 单轮是 3.185080333 s/op 和 10.05 MiB/s。完整结果见
+[技术笔记](technical-notes.md#9-terminal-actor-32-session-benchmark)。
+
+public resize、WebSocket 终端流和 attach 不属于 Issue #14。后续范围分别见
+[Issue #19](https://github.com/Duang777/drove/issues/19) 和
+[Issue #20](https://github.com/Duang777/drove/issues/20)。
 
 ## 一手来源
 

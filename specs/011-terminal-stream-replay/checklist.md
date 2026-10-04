@@ -100,19 +100,19 @@
 
 ## Verification
 
-- [ ] Reader-first event and Store tests pass.
-- [ ] Range-tail concurrency and reconnect property tests pass.
-- [ ] Binary codec tests pass in Go and TypeScript.
-- [ ] Multi-client resize ordering tests pass.
-- [ ] Slow-consumer isolation tests pass.
-- [ ] Snapshot coalescing and 2 Hz tests pass.
-- [ ] Timeline and Blocked fixture tests pass.
-- [ ] Frame golden and expiry tests pass.
-- [ ] 50 MiB cold and warm benchmark results are recorded.
-- [ ] Focused packages pass 20 race-enabled repetitions.
-- [ ] `go test ./... -race -count=1` passes.
-- [ ] `go vet ./...` passes.
-- [ ] `make build` passes.
-- [ ] Web typecheck and build pass.
-- [ ] Every implementation commit is pushed before the next begins.
+- [x] Reader-first event and Store tests pass.
+- [x] Range-tail concurrency and reconnect property tests pass.
+- [x] Binary codec tests pass in Go and TypeScript.
+- [x] Multi-client resize ordering tests pass.
+- [x] Slow-consumer isolation tests pass.
+- [x] Snapshot coalescing and 2 Hz tests pass.
+- [x] Timeline and Blocked fixture tests pass.
+- [x] Frame golden and expiry tests pass.
+- [x] 50 MiB cold and warm benchmark results are recorded.
+- [x] Focused packages pass 20 race-enabled repetitions.
+- [x] `go test ./... -race -count=1` passes.
+- [x] `go vet ./...` passes.
+- [x] `make build` passes.
+- [x] Web typecheck and build pass.
+- [x] Every implementation commit is pushed before the next begins.
 - [ ] Issues #19 and #25 contain final evidence and are closed.

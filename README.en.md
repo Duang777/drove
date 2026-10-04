@@ -20,7 +20,7 @@
 
 Drove is a local daemon and CLI. It starts Claude Code, Codex, or any executable in a real PTY, appends the raw terminal bytes to SQLite, and reports one shared set of states.
 
-The recorder works today: `drove log` replays bytes. The tower grid, scrubbable timeline, push notifications, and phone approval are tracked by [Epic #31](https://github.com/Duang777/drove/issues/31) and have no UI yet. There is no release build and no TUI.
+The recorder works today: `drove log` replays bytes, and `drove timeline` shows state spans and Blocked jump points. The tower grid, scrubbable playback UI, push notifications, and phone approval are tracked by [Epic #31](https://github.com/Duang777/drove/issues/31) and have no UI yet. There is no release build and no TUI.
 
 ## Status
 
@@ -33,15 +33,15 @@ The recorder works today: `drove log` replays bytes. The tower grid, scrubbable 
 | Capability | Status | Where |
 | --- | --- | --- |
 | One PTY per agent, owned by `droved` | Shipped | `internal/pty` |
-| `init` `up` `ps` `log` `stop` `send` `hook` `version` | Shipped | `cmd/drove` |
+| `init` `up` `ps` `log` `timeline` `explain` `stop` `send` `hook` `version` | Shipped | `cmd/drove` |
 | Per-session Claude / Codex signal injection | Shipped | [#15](https://github.com/Duang777/drove/issues/15) |
 | Raw terminal bytes, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` byte replay, `--plain` strips control sequences | Shipped | |
 | Loopback bind, local token for REST and WebSocket | Shipped | |
-| WebSocket event stream and input frames with `request_id` | Shipped | |
+| WebSocket v1 events and v2 per-session terminal streams, input, and resize | Shipped | [#19](https://github.com/Duang777/drove/issues/19) |
 | Web skeleton: list, start, stop, live events | Shipped | `web/` |
-| Terminal emulation and screen rules | In progress | [#14](https://github.com/Duang777/drove/issues/14), [spec 010](specs/010-terminal-screen-detection/spec.md) |
-| Replay timeline | Planned | [#25](https://github.com/Duang777/drove/issues/25) |
+| Terminal emulation, query replies, screen rules, and `drove explain` | Shipped | [#14](https://github.com/Duang777/drove/issues/14), [spec 010](specs/010-terminal-screen-detection/spec.md) |
+| State timeline, Blocked jumps, and exact terminal frames | Shipped | [#25](https://github.com/Duang777/drove/issues/25) |
 | Control-tower grid | Planned | [#26](https://github.com/Duang777/drove/issues/26) |
 | Push notifications | Planned | [#27](https://github.com/Duang777/drove/issues/27) |
 | Approve, deny, or reply from a phone | Planned | [#28](https://github.com/Duang777/drove/issues/28) |
@@ -52,28 +52,12 @@ The recorder works today: `drove log` replays bytes. The tower grid, scrubbable 
 
 ## Architecture
 
-```mermaid
-flowchart LR
-  cli["drove CLI"]
-  web["web/ dev skeleton"]
-  daemon["droved"]
-  session["session"]
-  detect["detect"]
-  store["SQLite event log"]
-  pty["PTY"]
-  agent["claude / codex / executable"]
-  hook["drove hook"]
-
-  cli -->|"REST + Bearer"| daemon
-  web -->|"Vite proxy for /api and /ws"| daemon
-  daemon --> session
-  session --> detect
-  session --> store
-  session --> pty
-  pty --> agent
-  agent -->|"DROVE_SIGNAL_*"| hook
-  hook -->|"loopback + session token"| daemon
-```
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture.en-dark.png">
+    <img alt="Architecture. drove CLI connects to droved over REST with a bearer token, and the web skeleton connects through the Vite proxy. droved owns the session. The session connects to detect, the SQLite event log, and the PTY. The PTY runs claude, codex, or another executable. The agent reaches drove hook through DROVE_SIGNAL variables, and the hook calls back to droved on loopback with the session token." src="docs/assets/architecture.en.png" width="720">
+  </picture>
+</p>
 
 The CLI is a short-lived client. Once started, `droved` owns the PTY. State and output are written to SQLite before they are published to WebSocket subscribers. Vendor-specific behavior stays in `internal/adapter`.
 
@@ -93,6 +77,8 @@ drove ps
 drove send <agent-id> 'hello'
 drove log <agent-id>
 drove log <agent-id> --plain
+drove timeline <agent-id>
+drove explain <agent-id>
 drove stop <agent-id>
 drove version
 ```
@@ -116,6 +102,8 @@ drove up claude --hooks required
 | `drove ps` | Print AGENT ID, NAME, VENDOR, MODE, STATE, PID. Prints `no agents running` when empty |
 | `drove log <agent-id>` | Write terminal bytes to stdout. Does not print state events |
 | `drove log <agent-id> --plain` | Strip control sequences with a streaming filter |
+| `drove timeline <agent-id>` | Print state spans, output retention, and one-based Blocked jump points. `--json` prints the full response |
+| `drove explain <agent-id>` | Print recent state decisions and the ephemeral bounded screen for an attached session |
 | `drove send <agent-id> <text>` | Send that line plus a newline. Prints the byte count |
 | `drove send <agent-id> --stdin` | Read stdin as-is, with no added newline |
 | `drove stop <agent-id>` | Stop that session |
@@ -137,9 +125,39 @@ A per-session detector computes one decision. That decision is stored in SQLite,
 1. **Process.** Startup failure and exit override other signals. An interactive session ends as `stopped`. A successful `--oneshot` exit is `done`.
 2. **Claude command hooks.** After the first valid hook signal is committed, that session is hook-authoritative. The event kind selects Working, Blocked, or an Idle candidate. Idle has a 1 second confirmation window that later activity can cancel.
 3. **Codex notify.** This does not become hook authority and does not satisfy `--hooks required`. In fallback it is only a cancellable Idle candidate.
-4. **Screen rules, in progress.** Before hooks activate, fallback uses screen rules. After hooks are active, the implementation allows only two screen writes: an approval prompt disappearing (Blocked → Working), and a Claude interrupt (Working → Idle). [#14](https://github.com/Duang777/drove/issues/14) is still open: there is no `drove explain`, and no acceptance fixtures or performance proof yet.
+4. **Screen rules.** Before hooks activate, fallback uses stable Claude and Codex screen rules. After hooks are active, only two screen signals can change state: an approval prompt disappearing (Blocked to Working), and a Claude interrupt (Working to Idle). Other screen edges are stored with a `suppressed` outcome.
 
 `--hooks auto` is the default for Claude and Codex. It waits 5 seconds, then enters fallback if no valid native hook arrived. In fallback, 60 seconds of output silence can become an Idle candidate. `--hooks off` does not inject a reporter. `--hooks required` stops the session as `stopped` if no valid native hook arrives within 5 seconds. generic cannot select `required`.
+
+### Terminal screen and streaming
+
+Each attached session has one terminal actor. It receives output only after
+SQLite commits it, owns the x/vt emulator, answers terminal queries directly
+through the PTY, and keeps a bounded in-memory screen. Query replies do not
+enter output replay or input audit. Use `drove explain <agent-id>` to inspect
+recent decisions and the current screen while the process is attached.
+
+A connection without a WebSocket subprotocol keeps the v1 global event
+stream. `Sec-WebSocket-Protocol: drove.v2` enables per-agent raw, events, and
+snapshot subscriptions, plus input and resize on a writable raw attachment.
+Any other explicit subprotocol is rejected before upgrade.
+
+A v2 cursor contains the last consumed global event sequence in `seq` and the
+next unconsumed session output byte in `next_offset`. JSON carries both values
+as decimal strings. A client advances its cursor only after it applies a
+message, then sends the full cursor when it reconnects. History and live data
+both come from bounded SQLite reads rather than the lossy event Hub.
+
+The per-session recording actor orders output and effective resize. Drove
+resizes the PTY and x/vt before it commits `agent.resized`. Each v2 connection
+has an 8 MiB outbound budget. If the queue overflows, the server reports
+`slow_consumer` with the last written cursor and closes that connection with
+code 1013. Other connections and event commits continue.
+
+A snapshot subscription is a live-only preview. Each attachment receives at
+most one frame every 500 ms, and a newer frame replaces an unread frame.
+Snapshots carry `restorable:false`, stay out of the Hub and SQLite, and cannot
+start an exact replay.
 
 ### Per-session injection
 
@@ -156,7 +174,23 @@ If the caller already passed Claude `--bare` or `--settings`, or a Codex `notify
 
 New sessions store PTY output as `output.chunk` events with a byte offset. Older `output` line events remain readable; replay adds a newline to each of them. `drove log` keeps ANSI sequences and invalid bytes. Expired attachments produce no placeholder text.
 
+`GET /api/v1/agents/{id}/timeline` projects half-open state spans, output
+retention ranges, and Blocked occurrences from event envelopes.
+`GET /api/v1/agents/{id}/timeline/blocked/{number}` returns one Blocked span and a
+jump cursor with a 30-second lead-in. `GET /api/v1/agents/{id}/frame` requires
+exactly one of `seq`, `at`, or `offset`, then replays output and resize records
+from the 40x120 origin. The CLI exposes the timeline but leaves terminal
+playback to #20.
+
 Raw output is kept for 30 days by default. `0` keeps it indefinitely. Cleanup deletes byte attachments only. Sequence numbers, timestamps, offsets, and lengths stay. Cleanup enables SQLite `secure_delete` and truncates the WAL. It does not run `VACUUM`, so allocated database space may not shrink.
+
+After attachment expiry, the timeline remains available and reports the
+missing ranges. A frame that needs missing bytes returns HTTP 410 with
+`output_expired` and the exact ranges. Exact frames use a 64-entry in-memory
+LRU that expires with the Store retention generation. A 50 MiB cold replay is
+still far above the 300 ms target. See the
+[technical notes](docs/technical-notes.md#11-terminal-stream-and-replay) and
+[#35](https://github.com/Duang777/drove/issues/35).
 
 Once a database contains `output.chunk`, the oldest safe reader is [`d11f6c3`](https://github.com/Duang777/drove/commit/d11f6c3). After a version 3 screen signal is written, the oldest safe reader is [`f361ab5`](https://github.com/Duang777/drove/commit/f361ab5).
 
@@ -223,7 +257,11 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The page can list, start, and stop sessions, and it shows the WebSocket event stream. An `output.chunk` row shows its offset and length, not a terminal. The class names on the page are not wired to a stylesheet. Replay bytes with `drove log`.
+Open `http://127.0.0.1:5173`. The page can list, start, and stop sessions, and
+it shows the WebSocket event stream. The repository includes a strict
+`drove.v2` browser client, but the page does not use it yet. An `output.chunk`
+row shows its offset and length, not a terminal. The class names on the page
+are not wired to a stylesheet. Replay bytes with `drove log`.
 
 A live terminal, scrubbable replay, and the tower grid are [#20](https://github.com/Duang777/drove/issues/20) and [#26](https://github.com/Duang777/drove/issues/26). The approved direction for #20 is web first.
 
@@ -231,14 +269,15 @@ A live terminal, scrubbable replay, and the tower grid are [#20](https://github.
 
 The approved MVP is [Epic #31, flight recorder + control tower](https://github.com/Duang777/drove/issues/31).
 
-1. [#14](https://github.com/Duang777/drove/issues/14) finishes the screen model, including `drove explain`
-2. [#19](https://github.com/Duang777/drove/issues/19) WebSocket terminal stream
-3. [#25](https://github.com/Duang777/drove/issues/25) replay timeline
-4. [#20](https://github.com/Duang777/drove/issues/20) web live terminal and replay
-5. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
-6. [#21](https://github.com/Duang777/drove/issues/21) unix socket, Host checks, cookie, token rotation
-7. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve / deny / reply from a phone
-8. [#16](https://github.com/Duang777/drove/issues/16) native resume and a gentler stop
+The screen model, WebSocket terminal stream, and replay timeline are complete.
+The next items are:
+
+1. [#20](https://github.com/Duang777/drove/issues/20) web live terminal and replay
+2. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
+3. [#21](https://github.com/Duang777/drove/issues/21) unix socket, Host checks, cookie, token rotation
+4. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
+5. [#16](https://github.com/Duang777/drove/issues/16) native resume and a gentler stop
+6. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
 
 After the MVP: the shim in [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18), then the away brief [#29](https://github.com/Duang777/drove/issues/29), full-text search [#30](https://github.com/Duang777/drove/issues/30), and worktrees [#23](https://github.com/Duang777/drove/issues/23). Structured state sources [#22](https://github.com/Duang777/drove/issues/22) and the persistent hook installer [#24](https://github.com/Duang777/drove/issues/24) are deferred.
 
@@ -272,7 +311,8 @@ The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-st
 | [spec 006](specs/006-hook-backed-state-detection/spec.md) | Hook-backed state detection |
 | [spec 008](specs/008-session-signal-injection/spec.md) | Per-session injection |
 | [spec 009](specs/009-raw-output-chunks/spec.md) | Raw bytes and retention |
-| [spec 010](specs/010-terminal-screen-detection/spec.md) | Screen detection, implementation in progress |
+| [spec 010](specs/010-terminal-screen-detection/spec.md) | Screen detection, query replies, and explain |
+| [spec 011](specs/011-terminal-stream-replay/spec.md) | Terminal streams, cursors, timeline, and exact frames |
 | [Technical notes](docs/technical-notes.md) | A point-in-time reading. Its opening says the first six sections are not current `main` |
 | [AGENTS.md](AGENTS.md) | Directory responsibilities and engineering constraints |
 

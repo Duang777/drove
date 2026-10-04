@@ -402,12 +402,16 @@ func newWebSocketV2Connection(
 	conn *websocket.Conn,
 ) *webSocketV2Connection {
 	ctx, cancel := context.WithCancel(context.Background())
+	queueBudget := server.webSocketV2QueueBudget
+	if queueBudget <= 0 {
+		queueBudget = webSocketV2QueueBytes
+	}
 	return &webSocketV2Connection{
 		server:        server,
 		conn:          conn,
 		ctx:           ctx,
 		cancel:        cancel,
-		queue:         newWebSocketV2Queue(webSocketV2QueueBytes),
+		queue:         newWebSocketV2Queue(queueBudget),
 		incoming:      make(chan webSocketV2Incoming, webSocketV2CommandBuffer),
 		readerDone:    make(chan struct{}),
 		failures:      make(chan webSocketV2SubscriptionFailure, webSocketV2FailureBuffer),

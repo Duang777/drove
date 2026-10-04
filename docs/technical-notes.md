@@ -458,3 +458,269 @@ signal、state、error、input audit 和旧 `output` event。20 轮 race 验证�
 - 过期回放保留 metadata，截止时间及更新附件仍可读取；
 - `secure_delete=ON`，零删除和实际删除都完成 WAL truncate checkpoint；
 - 清理后投影可恢复，下一会话从恢复后的全局序号继续。
+
+## 9. Terminal actor 32-session benchmark
+
+2026-10-04 在以下环境运行：
+
+- Go `go1.24.13 darwin/arm64`
+- macOS `26.5.1` (`25F80`)
+- CPU `Apple M5 Pro`
+- `github.com/charmbracelet/x/vt`
+  `v0.0.0-20261004011457-ad85c59fdf4e`
+
+`BenchmarkTerminalActor32` 同时启动 32 个真实 terminal actor。每个 actor
+在一秒目标窗口内接收恰好 1 MiB committed bytes；输入包含清屏、光标移动、
+覆盖、宽字符和光标显隐。每轮总计 32 MiB，并在 output end 后检查全部 32 个
+最终 screen marker。
+
+```bash
+go test ./internal/session -race -run '^$' \
+  -bench '^BenchmarkTerminalActor32$' -benchmem -benchtime=1x -count=1
+go test ./internal/session -run '^$' \
+  -bench BenchmarkTerminalActor32 -benchmem -count=5
+```
+
+无 race 五轮结果：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 平均时长 | 1.026781392 s/op |
+| 时长范围 | 1.005694500-1.078678583 s/op |
+| 平均聚合吞吐 | 31.19 MiB/s |
+| 聚合吞吐范围 | 29.67-31.82 MiB/s |
+| committed bytes | 33,554,432 B/op |
+| 平均分配字节 | 4,211,035,230 B/op |
+| 平均分配次数 | 33,541,001 allocs/op |
+| 峰值 goroutine | 99 |
+| actor inbox 最大观测深度 | 1 |
+| inbox backpressure | 未触发 |
+| 最终 screen marker | 32/32 通过 |
+
+race 单轮为 3.185080333 s/op、10.05 MiB/s、4,642,279,720 B/op 和
+33,552,058 allocs/op；字节核算、最终 screen marker 和 race detector 均通过。
+该基准不设置 CI 延迟阈值，数据只作为当前固定依赖和硬件环境下的基线。
+
+## 10. 终端屏幕隔离验收
+
+2026-10-04 使用 Commit `a47daaf` 构建的 `drove` 和 `droved` 完成手工验收。
+厂商版本是 Claude Code `2.1.181` 和 Codex CLI `0.160.0`：
+
+```bash
+/Users/bytedance/.local/share/mise/installs/node/24.16.0/bin/claude --version
+/Users/bytedance/.npm/_npx/c9494f7b1d83afb8/node_modules/\
+@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --version
+```
+
+### 隔离环境和命令
+
+验收把 Drove、Claude 和 Codex 数据放在同一个 `0700` 临时根目录的不同子目录。
+实际命令使用以下环境变量：
+
+```bash
+RUN_ROOT=$(mktemp -d /tmp/drove-spec010-manual.XXXXXX)
+chmod 700 "$RUN_ROOT"
+mkdir -m 700 "$RUN_ROOT/home" "$RUN_ROOT/claude-home" \
+  "$RUN_ROOT/codex-home" "$RUN_ROOT/drove-home" "$RUN_ROOT/bin" \
+  "$RUN_ROOT/evidence"
+
+export HOME="$RUN_ROOT/home"
+export CLAUDE_CONFIG_DIR="$RUN_ROOT/claude-home"
+export CODEX_HOME="$RUN_ROOT/codex-home"
+export DROVE_DATA_DIR="$RUN_ROOT/drove-home"
+export PATH="$RUN_ROOT/bin:$PATH"
+
+make build
+bin/drove init
+jq --arg data "$DROVE_DATA_DIR" \
+  '.data_dir=$data | .api_bind="127.0.0.1:17373" |
+    .storage.output_retention_days=0' \
+  "$HOME/.drove/config.json" \
+  > "$HOME/.drove/config.json.tmp"
+mv "$HOME/.drove/config.json.tmp" "$HOME/.drove/config.json"
+chmod 600 "$HOME/.drove/config.json"
+bin/drove ps
+```
+
+临时 `PATH` 中的 `claude` 和 `codex` wrapper 有两种模式。`real` 模式分别
+`exec` 上述厂商二进制。`fixture-hook` 模式执行一次性 PTY helper。helper 从
+`internal/session/testdata/terminal` 读取已提交的脱敏帧，发出五类启动查询，
+校验 72 字节 reply，然后按 `clear`、`interrupt` 和 `exit` 命令输出下一帧。
+wrapper、helper、Hub capture 和证据只存在于 `$RUN_ROOT`，没有进入仓库。
+
+真实交互启动和首屏检查使用以下命令：
+
+```bash
+bin/drove up claude --hooks off --name real-claude --dir "$RUN_ROOT/home"
+bin/drove up codex --hooks off --name real-codex --dir "$RUN_ROOT/home"
+bin/drove explain "$CLAUDE_REAL_ID" --json
+bin/drove explain "$CODEX_REAL_ID" --json
+bin/drove log "$CLAUDE_REAL_ID" > "$RUN_ROOT/evidence/real-claude.raw"
+bin/drove log "$CODEX_REAL_ID" > "$RUN_ROOT/evidence/real-codex.raw"
+```
+
+状态场景使用以下命令：
+
+```bash
+bin/drove up claude --hooks auto --name fixture-claude --dir "$RUN_ROOT/home"
+bin/drove up codex --hooks auto --name fixture-codex --dir "$RUN_ROOT/home"
+
+bin/drove explain "$CLAUDE_ID" --limit 20
+bin/drove explain "$CLAUDE_ID" --limit 20 --json
+bin/drove send "$CLAUDE_ID" clear
+bin/drove send "$CLAUDE_ID" interrupt
+bin/drove send "$CLAUDE_ID" exit
+
+bin/drove explain "$CODEX_ID" --limit 20
+bin/drove explain "$CODEX_ID" --limit 20 --json
+bin/drove send "$CODEX_ID" clear
+bin/drove send "$CODEX_ID" exit
+```
+
+Hub capture 使用控制 token 连接 `ws://127.0.0.1:17373/ws`。daemon 重启和历史
+检查使用以下命令：
+
+```bash
+kill -TERM "$(lsof -t -iTCP:17373 -sTCP:LISTEN)"
+bin/drove ps
+bin/drove explain "$CLAUDE_ID" --limit 20 --json
+bin/drove explain "$CODEX_ID" --limit 20 --json
+
+CONTROL_TOKEN=$(cat "$DROVE_DATA_DIR/control.token")
+curl -fsS -H "Authorization: Bearer $CONTROL_TOKEN" \
+  "http://127.0.0.1:17373/api/v1/agents/$CLAUDE_ID/events"
+sqlite3 "$DROVE_DATA_DIR/drove.db" \
+  "SELECT seq,type,reason,payload FROM events ORDER BY seq"
+```
+
+### 实测结果
+
+- Claude 真实启动流是 3101 字节。`drove explain` 返回 theme chooser 的底部
+  12 行，`attached=true`。Claude 在 offset 994 发出 DA1 查询。
+- Codex 真实启动流是 1027 字节。它在 offset 28、32、40、48 和 52 发出 DSR、
+  OSC 10、OSC 11、Kitty keyboard 和 DA1 查询，随后渲染完整登录首屏。此前
+  Issue #13 记录的 152 字节握手停顿没有出现。
+- 两个夹具子进程都收到五类 reply，共 72 字节。reply 在 SQLite、WAL、daemon
+  log、Hub capture、REST replay 和解码后的 raw replay 中命中 0 次。
+- Claude 和 Codex 的 approval present 在 active-hook 下都持久化为
+  `suppressed`。approval cleared 持久化为 `candidate`，并在 500 ms 后使
+  `blocked -> working`。同时出现的 idle prompt 仍为 `suppressed`。
+- Claude interrupt 持久化为 `candidate`，并在一秒后使
+  `working -> idle`。
+- 文本和 JSON explain 返回相同状态、hook status、事件顺序和稳定证据。attached
+  响应含受限 screen。进程退出后，两种格式都返回 `attached=false`，且没有
+  screen 字段。
+- daemon 重启前后，Claude 的 20 条 explain event 哈希都是
+  `5eb8b0e7665f77b0d7635f893b1fe84d87e0c42e5f8d69b74978ca5c624c8421`。
+  Codex 的 18 条 event 哈希都是
+  `b62d1e3829a389d0b92483b00b83d29370d27582b14598e78581a902d7632632`。
+- Claude raw replay 与 REST replay 解码结果的 SHA-256 都是
+  `cc7703723b26a5c3c1cbf4fae267b97619a7bde34eae93633feb8e53c28e5787`。
+  Codex 两条路径都是
+  `c242d6e6e0b2905bc91e057766315374ad58d5b3f6aeacb165275a36409c9a2c`。
+  两个进程 detach 后，`drove log` 仍包含各自的 trailing frame。
+- screen event payload 保存 rule、edge、region、静态 evidence、offset 和
+  sequence。屏幕行和 screen hash 在 event payload 中命中 0 次。原始输出
+  attachment 和解码 replay 按设计保留终端文字。
+- 三个精确的会话 signal token 在 SQLite、WAL、daemon log、Hub capture、
+  REST replay 和解码输出中命中 0 次。hook payload 中的
+  `manual-private-marker-010` 在同一组产物中命中 0 次。screen hash 字段命中
+  0 次。
+- Claude 场景有 3 条 `agent.input`，对应 `clear`、`interrupt` 和 `exit`。
+  Codex 场景有 2 条，对应 `clear` 和 `exit`。query reply 没有增加输入审计。
+
+验收前后，全部已知持久 vendor 配置的状态和 SHA-256 保持不变：
+
+```bash
+for path in \
+  /Users/bytedance/.claude/settings.json \
+  /Users/bytedance/.claude/settings.local.json \
+  /Users/bytedance/develop/drove/.claude/settings.json \
+  /Users/bytedance/develop/drove/.claude/settings.local.json \
+  /Users/bytedance/.codex/config.toml \
+  /Users/bytedance/.codex/hooks.json \
+  /Users/bytedance/develop/drove/.codex/config.toml \
+  /Users/bytedance/develop/drove/.codex/hooks.json \
+  "/Library/Application Support/ClaudeCode/managed-settings.json" \
+  "/Library/Application Support/ClaudeCode/managed-hooks.json" \
+  /etc/codex/config.toml /etc/codex/requirements.toml
+do
+  if [ -f "$path" ]; then
+    shasum -a 256 "$path"
+  else
+    printf 'ABSENT  %s\n' "$path"
+  fi
+done
+```
+
+| 配置 | 验收前后 |
+| --- | --- |
+| `~/.claude/settings.json` | `fdbce19b9724291049eda7c0031e25a351720fc5c7c8486535f0da43832d9cb0` |
+| `~/.claude/settings.local.json` | 不存在 |
+| 项目 `.claude/settings.json` 和 `settings.local.json` | 不存在 |
+| `~/.codex/config.toml` | `b866d2dc3d16746c24c19123a002b4a2f46bbfb4bc6fa34019c1bf97e46afc51` |
+| `~/.codex/hooks.json` | `62a09593618cfe1975a70d180ad05aa1adbcf902b13dbcc8a1ec9e183d9726cf` |
+| 项目 `.codex/config.toml` 和 `hooks.json` | 不存在 |
+| Claude managed settings/hooks 与系统 Codex config/requirements | 不存在 |
+
+## 11. Terminal stream and replay
+
+Spec 011 增加了两类读取路径。WebSocket v2 从 SQLite 读取每个会话的历史和实时
+尾部；timeline 和 frame 则在一次捕获的事件边界内读取。两类路径都把 Committer
+时钟当作唤醒信号，SQLite 事件和 `output_chunks` 仍是唯一事实源。
+
+### 协议与回放验收
+
+`internal/api/websocket_acceptance_test.go` 覆盖以下协议性质：
+
+- subscribe 与 output commit、resize 并发时，history 加 live 字节仍与 Store
+  完全相同；
+- 客户端可从首条流中每一个不同 cursor 重连，且不会重复或遗漏输出；
+- 单个连接的出站队列溢出后返回 `slow_consumer` 和最后写出 cursor，以 1013
+  关闭；另一个连接和后续 Committer 写入继续完成；
+- 无子协议的 v1 hello、事件和 error 帧与逐字节 golden transcript 相同。
+
+`internal/session/snapshot_test.go` 使用可控时钟验证 500 ms 最小间隔和容量为 1
+的 latest-value 合并。`internal/recording/replay_acceptance_test.go` 使用一份包含
+三段 Blocked、分片 UTF-8、跨块 CSI 与 OSC、alternate screen 和 resize 的录制。
+sequence、time 和 partial offset 三种 frame 都与独立的 from-origin 回放相同。
+删除前五个输出附件后，timeline 仍返回三段 Blocked 和缺失范围，frame 返回
+`OutputExpiredError`。
+
+### 50 MiB frame 基准
+
+2026-10-04 在以下环境运行：
+
+- Go `go1.24.13 darwin/arm64`
+- CPU `Apple M5 Pro`
+- 内存 48 GiB
+- `github.com/charmbracelet/x/vt`
+  `v0.0.0-20261004011457-ad85c59fdf4e`
+
+基准创建一份恰好 50 MiB、1600 个最大尺寸 `output.chunk` 的录制。冷请求禁用
+frame cache，并随机选择 offset 从原点回放。暖请求先缓存一个随机的 41.53 MiB
+目标，再重复读取同一精确 frame。
+
+```bash
+go test ./internal/recording -run '^$' \
+  -bench '^BenchmarkFrame50MiBColdRandom$' \
+  -benchmem -benchtime=5x -count=1
+go test ./internal/recording -run '^$' \
+  -bench '^BenchmarkFrame50MiBWarmRandom$' \
+  -benchmem -benchtime=20x -count=1
+```
+
+| 指标 | 冷随机 frame | 暖精确缓存 |
+| --- | ---: | ---: |
+| 样本数 | 5 | 20 |
+| 平均时长 | 27.439 s/op | 3.788 ms/op |
+| p50 | 32.729 s | 3.712 ms |
+| p95 | 36.500 s | 4.064 ms |
+| 平均逻辑回放量 | 36.26 MiB/op | 41.53 MiB/op |
+| 分配字节 | 1,577,616,041 B/op | 2,246,095 B/op |
+| 分配次数 | 14,912,991 allocs/op | 72,816 allocs/op |
+
+冷 p95 没有达到 300 ms 目标。当前实现保留精确 from-origin 语义，不把只含可见
+cell 的 `term.Snapshot` 当作可恢复状态。完整 x/vt checkpoint 与 offset
+selector 元数据索引由 [Issue #35](https://github.com/Duang777/drove/issues/35)
+继续跟踪。

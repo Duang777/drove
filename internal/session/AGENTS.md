@@ -14,7 +14,8 @@
   状态。容量 64 的 inbox 统一排序 output、resize、attached input、detach 和 close。
 - terminal actor 独占 x/vt controller、adapter classifier、容量 64 的 inbox、
   固定 100 ms sample timer 和当前不可变 snapshot。query reply 直接调用
-  `pty.Session.Write`，不经过 `SendInput`。
+  `pty.Session.Write`，不经过 `SendInput`，不产生 `agent.input`；只有子进程
+  显式回显的 reply 才作为新输出提交。
 - observation actor 独占容量 64 的 inbox 和一个真实计时器，一次只提交一个
   Decision；每次提交后按 Detector 返回的最早 timer ref 重置计时器，Detector
   本身不持有 goroutine 或回调。
