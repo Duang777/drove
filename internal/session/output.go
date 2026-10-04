@@ -58,9 +58,10 @@ type outputProcessor struct {
 	id      agent.ID
 	running *runningSession
 
-	redactor streamingRedactor
-	requests chan outputRequest
-	done     chan struct{}
+	redactor  streamingRedactor
+	sanitizer *term.OSC9Sanitizer
+	requests  chan outputRequest
+	done      chan struct{}
 
 	admissionMu sync.RWMutex
 	closing     bool
@@ -69,7 +70,8 @@ type outputProcessor struct {
 }
 
 type outputProcessorState struct {
-	redactor streamingRedactor
+	redactor  streamingRedactor
+	sanitizer *term.OSC9Sanitizer
 
 	nextSourceOffset uint64
 	nextOutputOffset uint64
@@ -92,14 +94,16 @@ func newOutputProcessor(
 	id agent.ID,
 	running *runningSession,
 	signalToken string,
+	sanitizer *term.OSC9Sanitizer,
 ) *outputProcessor {
 	processor := &outputProcessor{
-		manager:  manager,
-		id:       id,
-		running:  running,
-		redactor: newStreamingRedactor([]byte(signalToken)),
-		requests: make(chan outputRequest, outputInboxSize),
-		done:     make(chan struct{}),
+		manager:   manager,
+		id:        id,
+		running:   running,
+		redactor:  newStreamingRedactor([]byte(signalToken)),
+		sanitizer: sanitizer,
+		requests:  make(chan outputRequest, outputInboxSize),
+		done:      make(chan struct{}),
 	}
 	go processor.run()
 	return processor
@@ -283,6 +287,7 @@ func (p *outputProcessor) run() {
 	}
 	state := outputProcessorState{
 		redactor:             p.redactor,
+		sanitizer:            p.sanitizer,
 		effectiveSize:        initialSize,
 		attachments:          make(map[AttachmentID]*attachmentState),
 		acceptingAttachments: true,
@@ -373,6 +378,9 @@ func (p *outputProcessor) feed(
 	state.nextSourceOffset += uint64(len(chunk))
 	state.pendingActivity++
 	output := state.redactor.Feed(chunk)
+	if state.sanitizer != nil {
+		output = state.sanitizer.Feed(output)
+	}
 	if len(output) == 0 {
 		return nil
 	}
@@ -396,6 +404,10 @@ func (p *outputProcessor) end(
 	}()
 
 	output := state.redactor.Flush()
+	if state.sanitizer != nil {
+		sanitized := state.sanitizer.Feed(output)
+		output = append(sanitized, state.sanitizer.Flush()...)
+	}
 	if len(output) > 0 {
 		if err := p.commitAndObserve(state, output); err != nil {
 			return err

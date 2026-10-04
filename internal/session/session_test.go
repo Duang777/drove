@@ -1933,6 +1933,7 @@ func attachTestRuntime(
 	manager *Manager,
 	a *agent.Agent,
 	entry adapter.Entry,
+	terminalNotifications ...bool,
 ) *runningSession {
 	t.Helper()
 
@@ -1940,7 +1941,13 @@ func attachTestRuntime(
 	if !ok {
 		t.Fatalf("managed agent %q is not registered", a.ID())
 	}
-	running, _, _, err := manager.prepareManagedRuntime(managed, entry)
+	notificationsEnabled := len(terminalNotifications) > 0 &&
+		terminalNotifications[0]
+	running, _, _, err := manager.prepareManagedRuntime(
+		managed,
+		entry,
+		notificationsEnabled,
+	)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}

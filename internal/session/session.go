@@ -395,25 +395,16 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			cleanupErr,
 		)
 	}
-	running, processEnv, _, err := m.prepareManagedRuntime(managed, entry)
+	running, processEnv, _, err := m.prepareManagedRuntime(
+		managed,
+		entry,
+		injection.terminalNotifications,
+	)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)
 	}
 	running.injectionDir = injection.dir
-	if injection.terminalNotifications {
-		if !entry.SupportsTerminalNotifications() {
-			running.observer.Close()
-			cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-			return nil, errors.Join(
-				errors.New(
-					"session: injected terminal notifications have no adapter normalizer",
-				),
-				cleanupErr,
-			)
-		}
-		running.terminalNotice = entry.TerminalNotificationNormalizer
-	}
 	if _, err := m.committer.CommitAgent(
 		ctx,
 		a,
@@ -647,25 +638,16 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	running, processEnv, _, err := m.prepareManagedRuntime(managed, entry)
+	running, processEnv, _, err := m.prepareManagedRuntime(
+		managed,
+		entry,
+		injection.terminalNotifications,
+	)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)
 	}
 	running.injectionDir = injection.dir
-	if injection.terminalNotifications {
-		if !entry.SupportsTerminalNotifications() {
-			running.observer.Close()
-			cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-			return nil, errors.Join(
-				errors.New(
-					"session: injected terminal notifications have no adapter normalizer",
-				),
-				cleanupErr,
-			)
-		}
-		running.terminalNotice = entry.TerminalNotificationNormalizer
-	}
 
 	resumedPayload, err := json.Marshal(event.AgentResumedPayloadV1{
 		Version:          1,

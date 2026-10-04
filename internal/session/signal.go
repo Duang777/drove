@@ -17,6 +17,7 @@ import (
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
+	"github.com/Duang777/drove/internal/term"
 )
 
 const (
@@ -155,6 +156,7 @@ func isLoopbackHost(host string) bool {
 func (m *Manager) prepareManagedRuntime(
 	managed *managedAgent,
 	entry adapter.Entry,
+	terminalNotifications bool,
 ) (*runningSession, []string, string, error) {
 	if managed == nil || managed.agent == nil {
 		return nil, nil, "", errors.New("session: managed Agent is required")
@@ -174,6 +176,25 @@ func (m *Manager) prepareManagedRuntime(
 			err,
 		)
 	}
+	var (
+		terminalNotice    adapter.TerminalNotificationNormalizer
+		terminalSanitizer *term.OSC9Sanitizer
+	)
+	if terminalNotifications {
+		if !entry.SupportsTerminalNotifications() {
+			return nil, nil, "", errors.New(
+				"session: injected terminal notifications have no adapter normalizer",
+			)
+		}
+		terminalSanitizer, err = entry.NewOSC9Sanitizer()
+		if err != nil {
+			return nil, nil, "", fmt.Errorf(
+				"session: create terminal notification sanitizer: %w",
+				err,
+			)
+		}
+		terminalNotice = entry.TerminalNotificationNormalizer
+	}
 
 	observer, err := newManagedObservationActor(
 		managed,
@@ -188,13 +209,20 @@ func (m *Manager) prepareManagedRuntime(
 	running := &runningSession{
 		observer:       observer,
 		classifier:     classifier,
+		terminalNotice: terminalNotice,
 		callbacksReady: make(chan struct{}),
 		signalReady:    make(chan struct{}),
 		processExited:  make(chan struct{}),
 		vendor:         a.Vendor(),
 	}
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
-		running.output = newOutputProcessor(m, a.ID(), running, "")
+		running.output = newOutputProcessor(
+			m,
+			a.ID(),
+			running,
+			"",
+			terminalSanitizer,
+		)
 		return running, nil, "", nil
 	}
 
@@ -210,7 +238,13 @@ func (m *Manager) prepareManagedRuntime(
 	}
 	running.signalDigest = digest
 	running.hasSignalToken = true
-	running.output = newOutputProcessor(m, a.ID(), running, token)
+	running.output = newOutputProcessor(
+		m,
+		a.ID(),
+		running,
+		token,
+		terminalSanitizer,
+	)
 	environment := []string{
 		SignalAgentIDEnv + "=" + string(a.ID()),
 		SignalURLEnv + "=" + signalURL,

@@ -61,6 +61,10 @@ type TerminalNotificationNormalizer interface {
 	NormalizeOSC9(term.OSC9Frame) (detect.Signal, bool, error)
 }
 
+type terminalNotificationSanitizerFactory interface {
+	NewOSC9Sanitizer() (*term.OSC9Sanitizer, error)
+}
+
 // Entry 是注册表中的一个实现。
 type Entry struct {
 	Runner                         Runner
@@ -108,6 +112,24 @@ func (e Entry) NormalizeOSC9(
 		return detect.Signal{}, false, nil
 	}
 	return e.TerminalNotificationNormalizer.NormalizeOSC9(frame)
+}
+
+// NewOSC9Sanitizer constructs output sanitization state for this adapter.
+func (e Entry) NewOSC9Sanitizer() (*term.OSC9Sanitizer, error) {
+	factory, ok := e.TerminalNotificationNormalizer.(terminalNotificationSanitizerFactory)
+	if !ok {
+		return nil, errors.New(
+			"adapter: terminal notification sanitizer is unsupported",
+		)
+	}
+	sanitizer, err := factory.NewOSC9Sanitizer()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"adapter: create terminal notification sanitizer: %w",
+			err,
+		)
+	}
+	return sanitizer, nil
 }
 
 // SupportsResume reports whether the exact runner supports native resume.

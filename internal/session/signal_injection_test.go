@@ -147,15 +147,19 @@ func TestCodexSessionInjectionEnablesOSC9Observation(t *testing.T) {
 	waitForHookStatus(t, manager, id, detect.HookFallback)
 	waitForState(t, manager, id, agent.StateBlocked)
 
+	stored, err := manager.store.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("store replay: %v", err)
+	}
+	assertOSC9SecretAbsentFromRows(t, "private-command", stored)
+
 	rows, err := manager.Replay(status.AgentID)
 	if err != nil {
 		t.Fatalf("replay: %v", err)
 	}
+	assertOSC9SecretAbsentFromRows(t, "private-command", rows)
 	found := false
 	for _, row := range rows {
-		if strings.Contains(row.Payload, "private-command") {
-			t.Fatalf("event payload contains OSC body: %+v", row)
-		}
 		if row.Type == string(event.TypeAgentSignal) &&
 			signalPayloadVersion(row.Payload) == 4 {
 			found = true

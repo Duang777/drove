@@ -18,6 +18,10 @@ var codexApprovalPrefixes = [...]string{
 
 type codexOSC9Normalizer struct{}
 
+func (codexOSC9Normalizer) NewOSC9Sanitizer() (*term.OSC9Sanitizer, error) {
+	return term.NewOSC9Sanitizer(codexApprovalPrefixes[:]...)
+}
+
 func (codexOSC9Normalizer) NormalizeOSC9(
 	frame term.OSC9Frame,
 ) (detect.Signal, bool, error) {
