@@ -13,7 +13,9 @@
 - observation actor 独占容量 64 的 inbox 和真实计时器，一次只提交一个 Decision；
   Detector 本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
-- `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
+- `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
+- 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
+  PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
   `<data_dir>/sessions/<agent-id>/` 原子写入私有文件；退出回调完成后清理。
 - 缺失的 signal injection 根目录和会话目录使用 `0700`；既有根目录只校验类型，

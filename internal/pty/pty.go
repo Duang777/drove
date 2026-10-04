@@ -13,11 +13,58 @@ import (
 	"github.com/creack/pty"
 )
 
+const maxTerminalDimension = 1<<16 - 1
+
 // ExitInfo 描述进程退出信息。
 type ExitInfo struct {
 	PID  int
 	Code int
 	Err  error
+}
+
+// Size 是经过校验的 PTY 行列尺寸。
+type Size struct {
+	rows    int
+	columns int
+}
+
+// NewSize 校验并创建 PTY 尺寸。
+func NewSize(rows, columns int) (Size, error) {
+	size := Size{rows: rows, columns: columns}
+	if err := size.validate(); err != nil {
+		return Size{}, err
+	}
+	return size, nil
+}
+
+// Rows 返回 PTY 行数。
+func (s Size) Rows() int {
+	return s.rows
+}
+
+// Columns 返回 PTY 列数。
+func (s Size) Columns() int {
+	return s.columns
+}
+
+func (s Size) validate() error {
+	if s.rows <= 0 || s.rows > maxTerminalDimension {
+		return fmt.Errorf("PTY rows must be between 1 and %d", maxTerminalDimension)
+	}
+	if s.columns <= 0 || s.columns > maxTerminalDimension {
+		return fmt.Errorf("PTY columns must be between 1 and %d", maxTerminalDimension)
+	}
+	return nil
+}
+
+func (s Size) windowSize() (*pty.Winsize, error) {
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	return &pty.Winsize{
+		Rows: uint16(s.rows),
+		Cols: uint16(s.columns),
+	}, nil
 }
 
 // Config 是启动一个 PTY 会话的参数。
@@ -30,6 +77,8 @@ type Config struct {
 	Env []string
 	// Dir 是工作目录；空则继承当前目录。
 	Dir string
+	// Size 是子进程启动前生效的 PTY 行列尺寸。
+	Size Size
 	// OnOutput 在输出字节可用时被调用。回调不得长期阻塞。
 	OnOutput func(chunk []byte, offset uint64)
 	// OnOutputEnd 在最后一次输出回调后被调用一次。
@@ -68,13 +117,18 @@ var (
 
 // Start 创建 PTY 并启动命令。返回会话，或错误。
 func Start(cfg Config) (*Session, error) {
+	windowSize, err := cfg.Size.windowSize()
+	if err != nil {
+		return nil, fmt.Errorf("pty: invalid initial size: %w", err)
+	}
+
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	cmd.Dir = cfg.Dir
 	if len(cfg.Env) > 0 {
 		cmd.Env = append(os.Environ(), cfg.Env...)
 	}
 
-	ptmx, err := pty.Start(cmd)
+	ptmx, err := pty.StartWithSize(cmd, windowSize)
 	if err != nil {
 		return nil, fmt.Errorf("pty: start %q: %w", cfg.Command, err)
 	}
@@ -89,9 +143,6 @@ func Start(cfg Config) (*Session, error) {
 		done:        make(chan struct{}),
 		WaitCh:      make(chan ExitInfo, 1),
 	}
-
-	// 设置终端行数/列数（默认 120x40，可被上层调整）。
-	_ = pty.Setsize(ptmx, &pty.Winsize{Rows: 40, Cols: 120})
 
 	go s.readLoop()
 	go s.waitLoop()

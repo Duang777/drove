@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -833,6 +834,40 @@ func TestStartImmediateProcessRecordsWorkingBeforeCallbacks(t *testing.T) {
 	}
 	if final := waitForDetachedState(t, manager, id, agent.StateStopped); final.PID != 0 {
 		t.Fatalf("final status = %+v, want no PID", final)
+	}
+}
+
+func TestStartUsesDeclaredInitialTerminalSize(t *testing.T) {
+	stty, err := exec.LookPath("stty")
+	if err != nil {
+		t.Fatalf("find stty: %v", err)
+	}
+	manager, _ := newTestManager(t)
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Name:    "terminal-size",
+		Command: stty,
+		Args:    []string{"size"},
+		Mode:    agent.RunModeOneshot,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	waitForDetachedState(t, manager, id, agent.StateDone)
+
+	rows, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var output []byte
+	for _, row := range rows {
+		if row.Type == string(event.TypeOutputChunk) {
+			output = append(output, outputChunkData(t, row)...)
+		}
+	}
+	if observed := strings.TrimSpace(string(output)); observed != "40 120" {
+		t.Fatalf("initial terminal size = %q, want %q", observed, "40 120")
 	}
 }
 

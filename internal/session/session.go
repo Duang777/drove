@@ -19,6 +19,7 @@ import (
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/term"
 )
 
 // Status 是对外暴露的会话视图（供 daemon/api/CLI 使用）。
@@ -76,6 +77,11 @@ type inputAuditPayload struct {
 
 // MaxInputBytes 是一次输入操作允许的最大 UTF-8 字节数。
 const MaxInputBytes = 64 * 1024
+
+const (
+	initialTerminalRows    = 40
+	initialTerminalColumns = 120
+)
 
 var (
 	// ErrUnknownAgent 表示目标 Agent 不存在。
@@ -265,6 +271,14 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if cmdName == "" {
 		return nil, errors.New("session: generic vendor requires explicit command")
 	}
+	terminalSize, err := initialTerminalSize()
+	if err != nil {
+		return nil, fmt.Errorf("session: initial terminal size: %w", err)
+	}
+	initialPTYSize, err := toPTYSize(terminalSize)
+	if err != nil {
+		return nil, fmt.Errorf("session: initial PTY size: %w", err)
+	}
 
 	// 2. 生成会话专属配置，再持久化会话元数据。
 	id := agent.ID(uuid.NewString())
@@ -356,6 +370,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		Args:    injection.args,
 		Env:     processEnv,
 		Dir:     req.Dir,
+		Size:    initialPTYSize,
 		OnOutput: func(chunk []byte, offset uint64) {
 			<-running.callbacksReady
 			_ = running.output.Feed(chunk, offset)
@@ -423,6 +438,14 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	close(running.callbacksReady)
 
 	return m.Status(id)
+}
+
+func initialTerminalSize() (term.Size, error) {
+	return term.NewSize(initialTerminalRows, initialTerminalColumns)
+}
+
+func toPTYSize(size term.Size) (pty.Size, error) {
+	return pty.NewSize(size.Rows(), size.Columns())
 }
 
 // Close 停止全部已连接会话并等待 PTY 回调结束。

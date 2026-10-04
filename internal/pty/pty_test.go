@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -67,6 +70,134 @@ func TestWriteFullPreservesPartialFailure(t *testing.T) {
 	}
 }
 
+func TestNewSizeValidatesDimensions(t *testing.T) {
+	tests := []struct {
+		name    string
+		rows    int
+		columns int
+		wantErr bool
+	}{
+		{name: "valid", rows: 40, columns: 120},
+		{name: "zero rows", rows: 0, columns: 120, wantErr: true},
+		{name: "zero columns", rows: 40, columns: 0, wantErr: true},
+		{name: "rows overflow", rows: maxTerminalDimension + 1, columns: 120, wantErr: true},
+		{name: "columns overflow", rows: 40, columns: maxTerminalDimension + 1, wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			size, err := NewSize(test.rows, test.columns)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("NewSize(%d, %d) succeeded", test.rows, test.columns)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("new size: %v", err)
+			}
+			if size.Rows() != test.rows || size.Columns() != test.columns {
+				t.Fatalf(
+					"size = %dx%d, want %dx%d",
+					size.Rows(),
+					size.Columns(),
+					test.rows,
+					test.columns,
+				)
+			}
+		})
+	}
+}
+
+func TestStartRejectsInvalidSizeBeforeProcessStart(t *testing.T) {
+	touch, err := exec.LookPath("touch")
+	if err != nil {
+		t.Fatalf("find touch: %v", err)
+	}
+	tests := []struct {
+		name string
+		size Size
+	}{
+		{name: "zero rows", size: Size{columns: 120}},
+		{name: "zero columns", size: Size{rows: 40}},
+		{name: "rows overflow", size: Size{rows: maxTerminalDimension + 1, columns: 120}},
+		{name: "columns overflow", size: Size{rows: 40, columns: maxTerminalDimension + 1}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			marker := filepath.Join(t.TempDir(), "started")
+			sess, err := Start(Config{
+				Command: touch,
+				Args:    []string{marker},
+				Size:    test.size,
+			})
+			if err == nil {
+				t.Fatal("start succeeded with an invalid size")
+			}
+			if sess != nil {
+				t.Fatalf("session = %+v, want nil", sess)
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("process marker error = %v, want not exist", statErr)
+			}
+		})
+	}
+}
+
+func TestSessionChildObservesInitialSize(t *testing.T) {
+	stty, err := exec.LookPath("stty")
+	if err != nil {
+		t.Fatalf("find stty: %v", err)
+	}
+	size := testSize(t)
+	outputs := make(chan outputRecord)
+	outputEnds := make(chan uint64, 1)
+
+	sess, err := Start(Config{
+		Command: stty,
+		Args:    []string{"size"},
+		Size:    size,
+		OnOutput: func(chunk []byte, offset uint64) {
+			outputs <- outputRecord{data: chunk, offset: offset}
+		},
+		OnOutputEnd: func(offset uint64) {
+			outputEnds <- offset
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	var got []byte
+	var nextOffset uint64
+	for {
+		select {
+		case output := <-outputs:
+			if output.offset != nextOffset {
+				t.Fatalf("output offset = %d, want %d", output.offset, nextOffset)
+			}
+			got = append(got, output.data...)
+			nextOffset += uint64(len(output.data))
+		case endOffset := <-outputEnds:
+			if endOffset != nextOffset {
+				t.Fatalf("end offset = %d, want %d", endOffset, nextOffset)
+			}
+			if observed := strings.TrimSpace(string(got)); observed != "40 120" {
+				t.Fatalf("initial size = %q, want %q", observed, "40 120")
+			}
+			return
+		case <-time.After(2 * time.Second):
+			t.Fatal("initial size query timed out")
+		}
+	}
+}
+
 func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 	outputs := make(chan outputRecord, 4)
 	outputEnds := make(chan uint64, 2)
@@ -75,6 +206,7 @@ func TestStartDeliversImmediateOutputAndExitOnce(t *testing.T) {
 	sess, err := Start(Config{
 		Command: "/bin/sh",
 		Args:    []string{"-c", "printf 'first\\nlast'"},
+		Size:    testSize(t),
 		OnOutput: func(chunk []byte, offset uint64) {
 			outputs <- outputRecord{data: chunk, offset: offset}
 		},
@@ -151,6 +283,7 @@ func TestStartDeliversPromptWithoutNewline(t *testing.T) {
 	sess, err := Start(Config{
 		Command: "/bin/sh",
 		Args:    []string{"-c", "printf 'Allow? [y/n] '; sleep 30"},
+		Size:    testSize(t),
 		OnOutput: func(chunk []byte, offset uint64) {
 			outputs <- outputRecord{data: chunk, offset: offset}
 		},
@@ -183,6 +316,7 @@ func TestCloseWaitsForOutputCallbackAndIsIdempotent(t *testing.T) {
 	sess, err := Start(Config{
 		Command: "/bin/sh",
 		Args:    []string{"-c", "printf 'ready\\n'; sleep 30"},
+		Size:    testSize(t),
 		OnOutput: func([]byte, uint64) {
 			callbackOnce.Do(func() { close(callbackStarted) })
 			<-releaseCallback
@@ -245,6 +379,7 @@ func TestStartFailureInvokesNoCallback(t *testing.T) {
 
 	sess, err := Start(Config{
 		Command: filepath.Join(t.TempDir(), "missing-command"),
+		Size:    testSize(t),
 		OnOutput: func([]byte, uint64) {
 			outputCalls.Add(1)
 		},
@@ -384,4 +519,13 @@ func waitExit(t *testing.T, ch <-chan ExitInfo) ExitInfo {
 		t.Fatal("exit callback timed out")
 		return ExitInfo{}
 	}
+}
+
+func testSize(t *testing.T) Size {
+	t.Helper()
+	size, err := NewSize(40, 120)
+	if err != nil {
+		t.Fatalf("new test size: %v", err)
+	}
+	return size
 }
