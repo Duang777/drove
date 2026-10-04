@@ -121,7 +121,7 @@
 - [x] `/?agent=<id>` opens the detail view without a new router.
 - [x] Browser Back returns to the fleet without a full reload.
 - [x] Selecting a fleet row opens its detail view.
-- [ ] The detail header shows identity, state, working directory, and
+- [x] The detail header shows identity, state, working directory, and
   connection status.
 - [x] The terminal is the primary visual area.
 - [x] The playback rail shows state spans and Blocked markers.
@@ -165,6 +165,6 @@
 - [x] Web tests, typecheck, and build pass.
 - [x] `git diff --check` passes.
 - [ ] Both remote CI lanes pass.
-- [ ] Every implementation commit is pushed before the next begins.
-- [ ] A Bubble Tea follow-up issue is linked from Issue #20.
+- [x] Every implementation commit is pushed before the next begins.
+- [x] A Bubble Tea follow-up issue is linked from Issue #20.
 - [ ] Issue #20 contains final evidence and is closed.

@@ -24,6 +24,9 @@
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →
   等待 required hook。
+- `Start` 在构造 Agent 前把非空 `req.Dir` 解析为绝对路径。Agent 生命周期内不再
+  修改该路径；creation version 2 metadata 和 `Status.Dir` 使用同一个值。旧
+  creation 事件恢复为空路径。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
