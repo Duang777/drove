@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -65,6 +69,8 @@ func newRootCmd() *cobra.Command {
 		newSendCmd(),
 		newHookCmd(),
 		newStopCmd(),
+		newTokenCmd(),
+		newWebCmd(),
 		newVersionCmd(),
 	)
 	return root
@@ -76,7 +82,10 @@ func newClient(ctx context.Context) (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := client.New(cfg.APIBind, client.WithTokenFile(auth.TokenPath(cfg.DataDir)))
+	c := client.NewLocal(
+		cfg.DataDir,
+		client.WithTokenFile(auth.TokenPath(cfg.DataDir)),
+	)
 	if err := c.EnsureDaemon(ctx, configPath); err != nil {
 		return nil, err
 	}
@@ -481,6 +490,125 @@ func newStopCmd() *cobra.Command {
 	}
 }
 
+func newTokenCmd() *cobra.Command {
+	token := &cobra.Command{
+		Use:   "token",
+		Short: "管理本地控制令牌",
+	}
+	token.AddCommand(&cobra.Command{
+		Use:   "rotate",
+		Short: "轮换本地控制令牌",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			c, err := newClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if err := c.RotateToken(cmd.Context()); err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), "control token rotated")
+			return err
+		},
+	})
+	return token
+}
+
+var launchBrowser = openBrowser
+
+func newWebCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "web",
+		Short: "打开 Web 控制台",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, configPath, err := config.LoadResolved("")
+			if err != nil {
+				return err
+			}
+			if cfg.DisableTCP {
+				return errors.New("web console is unavailable while disable_tcp is true")
+			}
+			c := client.NewLocal(
+				cfg.DataDir,
+				client.WithTokenFile(auth.TokenPath(cfg.DataDir)),
+			)
+			if err := c.EnsureDaemon(cmd.Context(), configPath); err != nil {
+				return err
+			}
+			code, err := c.IssueLoginCode(cmd.Context())
+			if err != nil {
+				return err
+			}
+			browserURL, err := newBrowserURL(cfg.APIBind, code)
+			if err != nil {
+				return err
+			}
+			if err := launchBrowser(browserURL.login); err != nil {
+				return fmt.Errorf("open browser: %w", err)
+			}
+			_, err = fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"opened Drove console at %s\n",
+				browserURL.public,
+			)
+			return err
+		},
+	}
+}
+
+type browserURL struct {
+	login  string
+	public string
+}
+
+func newBrowserURL(address, code string) (browserURL, error) {
+	if _, _, err := net.SplitHostPort(address); err != nil {
+		return browserURL{}, fmt.Errorf("invalid browser address %q: %w", address, err)
+	}
+	if code == "" {
+		return browserURL{}, errors.New("browser login code is empty")
+	}
+	loginURL := url.URL{
+		Scheme:   "http",
+		Host:     address,
+		Path:     "/login",
+		Fragment: code,
+	}
+	publicURL := loginURL
+	publicURL.Fragment = ""
+	return browserURL{
+		login:  loginURL.String(),
+		public: publicURL.String(),
+	}, nil
+}
+
+func openBrowser(rawURL string) error {
+	var command string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		command = "open"
+		args = []string{rawURL}
+	case "linux":
+		command = "xdg-open"
+		args = []string{rawURL}
+	case "windows":
+		command = "rundll32"
+		args = []string{"url.dll,FileProtocolHandler", rawURL}
+	default:
+		return fmt.Errorf("unsupported platform %q", runtime.GOOS)
+	}
+	process := exec.Command(command, args...)
+	if err := process.Start(); err != nil {
+		return err
+	}
+	go func() {
+		_ = process.Wait()
+	}()
+	return nil
+}
+
 func newSendCmd() *cobra.Command {
 	var fromStdin bool
 	cmd := &cobra.Command{
@@ -567,9 +695,10 @@ func forwardHook(
 	args []string,
 ) error {
 	relay, err := client.NewHookRelay(client.HookRelayConfig{
-		AgentID:   os.Getenv(session.SignalAgentIDEnv),
-		SignalURL: os.Getenv(session.SignalURLEnv),
-		Token:     os.Getenv(session.SignalTokenEnv),
+		AgentID:    os.Getenv(session.SignalAgentIDEnv),
+		SignalURL:  os.Getenv(session.SignalURLEnv),
+		SocketPath: os.Getenv(session.SignalSocketEnv),
+		Token:      os.Getenv(session.SignalTokenEnv),
 	})
 	if err != nil {
 		return err

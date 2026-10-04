@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -32,9 +34,10 @@ var (
 
 // Client 封装对 daemon API 的调用。
 type Client struct {
-	baseURL   string
-	hc        *http.Client
-	tokenPath string
+	baseURL        string
+	hc             *http.Client
+	tokenPath      string
+	netDialContext func(context.Context, string, string) (net.Conn, error)
 }
 
 // Option configures a Client.
@@ -52,6 +55,23 @@ func New(baseURL string, options ...Option) *Client {
 	client := &Client{
 		baseURL: "http://" + baseURL,
 		hc:      &http.Client{Timeout: 10 * time.Second},
+	}
+	for _, option := range options {
+		option(client)
+	}
+	return client
+}
+
+// NewLocal creates a client that reaches the daemon over its Unix socket.
+func NewLocal(dataDir string, options ...Option) *Client {
+	transport := localipc.Transport(dataDir)
+	client := &Client{
+		baseURL:        "http://" + localipc.Authority,
+		netDialContext: transport.DialContext,
+		hc: &http.Client{
+			Transport: transport,
+			Timeout:   10 * time.Second,
+		},
 	}
 	for _, option := range options {
 		option(client)
@@ -100,6 +120,67 @@ func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.
 // Stop 停止一个会话。
 func (c *Client) Stop(ctx context.Context, id string) error {
 	return c.delete(ctx, "/api/v1/agents/"+id)
+}
+
+// RotateToken atomically rotates the daemon control token.
+func (c *Client) RotateToken(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/api/v1/auth/token/rotate",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if err := c.authorize(req, false); err != nil {
+		return err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return ErrDaemonUnreachable
+	}
+	defer resp.Body.Close()
+	if err := c.responseError(resp, "/api/v1/auth/token/rotate"); err != nil {
+		return err
+	}
+	return drain(resp.Body)
+}
+
+// IssueLoginCode creates a one-time browser login code over local transport.
+func (c *Client) IssueLoginCode(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/api/v1/auth/login-code",
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	if err := c.authorize(req, false); err != nil {
+		return "", err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return "", ErrDaemonUnreachable
+	}
+	defer resp.Body.Close()
+	if err := c.responseError(resp, "/api/v1/auth/login-code"); err != nil {
+		return "", err
+	}
+	var response loginCodeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("client: decode login code: %w", err)
+	}
+	if response.Code == "" {
+		return "", errors.New("client: daemon returned an empty login code")
+	}
+	return response.Code, nil
+}
+
+type loginCodeResponse struct {
+	Code string `json:"code"`
 }
 
 type inputRequest struct {

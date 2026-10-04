@@ -20,9 +20,10 @@ const signalInjectionDirectory = "sessions"
 
 // SignalInjectionOptions configures process-local vendor signal injection.
 type SignalInjectionOptions struct {
-	DataDir   string
-	RelayPath string
-	Modes     map[string]agent.SignalInjectionMode
+	DataDir    string
+	RelayPath  string
+	SocketPath string
+	Modes      map[string]agent.SignalInjectionMode
 }
 
 type signalInjectionFS struct {
@@ -63,6 +64,7 @@ func WithSignalInjection(options SignalInjectionOptions) ManagerOption {
 		manager.injectionDataDir = options.DataDir
 		manager.injectionRelay = options.RelayPath
 		manager.injectionModes = modes
+		manager.signalSocketPath = options.SocketPath
 	}
 }
 

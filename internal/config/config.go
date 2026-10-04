@@ -39,6 +39,8 @@ type Config struct {
 	DataDir string `json:"data_dir"`
 	// APIBind 是 daemon REST/WebSocket 监听地址。
 	APIBind string `json:"api_bind"`
+	// DisableTCP 关闭浏览器使用的 loopback TCP listener。
+	DisableTCP bool `json:"disable_tcp,omitempty"`
 	// EventBuffer 是每个事件订阅者的缓冲行数。
 	EventBuffer int `json:"event_buffer"`
 	// ConsoleOrigins 是允许建立 WebSocket 的本地控制台 Origin。

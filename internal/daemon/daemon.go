@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,9 +19,11 @@ import (
 	"github.com/Duang777/drove/internal/api"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
+	"github.com/Duang777/drove/internal/webui"
 )
 
 // Daemon 是常驻服务。
@@ -46,9 +49,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	if err := inspectStoragePaths(log, d.cfg.DataDir, d.cfg.DBPath); err != nil {
 		return fmt.Errorf("daemon: storage: %w", err)
 	}
-	controlToken, err := auth.Ensure(d.cfg.DataDir)
+	credentials, err := auth.Open(d.cfg.DataDir, auth.DefaultOptions())
 	if err != nil {
-		return fmt.Errorf("daemon: control token: %w", err)
+		return fmt.Errorf("daemon: control credentials: %w", err)
 	}
 
 	// 1. 存储。
@@ -69,7 +72,15 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	log.Info("startup output retention completed", "deleted", deleted)
 
 	// 2. 在 API 对外可见前恢复会话投影。
-	recovered, err := bootstrapSessions(ctx, st, signalInjectionOption(d.cfg))
+	socketPath, err := filepath.Abs(localipc.SocketPath(d.cfg.DataDir))
+	if err != nil {
+		return fmt.Errorf("daemon: resolve local socket: %w", err)
+	}
+	recovered, err := bootstrapSessions(
+		ctx,
+		st,
+		signalInjectionOption(d.cfg, socketPath),
+	)
 	if err != nil {
 		return err
 	}
@@ -86,46 +97,82 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		"last_seq", report.LastSeq,
 	)
 
-	// 3. API server。
-	srv := api.NewServer(api.ServerOptions{
-		Bind:           d.cfg.APIBind,
-		Manager:        mgr,
-		Hub:            hub,
-		EventBuffer:    d.cfg.EventBuffer,
-		ControlToken:   controlToken,
-		AllowedOrigins: d.cfg.ConsoleOrigins,
-	})
-
-	ln, err := net.Listen("tcp", d.cfg.APIBind)
+	localListener, err := localipc.Listen(d.cfg.DataDir)
 	if err != nil {
 		closeErr := mgr.Close()
 		hub.Close()
 		return errors.Join(
-			fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err),
+			fmt.Errorf("daemon: listen local socket: %w", err),
 			closeErr,
 		)
+	}
+	listeners := []net.Listener{localListener}
+	var tcpListener net.Listener
+	if !d.cfg.DisableTCP {
+		tcpListener, err = net.Listen("tcp", d.cfg.APIBind)
+		if err != nil {
+			closeErr := mgr.Close()
+			hub.Close()
+			return errors.Join(
+				fmt.Errorf("daemon: listen %s: %w", d.cfg.APIBind, err),
+				localListener.Close(),
+				closeErr,
+			)
+		}
+		listeners = append(listeners, tcpListener)
 	}
 	if err := session.CleanupStaleSignalInjections(d.cfg.DataDir); err != nil {
 		closeErr := mgr.Close()
 		hub.Close()
-		_ = ln.Close()
 		return errors.Join(
 			fmt.Errorf("daemon: clean stale signal injection: %w", err),
+			closeListeners(listeners),
 			closeErr,
 		)
+	}
+	signalHost := d.cfg.APIBind
+	if tcpListener != nil {
+		signalHost = tcpListener.Addr().String()
 	}
 	if err := mgr.ConfigureSignalOrigin(&url.URL{
 		Scheme: "http",
-		Host:   ln.Addr().String(),
+		Host:   signalHost,
 	}); err != nil {
 		closeErr := mgr.Close()
 		hub.Close()
-		_ = ln.Close()
 		return errors.Join(
 			fmt.Errorf("daemon: configure signal origin: %w", err),
+			closeListeners(listeners),
 			closeErr,
 		)
 	}
+
+	allowedOrigins := append([]string(nil), d.cfg.ConsoleOrigins...)
+	var browserHosts []string
+	if tcpListener != nil {
+		browserHosts, err = loopbackHosts(tcpListener.Addr().String())
+		if err != nil {
+			closeErr := mgr.Close()
+			hub.Close()
+			return errors.Join(
+				fmt.Errorf("daemon: browser access policy: %w", err),
+				closeListeners(listeners),
+				closeErr,
+			)
+		}
+		for _, host := range browserHosts {
+			allowedOrigins = append(allowedOrigins, "http://"+host)
+		}
+	}
+
+	srv := api.NewServer(api.ServerOptions{
+		Manager:        mgr,
+		Hub:            hub,
+		Auth:           credentials,
+		Web:            webui.FS(),
+		EventBuffer:    d.cfg.EventBuffer,
+		AllowedOrigins: allowedOrigins,
+	})
 
 	stopRetention, retentionDone := d.startRetentionLoop(st, log)
 
@@ -133,13 +180,39 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	errCh := make(chan error, 1)
-	go func() {
-		log.Info("drove daemon listening", "addr", ln.Addr().String(), "version", version.Version)
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-	}()
+	endpoints := []httpEndpoint{{
+		listener: localListener,
+		server: &http.Server{
+			Handler:           srv.Handler(api.LocalAccess, localipc.Authority),
+			ReadHeaderTimeout: 5 * time.Second,
+		},
+	}}
+	if tcpListener != nil {
+		endpoints = append(endpoints, httpEndpoint{
+			listener: tcpListener,
+			server: &http.Server{
+				Handler:           srv.Handler(api.BrowserAccess, browserHosts...),
+				ReadHeaderTimeout: 5 * time.Second,
+			},
+		})
+	}
+
+	errCh := make(chan error, len(endpoints))
+	for _, endpoint := range endpoints {
+		endpoint := endpoint
+		go func() {
+			log.Info(
+				"drove daemon listening",
+				"network", endpoint.listener.Addr().Network(),
+				"addr", endpoint.listener.Addr().String(),
+				"version", version.Version,
+			)
+			if err := endpoint.server.Serve(endpoint.listener); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
 
 	select {
 	case <-ctx.Done():
@@ -155,7 +228,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
+	if err := shutdownHTTPServers(shutdownCtx, endpoints); err != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("daemon: shutdown api: %w", err))
 	}
 	if err := mgr.Close(); err != nil {
@@ -164,6 +237,53 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	hub.Close()
 	log.Info("drove daemon stopped")
 	return runErr
+}
+
+type httpEndpoint struct {
+	listener net.Listener
+	server   *http.Server
+}
+
+func loopbackHosts(address string) ([]string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("split listener address %q: %w", address, err)
+	}
+	candidates := []string{
+		net.JoinHostPort(host, port),
+		net.JoinHostPort("127.0.0.1", port),
+		net.JoinHostPort("localhost", port),
+		net.JoinHostPort("::1", port),
+	}
+	hosts := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		hosts = append(hosts, candidate)
+	}
+	return hosts, nil
+}
+
+func closeListeners(listeners []net.Listener) error {
+	var err error
+	for _, listener := range listeners {
+		err = errors.Join(err, listener.Close())
+	}
+	return err
+}
+
+func shutdownHTTPServers(
+	ctx context.Context,
+	endpoints []httpEndpoint,
+) error {
+	var err error
+	for _, endpoint := range endpoints {
+		err = errors.Join(err, endpoint.server.Shutdown(ctx))
+	}
+	return err
 }
 
 func bootstrapSessions(

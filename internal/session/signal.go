@@ -26,6 +26,8 @@ const (
 	SignalAgentIDEnv = "DROVE_AGENT_ID"
 	// SignalURLEnv contains the per-session loopback callback URL.
 	SignalURLEnv = "DROVE_SIGNAL_URL"
+	// SignalSocketEnv contains the daemon Unix socket used by the hook relay.
+	SignalSocketEnv = "DROVE_SIGNAL_SOCKET"
 	// SignalTokenEnv contains the in-memory per-session callback credential.
 	SignalTokenEnv = "DROVE_SIGNAL_TOKEN"
 
@@ -205,11 +207,18 @@ func (m *Manager) prepareRuntime(
 	running.signalDigest = digest
 	running.hasSignalToken = true
 	running.output = newOutputProcessor(m, a.ID(), running, token)
-	return running, []string{
+	environment := []string{
 		SignalAgentIDEnv + "=" + string(a.ID()),
 		SignalURLEnv + "=" + signalURL,
 		SignalTokenEnv + "=" + token,
-	}, token, nil
+	}
+	if m.signalSocketPath != "" {
+		environment = append(
+			environment,
+			SignalSocketEnv+"="+m.signalSocketPath,
+		)
+	}
+	return running, environment, token, nil
 }
 
 func (m *Manager) signalURL(id agent.ID) (string, error) {

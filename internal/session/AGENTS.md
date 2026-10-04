@@ -28,6 +28,8 @@
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
   `<data_dir>/sessions/<agent-id>/` 原子写入私有文件；退出回调完成后清理。
+- hook 环境同时携带 loopback 形状的 callback URL 与 daemon Unix socket 路径；
+  session 只负责注入，实际拨号策略归 client。
 - 缺失的 signal injection 根目录和会话目录使用 `0700`；既有根目录只校验类型，
   不自动修改其模式。
 - 新请求默认 `interactive`；旧事件缺少 mode 时由恢复投影回退为 `oneshot`。

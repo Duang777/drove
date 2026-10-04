@@ -19,6 +19,7 @@ import (
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -591,7 +592,15 @@ func TestWriteTimelinePrintsSpansAndNumberedBlockedEntries(t *testing.T) {
 }
 
 func TestTimelineCommandJSONKeepsStdoutMachineClean(t *testing.T) {
-	home := t.TempDir()
+	home, err := os.MkdirTemp("/tmp", "drove-timeline-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
 	t.Setenv("HOME", home)
 	dataDir := filepath.Join(home, ".drove")
 	token, err := auth.Ensure(dataDir)
@@ -599,7 +608,11 @@ func TestTimelineCommandJSONKeepsStdoutMachineClean(t *testing.T) {
 		t.Fatalf("ensure control token: %v", err)
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
@@ -623,12 +636,16 @@ func TestTimelineCommandJSONKeepsStdoutMachineClean(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer server.Close()
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
 
 	cfg := config.Defaults()
 	cfg.DataDir = dataDir
-	cfg.APIBind = strings.TrimPrefix(server.URL, "http://")
 	cfg.DBPath = ""
 	rawConfig, err := json.Marshal(cfg)
 	if err != nil {
@@ -746,7 +763,15 @@ func TestWriteExplanationOmitsDetachedScreenPlaceholder(t *testing.T) {
 }
 
 func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
-	home := t.TempDir()
+	home, err := os.MkdirTemp("/tmp", "drove-explain-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
 	t.Setenv("HOME", home)
 	dataDir := filepath.Join(home, ".drove")
 	token, err := auth.Ensure(dataDir)
@@ -754,7 +779,11 @@ func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
 		t.Fatalf("ensure control token: %v", err)
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
@@ -775,12 +804,16 @@ func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer server.Close()
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
 
 	cfg := config.Defaults()
 	cfg.DataDir = dataDir
-	cfg.APIBind = strings.TrimPrefix(server.URL, "http://")
 	cfg.DBPath = ""
 	rawConfig, err := json.Marshal(cfg)
 	if err != nil {
@@ -822,6 +855,197 @@ func TestExplainCommandRejectsInvalidExplicitLimitBeforeClientSetup(t *testing.T
 		if err := command.Execute(); !errors.Is(err, session.ErrInvalidExplainLimit) {
 			t.Fatalf("limit %s error = %v, want ErrInvalidExplainLimit", limit, err)
 		}
+	}
+}
+
+func TestTokenRotateCommandUsesLocalDaemon(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "drove-token-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".drove")
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	rotateCalls := 0
+	server := &http.Server{Handler: http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents":
+			_, _ = io.WriteString(w, "[]")
+		case r.Method == http.MethodPost &&
+			r.URL.Path == "/api/v1/auth/token/rotate":
+			rotateCalls++
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	cfg := config.Defaults()
+	cfg.DataDir = dataDir
+	cfg.DBPath = ""
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	command := newTokenCmd()
+	command.SetArgs([]string{"rotate"})
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute token rotate: %v", err)
+	}
+	if rotateCalls != 1 {
+		t.Fatalf("rotate calls = %d, want 1", rotateCalls)
+	}
+	if stdout.String() != "control token rotated\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestWebCommandIssuesCodeAndOpensFragmentURL(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "drove-web-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".drove")
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents":
+			_, _ = io.WriteString(w, "[]")
+		case r.Method == http.MethodPost &&
+			r.URL.Path == "/api/v1/auth/login-code":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"code":"single-use-code"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	cfg := config.Defaults()
+	cfg.DataDir = dataDir
+	cfg.APIBind = "127.0.0.1:7373"
+	cfg.DBPath = ""
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	previousLauncher := launchBrowser
+	var openedURL string
+	launchBrowser = func(rawURL string) error {
+		openedURL = rawURL
+		return nil
+	}
+	t.Cleanup(func() {
+		launchBrowser = previousLauncher
+	})
+
+	command := newWebCmd()
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute web: %v", err)
+	}
+	if openedURL != "http://127.0.0.1:7373/login#single-use-code" {
+		t.Fatalf("opened URL = %q", openedURL)
+	}
+	if strings.Contains(stdout.String(), "single-use-code") {
+		t.Fatalf("stdout exposed login code: %q", stdout.String())
+	}
+	if stdout.String() != "opened Drove console at http://127.0.0.1:7373/login\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestWebCommandRejectsDisabledTCPBeforeDaemonAccess(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg := config.Defaults()
+	cfg.DisableTCP = true
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(config.DefaultPath()), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	err = newWebCmd().Execute()
+	if err == nil || !strings.Contains(err.Error(), "disable_tcp") {
+		t.Fatalf("web command error = %v, want disable_tcp error", err)
+	}
+}
+
+func TestBrowserLoginURLPreservesIPv6Authority(t *testing.T) {
+	browserURL, err := newBrowserURL("[::1]:7373", "code")
+	if err != nil {
+		t.Fatalf("browser login URL: %v", err)
+	}
+	if browserURL.login != "http://[::1]:7373/login#code" ||
+		browserURL.public != "http://[::1]:7373/login" {
+		t.Fatalf("browser URL = %+v", browserURL)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 )
@@ -77,6 +78,75 @@ func TestSendInputRejectsInvalidUTF8BeforeRequest(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestRotateTokenUsesAuthenticatedPost(t *testing.T) {
+	dataDir := t.TempDir()
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/auth/token/rotate" {
+			t.Errorf("path = %q, want token rotation endpoint", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	c := New(
+		strings.TrimPrefix(server.URL, "http://"),
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	if err := c.RotateToken(context.Background()); err != nil {
+		t.Fatalf("rotate token: %v", err)
+	}
+}
+
+func TestIssueLoginCodeUsesAuthenticatedPost(t *testing.T) {
+	dataDir := t.TempDir()
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/auth/login-code" {
+			t.Errorf("path = %q, want login-code endpoint", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":"one-time-code"}`)
+	}))
+	defer server.Close()
+
+	c := New(
+		strings.TrimPrefix(server.URL, "http://"),
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	code, err := c.IssueLoginCode(context.Background())
+	if err != nil {
+		t.Fatalf("issue login code: %v", err)
+	}
+	if code != "one-time-code" {
+		t.Fatalf("code = %q, want one-time-code", code)
 	}
 }
 
@@ -443,5 +513,54 @@ func TestListFailsBeforeRequestWhenTokenFileIsInvalid(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("server calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestLocalClientUsesUnixSocketWithoutTCP(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "drove-client-")
+	if err != nil {
+		t.Fatalf("create data directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove data directory: %v", err)
+		}
+	})
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != localipc.Authority {
+			t.Errorf("host = %q, want %q", r.Host, localipc.Authority)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write([]byte("[]"))
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	localClient := NewLocal(
+		dataDir,
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	statuses, err := localClient.List(ctx)
+	if err != nil {
+		t.Fatalf("list over Unix socket: %v", err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("statuses = %+v, want empty", statuses)
 	}
 }

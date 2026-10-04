@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,10 +15,49 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 )
+
+func TestWebSocketV2ClosesWhenAuthorizationExpires(t *testing.T) {
+	server, _, _ := newTestServerWithOptions(t, true, auth.Options{
+		RotationGrace: 20 * time.Millisecond,
+		LoginCodeTTL:  time.Minute,
+		SessionTTL:    time.Minute,
+	})
+	httpServer := newBrowserTestServer(t, server)
+	defer httpServer.Close()
+
+	header := http.Header{"Authorization": []string{"Bearer " + testControlToken}}
+	dialer := *websocket.DefaultDialer
+	dialer.Subprotocols = []string{webSocketV2Protocol}
+	conn, _, err := dialer.Dial(
+		"ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws",
+		header,
+	)
+	if err != nil {
+		t.Fatalf("dial WebSocket v2: %v", err)
+	}
+	defer conn.Close()
+	_ = readWebSocketV2TextType(t, conn, "hello", time.Now().Add(time.Second))
+
+	if err := server.opts.Auth.Rotate(); err != nil {
+		t.Fatalf("rotate token: %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, _, err = conn.ReadMessage()
+	if !websocket.IsCloseError(err, websocket.ClosePolicyViolation) {
+		t.Fatalf("read after authorization expiry = %v, want policy close", err)
+	}
+	var closeError *websocket.CloseError
+	if !errors.As(err, &closeError) || closeError.Text != "authorization expired" {
+		t.Fatalf("close error = %v, want authorization expired", err)
+	}
+}
 
 func TestWebSocketV2NegotiatesAndStreamsRawHistoryFromOffset(t *testing.T) {
 	server, manager, _ := newTestServer(t)

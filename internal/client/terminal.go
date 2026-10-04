@@ -270,6 +270,10 @@ func (c *Client) OpenTerminal(ctx context.Context) (*TerminalStream, error) {
 	}
 	dialer := *websocket.DefaultDialer
 	dialer.Subprotocols = []string{terminalProtocol}
+	if c.netDialContext != nil {
+		dialer.Proxy = nil
+		dialer.NetDialContext = c.netDialContext
+	}
 	conn, response, err := dialer.DialContext(ctx, endpoint, request.Header)
 	if err != nil {
 		if response != nil {

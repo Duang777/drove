@@ -368,6 +368,7 @@ func (q *webSocketV2Queue) Overflowed() bool {
 }
 
 func (s *Server) handleWebSocketV2(w http.ResponseWriter, r *http.Request) {
+	grant := requestGrant(r)
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 4096,
@@ -380,7 +381,7 @@ func (s *Server) handleWebSocketV2(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	connection := newWebSocketV2Connection(s, conn)
+	connection := newWebSocketV2Connection(s, conn, grant.Done())
 	connection.run()
 }
 
@@ -395,11 +396,14 @@ type webSocketV2Connection struct {
 	failures      chan webSocketV2SubscriptionFailure
 	subscriptions map[webSocketV2SubscriptionKey]*webSocketV2Subscription
 	slowClosed    bool
+	authClosed    bool
+	authDone      <-chan struct{}
 }
 
 func newWebSocketV2Connection(
 	server *Server,
 	conn *websocket.Conn,
+	authDone <-chan struct{},
 ) *webSocketV2Connection {
 	ctx, cancel := context.WithCancel(context.Background())
 	queueBudget := server.webSocketV2QueueBudget
@@ -416,6 +420,7 @@ func newWebSocketV2Connection(
 		readerDone:    make(chan struct{}),
 		failures:      make(chan webSocketV2SubscriptionFailure, webSocketV2FailureBuffer),
 		subscriptions: make(map[webSocketV2SubscriptionKey]*webSocketV2Subscription),
+		authDone:      authDone,
 	}
 }
 
@@ -426,7 +431,7 @@ func (c *webSocketV2Connection) run() {
 		}
 		c.cancel()
 		c.closeSubscriptions()
-		if !c.slowClosed {
+		if !c.slowClosed && !c.authClosed {
 			_ = c.conn.WriteControl(
 				websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
@@ -463,6 +468,9 @@ func (c *webSocketV2Connection) run() {
 	defer ping.Stop()
 	for {
 		select {
+		case <-c.authDone:
+			c.closeAuthorizationExpired()
+			return
 		case <-c.readerDone:
 			return
 		case incoming := <-c.incoming:
@@ -492,6 +500,18 @@ func (c *webSocketV2Connection) run() {
 			}
 		}
 	}
+}
+
+func (c *webSocketV2Connection) closeAuthorizationExpired() {
+	_ = c.conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(
+			websocket.ClosePolicyViolation,
+			"authorization expired",
+		),
+		time.Now().Add(webSocketWriteTimeout),
+	)
+	c.authClosed = true
 }
 
 func (c *webSocketV2Connection) read() {

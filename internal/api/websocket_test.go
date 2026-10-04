@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 )
@@ -194,6 +195,42 @@ func TestWebSocketInputReturnsStableErrorsAndRejectsDuplicateIDs(t *testing.T) {
 	response := readWebSocketType(t, conn, "error", time.Now().Add(3*time.Second))
 	if response["code"] != "invalid_message" {
 		t.Fatalf("binary response = %#v", response)
+	}
+}
+
+func TestWebSocketClosesWhenBearerGenerationExpires(t *testing.T) {
+	server, _, _ := newTestServerWithOptions(t, true, auth.Options{
+		RotationGrace: 40 * time.Millisecond,
+		LoginCodeTTL:  time.Minute,
+		SessionTTL:    time.Minute,
+	})
+	httpServer := newBrowserTestServer(t, server)
+	defer httpServer.Close()
+	conn := dialTestWebSocket(t, httpServer.URL)
+
+	rotate := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/token/rotate",
+		nil,
+	)
+	rotate.Host = "drove.local"
+	rotate.Header.Set("Authorization", "Bearer "+testControlToken)
+	response := httptest.NewRecorder()
+	server.Handler(LocalAccess, "drove.local").ServeHTTP(response, rotate)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf(
+			"rotate response = %d %q, want 204",
+			response.Code,
+			response.Body.String(),
+		)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, _, err := conn.ReadMessage()
+	if !websocket.IsCloseError(err, websocket.ClosePolicyViolation) {
+		t.Fatalf("read after rotation error = %v, want policy close", err)
 	}
 }
 

@@ -9,14 +9,88 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/recording"
 )
+
+func TestOpenTerminalUsesLocalUnixSocket(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "drove-terminal-client-")
+	if err != nil {
+		t.Fatalf("create data directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove data directory: %v", err)
+		}
+	})
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	serverErrors := make(chan error, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Host != localipc.Authority {
+			serverErrors <- fmt.Errorf("host = %q, want %q", r.Host, localipc.Authority)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			serverErrors <- fmt.Errorf("authorization = %q", r.Header.Get("Authorization"))
+			return
+		}
+		upgrader := websocket.Upgrader{Subprotocols: []string{terminalProtocol}}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			serverErrors <- err
+			return
+		}
+		defer conn.Close()
+		if err := conn.WriteJSON(terminalHelloResponse{
+			Version: terminalVersion,
+			Type:    "hello",
+		}); err != nil {
+			serverErrors <- err
+			return
+		}
+		_, _, _ = conn.ReadMessage()
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	client := NewLocal(dataDir, WithTokenFile(auth.TokenPath(dataDir)))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	stream, err := client.OpenTerminal(ctx)
+	if err != nil {
+		t.Fatalf("open terminal over Unix socket: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close terminal: %v", err)
+	}
+	select {
+	case err := <-serverErrors:
+		t.Fatal(err)
+	default:
+	}
+}
 
 func TestTerminalStreamCommandsAndApplyThenAdvance(t *testing.T) {
 	serverErrors := make(chan error, 1)

@@ -42,12 +42,14 @@ export function AgentList({ agents, events, onChanged }: Props) {
   }
 
   return (
-    <section className="space-y-3">
-      <div className="flex items-center gap-2">
+    <section className="agent-section" aria-labelledby="agents-title">
+      <div className="section-toolbar">
+        <h2 id="agents-title">会话</h2>
+        <div className="agent-actions">
         <select
+          aria-label="Agent vendor"
           value={vendor}
           onChange={(e) => setVendor(e.target.value)}
-          className="rounded border border-gray-300 px-2 py-1 text-sm"
         >
           <option value="claude">claude</option>
           <option value="codex">codex</option>
@@ -56,17 +58,18 @@ export function AgentList({ agents, events, onChanged }: Props) {
         <button
           type="button"
           onClick={handleStart}
-          className="rounded bg-blue-600 px-3 py-1 text-sm text-white hover:bg-blue-700"
+          className="button button-primary"
         >
           启动 Agent
         </button>
-        {err && <p className="text-xs text-red-500">{err}</p>}
+        </div>
       </div>
+      {err && <p className="inline-error" role="alert">{err}</p>}
 
       {agents.length === 0 ? (
-        <p className="py-8 text-center text-sm text-gray-400">暂无 Agent，点击上方按钮启动一个。</p>
+        <p className="empty-state">暂无 Agent</p>
       ) : (
-        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
+        <div className="agent-grid">
           {agents.map((a) => (
             <AgentCard
               key={a.agent_id}

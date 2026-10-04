@@ -17,6 +17,8 @@ cmd/* ──▶ internal/client ──▶ internal/session
 
 - `session` 编排一切：agent + pty + adapter + detect + event + store。
 - `daemon` 装配 session/api/config/store/hub（composition root）。
+- `localipc` 封装 Unix listener、peer credential 与客户端 transport，供 daemon
+  和 client 依赖。
 - `api` 只依赖 `session` 与 `event` 的公开接口。
 - `client` 只做 JSON 透传（HTTP 客户端），不解析领域类型。
 - `adapter` 依赖 `detect` 的标准信号类型和 `agent` 的运行模式；`detect` 只依赖

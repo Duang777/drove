@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net"
@@ -28,28 +29,43 @@ import (
 
 // ServerOptions 配置 API server。
 type ServerOptions struct {
-	// Bind 是监听地址（如 127.0.0.1:7373）。
-	Bind string
 	// Manager 处理会话逻辑。
 	Manager *session.Manager
 	// Hub 提供实时事件流。
 	Hub *event.Hub
+	// Auth owns control-plane credentials and their revocation lifecycle.
+	Auth *auth.Controller
+	// Web contains the embedded browser console production build.
+	Web fs.FS
 	// EventBuffer 是每个 WS 订阅的缓冲行数。
 	EventBuffer int
-	// ControlToken 认证 REST 与 WebSocket 控制面请求。
-	ControlToken string
-	// AllowedOrigins 是 WebSocket 可接受的精确 Origin。
+	// AllowedOrigins contains the exact browser origins accepted by REST and WebSocket.
 	AllowedOrigins []string
 }
 
 // Server 是 HTTP/WS 服务。
 type Server struct {
 	opts                   ServerOptions
-	http                   *http.Server
 	mux                    http.Handler
+	web                    http.Handler
 	allowedOrigins         map[string]struct{}
 	webSocketV2QueueBudget int
 }
+
+// Access identifies the transport boundary that accepted a request.
+type Access uint8
+
+const (
+	// LocalAccess is a same-UID Unix socket request.
+	LocalAccess Access = iota + 1
+	// BrowserAccess is a loopback TCP request.
+	BrowserAccess
+)
+
+type accessContextKey struct{}
+type grantContextKey struct{}
+
+const sessionCookieName = "drove_session"
 
 // NewServer 创建 Server（路由已注册）。
 func NewServer(opts ServerOptions) *Server {
@@ -62,16 +78,18 @@ func NewServer(opts ServerOptions) *Server {
 		allowedOrigins:         allowedOrigins,
 		webSocketV2QueueBudget: webSocketV2QueueBytes,
 	}
+	if opts.Web != nil {
+		s.web = http.FileServer(http.FS(opts.Web))
+	}
 	controlMux := http.NewServeMux()
 	s.routes(controlMux)
 	rootMux := http.NewServeMux()
 	rootMux.HandleFunc("POST /api/v1/agents/{id}/signal", s.handleSignal)
-	rootMux.Handle("/", s.authenticate(controlMux))
+	rootMux.HandleFunc("POST /api/v1/auth/login", s.handleExchangeLogin)
+	rootMux.Handle("/api/", s.authenticate(controlMux))
+	rootMux.Handle("/ws", s.authenticate(controlMux))
+	rootMux.HandleFunc("/", s.handleWeb)
 	s.mux = rootMux
-	s.http = &http.Server{
-		Handler:           s.mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
 	return s
 }
 
@@ -83,6 +101,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
+	mux.HandleFunc("POST /api/v1/auth/login-code", s.handleIssueLoginCode)
+	mux.HandleFunc("POST /api/v1/auth/token/rotate", s.handleRotateToken)
 	mux.HandleFunc("GET /api/v1/agents/{id}/timeline", s.handleTimeline)
 	mux.HandleFunc(
 		"GET /api/v1/agents/{id}/timeline/blocked/{number}",
@@ -95,23 +115,53 @@ func (s *Server) routes(mux *http.ServeMux) {
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		values := r.Header.Values("Authorization")
-		if len(values) != 1 || !auth.Verify(s.opts.ControlToken, values[0]) {
+		var (
+			grant auth.Grant
+			ok    bool
+		)
+		switch {
+		case len(values) == 1:
+			grant, ok = s.opts.Auth.AuthorizeBearer(values[0])
+		case len(values) == 0 && requestAccess(r) == BrowserAccess:
+			cookie, err := r.Cookie(sessionCookieName)
+			if err == nil {
+				grant, ok = s.opts.Auth.AuthorizeCookie(cookie.Value)
+			}
+		}
+		if !ok {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		next.ServeHTTP(w, r)
+		if grant.Kind() == auth.CookieAccess &&
+			requiresOrigin(r) &&
+			len(r.Header.Values("Origin")) == 0 {
+			writeErr(w, http.StatusForbidden, "origin required")
+			return
+		}
+		ctx := context.WithValue(r.Context(), grantContextKey{}, grant)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// Serve 开始监听并服务。
-func (s *Server) Serve(ln net.Listener) error {
-	return s.http.Serve(ln)
-}
-
-// Shutdown 优雅关闭。
-func (s *Server) Shutdown(ctx context.Context) error {
-	return s.http.Shutdown(ctx)
+// Handler returns the route tree bound to one accepted transport.
+func (s *Server) Handler(access Access, allowedHosts ...string) http.Handler {
+	hosts := make(map[string]struct{}, len(allowedHosts))
+	for _, host := range allowedHosts {
+		hosts[host] = struct{}{}
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := hosts[r.Host]; !ok {
+			writeErr(w, http.StatusForbidden, "host not allowed")
+			return
+		}
+		if access == BrowserAccess && !s.originAllowed(r) {
+			writeErr(w, http.StatusForbidden, "origin not allowed")
+			return
+		}
+		ctx := context.WithValue(r.Context(), accessContextKey{}, access)
+		s.mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // -- handlers --
@@ -211,11 +261,132 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleRotateToken(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != LocalAccess {
+		writeErr(w, http.StatusForbidden, "token rotation requires local access")
+		return
+	}
+	if err := s.opts.Auth.Rotate(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleIssueLoginCode(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != LocalAccess {
+		writeErr(w, http.StatusForbidden, "login code requires local access")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	code, err := s.opts.Auth.IssueLoginCode()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, loginCodeResponse{Code: code})
+}
+
+func (s *Server) handleExchangeLogin(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != BrowserAccess {
+		writeErr(w, http.StatusForbidden, "browser login requires browser access")
+		return
+	}
+	if !s.hasAllowedOrigin(r) {
+		writeErr(w, http.StatusForbidden, "origin required")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginRequestBytes)
+	var request loginExchangeRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum size")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+
+	cookie, _, err := s.opts.Auth.ExchangeLoginCode(request.Code)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "invalid login code")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    cookie,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != BrowserAccess || s.web == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	w.Header().Set(
+		"Content-Security-Policy",
+		fmt.Sprintf("default-src 'self'; connect-src 'self' ws://%s wss://%s; "+
+			"img-src 'self' data:; object-src 'none'; base-uri 'none'; "+
+			"frame-ancestors 'none'; form-action 'none'", r.Host, r.Host),
+	)
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+
+	switch {
+	case r.URL.Path == "/" || r.URL.Path == "/login":
+		cloned := r.Clone(r.Context())
+		urlCopy := *r.URL
+		urlCopy.Path = "/"
+		cloned.URL = &urlCopy
+		w.Header().Set("Cache-Control", "no-store")
+		s.web.ServeHTTP(w, cloned)
+	case strings.HasPrefix(r.URL.Path, "/assets/"):
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		s.web.ServeHTTP(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
 const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 4096
+const maxLoginRequestBytes = 4096
 
 type inputRequest struct {
 	Data string `json:"data"`
+}
+
+type loginCodeResponse struct {
+	Code string `json:"code"`
+}
+
+type loginExchangeRequest struct {
+	Code string `json:"code"`
 }
 
 type signalRequest struct {
@@ -281,7 +452,7 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
-	if !isLoopbackRemote(r.RemoteAddr) {
+	if requestAccess(r) != LocalAccess && !isLoopbackRemote(r.RemoteAddr) {
 		writeErr(w, http.StatusForbidden, "signal endpoint accepts loopback requests only")
 		return
 	}
@@ -552,6 +723,44 @@ func isLoopbackRemote(remoteAddr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func requestAccess(r *http.Request) Access {
+	access, _ := r.Context().Value(accessContextKey{}).(Access)
+	return access
+}
+
+func requestGrant(r *http.Request) auth.Grant {
+	grant, _ := r.Context().Value(grantContextKey{}).(auth.Grant)
+	return grant
+}
+
+func (s *Server) originAllowed(r *http.Request) bool {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return true
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	_, allowed := s.allowedOrigins[origins[0]]
+	return allowed
+}
+
+func (s *Server) hasAllowedOrigin(r *http.Request) bool {
+	return len(r.Header.Values("Origin")) == 1 && s.originAllowed(r)
+}
+
+func requiresOrigin(r *http.Request) bool {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
 }
 
 // -- helpers --

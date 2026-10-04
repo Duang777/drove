@@ -3,7 +3,6 @@
 package auth
 
 import (
-	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -45,11 +44,10 @@ func Ensure(dataDir string) (string, error) {
 		return "", err
 	}
 
-	raw := make([]byte, tokenBytes)
-	if _, err := rand.Read(raw); err != nil {
+	token, err = newToken()
+	if err != nil {
 		return "", fmt.Errorf("auth: generate control token: %w", err)
 	}
-	token = hex.EncodeToString(raw)
 
 	temp, err := os.CreateTemp(dataDir, "."+TokenFileName+"-*")
 	if err != nil {

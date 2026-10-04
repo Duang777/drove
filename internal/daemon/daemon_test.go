@@ -7,7 +7,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
@@ -114,6 +117,61 @@ func TestBootstrapSessionsStartsEmptyDatabaseAtOne(t *testing.T) {
 	}
 }
 
+func TestRunServesLocalClientWithTCPDisabled(t *testing.T) {
+	dataDir := shortDaemonDataDir(t)
+	controlToken, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+	tcpAddress := reserveAddress(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- New(&config.Config{
+			DataDir:        dataDir,
+			DBPath:         filepath.Join(dataDir, "drove.db"),
+			APIBind:        tcpAddress,
+			DisableTCP:     true,
+			EventBuffer:    16,
+			ConsoleOrigins: []string{"http://localhost:5173"},
+		}).Run(ctx)
+	}()
+	t.Cleanup(cancel)
+
+	localClient := client.NewLocal(
+		dataDir,
+		client.WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		err := localClient.Ping(context.Background())
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("local API did not become ready: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if tokenRead, err := auth.Read(auth.TokenPath(dataDir)); err != nil || tokenRead != controlToken {
+		t.Fatalf("control token = %q, error = %v", tokenRead, err)
+	}
+	if connection, err := net.DialTimeout("tcp", tcpAddress, 100*time.Millisecond); err == nil {
+		_ = connection.Close()
+		t.Fatal("TCP listener is open while disabled")
+	}
+
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("daemon run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not stop")
+	}
+}
+
 func TestBootstrapSessionsRestoresHistoricalSession(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "drove.db"))
 	if err != nil {
@@ -177,7 +235,7 @@ func TestBootstrapSessionsReturnsScanError(t *testing.T) {
 }
 
 func TestRunStopsLiveSessionBeforeClosingStore(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := shortDaemonDataDir(t)
 	dbPath := filepath.Join(dataDir, "drove.db")
 	addr := reserveAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -273,7 +331,7 @@ func TestRunStopsLiveSessionBeforeClosingStore(t *testing.T) {
 }
 
 func TestRunStopsAfterRuntimeEventCommitFailure(t *testing.T) {
-	dataDir := t.TempDir()
+	dataDir := shortDaemonDataDir(t)
 	dbPath := filepath.Join(dataDir, "drove.db")
 	addr := reserveAddress(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -338,6 +396,22 @@ func TestRunStopsAfterRuntimeEventCommitFailure(t *testing.T) {
 	}
 }
 
+func TestLoopbackHostsIncludesConfiguredAddressAndAliases(t *testing.T) {
+	hosts, err := loopbackHosts("127.0.0.2:7373")
+	if err != nil {
+		t.Fatalf("loopback hosts: %v", err)
+	}
+	want := []string{
+		"127.0.0.2:7373",
+		"127.0.0.1:7373",
+		"localhost:7373",
+		"[::1]:7373",
+	}
+	if !slices.Equal(hosts, want) {
+		t.Fatalf("hosts = %#v, want %#v", hosts, want)
+	}
+}
+
 func reserveAddress(t *testing.T) string {
 	t.Helper()
 
@@ -350,6 +424,20 @@ func reserveAddress(t *testing.T) string {
 		t.Fatalf("release address: %v", err)
 	}
 	return addr
+}
+
+func shortDaemonDataDir(t *testing.T) string {
+	t.Helper()
+	dataDir, err := os.MkdirTemp("/tmp", "drove-daemon-")
+	if err != nil {
+		t.Fatalf("create data directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove data directory: %v", err)
+		}
+	})
+	return dataDir
 }
 
 func waitForAPI(t *testing.T, addr, controlToken string) {

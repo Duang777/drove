@@ -3,13 +3,13 @@ import type { Event, EventRow } from '../api/types'
 import { replayAgent } from '../api/client'
 
 const KIND_STYLE: Record<string, string> = {
-  state_changed: 'text-purple-600',
-  output: 'text-gray-700',
-  'output.chunk': 'text-amber-600',
-  error: 'text-red-600',
-  session_lifecycle: 'text-blue-600',
-  'agent.input': 'text-cyan-600',
-  'agent.signal': 'text-emerald-600',
+  state_changed: 'event-state',
+  output: 'event-output',
+  'output.chunk': 'event-chunk',
+  error: 'event-error',
+  session_lifecycle: 'event-lifecycle',
+  'agent.input': 'event-input',
+  'agent.signal': 'event-signal',
 }
 
 interface Props {
@@ -40,16 +40,21 @@ export function EventLog({ liveEvents, replayID }: Props) {
     }
   }, [replayID])
 
-  const isReplay = replayID !== undefined && rows !== null
+  const replayRows = replayID === undefined ? null : rows
 
   return (
-    <div className="rounded border border-gray-200 bg-gray-950 p-3 font-mono text-xs">
-      <p className="mb-2 text-gray-400">
-        {isReplay ? `回放：${replayID.slice(0, 8)}（${rows?.length ?? 0} 条）` : '实时事件流'}
-      </p>
-      <div className="max-h-96 space-y-0.5 overflow-y-auto">
-        {isReplay
-          ? rows!.map((r) => (
+    <section className="event-section" aria-labelledby="events-title">
+      <div className="section-toolbar">
+        <h2 id="events-title">
+          {replayID === undefined || replayRows === null
+            ? '实时事件'
+            : `回放 ${replayID.slice(0, 8)} · ${replayRows.length}`}
+        </h2>
+      </div>
+      <div className="event-log">
+        <div className="event-scroll">
+        {replayRows !== null
+          ? replayRows.map((r) => (
               <Row
                 key={r.Seq}
                 ts={r.Timestamp}
@@ -71,11 +76,12 @@ export function EventLog({ liveEvents, replayID }: Props) {
                 )}
               />
             ))}
-        {!isReplay && liveEvents.length === 0 && (
-          <p className="text-gray-600">等待事件…（连接后启动一个 agent 即可看到）</p>
+        {replayRows === null && liveEvents.length === 0 && (
+          <p className="event-empty">等待事件</p>
         )}
+        </div>
       </div>
-    </div>
+    </section>
   )
 }
 
@@ -123,10 +129,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function Row({ ts, kind, text }: { ts: string; kind: string; text: string }) {
   const time = new Date(ts).toLocaleTimeString('zh-CN', { hour12: false })
   return (
-    <p className="truncate">
-      <span className="text-gray-500">{time}</span>{' '}
-      <span className={KIND_STYLE[kind] ?? 'text-gray-400'}>[{kind}]</span>{' '}
-      <span className="text-gray-300">{text}</span>
+    <p className="event-row" title={text}>
+      <time>{time}</time>{' '}
+      <span className={KIND_STYLE[kind] ?? 'event-default'}>[{kind}]</span>{' '}
+      <span className="event-text">{text}</span>
     </p>
   )
 }

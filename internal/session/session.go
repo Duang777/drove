@@ -160,6 +160,7 @@ type Manager struct {
 	injectionRelay   string
 	injectionModes   map[string]agent.SignalInjectionMode
 	injectionFS      signalInjectionFS
+	signalSocketPath string
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*agent.Agent

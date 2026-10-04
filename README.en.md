@@ -33,11 +33,11 @@ The recorder works today: `drove log` replays bytes, and `drove timeline` shows 
 | Capability | Status | Where |
 | --- | --- | --- |
 | One PTY per agent, owned by `droved` | Shipped | `internal/pty` |
-| `init` `up` `ps` `log` `timeline` `explain` `stop` `send` `hook` `version` | Shipped | `cmd/drove` |
+| `init` `up` `ps` `log` `timeline` `explain` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
 | Per-session Claude / Codex signal injection | Shipped | [#15](https://github.com/Duang777/drove/issues/15) |
 | Raw terminal bytes, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` byte replay, `--plain` strips control sequences | Shipped | |
-| Loopback bind, local token for REST and WebSocket | Shipped | |
+| Unix local control, Host / Origin checks, cookie login, and token rotation | Shipped | [#21](https://github.com/Duang777/drove/issues/21) |
 | WebSocket v1 events and v2 per-session terminal streams, input, and resize | Shipped | [#19](https://github.com/Duang777/drove/issues/19) |
 | Web skeleton: list, start, stop, live events | Shipped | `web/` |
 | Terminal emulation, query replies, screen rules, and `drove explain` | Shipped | [#14](https://github.com/Duang777/drove/issues/14), [spec 010](specs/010-terminal-screen-detection/spec.md) |
@@ -55,7 +55,7 @@ The recorder works today: `drove log` replays bytes, and `drove timeline` shows 
 <p>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture.en-dark.png">
-    <img alt="Architecture. drove CLI connects to droved over REST with a bearer token, and the web skeleton connects through the Vite proxy. droved owns the session. The session connects to detect, the SQLite event log, and the PTY. The PTY runs claude, codex, or another executable. The agent reaches drove hook through DROVE_SIGNAL variables, and the hook calls back to droved on loopback with the session token." src="docs/assets/architecture.en.png" width="720">
+    <img alt="Architecture. drove CLI connects to droved through a Unix socket, and the browser console connects through loopback HTTP. droved owns the session. The session connects to detect, the SQLite event log, and the PTY. The PTY runs claude, codex, or another executable. The agent reaches drove hook through DROVE_SIGNAL variables, and the hook calls back to droved with the session token." src="docs/assets/architecture.en.png" width="720">
   </picture>
 </p>
 
@@ -80,6 +80,7 @@ drove log <agent-id> --plain
 drove timeline <agent-id>
 drove explain <agent-id>
 drove stop <agent-id>
+drove web
 drove version
 ```
 
@@ -108,6 +109,8 @@ drove up claude --hooks required
 | `drove send <agent-id> --stdin` | Read stdin as-is, with no added newline |
 | `drove stop <agent-id>` | Stop that session |
 | `drove hook --vendor claude\|codex` | Used by the injected agent child. Reads one JSON document from stdin and exits 0 even when delivery fails |
+| `drove web` | Issue a one-time login code over the Unix socket and open the embedded browser console |
+| `drove token rotate` | Atomically rotate the control token without printing it |
 | `drove version` | Print the version. `make build` fills it from `git describe`. Commit and build time stay `unknown` unless those ldflags are set |
 
 Flags on `drove up`: `--name`, `--dir`, `--oneshot`, `--hooks off|auto|required`.
@@ -222,6 +225,7 @@ The config file is `~/.drove/config.json`. `DROVE_DATA_DIR` overrides `data_dir`
 {
   "data_dir": "/home/you/.drove",
   "api_bind": "127.0.0.1:7373",
+  "disable_tcp": false,
   "event_buffer": 1024,
   "console_origins": [
     "http://localhost:5173",
@@ -232,6 +236,9 @@ The config file is `~/.drove/config.json`. `DROVE_DATA_DIR` overrides `data_dir`
   }
 }
 ```
+
+`disable_tcp=true` disables the browser listener while keeping the Unix socket
+and CLI available. `drove web` returns an error in this mode.
 
 `agents.<vendor>.signal_injection` accepts only `auto` or `off`. That is the vendor default for injection. `off|auto|required` is the per-invocation `drove up --hooks` policy and is not stored in this field.
 
@@ -246,9 +253,21 @@ The config file is `~/.drove/config.json`. `DROVE_DATA_DIR` overrides `data_dir`
 
 The control token is 256 random bits, stored as lowercase hex in `<data_dir>/control.token` with mode `0600`. It is created the first time the daemon starts. The config file itself is mode `0644`.
 
-## Web skeleton
+## Web console
 
-The daemon does not serve the frontend. The Vite dev server proxies `/api` and `/ws` to `api_bind` and adds a Bearer token from `control.token`. Start the daemon first, or the token file does not exist yet:
+The daemon embeds and serves the production frontend from the loopback browser
+listener. This command issues a one-time login code over the Unix socket and
+opens a local URL with the code in its fragment:
+
+```bash
+drove web
+```
+
+The page exchanges the code for an HttpOnly, SameSite=Strict cookie and clears
+the fragment. Browser JavaScript never reads `control.token`.
+
+The Vite development server still proxies `/api` and `/ws` to `api_bind` and
+adds a Bearer token from `control.token`. Start the daemon first:
 
 ```bash
 drove ps
@@ -260,8 +279,10 @@ npm run dev
 Open `http://127.0.0.1:5173`. The page can list, start, and stop sessions, and
 it shows the WebSocket event stream. The repository includes a strict
 `drove.v2` browser client, but the page does not use it yet. An `output.chunk`
-row shows its offset and length, not a terminal. The class names on the page
-are not wired to a stylesheet. Replay bytes with `drove log`.
+row shows its offset and length, not a terminal. Replay bytes with `drove log`.
+
+`npm run build` updates `internal/webui/dist/`. Commit the generated assets
+with the frontend source so a clean checkout builds with only the Go toolchain.
 
 A live terminal, scrubbable replay, and the tower grid are [#20](https://github.com/Duang777/drove/issues/20) and [#26](https://github.com/Duang777/drove/issues/26). The approved direction for #20 is web first.
 
@@ -269,15 +290,15 @@ A live terminal, scrubbable replay, and the tower grid are [#20](https://github.
 
 The approved MVP is [Epic #31, flight recorder + control tower](https://github.com/Duang777/drove/issues/31).
 
-The screen model, WebSocket terminal stream, and replay timeline are complete.
+The screen model, WebSocket terminal stream, replay timeline, and control-plane
+hardening are complete.
 The next items are:
 
 1. [#20](https://github.com/Duang777/drove/issues/20) web live terminal and replay
 2. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
-3. [#21](https://github.com/Duang777/drove/issues/21) unix socket, Host checks, cookie, token rotation
-4. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
-5. [#16](https://github.com/Duang777/drove/issues/16) native resume and a gentler stop
-6. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
+3. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
+4. [#16](https://github.com/Duang777/drove/issues/16) native resume and a gentler stop
+5. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
 
 After the MVP: the shim in [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18), then the away brief [#29](https://github.com/Duang777/drove/issues/29), full-text search [#30](https://github.com/Duang777/drove/issues/30), and worktrees [#23](https://github.com/Duang777/drove/issues/23). Structured state sources [#22](https://github.com/Duang777/drove/issues/22) and the persistent hook installer [#24](https://github.com/Duang777/drove/issues/24) are deferred.
 
@@ -292,8 +313,10 @@ Drove runs the vendor's own CLI and does not link a vendor SDK. What it offers t
 This is a single-user control plane on the local machine.
 
 - `api_bind` must be loopback. Any other host is rejected while validating config.
-- REST and WebSocket require `Authorization: Bearer`. The token comes from `control.token`. Comparison is constant-time.
-- A WebSocket with no `Origin` is allowed, which is the CLI case. A single `Origin` must match `console_origins` exactly.
+- The CLI uses `<data_dir>/run/droved.sock`. Its directory is mode `0700`, the socket is mode `0600`, and Darwin / Linux reject peers with another UID.
+- Browsers use loopback TCP. Every request must have an exact allowed Host. Requests with an Origin must match the allowlist, and cookie-authenticated writes and WebSockets require an Origin.
+- Control APIs accept a `control.token` bearer or an HttpOnly cookie. `drove token rotate` atomically replaces the token. The previous generation has a 30-second grace period, then existing WebSockets receive a policy close.
+- Static frontend files and one-time login exchange do not require an existing cookie. Login exchange requires an Origin, and a code can be used once.
 - `/signal` accepts only loopback and that session's token. It does not accept the control-plane token.
 - Any process running as the same OS user can read the token file. The token does not defend against other local processes, or against the agent itself.
 - Input audit does not store the text. Raw output may contain source and secrets; attachments are deleted after the default 30 days.
