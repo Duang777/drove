@@ -17,3 +17,7 @@ func renameRecordFile(
 	fd := int(directory.Fd())
 	return unix.Renameat(fd, temporaryName, fd, recordName)
 }
+
+func syncRecordDirectory(directory *os.File) error {
+	return directory.Sync()
+}

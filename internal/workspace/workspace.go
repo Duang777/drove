@@ -18,8 +18,9 @@ import (
 )
 
 const (
-	worktreeDirectory = "worktrees"
-	repositoryHashLen = 16
+	worktreeDirectory        = "worktrees"
+	repositoryHashLen        = 16
+	branchOwnershipRefPrefix = "refs/drove/preparations/"
 )
 
 var (
@@ -43,18 +44,21 @@ type Workspace struct {
 	Detached   bool   `json:"detached,omitempty"`
 	Missing    bool   `json:"missing,omitempty"`
 
-	createdBranch   bool
-	sourcePath      string
-	protectionKnown bool
-	includedPaths   []string
+	createdBranch     bool
+	branchOperationID string
+	sourcePath        string
+	protectionKnown   bool
+	includedPaths     []string
 }
 
 // Manager owns worktrees below one Drove data directory.
 type Manager struct {
-	root        string
-	git         string
-	dataDirInfo os.FileInfo
-	mu          sync.Mutex
+	root         string
+	git          string
+	dataDirInfo  os.FileInfo
+	worktreeInfo os.FileInfo
+	bucketInfo   map[string]os.FileInfo
+	mu           sync.Mutex
 }
 
 // New creates a worktree manager without changing the filesystem.
@@ -89,11 +93,73 @@ func New(dataDir string) (*Manager, error) {
 			err,
 		)
 	}
-	return &Manager{
-		root:        filepath.Join(filepath.Clean(absolute), worktreeDirectory),
-		git:         "git",
-		dataDirInfo: dataDirInfo,
-	}, nil
+	rootPath := filepath.Join(filepath.Clean(absolute), worktreeDirectory)
+	var worktreeInfo os.FileInfo
+	bucketInfo := make(map[string]os.FileInfo)
+	info, err = os.Lstat(rootPath)
+	switch {
+	case err == nil:
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf(
+				"workspace: worktree root %q is not a real directory",
+				rootPath,
+			)
+		}
+		worktreeInfo = info
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return nil, fmt.Errorf("workspace: inspect worktree root: %w", err)
+	}
+	manager := &Manager{
+		root:         rootPath,
+		git:          "git",
+		dataDirInfo:  dataDirInfo,
+		worktreeInfo: worktreeInfo,
+		bucketInfo:   bucketInfo,
+	}
+	if worktreeInfo == nil {
+		return manager, nil
+	}
+	root, err := manager.openWorktreeRoot()
+	if err != nil {
+		return nil, err
+	}
+	entries, readErr := readRootDirectory(root)
+	closeErr := root.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, fmt.Errorf(
+			"workspace: read worktree root %q: %w",
+			rootPath,
+			err,
+		)
+	}
+	for _, entry := range entries {
+		if !validRepositoryHash(entry.Name()) {
+			continue
+		}
+		root, err := manager.openWorktreeRoot()
+		if err != nil {
+			return nil, err
+		}
+		bucket, bucketErr := openRealRootFromRoot(root, entry.Name())
+		closeRootErr := root.Close()
+		if err := errors.Join(bucketErr, closeRootErr); err != nil {
+			if bucket != nil {
+				_ = bucket.Close()
+			}
+			return nil, fmt.Errorf(
+				"workspace: open repository bucket %q: %w",
+				entry.Name(),
+				err,
+			)
+		}
+		verifyErr := manager.verifyRepositoryBucket(entry.Name(), bucket)
+		closeBucketErr := bucket.Close()
+		if err := errors.Join(verifyErr, closeBucketErr); err != nil {
+			return nil, err
+		}
+	}
+	return manager, nil
 }
 
 // Prepare creates a worktree for one Agent. An empty branch gets a stable default.
@@ -147,13 +213,17 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 	createdBranch := !exists
+	branchOperationID := ""
+	if createdBranch {
+		branchOperationID = uuid.NewString()
+	}
 	result := Workspace{
-		AgentID:       agentID,
-		Repository:    repository,
-		Path:          path,
-		Branch:        branch,
-		createdBranch: createdBranch,
-		sourcePath:    sourcePath,
+		AgentID:           agentID,
+		Repository:        repository,
+		Path:              path,
+		Branch:            branch,
+		branchOperationID: branchOperationID,
+		sourcePath:        sourcePath,
 	}
 	includedPaths, err := m.includedPaths(ctx, sourcePath)
 	if err != nil {
@@ -173,30 +243,91 @@ func (m *Manager) prepare(
 		)
 	}
 	if createdBranch {
-		if _, err := m.run(
+		if err := m.createOwnedBranch(
 			ctx,
-			"-C",
 			sourcePath,
-			"branch",
 			branch,
-			"HEAD",
+			branchOperationID,
 		); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(
 				context.Background(),
 				10*time.Second,
 			)
 			defer cancel()
-			cleanupTarget := result
-			cleanupTarget.createdBranch = false
 			return Workspace{}, errors.Join(
 				fmt.Errorf(
 					"workspace: create branch %q: %w",
 					branch,
 					err,
 				),
-				m.discard(cleanupCtx, cleanupTarget),
+				m.discard(cleanupCtx, result),
 			)
 		}
+		result.createdBranch = true
+		record, exists, err := m.readWorkspaceRecord(result.Path)
+		if err == nil && !exists {
+			err = errors.New("workspace: branch ownership record is missing")
+		}
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			return Workspace{}, errors.Join(
+				fmt.Errorf(
+					"workspace: read branch ownership record: %w",
+					err,
+				),
+				m.discard(cleanupCtx, result),
+			)
+		}
+		record.CreatedBranch = true
+		if err := m.replaceWorkspaceRecord(record); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			return Workspace{}, errors.Join(
+				fmt.Errorf(
+					"workspace: confirm branch ownership: %w",
+					err,
+				),
+				m.discard(cleanupCtx, result),
+			)
+		}
+		if err := m.removeBranchOwnershipMarker(
+			ctx,
+			sourcePath,
+			branchOperationID,
+		); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			return Workspace{}, errors.Join(
+				err,
+				m.discard(cleanupCtx, result),
+			)
+		}
+		record.BranchOperationID = ""
+		if err := m.replaceWorkspaceRecord(record); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			return Workspace{}, errors.Join(
+				fmt.Errorf(
+					"workspace: clear branch ownership marker: %w",
+					err,
+				),
+				m.discard(cleanupCtx, result),
+			)
+		}
+		result.branchOperationID = ""
 	}
 	arguments := []string{"-C", sourcePath, "worktree", "add", "--quiet"}
 	arguments = append(arguments, path, branch)
@@ -229,117 +360,50 @@ func (m *Manager) List(ctx context.Context) ([]Workspace, error) {
 	return m.list(ctx)
 }
 
-func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
-	info, err := os.Lstat(m.root)
+func (m *Manager) list(
+	ctx context.Context,
+) (result []Workspace, resultErr error) {
+	root, err := m.openWorktreeRoot()
 	if errors.Is(err, os.ErrNotExist) {
 		return []Workspace{}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("workspace: inspect worktree root: %w", err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("workspace: worktree root %q is not a real directory", m.root)
-	}
-	if err := m.pinDataDirectory(); err != nil {
 		return nil, err
 	}
-	buckets, err := os.ReadDir(m.root)
+	defer func() {
+		resultErr = errors.Join(resultErr, root.Close())
+	}()
+	buckets, err := readRootDirectory(root)
 	if err != nil {
 		return nil, fmt.Errorf("workspace: read worktree root: %w", err)
 	}
 
-	var result []Workspace
 	for _, bucket := range buckets {
 		if !validRepositoryHash(bucket.Name()) {
 			continue
 		}
-		bucketPath := filepath.Join(m.root, bucket.Name())
-		bucketInfo, err := os.Lstat(bucketPath)
+		bucketRoot, err := openRealRootFromRoot(root, bucket.Name())
 		if err != nil {
 			return nil, fmt.Errorf(
-				"workspace: inspect repository bucket %q: %w",
+				"workspace: open repository bucket %q: %w",
 				bucket.Name(),
 				err,
 			)
 		}
-		if !bucketInfo.IsDir() || bucketInfo.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf(
-				"workspace: repository bucket %q is not a real directory",
-				bucket.Name(),
-			)
+		if err := m.verifyRepositoryBucket(bucket.Name(), bucketRoot); err != nil {
+			_ = bucketRoot.Close()
+			return nil, err
 		}
-		entries, err := os.ReadDir(bucketPath)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"workspace: read repository bucket %q: %w",
-				bucket.Name(),
-				err,
-			)
+		current, err := m.listRepositoryBucket(
+			ctx,
+			bucket.Name(),
+			bucketRoot,
+		)
+		closeErr := bucketRoot.Close()
+		if err := errors.Join(err, closeErr); err != nil {
+			return nil, err
 		}
-		candidateIDs := make(map[string]struct{})
-		for _, entry := range entries {
-			if entry.IsDir() && validateAgentID(entry.Name()) == nil {
-				candidateIDs[entry.Name()] = struct{}{}
-			}
-			if agentID, ok := workspaceRecordAgentID(entry.Name()); ok {
-				candidateIDs[agentID] = struct{}{}
-			}
-		}
-		agentIDs := make([]string, 0, len(candidateIDs))
-		for agentID := range candidateIDs {
-			agentIDs = append(agentIDs, agentID)
-		}
-		sort.Strings(agentIDs)
-		for _, agentID := range agentIDs {
-			path := filepath.Join(bucketPath, agentID)
-			record, hasRecord, err := m.readWorkspaceRecord(path)
-			if err != nil {
-				return nil, err
-			}
-			pathInfo, pathErr := os.Lstat(path)
-			if errors.Is(pathErr, os.ErrNotExist) {
-				if !hasRecord {
-					continue
-				}
-				missing := record.workspace()
-				missing.Missing = true
-				missing.protectionKnown = record.ProtectionKnown
-				missing.includedPaths = append(
-					[]string(nil),
-					record.IncludedPaths...,
-				)
-				result = append(result, missing)
-				continue
-			}
-			if pathErr != nil {
-				return nil, fmt.Errorf(
-					"workspace: inspect managed path %q: %w",
-					path,
-					pathErr,
-				)
-			}
-			if !pathInfo.IsDir() || pathInfo.Mode()&os.ModeSymlink != 0 {
-				return nil, fmt.Errorf(
-					"workspace: managed path %q is not a real directory",
-					path,
-				)
-			}
-			var recorded *workspaceRecord
-			if hasRecord {
-				recorded = &record
-			}
-			current, err := m.inspect(ctx, path, recorded)
-			if err != nil {
-				return nil, err
-			}
-			if repositoryHash(current.Repository) != bucket.Name() {
-				return nil, fmt.Errorf(
-					"workspace: repository hash mismatch for %q",
-					current.Path,
-				)
-			}
-			result = append(result, current)
-		}
+		result = append(result, current...)
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Repository == result[j].Repository {
@@ -347,6 +411,91 @@ func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
 		}
 		return result[i].Repository < result[j].Repository
 	})
+	return result, nil
+}
+
+func (m *Manager) listRepositoryBucket(
+	ctx context.Context,
+	bucketName string,
+	bucket *os.Root,
+) ([]Workspace, error) {
+	entries, err := readRootDirectory(bucket)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"workspace: read repository bucket %q: %w",
+			bucketName,
+			err,
+		)
+	}
+	candidateIDs := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry.IsDir() && validateAgentID(entry.Name()) == nil {
+			candidateIDs[entry.Name()] = struct{}{}
+		}
+		if agentID, ok := workspaceRecordAgentID(entry.Name()); ok {
+			candidateIDs[agentID] = struct{}{}
+		}
+	}
+	agentIDs := make([]string, 0, len(candidateIDs))
+	for agentID := range candidateIDs {
+		agentIDs = append(agentIDs, agentID)
+	}
+	sort.Strings(agentIDs)
+
+	result := make([]Workspace, 0, len(agentIDs))
+	for _, agentID := range agentIDs {
+		path := filepath.Join(m.root, bucketName, agentID)
+		record, hasRecord, err := m.readWorkspaceRecord(path)
+		if err != nil {
+			return nil, err
+		}
+		pathInfo, pathErr := bucket.Lstat(agentID)
+		if errors.Is(pathErr, os.ErrNotExist) {
+			if !hasRecord {
+				continue
+			}
+			missing := record.workspace()
+			missing.Missing = true
+			missing.protectionKnown = record.ProtectionKnown
+			missing.includedPaths = append(
+				[]string(nil),
+				record.IncludedPaths...,
+			)
+			result = append(result, missing)
+			continue
+		}
+		if pathErr != nil {
+			return nil, fmt.Errorf(
+				"workspace: inspect managed path %q: %w",
+				path,
+				pathErr,
+			)
+		}
+		if !pathInfo.IsDir() || pathInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf(
+				"workspace: managed path %q is not a real directory",
+				path,
+			)
+		}
+		if err := m.pinDataDirectory(); err != nil {
+			return nil, err
+		}
+		var recorded *workspaceRecord
+		if hasRecord {
+			recorded = &record
+		}
+		current, err := m.inspect(ctx, path, recorded)
+		if err != nil {
+			return nil, err
+		}
+		if repositoryHash(current.Repository) != bucketName {
+			return nil, fmt.Errorf(
+				"workspace: repository hash mismatch for %q",
+				current.Path,
+			)
+		}
+		result = append(result, current)
+	}
 	return result, nil
 }
 
@@ -428,18 +577,50 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 			}
 		}
 	}
+	branchCleaned := !worktreeRemoved
 	if worktreeRemoved {
-		if err := m.removeWorkspaceRecord(target.Path); err != nil {
-			result = errors.Join(
-				result,
-				err,
-			)
+		if err := m.cleanupPreparedBranch(ctx, target); err != nil {
+			result = errors.Join(result, err)
+		} else {
+			branchCleaned = true
 		}
 	}
-	if worktreeRemoved && target.createdBranch {
+	recordRemoved := false
+	if worktreeRemoved && branchCleaned {
+		if err := m.removeWorkspaceRecord(target.Path, ""); err != nil {
+			result = errors.Join(result, err)
+		} else {
+			recordRemoved = true
+		}
+	}
+	if recordRemoved {
+		if err := m.removeManagedBucketIfEmpty(target); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+
+func (m *Manager) cleanupPreparedBranch(
+	ctx context.Context,
+	target Workspace,
+) error {
+	owned := target.createdBranch
+	if !owned && target.branchOperationID != "" {
+		markerExists, err := m.branchOwnershipMarkerExists(
+			ctx,
+			target.Repository,
+			target.branchOperationID,
+		)
+		if err != nil {
+			return err
+		}
+		owned = markerExists
+	}
+	if owned {
 		exists, err := m.branchExists(ctx, target.Repository, target.Branch)
 		if err != nil {
-			result = errors.Join(result, err)
+			return err
 		} else if exists {
 			if _, err := m.run(
 				ctx,
@@ -449,19 +630,18 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 				"-D",
 				target.Branch,
 			); err != nil {
-				result = errors.Join(
-					result,
-					fmt.Errorf("workspace: discard branch: %w", err),
-				)
+				return fmt.Errorf("workspace: discard branch: %w", err)
 			}
 		}
 	}
-	if worktreeRemoved {
-		if err := m.removeManagedBucketIfEmpty(target); err != nil {
-			result = errors.Join(result, err)
-		}
+	if err := m.removeBranchOwnershipMarker(
+		ctx,
+		target.Repository,
+		target.branchOperationID,
+	); err != nil {
+		return err
 	}
-	return result
+	return nil
 }
 
 func (m *Manager) rollbackFailedAdd(
@@ -826,6 +1006,92 @@ func (m *Manager) branchExists(
 	return false, fmt.Errorf("workspace: inspect branch %q: %w", branch, err)
 }
 
+func (m *Manager) createOwnedBranch(
+	ctx context.Context,
+	repository string,
+	branch string,
+	operationID string,
+) error {
+	head, err := m.run(ctx, "-C", repository, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("workspace: resolve branch start: %w", err)
+	}
+	commit := strings.TrimSpace(string(head))
+	input := fmt.Sprintf(
+		"start\ncreate refs/heads/%s %s\ncreate %s %s\nprepare\ncommit\n",
+		branch,
+		commit,
+		branchOwnershipRef(operationID),
+		commit,
+	)
+	if _, err := m.runInput(
+		ctx,
+		input,
+		"-C",
+		repository,
+		"update-ref",
+		"--stdin",
+	); err != nil {
+		return fmt.Errorf("workspace: create owned branch transaction: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) branchOwnershipMarkerExists(
+	ctx context.Context,
+	repository string,
+	operationID string,
+) (bool, error) {
+	_, err := m.run(
+		ctx,
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		branchOwnershipRef(operationID),
+	)
+	switch {
+	case err == nil:
+		return true, nil
+	case isExitCode(err, 1):
+		return false, nil
+	default:
+		return false, fmt.Errorf(
+			"workspace: inspect branch ownership marker: %w",
+			err,
+		)
+	}
+}
+
+func (m *Manager) removeBranchOwnershipMarker(
+	ctx context.Context,
+	repository string,
+	operationID string,
+) error {
+	if operationID == "" {
+		return nil
+	}
+	if _, err := m.run(
+		ctx,
+		"-C",
+		repository,
+		"update-ref",
+		"-d",
+		branchOwnershipRef(operationID),
+	); err != nil {
+		return fmt.Errorf(
+			"workspace: remove branch ownership marker: %w",
+			err,
+		)
+	}
+	return nil
+}
+
+func branchOwnershipRef(operationID string) string {
+	return branchOwnershipRefPrefix + operationID
+}
+
 func (m *Manager) validateManagedPath(target Workspace) error {
 	if err := validateAgentID(target.AgentID); err != nil {
 		return err
@@ -856,8 +1122,19 @@ func (m *Manager) validateManagedPath(target Workspace) error {
 }
 
 func (m *Manager) run(ctx context.Context, arguments ...string) ([]byte, error) {
+	return m.runInput(ctx, "", arguments...)
+}
+
+func (m *Manager) runInput(
+	ctx context.Context,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
 	command := exec.CommandContext(ctx, m.git, arguments...)
 	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	if input != "" {
+		command.Stdin = strings.NewReader(input)
+	}
 	output, err := command.Output()
 	if err == nil {
 		return output, nil

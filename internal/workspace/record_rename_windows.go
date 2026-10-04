@@ -46,3 +46,7 @@ func renameRecordFile(
 		windows.FileRenameInformation,
 	)
 }
+
+func syncRecordDirectory(*os.File) error {
+	return nil
+}

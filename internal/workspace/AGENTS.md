@@ -19,8 +19,9 @@
   拒绝。创建时选中的规范相对路径保存在 version 3 sidecar 中，后续 dirty 检查不得
   重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
-  sidecar，并记录分支是否由本次创建。session 创建事件 durable 后必须调用
-  `AcknowledgePreparation`；
+  sidecar。新分支与私有 ownership ref 通过同一 `git update-ref --stdin` transaction
+  创建；只有该 marker 或已确认的 `CreatedBranch` 才能授权回滚删除分支，避免并发外部
+  建分支时误删。session 创建事件 durable 后必须调用 `AcknowledgePreparation`；
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
@@ -37,10 +38,10 @@
   dirty 状态回滚。version 2 的历史 removal intent 兼容视为已开始。清理始终保留分支。
 - Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
   因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。
-- Manager 在首次创建受管根前固定 data directory 的文件身份，后续通过该身份和
-  `os.Root` 逐级打开 worktrees、repository bucket、Agent 目录及 sidecar；data directory
-  或任一中间目录被替换时必须 fail-stop。sidecar 的确认读取和删除必须在同一受约束
-  bucket 句柄内完成。
+- Manager 初始化时固定既有 data directory、worktrees root 和 repository bucket 的
+  文件身份，新建目录则在首次打开时固定。后续通过 `os.Root` 逐级打开并持续复核；
+  任一中间实目录或 symlink 被替换时必须 fail-stop。List 与 record scan 全程持有固定
+  root/bucket 句柄。sidecar 的原子写、确认读取和删除必须在受约束 bucket 句柄内完成。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。未注册残留目录通过已验证的 `os.Root` 相对操作删除，任一中间
   symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理

@@ -1413,7 +1413,10 @@ func TestListRejectsSymlinkedWorktreeRoot(t *testing.T) {
 	}
 	manager, err := New(dataDir)
 	if err != nil {
-		t.Fatalf("new manager: %v", err)
+		if !strings.Contains(err.Error(), "not a real directory") {
+			t.Fatalf("new manager: %v", err)
+		}
+		return
 	}
 	if _, err := manager.List(context.Background()); err == nil {
 		t.Fatal("list accepted a symlinked worktree root")

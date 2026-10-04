@@ -44,6 +44,10 @@ func (m *Manager) ensureManagedRoot() (result error) {
 	if err != nil {
 		return fmt.Errorf("workspace: open worktree root: %w", err)
 	}
+	if err := m.verifyWorktreeRoot(opened); err != nil {
+		_ = opened.Close()
+		return err
+	}
 	return opened.Close()
 }
 
@@ -91,6 +95,11 @@ func (m *Manager) openWorktreeRoot() (*os.Root, error) {
 		_ = dataDir.Close()
 		return nil, fmt.Errorf("open managed root: %w", err)
 	}
+	if err := m.verifyWorktreeRoot(root); err != nil {
+		_ = dataDir.Close()
+		_ = root.Close()
+		return nil, err
+	}
 	if err := dataDir.Close(); err != nil {
 		_ = root.Close()
 		return nil, fmt.Errorf("close data directory: %w", err)
@@ -113,6 +122,14 @@ func (m *Manager) openManagedBucketRoot(target Workspace) (*os.Root, error) {
 	if err != nil {
 		_ = root.Close()
 		return nil, fmt.Errorf("open repository bucket: %w", err)
+	}
+	if err := m.verifyRepositoryBucket(
+		repositoryHash(target.Repository),
+		bucket,
+	); err != nil {
+		_ = root.Close()
+		_ = bucket.Close()
+		return nil, err
 	}
 	if err := root.Close(); err != nil {
 		_ = bucket.Close()
@@ -151,7 +168,48 @@ func (m *Manager) ensureManagedBucket(repository string) (result error) {
 	if err != nil {
 		return fmt.Errorf("workspace: open repository bucket: %w", err)
 	}
+	if err := m.verifyRepositoryBucket(name, opened); err != nil {
+		_ = opened.Close()
+		return err
+	}
 	return opened.Close()
+}
+
+func (m *Manager) verifyWorktreeRoot(root *os.Root) error {
+	opened, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("workspace: inspect opened worktree root: %w", err)
+	}
+	if m.worktreeInfo != nil && !os.SameFile(m.worktreeInfo, opened) {
+		return errors.New(
+			"workspace: worktree root changed after manager initialization",
+		)
+	}
+	if m.worktreeInfo == nil {
+		m.worktreeInfo = opened
+	}
+	return nil
+}
+
+func (m *Manager) verifyRepositoryBucket(
+	name string,
+	root *os.Root,
+) error {
+	opened, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("workspace: inspect opened repository bucket: %w", err)
+	}
+	if expected := m.bucketInfo[name]; expected != nil &&
+		!os.SameFile(expected, opened) {
+		return fmt.Errorf(
+			"workspace: repository bucket %q changed after manager initialization",
+			name,
+		)
+	}
+	if m.bucketInfo[name] == nil {
+		m.bucketInfo[name] = opened
+	}
+	return nil
 }
 
 func (m *Manager) openManagedWorkspaceRoot(
@@ -200,9 +258,13 @@ func (m *Manager) removeManagedBucketIfEmpty(
 	defer func() {
 		result = errors.Join(result, root.Close())
 	}()
-	err = root.Remove(repositoryHash(target.Repository))
+	name := repositoryHash(target.Repository)
+	err = root.Remove(name)
 	switch {
-	case err == nil, errors.Is(err, os.ErrNotExist):
+	case err == nil:
+		delete(m.bucketInfo, name)
+		return nil
+	case errors.Is(err, os.ErrNotExist):
 		return nil
 	case errors.Is(err, syscall.ENOTEMPTY), errors.Is(err, syscall.EEXIST):
 		return nil
@@ -242,6 +304,11 @@ func (m *Manager) openRecordBucket(
 	if err != nil {
 		_ = root.Close()
 		return nil, "", fmt.Errorf("workspace: open record bucket: %w", err)
+	}
+	if err := m.verifyRepositoryBucket(components[0], bucket); err != nil {
+		_ = root.Close()
+		_ = bucket.Close()
+		return nil, "", err
 	}
 	if err := root.Close(); err != nil {
 		_ = bucket.Close()
@@ -296,6 +363,16 @@ func openRealRootFromRoot(parent *os.Root, name string) (*os.Root, error) {
 		return nil, fmt.Errorf("%q changed while opening", name)
 	}
 	return root, nil
+}
+
+func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	return entries, errors.Join(readErr, closeErr)
 }
 
 func removeAllFromRoot(root *os.Root, name string) (result error) {

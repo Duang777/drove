@@ -31,6 +31,7 @@ type workspaceRecord struct {
 	IncludedPaths        []string                `json:"included_paths"`
 	PreparationCommitted bool                    `json:"preparation_committed"`
 	CreatedBranch        bool                    `json:"created_branch"`
+	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
 	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
 }
 
@@ -57,24 +58,26 @@ func workspaceRecordAgentID(name string) (string, bool) {
 
 func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecord {
 	return workspaceRecord{
-		Version:         workspaceRecordVersion,
-		AgentID:         target.AgentID,
-		Repository:      target.Repository,
-		Path:            target.Path,
-		Branch:          target.Branch,
-		ProtectionKnown: true,
-		IncludedPaths:   append([]string{}, includedPaths...),
-		CreatedBranch:   target.createdBranch,
+		Version:           workspaceRecordVersion,
+		AgentID:           target.AgentID,
+		Repository:        target.Repository,
+		Path:              target.Path,
+		Branch:            target.Branch,
+		ProtectionKnown:   true,
+		IncludedPaths:     append([]string{}, includedPaths...),
+		CreatedBranch:     target.createdBranch,
+		BranchOperationID: target.branchOperationID,
 	}
 }
 
 func (r workspaceRecord) workspace() Workspace {
 	return Workspace{
-		AgentID:       r.AgentID,
-		Repository:    r.Repository,
-		Path:          r.Path,
-		Branch:        r.Branch,
-		createdBranch: r.CreatedBranch,
+		AgentID:           r.AgentID,
+		Repository:        r.Repository,
+		Path:              r.Path,
+		Branch:            r.Branch,
+		createdBranch:     r.CreatedBranch,
+		branchOperationID: r.BranchOperationID,
 	}
 }
 
@@ -185,7 +188,7 @@ func (m *Manager) installWorkspaceRecord(
 			closeErr,
 		)
 	}
-	syncErr := directory.Sync()
+	syncErr := syncRecordDirectory(directory)
 	directoryCloseErr := directory.Close()
 	if err := errors.Join(syncErr, directoryCloseErr); err != nil {
 		return fmt.Errorf(
@@ -328,6 +331,7 @@ func (m *Manager) readWorkspaceRecord(
 			len(record.IncludedPaths) != 0 ||
 			record.PreparationCommitted ||
 			record.CreatedBranch ||
+			record.BranchOperationID != "" ||
 			record.Removal != nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: legacy record %q contains newer fields",
@@ -342,7 +346,9 @@ func (m *Manager) readWorkspaceRecord(
 				recordPath,
 			)
 		}
-		if record.PreparationCommitted || record.CreatedBranch {
+		if record.PreparationCommitted ||
+			record.CreatedBranch ||
+			record.BranchOperationID != "" {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: version 2 record %q contains version 3 fields",
 				recordPath,
@@ -422,11 +428,20 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 			)
 		}
 	}
+	if record.BranchOperationID != "" {
+		operationID, err := uuid.Parse(record.BranchOperationID)
+		if err != nil || operationID.String() != record.BranchOperationID {
+			return errors.New(
+				"workspace: branch operation ID is not a canonical UUID",
+			)
+		}
+	}
 	return nil
 }
 
 func (m *Manager) removeWorkspaceRecord(
 	worktreePath string,
+	expectedRemovalID string,
 ) (result error) {
 	recordPath := workspaceRecordPath(worktreePath)
 	bucket, agentID, err := m.openRecordBucket(worktreePath)
@@ -457,6 +472,16 @@ func (m *Manager) removeWorkspaceRecord(
 			recordPath,
 		)
 	}
+	if expectedRemovalID != "" {
+		if err := verifyRemovalRecord(
+			bucket,
+			name,
+			recordPath,
+			expectedRemovalID,
+		); err != nil {
+			return err
+		}
+	}
 	if err := bucket.Remove(name); err != nil {
 		return fmt.Errorf("workspace: remove record %q: %w", recordPath, err)
 	}
@@ -468,13 +493,75 @@ func (m *Manager) removeWorkspaceRecord(
 			err,
 		)
 	}
-	syncErr := directory.Sync()
+	syncErr := syncRecordDirectory(directory)
 	closeErr := directory.Close()
 	if err := errors.Join(syncErr, closeErr); err != nil {
 		return fmt.Errorf(
 			"workspace: sync record directory %q: %w",
 			filepath.Dir(recordPath),
 			err,
+		)
+	}
+	return nil
+}
+
+func verifyRemovalRecord(
+	bucket *os.Root,
+	name string,
+	path string,
+	expectedOperationID string,
+) (result error) {
+	file, err := bucket.Open(name)
+	if err != nil {
+		return fmt.Errorf("workspace: open removal record %q: %w", path, err)
+	}
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect opened removal record %q: %w",
+			path,
+			err,
+		)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxWorkspaceRecordSize+1))
+	if err != nil {
+		return fmt.Errorf("workspace: read removal record %q: %w", path, err)
+	}
+	if len(raw) > maxWorkspaceRecordSize {
+		return fmt.Errorf(
+			"workspace: removal record %q exceeds %d bytes",
+			path,
+			maxWorkspaceRecordSize,
+		)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var record workspaceRecord
+	if err := decoder.Decode(&record); err != nil {
+		return fmt.Errorf("workspace: decode removal record %q: %w", path, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return fmt.Errorf(
+			"workspace: removal record %q has trailing data",
+			path,
+		)
+	}
+	if record.Removal == nil ||
+		record.Removal.OperationID != expectedOperationID {
+		return errors.New(
+			"workspace: removal record changed before acknowledgement",
+		)
+	}
+	current, err := bucket.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("workspace: reinspect removal record %q: %w", path, err)
+	}
+	if !os.SameFile(opened, current) {
+		return errors.New(
+			"workspace: removal record changed before acknowledgement",
 		)
 	}
 	return nil

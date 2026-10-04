@@ -18,3 +18,7 @@ func renameRecordFile(
 		filepath.Join(directory.Name(), recordName),
 	)
 }
+
+func syncRecordDirectory(directory *os.File) error {
+	return directory.Sync()
+}

@@ -215,7 +215,22 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 	if facts.pathExists || facts.registered {
 		return errors.New("workspace: cannot acknowledge an incomplete removal")
 	}
-	if err := m.removeWorkspaceRecord(record.Path); err != nil {
+	current, exists, err := m.readWorkspaceRecord(record.Path)
+	if err != nil {
+		return err
+	}
+	if !exists ||
+		current.AgentID != record.AgentID ||
+		current.Repository != record.Repository ||
+		current.Path != record.Path ||
+		current.Branch != record.Branch ||
+		current.Removal == nil ||
+		current.Removal.OperationID != removal.operationID {
+		return errors.New(
+			"workspace: removal record changed before acknowledgement",
+		)
+	}
+	if err := m.removeWorkspaceRecord(record.Path, removal.operationID); err != nil {
 		return err
 	}
 	if err := m.removeManagedBucketIfEmpty(record.workspace()); err != nil {
@@ -510,46 +525,40 @@ func (m *Manager) findWorkspaceRecord(
 	}
 }
 
-func (m *Manager) workspaceRecords() ([]workspaceRecord, error) {
-	info, err := os.Lstat(m.root)
+func (m *Manager) workspaceRecords() (records []workspaceRecord, resultErr error) {
+	root, err := m.openWorktreeRoot()
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("workspace: inspect worktree root: %w", err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("workspace: worktree root %q is not a real directory", m.root)
-	}
-	if err := m.pinDataDirectory(); err != nil {
 		return nil, err
 	}
-	buckets, err := os.ReadDir(m.root)
+	defer func() {
+		resultErr = errors.Join(resultErr, root.Close())
+	}()
+	buckets, err := readRootDirectory(root)
 	if err != nil {
 		return nil, fmt.Errorf("workspace: read worktree root: %w", err)
 	}
-	var records []workspaceRecord
 	for _, bucket := range buckets {
 		if !validRepositoryHash(bucket.Name()) {
 			continue
 		}
-		bucketPath := filepath.Join(m.root, bucket.Name())
-		bucketInfo, err := os.Lstat(bucketPath)
+		bucketRoot, err := openRealRootFromRoot(root, bucket.Name())
 		if err != nil {
 			return nil, fmt.Errorf(
-				"workspace: inspect repository bucket %q: %w",
+				"workspace: open repository bucket %q: %w",
 				bucket.Name(),
 				err,
 			)
 		}
-		if !bucketInfo.IsDir() || bucketInfo.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf(
-				"workspace: repository bucket %q is not a real directory",
-				bucket.Name(),
-			)
+		if err := m.verifyRepositoryBucket(bucket.Name(), bucketRoot); err != nil {
+			_ = bucketRoot.Close()
+			return nil, err
 		}
-		entries, err := os.ReadDir(bucketPath)
+		entries, err := readRootDirectory(bucketRoot)
 		if err != nil {
+			_ = bucketRoot.Close()
 			return nil, fmt.Errorf(
 				"workspace: read repository bucket %q: %w",
 				bucket.Name(),
@@ -562,14 +571,22 @@ func (m *Manager) workspaceRecords() ([]workspaceRecord, error) {
 				continue
 			}
 			record, exists, err := m.readWorkspaceRecord(
-				filepath.Join(bucketPath, agentID),
+				filepath.Join(m.root, bucket.Name(), agentID),
 			)
 			if err != nil {
+				_ = bucketRoot.Close()
 				return nil, err
 			}
 			if exists {
 				records = append(records, record)
 			}
+		}
+		if err := bucketRoot.Close(); err != nil {
+			return nil, fmt.Errorf(
+				"workspace: close repository bucket %q: %w",
+				bucket.Name(),
+				err,
+			)
 		}
 	}
 	sort.Slice(records, func(i, j int) bool {
