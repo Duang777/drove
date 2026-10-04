@@ -14,9 +14,12 @@
 | `src/api/replayParsing.ts` | timeline、frame 与 output expiry 契约解析 |
 | `src/terminal/recordingBoundary.ts` | terminal DTO 到 bigint 录制领域值的单向转换 |
 | `src/terminal/sessionTape.ts` | 浏览器内存中的精确 origin 前缀与时间戳关联 |
+| `src/terminal/xtermAdapter.ts` | controller 私有的 xterm 构造、挂载、写入、测量与释放封装 |
+| `src/terminal/sessionController.ts` | live/replay xterm、双流游标、重连、输入、resize、seek 与 teardown 的唯一所有者 |
 | `src/ws/eventStream.ts` | WebSocket 事件流与输入 ack/error 关联：自动重连、超时、连接状态回调、幂等关闭 |
 | `src/ws/terminalStream.ts` | `drove.v2` terminal 客户端：严格解码 raw/event/resize/snapshot，消费成功后推进 cursor |
 | `src/hooks/useAgentEvents.ts` | React hook：订阅事件流 + 本地投影（`latestAgentState`） |
+| `src/hooks/useAgentTerminal.ts` | controller 的 external-store React 生命周期适配器 |
 | `src/components/` | AgentList / AgentCard / StatusBadge / EventLog |
 | `src/App.tsx` | 布局 + 5s 轮询刷新 agent 列表 + 实时事件面板 |
 | `src/auth/login.ts` | 启动前从 `/login#code` 同源兑换 HttpOnly cookie 并清除 fragment |

@@ -70,51 +70,51 @@
 - [x] Timeline spans and Blocked markers remain authoritative REST data.
 - [x] The tape freezes before it exceeds the 64 MiB byte limit.
 - [x] The tape never evicts the origin prefix.
-- [ ] Live rendering continues after the local replay limit.
+- [x] Live rendering continues after the local replay limit.
 - [x] HTTP 410 becomes a typed `OutputExpiredError`.
 - [x] Neither a `Frame` nor a `Snapshot` can seed exact replay.
 
 ## Live terminal and reconnect
 
-- [ ] The live xterm persists for the detail-page lifetime.
-- [ ] Raw and event modes track separate locally applied cursors.
-- [ ] A stream callback advances its cursor only after terminal application.
-- [ ] Writable input stays disabled until raw `caught_up`.
-- [ ] Reconnect keeps the live xterm and resumes from local cursors.
-- [ ] Server-written cursors do not override local application state.
-- [ ] Reconnect backoff is bounded and cancelable.
-- [ ] Generation checks reject stale callbacks.
-- [ ] Terminal output writes and durable resizes do not overlap.
+- [x] The live xterm persists for the detail-page lifetime.
+- [x] Raw and event modes track separate locally applied cursors.
+- [x] A stream callback advances its cursor only after terminal application.
+- [x] Writable input stays disabled until raw `caught_up`.
+- [x] Reconnect keeps the live xterm and resumes from local cursors.
+- [x] Server-written cursors do not override local application state.
+- [x] Reconnect backoff is bounded and cancelable.
+- [x] Generation checks reject stale callbacks.
+- [x] Terminal output writes and durable resizes do not overlap.
 
 ## Seek and playback
 
-- [ ] Slider movement updates labels without sending frame requests.
-- [ ] A committed seek owns at most one current frame request.
-- [ ] A newer seek aborts the previous frame request and replay build.
-- [ ] Every exact seek creates a fresh replay xterm at 40x120.
-- [ ] Exact replay applies output and resize from origin in sequence order.
-- [ ] Replay work yields between bounded batches.
-- [ ] Playback awaits each output write or resize before the next timer.
-- [ ] Playback supports pause and `0.5`, `1`, `2`, and `4` speeds.
-- [ ] Pause and speed changes resume at the current replay cursor.
-- [ ] Recorded idle gaps remain part of playback time.
-- [ ] Returning to live reveals output received during replay.
-- [ ] Frame previews remain labeled and separate from xterm state.
+- [x] Slider movement updates labels without sending frame requests.
+- [x] A committed seek owns at most one current frame request.
+- [x] A newer seek aborts the previous frame request and replay build.
+- [x] Every exact seek creates a fresh replay xterm at 40x120.
+- [x] Exact replay applies output and resize from origin in sequence order.
+- [x] Replay work yields between bounded batches.
+- [x] Playback awaits each output write or resize before the next timer.
+- [x] Playback supports pause and `0.5`, `1`, `2`, and `4` speeds.
+- [x] Pause and speed changes resume at the current replay cursor.
+- [x] Recorded idle gaps remain part of playback time.
+- [x] Returning to live reveals output received during replay.
+- [x] Frame previews remain labeled and separate from xterm state.
 
 ## Input, resize, and teardown
 
-- [ ] The controller owns xterm `onData`.
-- [ ] Browser input splits on UTF-8 boundaries and stays within 64 KiB.
-- [ ] Browser input acknowledgements are serialized.
-- [ ] Fit measurement proposes dimensions without mutating xterm.
-- [ ] The controller keeps at most one pending resize proposal.
-- [ ] Live xterm resizes only after the durable resize record arrives.
-- [ ] Replay applies only recorded sizes.
-- [ ] Disposal invalidates stream and replay generations.
-- [ ] Disposal aborts fetches, timers, replay, and queued input.
-- [ ] Disposal disconnects observers and closes the stream.
-- [ ] Disposal releases both xterms exactly once.
-- [ ] Stale callbacks cannot mutate a disposed controller.
+- [x] The controller owns xterm `onData`.
+- [x] Browser input splits on UTF-8 boundaries and stays within 64 KiB.
+- [x] Browser input acknowledgements are serialized.
+- [x] Fit measurement proposes dimensions without mutating xterm.
+- [x] The controller keeps at most one pending resize proposal.
+- [x] Live xterm resizes only after the durable resize record arrives.
+- [x] Replay applies only recorded sizes.
+- [x] Disposal invalidates stream and replay generations.
+- [x] Disposal aborts fetches, timers, replay, and queued input.
+- [x] Disposal disconnects observers and closes the stream.
+- [x] Disposal releases both xterms exactly once.
+- [x] Stale callbacks cannot mutate a disposed controller.
 
 ## Web experience
 
@@ -138,14 +138,14 @@
 
 ## Privacy and compatibility
 
-- [ ] WebSocket v1 behavior remains unchanged.
-- [ ] Existing REST response shapes remain unchanged.
-- [ ] Raw bytes come only from committed, token-redacted output.
-- [ ] No event stores input text, terminal screen data, or a control token.
+- [x] WebSocket v1 behavior remains unchanged.
+- [x] Existing REST response shapes remain unchanged.
+- [x] Raw bytes come only from committed, token-redacted output.
+- [x] No event stores input text, terminal screen data, or a control token.
 - [x] Attachment events store no attachment ID or client identity.
-- [ ] Browser terminal and replay state remain memory-only.
-- [ ] Production frontend code never reads the control token.
-- [ ] No vendor-specific behavior appears outside `internal/adapter`.
+- [x] Browser terminal and replay state remain memory-only.
+- [x] Production frontend code never reads the control token.
+- [x] No vendor-specific behavior appears outside `internal/adapter`.
 
 ## Verification
 
@@ -153,8 +153,8 @@
 - [x] Attachment teardown and exactly-once audit tests pass.
 - [x] CLI UTF-8 framing and cleanup unit tests pass.
 - [x] A pseudo-terminal attach acceptance test passes.
-- [ ] `SessionTape` property and limit tests pass.
-- [ ] Controller fake-clock, reconnect, seek, and disposal tests pass.
+- [x] `SessionTape` property and limit tests pass.
+- [x] Controller fake-clock, reconnect, seek, and disposal tests pass.
 - [ ] Browser tests pass for desktop, 375 px, and 320 px viewports.
 - [ ] A real daemon and PTY pass live, input, resize, reconnect, and replay
   acceptance.
@@ -162,7 +162,7 @@
 - [x] `go test ./... -race -count=1` passes.
 - [x] `go vet ./...` passes.
 - [x] `make build` passes.
-- [ ] Web tests, typecheck, and build pass.
+- [x] Web tests, typecheck, and build pass.
 - [x] `git diff --check` passes.
 - [ ] Both remote CI lanes pass.
 - [ ] Every implementation commit is pushed before the next begins.

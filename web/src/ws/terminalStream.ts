@@ -65,7 +65,7 @@ export type TerminalSubscription =
       mode: 'snapshot'
     }
 
-interface Options {
+export interface TerminalStreamOptions {
   onMessage: (message: TerminalMessage) => void | Promise<void>
   onError?: (error: Error) => void
   onStateChange?: (state: ConnectionState) => void
@@ -153,7 +153,7 @@ export class TerminalStream {
   private readonly onError?: (error: Error) => void
   private readonly onStateChange?: (state: ConnectionState) => void
 
-  constructor(options: Options) {
+  constructor(options: TerminalStreamOptions) {
     this.onMessage = options.onMessage
     this.onError = options.onError
     this.onStateChange = options.onStateChange
@@ -218,9 +218,9 @@ export class TerminalStream {
       agent_id: subscription.agent_id,
       mode: subscription.mode,
     }
-    if (subscription.mode === 'raw' && subscription.writable === true) {
-      command.writable = true
-      if (subscription.viewport !== undefined) {
+    if (subscription.mode === 'raw' && subscription.writable !== undefined) {
+      command.writable = subscription.writable
+      if (subscription.writable && subscription.viewport !== undefined) {
         command.rows = subscription.viewport.rows
         command.columns = subscription.viewport.columns
       }
@@ -249,9 +249,6 @@ export class TerminalStream {
       result.mode !== subscription.mode
     ) {
       throw new Error('Terminal subscribe response does not match the request')
-    }
-    if (result.cursor !== undefined) {
-      this.cursors.set(subscriptionKey(result.agent_id, result.mode), result.cursor)
     }
   }
 
