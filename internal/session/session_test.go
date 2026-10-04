@@ -376,7 +376,7 @@ func TestStopRejectsLiveAgentWithoutPTY(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restore test agent: %v", err)
 	}
-	manager.agents[restored.ID()] = restored
+	manager.agents[restored.ID()] = newManagedAgent(restored)
 
 	err = manager.Stop(restored.ID())
 	if err == nil || !strings.Contains(err.Error(), "working without a PTY") {
@@ -521,7 +521,7 @@ func TestTransitionPersistenceFailureLeavesAgentAndHubUnchanged(t *testing.T) {
 		agent.WithRunMode(agent.RunModeInteractive),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	subscription := manager.hub.Subscribe(1)
 	defer manager.hub.Unsubscribe(subscription)
@@ -1039,7 +1039,7 @@ func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
 	)
 	process := &fakeProcessSession{writeN: 2, writeErr: errors.New("broken pipe")}
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.sessions[id] = &runningSession{process: process}
 	manager.mu.Unlock()
 
@@ -1123,7 +1123,7 @@ func TestSendInputReportsDeliveredButUnaudited(t *testing.T) {
 	)
 	process := &fakeProcessSession{writeN: 5}
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.sessions[id] = &runningSession{process: process}
 	manager.mu.Unlock()
 	if err := st.Close(); err != nil {
@@ -1365,7 +1365,7 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksOff),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
@@ -1506,7 +1506,11 @@ func attachTestRuntime(
 ) *runningSession {
 	t.Helper()
 
-	running, _, _, err := manager.prepareRuntime(a, entry)
+	managed, ok := manager.managed(a.ID())
+	if !ok {
+		t.Fatalf("managed agent %q is not registered", a.ID())
+	}
+	running, _, _, err := manager.prepareManagedRuntime(managed, entry)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}

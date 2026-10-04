@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -319,20 +320,75 @@ func TestSignalPayloadV1Validation(t *testing.T) {
 	}
 }
 
+func TestSignalPayloadVendorSessionReferenceCompatibility(t *testing.T) {
+	base := SignalPayloadV1{
+		Version:     1,
+		Source:      "hook",
+		Kind:        "session_started",
+		Vendor:      "claude",
+		VendorEvent: "SessionStart",
+		Scope:       "root",
+		Confidence:  1,
+		ReceivedAt:  time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DeliveryID:  "550e8400-e29b-41d4-a716-446655440000",
+		Outcome:     "observed",
+	}
+
+	current := base
+	current.VendorSessionRef = "session-ref"
+	if err := current.Validate(); err != nil {
+		t.Fatalf("validate current payload: %v", err)
+	}
+	if got := current.VendorSessionReference(); got != "session-ref" {
+		t.Fatalf("current session reference = %q", got)
+	}
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		t.Fatalf("encode current payload: %v", err)
+	}
+	if strings.Contains(string(encoded), "vendor_session_id") ||
+		strings.Contains(string(encoded), "vendor_turn_id") {
+		t.Fatalf("current payload contains legacy identifiers: %s", encoded)
+	}
+
+	legacy := base
+	legacy.VendorSessionID = "legacy-session"
+	legacy.VendorTurnID = "legacy-turn"
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("validate legacy payload: %v", err)
+	}
+	if got := legacy.VendorSessionReference(); got != "legacy-session" {
+		t.Fatalf("legacy session reference = %q", got)
+	}
+
+	for _, ref := range []string{" leading", "trailing ", "line\nbreak", strings.Repeat("x", 257)} {
+		invalid := base
+		invalid.VendorSessionRef = ref
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("accepted invalid session reference %q", ref)
+		}
+	}
+
+	ambiguous := current
+	ambiguous.VendorSessionID = "other-session"
+	if err := ambiguous.Validate(); err == nil {
+		t.Fatal("accepted conflicting current and legacy session references")
+	}
+}
+
 func TestSignalPayloadV2ValidatesNotifyOnly(t *testing.T) {
 	payload := SignalPayloadV2{
-		Version:         2,
-		Source:          "notify",
-		Kind:            "turn_stopped",
-		Vendor:          "codex",
-		VendorEvent:     "agent-turn-complete",
-		Scope:           "root",
-		VendorSessionID: "thread-1",
-		VendorTurnID:    "turn-1",
-		Confidence:      1,
-		ReceivedAt:      time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
-		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
-		Outcome:         "candidate",
+		Version:          2,
+		Source:           "notify",
+		Kind:             "turn_stopped",
+		Vendor:           "codex",
+		VendorEvent:      "agent-turn-complete",
+		Scope:            "root",
+		VendorSessionRef: "thread-1",
+		Confidence:       1,
+		ReceivedAt:       time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DeliveryID:       "550e8400-e29b-41d4-a716-446655440000",
+		Outcome:          "candidate",
 	}
 	if err := payload.Validate(); err != nil {
 		t.Fatalf("validate notify payload: %v", err)

@@ -52,14 +52,17 @@ type sessionDraft struct {
 	updatedAt              time.Time
 	firstSeq               uint64
 	lastStateGapGeneration uint64
+	vendorSessionRef       string
 	hasCreated             bool
 	hasState               bool
 }
 
 type recoveryPlan struct {
-	Snapshots      []agent.RestoreSnapshot
-	Reconciliation []store.EventRow
-	Report         RecoveryReport
+	Snapshots         []agent.RestoreSnapshot
+	VendorSessionRefs map[string]string
+	ResumeOnStart     map[string]bool
+	Reconciliation    []store.EventRow
+	Report            RecoveryReport
 }
 
 func newRecoveryProjector() *recoveryProjector {
@@ -286,38 +289,41 @@ func (p *recoveryProjector) applySignal(row store.EventRow) error {
 	if version.Version == 0 {
 		return projectionError(row, "signal payload version is required")
 	}
+	var payload event.SignalPayloadV1
 	switch version.Version {
 	case 1:
-		var payload event.SignalPayloadV1
 		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
 			return projectionWrapError(row, "decode signal payload", err)
 		}
 		if err := payload.Validate(); err != nil {
 			return projectionWrapError(row, "validate signal payload", err)
 		}
-		return nil
 	case 2:
-		var payload event.SignalPayloadV2
-		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		var versioned event.SignalPayloadV2
+		if err := json.Unmarshal([]byte(row.Payload), &versioned); err != nil {
 			return projectionWrapError(row, "decode signal payload", err)
 		}
-		if err := payload.Validate(); err != nil {
+		if err := versioned.Validate(); err != nil {
 			return projectionWrapError(row, "validate signal payload", err)
 		}
-		return nil
+		payload = event.SignalPayloadV1(versioned)
 	case 3:
-		var payload event.SignalPayloadV3
-		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		var versioned event.SignalPayloadV3
+		if err := json.Unmarshal([]byte(row.Payload), &versioned); err != nil {
 			return projectionWrapError(row, "decode signal payload", err)
 		}
-		if err := payload.Validate(); err != nil {
+		if err := versioned.Validate(); err != nil {
 			return projectionWrapError(row, "validate signal payload", err)
 		}
-		return nil
+		payload = versioned.SignalPayloadV1
 	default:
 		p.report.UnknownSignalPayloadVersions++
 		return nil
 	}
+	if ref := payload.VendorSessionReference(); ref != "" {
+		p.draft(row).vendorSessionRef = ref
+	}
+	return nil
 }
 
 func parseStateEvidence(row store.EventRow) (*agent.Evidence, bool, error) {
@@ -478,8 +484,10 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 	})
 
 	plan := recoveryPlan{
-		Snapshots: make([]agent.RestoreSnapshot, 0, len(drafts)),
-		Report:    p.report,
+		Snapshots:         make([]agent.RestoreSnapshot, 0, len(drafts)),
+		VendorSessionRefs: make(map[string]string),
+		ResumeOnStart:     make(map[string]bool),
+		Report:            p.report,
 	}
 	nextSeq := p.lastSeq
 	for _, draft := range drafts {
@@ -495,6 +503,11 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		}
 
 		state := draft.state
+		if draft.vendorSessionRef != "" {
+			plan.VendorSessionRefs[draft.id] = draft.vendorSessionRef
+			plan.ResumeOnStart[draft.id] =
+				state != agent.StateDone && state != agent.StateStopped
+		}
 		lastError := draft.lastError
 		updatedAt := draft.updatedAt
 		if state != agent.StateStopped {

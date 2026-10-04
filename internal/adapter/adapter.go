@@ -5,6 +5,7 @@ package adapter
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -20,6 +21,27 @@ type Runner interface {
 	// Command 返回指定运行模式的可执行文件与参数（不含环境变量透传）。
 	Command(mode agent.RunMode) (name string, args []string)
 }
+
+// Command is one executable and its argument vector.
+type Command struct {
+	Name string
+	Args []string
+}
+
+// CreationMeta is the persisted creation data needed to resume a session.
+type CreationMeta struct {
+	Mode agent.RunMode
+}
+
+// Resumer describes a vendor's native session-resume command.
+type Resumer interface {
+	ResumeCommand(meta CreationMeta, ref string) (Command, error)
+}
+
+var (
+	// ErrUnsupportedResume indicates that the vendor has no native resume command.
+	ErrUnsupportedResume = errors.New("adapter: vendor resume is unsupported")
+)
 
 // HookInput is the transport-neutral input to a vendor hook normalizer.
 type HookInput struct {
@@ -64,6 +86,37 @@ func (e Entry) NormalizeHook(input HookInput) (detect.Signal, error) {
 		return detect.Signal{}, ErrUnsupportedHook
 	}
 	return e.HookNormalizer.NormalizeHook(input)
+}
+
+// SupportsResume reports whether the exact runner supports native resume.
+func (e Entry) SupportsResume() bool {
+	_, ok := e.Runner.(Resumer)
+	return ok
+}
+
+// ResumeCommand returns the vendor's native resume command.
+func (e Entry) ResumeCommand(meta CreationMeta, ref string) (Command, error) {
+	resumer, ok := e.Runner.(Resumer)
+	if !ok {
+		return Command{}, ErrUnsupportedResume
+	}
+	if !agent.ValidRunMode(meta.Mode) {
+		return Command{}, fmt.Errorf("adapter: invalid creation mode %q", meta.Mode)
+	}
+	if !validVendorSessionRef(ref) {
+		return Command{}, errors.New(
+			"adapter: vendor session reference must contain 1 to 256 printable ASCII bytes",
+		)
+	}
+	command, err := resumer.ResumeCommand(meta, ref)
+	if err != nil {
+		return Command{}, err
+	}
+	if command.Name == "" {
+		return Command{}, errors.New("adapter: resume command name is empty")
+	}
+	command.Args = append([]string(nil), command.Args...)
+	return command, nil
 }
 
 // SupportsSignalInjection reports whether the vendor has a session-only plan.
@@ -160,4 +213,16 @@ func (r *Registry) Vendors() []string {
 	}
 	out = append(out, "generic")
 	return out
+}
+
+func validVendorSessionRef(ref string) bool {
+	if len(ref) == 0 || len(ref) > 256 {
+		return false
+	}
+	for i := range len(ref) {
+		if ref[i] < 0x20 || ref[i] > 0x7e {
+			return false
+		}
+	}
+	return ref[0] != ' ' && ref[len(ref)-1] != ' '
 }

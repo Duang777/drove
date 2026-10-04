@@ -439,23 +439,32 @@ func (e Event) OutputAttachment() []byte {
 
 // SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.
 type SignalPayloadV1 struct {
-	Version         int     `json:"version"`
-	Source          string  `json:"source"`
-	Kind            string  `json:"kind"`
-	Vendor          string  `json:"vendor,omitempty"`
-	VendorEvent     string  `json:"vendor_event"`
-	Scope           string  `json:"scope"`
-	VendorSessionID string  `json:"vendor_session_id,omitempty"`
-	VendorTurnID    string  `json:"vendor_turn_id,omitempty"`
-	Notification    string  `json:"notification,omitempty"`
-	Evidence        string  `json:"evidence,omitempty"`
-	Confidence      float64 `json:"confidence"`
-	OccurredAt      string  `json:"occurred_at,omitempty"`
-	ReceivedAt      string  `json:"received_at"`
-	DeliveryID      string  `json:"delivery_id,omitempty"`
-	Outcome         string  `json:"outcome"`
-	ExitCode        *int    `json:"exit_code,omitempty"`
-	ExitKind        string  `json:"exit_kind,omitempty"`
+	Version          int     `json:"version"`
+	Source           string  `json:"source"`
+	Kind             string  `json:"kind"`
+	Vendor           string  `json:"vendor,omitempty"`
+	VendorEvent      string  `json:"vendor_event"`
+	Scope            string  `json:"scope"`
+	VendorSessionRef string  `json:"vendor_session_ref,omitempty"`
+	VendorSessionID  string  `json:"vendor_session_id,omitempty"`
+	VendorTurnID     string  `json:"vendor_turn_id,omitempty"`
+	Notification     string  `json:"notification,omitempty"`
+	Evidence         string  `json:"evidence,omitempty"`
+	Confidence       float64 `json:"confidence"`
+	OccurredAt       string  `json:"occurred_at,omitempty"`
+	ReceivedAt       string  `json:"received_at"`
+	DeliveryID       string  `json:"delivery_id,omitempty"`
+	Outcome          string  `json:"outcome"`
+	ExitCode         *int    `json:"exit_code,omitempty"`
+	ExitKind         string  `json:"exit_kind,omitempty"`
+}
+
+// VendorSessionReference returns the current reference or its legacy alias.
+func (p SignalPayloadV1) VendorSessionReference() string {
+	if p.VendorSessionRef != "" {
+		return p.VendorSessionRef
+	}
+	return p.VendorSessionID
 }
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
@@ -603,11 +612,25 @@ func validateSignalPayload(
 		return fmt.Errorf("event: invalid signal scope %q", p.Scope)
 	}
 	if len(p.Vendor) > 64 ||
+		len(p.VendorSessionRef) > 256 ||
 		len(p.VendorSessionID) > 256 ||
 		len(p.VendorTurnID) > 256 ||
 		len(p.Notification) > 64 ||
 		len(p.Evidence) > 128 {
 		return errors.New("event: signal metadata exceeds its size limit")
+	}
+	if p.VendorSessionRef != "" && !ascii(p.VendorSessionRef) {
+		return errors.New(
+			"event: vendor_session_ref must contain printable ASCII without surrounding whitespace",
+		)
+	}
+	if p.VendorSessionID != "" && !ascii(p.VendorSessionID) {
+		return errors.New(
+			"event: legacy vendor_session_id must contain printable ASCII without surrounding whitespace",
+		)
+	}
+	if p.VendorSessionRef != "" && p.VendorSessionID != "" {
+		return errors.New("event: signal contains current and legacy vendor session references")
 	}
 	if math.IsNaN(p.Confidence) || math.IsInf(p.Confidence, 0) ||
 		p.Confidence < 0 || p.Confidence > 1 {
@@ -803,7 +826,7 @@ func ascii(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if r > 0x7f || r < 0x20 {
+		if r > 0x7e || r < 0x20 {
 			return false
 		}
 	}

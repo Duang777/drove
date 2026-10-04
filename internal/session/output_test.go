@@ -189,7 +189,7 @@ func TestOutputProcessorDefersActivityUntilBufferedBytesCommit(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksOff),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
@@ -281,7 +281,7 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		hub:       hub,
 		committer: committer,
 		clock:     clock,
-		agents:    make(map[agent.ID]*agent.Agent),
+		agents:    make(map[agent.ID]*managedAgent),
 		sessions:  make(map[agent.ID]*runningSession),
 	}
 	a := agent.New(
@@ -289,8 +289,8 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		agent.WithVendor("test"),
 		agent.WithHookPolicy(agent.HooksOff),
 	)
-	observer, err := newObservationActor(
-		a,
+	observer, err := newManagedObservationActor(
+		newManagedAgent(a),
 		committer,
 		agent.HooksOff,
 		detect.DefaultConfig(),
@@ -368,7 +368,7 @@ func TestOutputProcessorScreenEvidenceReferencesCommittedOutput(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksOff),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
@@ -449,7 +449,7 @@ func TestOutputProcessorOrdinaryErrorCreatesNoScreenEdge(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksOff),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	commitTestState(t, manager, a, agent.StateWorking, "test working")

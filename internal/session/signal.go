@@ -152,10 +152,14 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (m *Manager) prepareRuntime(
-	a *agent.Agent,
+func (m *Manager) prepareManagedRuntime(
+	managed *managedAgent,
 	entry adapter.Entry,
 ) (*runningSession, []string, string, error) {
+	if managed == nil || managed.agent == nil {
+		return nil, nil, "", errors.New("session: managed Agent is required")
+	}
+	a := managed.agent
 	policy := a.HookPolicy()
 	if !agent.ValidHookPolicy(policy) {
 		return nil, nil, "", fmt.Errorf("%w: %q", ErrInvalidHookPolicy, policy)
@@ -171,8 +175,8 @@ func (m *Manager) prepareRuntime(
 		)
 	}
 
-	observer, err := newObservationActor(
-		a,
+	observer, err := newManagedObservationActor(
+		managed,
 		m.committer,
 		policy,
 		m.detectConfig,
@@ -265,7 +269,7 @@ func (m *Manager) DeliverHook(
 ) error {
 	m.mu.RLock()
 	closed := m.closed
-	a, known := m.agents[id]
+	managed, known := m.agents[id]
 	running, attached := m.sessions[id]
 	var signalDigest signalTokenDigest
 	hasSignalToken := false
@@ -280,6 +284,7 @@ func (m *Manager) DeliverHook(
 	if !known {
 		return fmt.Errorf("%w: %q", ErrUnknownAgent, id)
 	}
+	a := managed.agent
 	if !attached || running.observer == nil {
 		return fmt.Errorf("%w: %q", ErrHookDetached, id)
 	}

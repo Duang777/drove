@@ -163,7 +163,7 @@ type Manager struct {
 	signalSocketPath string
 
 	mu       sync.RWMutex
-	agents   map[agent.ID]*agent.Agent
+	agents   map[agent.ID]*managedAgent
 	sessions map[agent.ID]*runningSession
 	closed   bool
 
@@ -192,7 +192,7 @@ func NewManager(
 		hub:           hub,
 		store:         st,
 		committer:     newCommitter(initialSeq, st, hub),
-		agents:        make(map[agent.ID]*agent.Agent),
+		agents:        make(map[agent.ID]*managedAgent),
 		sessions:      make(map[agent.ID]*runningSession),
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
@@ -223,13 +223,16 @@ func Bootstrap(
 		return nil, fmt.Errorf("session: bootstrap projection: %w", err)
 	}
 
-	restoredAgents := make(map[agent.ID]*agent.Agent, len(plan.Snapshots))
+	restoredAgents := make(map[agent.ID]*managedAgent, len(plan.Snapshots))
 	for _, snapshot := range plan.Snapshots {
 		restored, err := agent.Restore(snapshot)
 		if err != nil {
 			return nil, fmt.Errorf("session: bootstrap restore agent %q: %w", snapshot.ID, err)
 		}
-		restoredAgents[snapshot.ID] = restored
+		managed := newManagedAgent(restored)
+		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
+		managed.resumeOnStart = plan.ResumeOnStart[string(snapshot.ID)]
+		restoredAgents[snapshot.ID] = managed
 	}
 
 	committedLastSeq, err := st.AppendEvents(ctx, lastSeq, plan.Reconciliation)
@@ -315,6 +318,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			injection.reason,
 		),
 	)
+	managed := newManagedAgent(a)
 	persistedMode := req.Mode
 	persistedPolicy := req.Hooks
 	persistedInjection := injection.mode
@@ -337,7 +341,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			cleanupErr,
 		)
 	}
-	running, processEnv, _, err := m.prepareRuntime(a, entry)
+	running, processEnv, _, err := m.prepareManagedRuntime(managed, entry)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)
@@ -369,7 +373,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	}
 
 	m.mu.Lock()
-	m.agents[id] = a
+	m.agents[id] = managed
 	m.sessions[id] = running
 	m.mu.Unlock()
 
@@ -654,8 +658,8 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 func (m *Manager) List() []*Status {
 	m.mu.RLock()
 	agents := make([]*agent.Agent, 0, len(m.agents))
-	for _, a := range m.agents {
-		agents = append(agents, a)
+	for _, managed := range m.agents {
+		agents = append(agents, managed.agent)
 	}
 	m.mu.RUnlock()
 
@@ -991,10 +995,18 @@ func (m *Manager) failTerminalActor(id agent.ID, cause error) {
 
 // agent 返回 agent 实例。
 func (m *Manager) agent(id agent.ID) (*agent.Agent, bool) {
+	managed, ok := m.managed(id)
+	if !ok {
+		return nil, false
+	}
+	return managed.agent, true
+}
+
+func (m *Manager) managed(id agent.ID) (*managedAgent, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	a, ok := m.agents[id]
-	return a, ok
+	managed, ok := m.agents[id]
+	return managed, ok
 }
 
 func (m *Manager) beginStart() error {
