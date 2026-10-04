@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -82,6 +83,161 @@ func TestReconcilePreparationsAdoptsDurableAndDiscardsOrphan(t *testing.T) {
 	)
 	if err := command.Run(); err == nil {
 		t.Fatalf("orphan branch %q remains", orphan.Branch)
+	}
+}
+
+func TestAcknowledgePreparationClearsBranchOwnershipMarker(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if prepared.branchOperationID == "" {
+		t.Fatal("prepared workspace has no branch operation ID")
+	}
+	exists, err := manager.branchOwnershipMarkerExists(
+		context.Background(),
+		repository,
+		prepared.branchOperationID,
+	)
+	if err != nil || !exists {
+		t.Fatalf("branch ownership marker exists = %v, err=%v", exists, err)
+	}
+
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	exists, err = manager.branchOwnershipMarkerExists(
+		context.Background(),
+		repository,
+		prepared.branchOperationID,
+	)
+	if err != nil || exists {
+		t.Fatalf("branch ownership marker exists = %v, err=%v", exists, err)
+	}
+	record, hasRecord, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !hasRecord {
+		t.Fatalf("read acknowledged record: exists=%v err=%v", hasRecord, err)
+	}
+	if !record.PreparationCommitted || record.BranchOperationID != "" {
+		t.Fatalf("acknowledged record = %+v", record)
+	}
+}
+
+func TestReconcilePreparationsRejectsCommittedMetadataMismatch(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	otherRepository := filepath.Join(t.TempDir(), "other-repository")
+	expected := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: otherRepository,
+		Path: filepath.Join(
+			manager.root,
+			repositoryHash(otherRepository),
+			prepared.AgentID,
+		),
+		Branch: prepared.Branch,
+	}
+
+	err = manager.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	)
+	if err == nil || !strings.Contains(err.Error(), "does not match session metadata") {
+		t.Fatalf("reconcile mismatched committed record error = %v", err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("mismatched committed workspace was changed: %v", err)
+	}
+}
+
+func TestReconcilePreparationsRejectsMissingDurableRecord(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	expected := Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path: filepath.Join(
+			manager.root,
+			repositoryHash(repository),
+			testAgentID,
+		),
+		Branch: "missing-record",
+	}
+
+	err = manager.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	)
+	if err == nil || !strings.Contains(err.Error(), "records missing") {
+		t.Fatalf("reconcile missing record error = %v", err)
+	}
+}
+
+func TestReconcilePreparationsLeavesRemovalForRemovalReconciliation(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil {
+		t.Fatalf("remove workspace: %v", err)
+	}
+
+	if err := manager.ReconcilePreparations(context.Background(), nil); err != nil {
+		t.Fatalf("reconcile preparations with removal record: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal == nil {
+		t.Fatalf(
+			"removal record after preparation reconciliation = %+v, exists=%v err=%v",
+			record,
+			exists,
+			err,
+		)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
 	}
 }
 

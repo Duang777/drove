@@ -3,6 +3,8 @@
 package workspace
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"unsafe"
 
@@ -19,9 +21,28 @@ type recordRenameInformation struct {
 func renameRecordFile(
 	directory *os.File,
 	temporary *os.File,
-	_ string,
+	temporaryName string,
 	recordName string,
-) error {
+) (result error) {
+	renaming, err := openRecordForRename(directory, temporaryName)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, renaming.Close())
+	}()
+	writtenInfo, err := temporary.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect written temporary record: %w", err)
+	}
+	renamingInfo, err := renaming.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect rename temporary record: %w", err)
+	}
+	if !os.SameFile(writtenInfo, renamingInfo) {
+		return errors.New("temporary record changed before rename")
+	}
+
 	name, err := windows.UTF16FromString(recordName)
 	if err != nil {
 		return err
@@ -39,12 +60,52 @@ func renameRecordFile(
 	copy(target, name)
 	var status windows.IO_STATUS_BLOCK
 	return windows.NtSetInformationFile(
-		windows.Handle(temporary.Fd()),
+		windows.Handle(renaming.Fd()),
 		&status,
 		&buffer[0],
 		uint32(size),
 		windows.FileRenameInformation,
 	)
+}
+
+func openRecordForRename(directory *os.File, name string) (*os.File, error) {
+	objectName, err := windows.NewNTUnicodeString(name)
+	if err != nil {
+		return nil, err
+	}
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		Length:        uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})),
+		RootDirectory: windows.Handle(directory.Fd()),
+		ObjectName:    objectName,
+	}
+	var (
+		handle windows.Handle
+		status windows.IO_STATUS_BLOCK
+	)
+	err = windows.NtCreateFile(
+		&handle,
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.DELETE,
+		attributes,
+		&status,
+		nil,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		windows.FILE_OPEN,
+		windows.FILE_SYNCHRONOUS_IO_NONALERT|
+			windows.FILE_NON_DIRECTORY_FILE|
+			windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(handle), name)
+	if file == nil {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New("create rename file from Windows handle")
+	}
+	return file, nil
 }
 
 func syncRecordDirectory(*os.File) error {

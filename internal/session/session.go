@@ -296,7 +296,11 @@ func Bootstrap(
 	hub := event.NewHub(committedLastSeq)
 	manager := NewManager(reg, hub, st, committedLastSeq, options...)
 	manager.agents = restoredAgents
-	if err := manager.reconcileWorkspacePreparations(ctx, plan.Workspaces); err != nil {
+	if err := manager.reconcileWorkspacePreparations(
+		ctx,
+		plan.Workspaces,
+		plan.WorkspaceRemoved,
+	); err != nil {
 		_ = manager.Close()
 		return nil, err
 	}

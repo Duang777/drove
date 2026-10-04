@@ -10,6 +10,9 @@ import (
 )
 
 func (m *Manager) ensureManagedRoot() (result error) {
+	if m.rootErr != nil {
+		return m.rootErr
+	}
 	dataDir := filepath.Dir(m.root)
 	if err := ensureDirectory(dataDir); err != nil {
 		return err
@@ -86,6 +89,9 @@ func (m *Manager) openDataDirectoryRoot() (*os.Root, error) {
 }
 
 func (m *Manager) openWorktreeRoot() (*os.Root, error) {
+	if m.rootErr != nil {
+		return nil, m.rootErr
+	}
 	dataDir, err := m.openDataDirectoryRoot()
 	if err != nil {
 		return nil, err
@@ -363,6 +369,27 @@ func openRealRootFromRoot(parent *os.Root, name string) (*os.Root, error) {
 		return nil, fmt.Errorf("%q changed while opening", name)
 	}
 	return root, nil
+}
+
+func verifyRootEntryUnchanged(
+	parent *os.Root,
+	name string,
+	opened *os.Root,
+) error {
+	openedInfo, err := opened.Stat(".")
+	if err != nil {
+		return fmt.Errorf("inspect opened directory %q: %w", name, err)
+	}
+	current, err := parent.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("reinspect directory %q: %w", name, err)
+	}
+	if !current.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(openedInfo, current) {
+		return fmt.Errorf("directory %q changed while in use", name)
+	}
+	return nil
 }
 
 func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {

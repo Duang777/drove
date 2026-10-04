@@ -368,6 +368,7 @@ func (m *Manager) reconcileWorkspaceRemovals(
 func (m *Manager) reconcileWorkspacePreparations(
 	ctx context.Context,
 	metadata map[string]workspaceMetadata,
+	removed map[string]bool,
 ) error {
 	if m.workspaceErr != nil {
 		return errors.Join(
@@ -380,6 +381,9 @@ func (m *Manager) reconcileWorkspacePreparations(
 	}
 	agentIDs := make([]string, 0, len(metadata))
 	for id := range metadata {
+		if removed[id] {
+			continue
+		}
 		agentIDs = append(agentIDs, id)
 	}
 	sort.Strings(agentIDs)

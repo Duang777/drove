@@ -780,6 +780,12 @@ func TestCleanupWorkspaceStoreFailureReconcilesOnceAfterRestart(t *testing.T) {
 			secondWorkspace.acknowledgeCount,
 		)
 	}
+	if len(secondWorkspace.reconcileExpected) != 0 {
+		t.Fatalf(
+			"removed workspace preparations = %+v, want none",
+			secondWorkspace.reconcileExpected,
+		)
+	}
 }
 
 func TestCleanupWorkspaceAcknowledgesAfterDurablePublishFailure(t *testing.T) {

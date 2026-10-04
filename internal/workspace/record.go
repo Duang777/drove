@@ -244,6 +244,15 @@ func (m *Manager) readWorkspaceRecord(
 	defer func() {
 		result = errors.Join(result, bucket.Close())
 	}()
+	return m.readWorkspaceRecordFromBucket(bucket, agentID, worktreePath)
+}
+
+func (m *Manager) readWorkspaceRecordFromBucket(
+	bucket *os.Root,
+	agentID string,
+	worktreePath string,
+) (_ workspaceRecord, _ bool, result error) {
+	recordPath := workspaceRecordPath(worktreePath)
 	name := agentID + workspaceRecordSuffix
 	info, err := bucket.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {

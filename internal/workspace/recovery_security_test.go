@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -201,6 +202,80 @@ func TestListRejectsReplacementDataDirectory(t *testing.T) {
 	}
 }
 
+func TestListRejectsReplacedWorkspaceDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"managed-branch",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare managed workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge managed workspace: %v", err)
+	}
+	replacementPath := filepath.Join(t.TempDir(), "replacement-worktree")
+	runGit(t, repository, "branch", "replacement-branch", "HEAD")
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"--quiet",
+		replacementPath,
+		"replacement-branch",
+	)
+	originalPath := filepath.Join(filepath.Dir(prepared.Path), "original-worktree")
+	swapMarker := filepath.Join(t.TempDir(), "swapped")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" rev-parse --is-bare-repository "*)
+    if test ! -e "$DROVE_TEST_SWAP_MARKER"; then
+      mv "$DROVE_TEST_MANAGED_PATH" "$DROVE_TEST_ORIGINAL_PATH" || exit 91
+      mv "$DROVE_TEST_REPLACEMENT_PATH" "$DROVE_TEST_MANAGED_PATH" || exit 92
+      : > "$DROVE_TEST_SWAP_MARKER"
+    fi
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_MANAGED_PATH", prepared.Path)
+	t.Setenv("DROVE_TEST_ORIGINAL_PATH", originalPath)
+	t.Setenv("DROVE_TEST_REPLACEMENT_PATH", replacementPath)
+	t.Setenv("DROVE_TEST_SWAP_MARKER", swapMarker)
+	manager.git = wrapper
+	defer func() {
+		manager.git = realGit
+		if _, err := os.Lstat(swapMarker); err == nil {
+			_ = os.Rename(prepared.Path, replacementPath)
+			_ = os.Rename(originalPath, prepared.Path)
+		}
+	}()
+
+	listed, err := manager.List(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "changed while in use") {
+		t.Fatalf("list replaced workspace = %+v, err=%v", listed, err)
+	}
+}
+
 func TestPreparePersistsRecordBeforeCreatingBranch(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires a POSIX shell")
@@ -363,6 +438,90 @@ func TestReconcilePreparationUsesBranchOwnershipMarker(t *testing.T) {
 		operationID,
 	); err != nil || marker {
 		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+}
+
+func TestReconcilePreparationPreservesRecreatedBranch(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := manager.ensureManagedRoot(); err != nil {
+		t.Fatalf("ensure managed root: %v", err)
+	}
+	if err := manager.ensureManagedBucket(repository); err != nil {
+		t.Fatalf("ensure repository bucket: %v", err)
+	}
+	const operationID = "45454545-4545-4454-8454-454545454545"
+	target := Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path: filepath.Join(
+			manager.root,
+			repositoryHash(repository),
+			testAgentID,
+		),
+		Branch:            "recreated-external-branch",
+		branchOperationID: operationID,
+	}
+	if err := manager.writeWorkspaceRecord(target, nil); err != nil {
+		t.Fatalf("write pending preparation: %v", err)
+	}
+	if err := manager.createOwnedBranch(
+		context.Background(),
+		repository,
+		target.Branch,
+		operationID,
+	); err != nil {
+		t.Fatalf("create marker-owned branch: %v", err)
+	}
+	originalOID := strings.TrimSpace(runGit(
+		t,
+		repository,
+		"rev-parse",
+		"refs/heads/"+target.Branch,
+	))
+	runGit(t, repository, "branch", "-D", target.Branch)
+	if err := os.WriteFile(
+		filepath.Join(repository, "replacement.txt"),
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement commit: %v", err)
+	}
+	runGit(t, repository, "add", "replacement.txt")
+	runGit(t, repository, "commit", "-m", "create replacement commit")
+	replacementOID := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	if replacementOID == originalOID {
+		t.Fatal("replacement commit did not change the branch object ID")
+	}
+	runGit(t, repository, "branch", target.Branch, replacementOID)
+
+	if err := manager.ReconcilePreparations(context.Background(), nil); err != nil {
+		t.Fatalf("reconcile pending preparation: %v", err)
+	}
+	currentOID := strings.TrimSpace(runGit(
+		t,
+		repository,
+		"rev-parse",
+		"refs/heads/"+target.Branch,
+	))
+	if currentOID != replacementOID {
+		t.Fatalf("recreated branch object ID = %q, want %q", currentOID, replacementOID)
+	}
+	if marker, err := manager.branchOwnershipMarkerExists(
+		context.Background(),
+		repository,
+		operationID,
+	); err != nil || marker {
+		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(target.Path)); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("discarded preparation record remains or inspect failed: %v", err)
 	}
 }
 
