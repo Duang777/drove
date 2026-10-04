@@ -56,6 +56,7 @@ type Entry struct {
 	Heuristic      Heuristic
 	HookNormalizer HookNormalizer
 	SignalInjector SignalInjector
+	screenRules    screenRuleProvider
 }
 
 // Classify sanitizes terminal control sequences before invoking the vendor heuristic.
@@ -64,6 +65,18 @@ func (e Entry) Classify(line string) (OutputHint, bool) {
 		return OutputHint{}, false
 	}
 	return e.Heuristic.Classify(term.StripString(line))
+}
+
+// NewScreenClassifier constructs independent screen-rule state for one session.
+func (e Entry) NewScreenClassifier() (*ScreenClassifier, error) {
+	if e.Runner == nil {
+		return nil, fmt.Errorf("adapter: screen classifier runner is required")
+	}
+	var definitions []screenRuleDefinition
+	if e.screenRules != nil {
+		definitions = e.screenRules()
+	}
+	return newScreenClassifier(e.Runner.Vendor(), definitions)
 }
 
 // SupportsHooks reports whether this vendor can decode command-hook payloads.
@@ -109,12 +122,14 @@ func NewRegistry() *Registry {
 		claudeHeuristic{},
 		claudeHookDecoder{},
 		claudeSignalInjector{},
+		claudeScreenRules,
 	)
 	r.register(
 		codexRunner{},
 		codexHeuristic{},
 		codexHookDecoder{},
 		codexSignalInjector{},
+		codexScreenRules,
 	)
 	r.generic = Entry{Runner: genericRunner{}, Heuristic: nil}
 	return r
@@ -126,6 +141,7 @@ func (r *Registry) register(
 	heuristic Heuristic,
 	normalizer HookNormalizer,
 	injector SignalInjector,
+	screenRules screenRuleProvider,
 ) {
 	v := runner.Vendor()
 	if _, dup := r.entries[v]; dup {
@@ -136,6 +152,7 @@ func (r *Registry) register(
 		Heuristic:      heuristic,
 		HookNormalizer: normalizer,
 		SignalInjector: injector,
+		screenRules:    screenRules,
 	}
 }
 
