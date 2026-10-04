@@ -55,6 +55,10 @@
 - writable attachment 采用 `latest` 尺寸策略：首个 writer 初始持有尺寸，非 owner
   只更新 proposal，成功输入在写入前应用 proposal 并在写入后晋升，owner detach
   按 actor activity ticket 选择回退。attachment ID 不进入事件。
+- attachment 必须显式声明 `recording` 或 `user` purpose；recording 只读且不审计，
+  user 在本地建立成功后写 `attached`，在本地清理完成后写 `detached`。显式关闭、
+  进程退出、`DetachAll` 和 actor shutdown 都由 recording actor 收敛为同一个
+  exactly-once removal；强制清理期间 Committer 必须保持可用。
 - 有效 resize 先由 terminal actor 依次应用到 PTY 与 x/vt，再提交
   `agent.resized`；重复尺寸不写事件。应用后提交失败会触发 fail-stop。
 - live snapshot 仅存在内存中，每个 attachment 最多 2 Hz、channel 容量为 1，
@@ -80,5 +84,5 @@
 - 临时注入路径必须二次校验并拒绝 symlink；adapter 不得直接操作文件系统。
 - 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`、
   `ExplainOptions`、`ExplainEvent`、`ExplainScreen`、`Explanation`、
-  `AttachmentID`、`AttachmentMode`、`AttachmentOptions`、
+  `AttachmentID`、`AttachmentMode`、`AttachmentPurpose`、`AttachmentOptions`、
   `TerminalAttachment`、`LiveSnapshot`。

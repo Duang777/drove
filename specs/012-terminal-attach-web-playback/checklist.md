@@ -35,27 +35,27 @@
 - [x] Recovery treats `agent.attachment` as a known non-state event.
 - [x] The browser event union accepts `agent.attachment`.
 - [x] The audit payload contains only version, action, and access.
-- [ ] Successful user setup writes one attached event.
-- [ ] Every attachment removal path writes one detached event.
-- [ ] Duplicate close paths do not write duplicate detach events.
-- [ ] Recording-reader and snapshot subscriptions write no attachment audit.
-- [ ] Existing `agent.input` byte-count audit remains unchanged.
+- [x] Successful user setup writes one attached event.
+- [x] Every attachment removal path writes one detached event.
+- [x] Duplicate close paths do not write duplicate detach events.
+- [x] Recording-reader and snapshot subscriptions write no attachment audit.
+- [x] Existing `agent.input` byte-count audit remains unchanged.
 
 ## CLI attach
 
-- [ ] `drove attach <agent-id>` opens a writable raw subscription.
-- [ ] `--read-only` sends no input or viewport.
-- [ ] Attach requires a terminal on stdin and enters raw mode.
-- [ ] Stdin reads are at most 32 KiB.
-- [ ] An incomplete UTF-8 suffix survives across reads.
-- [ ] Every input request is valid UTF-8 and at most 64 KiB.
-- [ ] Ctrl-C reaches the remote agent.
-- [ ] Ctrl-Q detaches locally and never reaches the remote agent.
-- [ ] Writable attach sends the initial viewport and `SIGWINCH` changes.
-- [ ] Read-only attach does not install resize handling.
-- [ ] Stream EOF and cancellation unblock a pending stdin read.
-- [ ] Every exit path closes resources and restores the TTY exactly once.
-- [ ] Local detach leaves the remote agent running.
+- [x] `drove attach <agent-id>` opens a writable raw subscription.
+- [x] `--read-only` sends no input or viewport.
+- [x] Attach requires a terminal on stdin and enters raw mode.
+- [x] Stdin reads are at most 32 KiB.
+- [x] An incomplete UTF-8 suffix survives across reads.
+- [x] Every input request is valid UTF-8 and at most 64 KiB.
+- [x] Ctrl-C reaches the remote agent.
+- [x] Ctrl-Q detaches locally and never reaches the remote agent.
+- [x] Writable attach sends the initial viewport and `SIGWINCH` changes.
+- [x] Read-only attach does not install resize handling.
+- [x] Stream EOF and cancellation unblock a pending stdin read.
+- [x] Every exit path closes resources and restores the TTY exactly once.
+- [x] Local detach leaves the remote agent running.
 
 ## Browser recording
 
@@ -142,7 +142,7 @@
 - [ ] Existing REST response shapes remain unchanged.
 - [ ] Raw bytes come only from committed, token-redacted output.
 - [ ] No event stores input text, terminal screen data, or a control token.
-- [ ] Attachment events store no attachment ID or client identity.
+- [x] Attachment events store no attachment ID or client identity.
 - [ ] Browser terminal and replay state remain memory-only.
 - [ ] Production frontend code never reads the control token.
 - [ ] No vendor-specific behavior appears outside `internal/adapter`.
@@ -150,20 +150,20 @@
 ## Verification
 
 - [x] Reader-first attachment event tests pass.
-- [ ] Attachment teardown and exactly-once audit tests pass.
-- [ ] CLI UTF-8 framing and cleanup unit tests pass.
-- [ ] A pseudo-terminal attach acceptance test passes.
+- [x] Attachment teardown and exactly-once audit tests pass.
+- [x] CLI UTF-8 framing and cleanup unit tests pass.
+- [x] A pseudo-terminal attach acceptance test passes.
 - [ ] `SessionTape` property and limit tests pass.
 - [ ] Controller fake-clock, reconnect, seek, and disposal tests pass.
 - [ ] Browser tests pass for desktop, 375 px, and 320 px viewports.
 - [ ] A real daemon and PTY pass live, input, resize, reconnect, and replay
   acceptance.
-- [ ] Focused packages pass 20 race-enabled repetitions.
-- [ ] `go test ./... -race -count=1` passes.
-- [ ] `go vet ./...` passes.
-- [ ] `make build` passes.
+- [x] Focused packages pass 20 race-enabled repetitions.
+- [x] `go test ./... -race -count=1` passes.
+- [x] `go vet ./...` passes.
+- [x] `make build` passes.
 - [ ] Web tests, typecheck, and build pass.
-- [ ] `git diff --check` passes.
+- [x] `git diff --check` passes.
 - [ ] Both remote CI lanes pass.
 - [ ] Every implementation commit is pushed before the next begins.
 - [ ] A Bubble Tea follow-up issue is linked from Issue #20.

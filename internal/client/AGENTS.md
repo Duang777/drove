@@ -21,6 +21,9 @@
   输入和 resize。`TerminalStream.Next` 只在消费回调成功后推进该订阅 cursor，
   回调失败时保留同一帧供重试；`NewLocal` 创建的终端连接复用同一个 Unix socket
   dialer。
+- raw `TerminalSubscription` 必须显式选择 `recording`、`read_only` 或
+  `read_write` access；client 分别编码为省略 `writable`、`writable:false` 和
+  `writable:true`。events 与 snapshot 不接受 access。
 - Hook relay 不读取控制令牌或 Drove 配置，也不自动拉起 daemon。
 - `EnsureDaemon(ctx, configPath)`：先探测 `/api/v1/agents`（500ms 超时）；仅网络不可达时自动拉起，认证失败不得启动第二个 daemon。
 - 自动拉起日志与控制令牌使用同一个 DataDir；缺失目录以 `0700` 创建，新日志文件使用
@@ -32,5 +35,5 @@
 - 禁止在本包解析 agent 状态机/事件结构——只做 JSON 透传。
 - 自动拉起只允许出现在 `EnsureDaemon`；其它路径不得隐式启动进程。
 - 导出类型：`Client`、`HookRelay`、`HookRelayConfig`、
-  `TerminalStream`、`TerminalSubscription`、`TerminalMessage`、
+  `TerminalStream`、`TerminalAccess`、`TerminalSubscription`、`TerminalMessage`、
   `TerminalStreamError`、`ErrDaemonUnreachable`。

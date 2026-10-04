@@ -629,8 +629,15 @@ func (c *webSocketV2Connection) subscribe(command webSocketV2Subscribe) error {
 	var startCursor *recording.Cursor
 	switch command.Mode {
 	case webSocketV2ModeRaw:
-		if subscription.writable {
-			options := session.AttachmentOptions{Mode: session.AttachmentWritable}
+		if command.Writable != nil {
+			mode := session.AttachmentReadOnly
+			if subscription.writable {
+				mode = session.AttachmentWritable
+			}
+			options := session.AttachmentOptions{
+				Purpose: session.AttachmentPurposeUser,
+				Mode:    mode,
+			}
 			if command.Rows != nil {
 				options.Rows = *command.Rows
 				options.Columns = *command.Columns
@@ -693,7 +700,10 @@ func (c *webSocketV2Connection) subscribe(command webSocketV2Subscribe) error {
 		attachment, err := c.server.opts.Manager.AttachTerminal(
 			ctx,
 			agent.ID(command.AgentID),
-			session.AttachmentOptions{Mode: session.AttachmentReadOnly},
+			session.AttachmentOptions{
+				Purpose: session.AttachmentPurposeRecording,
+				Mode:    session.AttachmentReadOnly,
+			},
 		)
 		if err != nil {
 			cancel()

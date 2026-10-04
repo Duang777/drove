@@ -287,9 +287,7 @@ func (p *outputProcessor) run() {
 		select {
 		case request := <-p.requests:
 			if request.operation == outputClose {
-				p.stopSnapshotTimer(&state)
-				p.closeSnapshotWatches(&state)
-				request.result <- outputResult{}
+				request.result <- outputResult{err: p.detachAll(&state)}
 				return
 			}
 			request.result <- p.handle(&state, request)
@@ -332,8 +330,7 @@ func (p *outputProcessor) handle(
 	case outputDetach:
 		return outputResult{err: p.detach(state, request.attachmentID)}
 	case outputDetachAll:
-		p.detachAll(state)
-		return outputResult{}
+		return outputResult{err: p.detachAll(state)}
 	case outputAttachedInput:
 		input, err := p.sendAttachedInput(
 			state,

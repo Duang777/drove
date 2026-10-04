@@ -40,6 +40,10 @@
   通过保留控制槽发送各订阅最后成功写出的 cursor，并以 1013 关闭。
 - resume cursor 只在 writer 成功写完整帧后推进；history 和 live 必须使用同一
   Store tail，订阅建立竞态不得通过 Hub 补洞。
+- v2 raw subscribe 保留 `writable` 字段 presence：省略是无审计 recording
+  reader，显式 `false` 是用户只读 attachment，显式 `true` 是用户可写
+  attachment；selector 不表达 attachment intent。snapshot 使用无审计 recording
+  attachment。
 - v1 hello、事件和输入错误的逐帧字节形状由
   `testdata/websocket_v1.golden` 锁定。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload

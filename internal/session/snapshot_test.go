@@ -22,7 +22,10 @@ func TestSnapshotWatchCarriesCursorAndCoalescesLatest(t *testing.T) {
 	attachment, err := manager.AttachTerminal(
 		context.Background(),
 		id,
-		AttachmentOptions{Mode: AttachmentReadOnly},
+		AttachmentOptions{
+			Purpose: AttachmentPurposeRecording,
+			Mode:    AttachmentReadOnly,
+		},
 	)
 	if err != nil {
 		t.Fatalf("attach snapshot reader: %v", err)
@@ -119,7 +122,10 @@ func TestSnapshotWatchClosesAtOutputEnd(t *testing.T) {
 	attachment, err := manager.AttachTerminal(
 		context.Background(),
 		id,
-		AttachmentOptions{Mode: AttachmentReadOnly},
+		AttachmentOptions{
+			Purpose: AttachmentPurposeRecording,
+			Mode:    AttachmentReadOnly,
+		},
 	)
 	if err != nil {
 		t.Fatalf("attach snapshot reader: %v", err)

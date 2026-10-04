@@ -46,11 +46,23 @@ const (
 	TerminalModeSnapshot TerminalMode = "snapshot"
 )
 
+// TerminalAccess identifies raw stream attachment intent and capabilities.
+type TerminalAccess string
+
+const (
+	// TerminalAccessRecording reads retained and live output without user audit.
+	TerminalAccessRecording TerminalAccess = "recording"
+	// TerminalAccessReadOnly creates an audited user attachment without input.
+	TerminalAccessReadOnly TerminalAccess = "read_only"
+	// TerminalAccessReadWrite creates an audited user attachment with input.
+	TerminalAccessReadWrite TerminalAccess = "read_write"
+)
+
 // TerminalSubscription configures one agent and mode subscription.
 type TerminalSubscription struct {
 	AgentID  string
 	Mode     TerminalMode
-	Writable bool
+	Access   TerminalAccess
 	Rows     int
 	Columns  int
 	Cursor   *recording.Cursor
@@ -663,7 +675,7 @@ func newTerminalSubscribeRequest(
 	}
 	if subscription.Mode == TerminalModeSnapshot &&
 		(selectorCount != 0 ||
-			subscription.Writable ||
+			subscription.Access != "" ||
 			subscription.Rows != 0 ||
 			subscription.Columns != 0) {
 		return terminalSubscribeRequest{}, errors.New(
@@ -671,7 +683,7 @@ func newTerminalSubscribeRequest(
 		)
 	}
 	if subscription.Mode == TerminalModeEvents &&
-		(subscription.Writable ||
+		(subscription.Access != "" ||
 			subscription.Rows != 0 ||
 			subscription.Columns != 0) {
 		return terminalSubscribeRequest{}, errors.New(
@@ -679,12 +691,21 @@ func newTerminalSubscribeRequest(
 		)
 	}
 	if subscription.Mode == TerminalModeRaw {
+		switch subscription.Access {
+		case TerminalAccessRecording,
+			TerminalAccessReadOnly,
+			TerminalAccessReadWrite:
+		default:
+			return terminalSubscribeRequest{}, errors.New(
+				"client: raw terminal access is invalid",
+			)
+		}
 		if (subscription.Rows == 0) != (subscription.Columns == 0) {
 			return terminalSubscribeRequest{}, errors.New(
 				"client: terminal rows and columns must be provided together",
 			)
 		}
-		if !subscription.Writable &&
+		if subscription.Access != TerminalAccessReadWrite &&
 			(subscription.Rows != 0 || subscription.Columns != 0) {
 			return terminalSubscribeRequest{}, errors.New(
 				"client: terminal viewport requires a writable subscription",
@@ -710,10 +731,11 @@ func newTerminalSubscribeRequest(
 		Sequence:  subscription.Sequence,
 		Offset:    subscription.Offset,
 	}
-	if subscription.Mode == TerminalModeRaw && subscription.Writable {
-		writable := true
+	if subscription.Mode == TerminalModeRaw &&
+		subscription.Access != TerminalAccessRecording {
+		writable := subscription.Access == TerminalAccessReadWrite
 		request.Writable = &writable
-		if subscription.Rows != 0 {
+		if writable && subscription.Rows != 0 {
 			rows := subscription.Rows
 			columns := subscription.Columns
 			request.Rows = &rows
