@@ -117,6 +117,10 @@ func TestInitCreatesPrivateDataDirectoryWithRetentionDefault(t *testing.T) {
 			cfg.Storage.OutputRetentionDays,
 		)
 	}
+	if cfg.Session.AutoResumeOnStart ||
+		cfg.Session.TerminationGraceSeconds != 5 {
+		t.Fatalf("session defaults = %+v", cfg.Session)
+	}
 }
 
 func TestUpCommandExposesRunnerAndHookFlags(t *testing.T) {

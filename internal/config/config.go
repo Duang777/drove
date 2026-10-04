@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+const maxTerminationGraceSeconds int64 = 9_223_372_036
+
 // SignalInjection controls process-local vendor signal configuration.
 type SignalInjection string
 
@@ -33,9 +35,10 @@ type StorageConfig struct {
 	OutputRetentionDays int `json:"output_retention_days"`
 }
 
-// SessionConfig controls daemon-start session behavior.
+// SessionConfig controls daemon session recovery and process shutdown.
 type SessionConfig struct {
-	AutoResumeOnStart bool `json:"auto_resume_on_start"`
+	AutoResumeOnStart       bool  `json:"auto_resume_on_start"`
+	TerminationGraceSeconds int64 `json:"termination_grace_seconds"`
 }
 
 // Config 是 Drove 的运行时配置。
@@ -56,7 +59,7 @@ type Config struct {
 	Agents map[string]AgentConfig `json:"agents,omitempty"`
 	// Storage controls retention for raw attachment data.
 	Storage StorageConfig `json:"storage"`
-	// Session controls restart behavior for persisted sessions.
+	// Session controls automatic recovery and PTY shutdown behavior.
 	Session SessionConfig `json:"session"`
 }
 
@@ -72,6 +75,9 @@ func Defaults() *Config {
 		},
 		Storage: StorageConfig{
 			OutputRetentionDays: 30,
+		},
+		Session: SessionConfig{
+			TerminationGraceSeconds: 5,
 		},
 	}
 }
@@ -153,6 +159,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Storage.OutputRetentionDays < 0 {
 		return fmt.Errorf("config: storage.output_retention_days must not be negative")
+	}
+	if c.Session.TerminationGraceSeconds < 0 {
+		return fmt.Errorf("config: session.termination_grace_seconds must not be negative")
+	}
+	if c.Session.TerminationGraceSeconds > maxTerminationGraceSeconds {
+		return fmt.Errorf(
+			"config: session.termination_grace_seconds must not exceed %d",
+			maxTerminationGraceSeconds,
+		)
 	}
 	if len(c.ConsoleOrigins) == 0 {
 		return fmt.Errorf("config: console_origins must not be empty")

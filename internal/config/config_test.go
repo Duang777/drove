@@ -295,7 +295,8 @@ func TestLoadResolvedParsesSessionResumeSettings(t *testing.T) {
 		"event_buffer": 16,
 		"console_origins": ["http://localhost:5173"],
 		"session": {
-			"auto_resume_on_start": true
+			"auto_resume_on_start": true,
+			"termination_grace_seconds": 9
 		}
 	}`), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -307,8 +308,20 @@ func TestLoadResolvedParsesSessionResumeSettings(t *testing.T) {
 	if !cfg.Session.AutoResumeOnStart {
 		t.Fatal("auto_resume_on_start = false, want true")
 	}
+	if cfg.Session.TerminationGraceSeconds != 9 {
+		t.Fatalf(
+			"termination grace = %d, want 9",
+			cfg.Session.TerminationGraceSeconds,
+		)
+	}
 	if Defaults().Session.AutoResumeOnStart {
 		t.Fatal("default auto_resume_on_start = true, want false")
+	}
+	if Defaults().Session.TerminationGraceSeconds != 5 {
+		t.Fatalf(
+			"default termination grace = %d, want 5",
+			Defaults().Session.TerminationGraceSeconds,
+		)
 	}
 }
 
@@ -320,6 +333,28 @@ func TestValidateRejectsNegativeOutputRetention(t *testing.T) {
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "output_retention_days") {
 		t.Fatalf("validate error = %v, want output retention error", err)
+	}
+}
+
+func TestValidateRejectsNegativeTerminationGrace(t *testing.T) {
+	cfg := Defaults()
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
+	cfg.Session.TerminationGraceSeconds = -1
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "termination_grace_seconds") {
+		t.Fatalf("validate error = %v, want termination grace error", err)
+	}
+}
+
+func TestValidateRejectsTerminationGraceDurationOverflow(t *testing.T) {
+	cfg := Defaults()
+	cfg.DataDir = filepath.Join(t.TempDir(), "data")
+	cfg.Session.TerminationGraceSeconds = maxTerminationGraceSeconds + 1
+
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "must not exceed") {
+		t.Fatalf("validate error = %v, want termination grace upper bound", err)
 	}
 }
 

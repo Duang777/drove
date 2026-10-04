@@ -94,6 +94,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		ctx,
 		st,
 		signalInjectionOption(d.cfg, socketPath),
+		session.WithTerminationGrace(
+			time.Duration(d.cfg.Session.TerminationGraceSeconds)*time.Second,
+		),
 	)
 	if err != nil {
 		return err

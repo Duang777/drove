@@ -723,3 +723,42 @@ go test ./internal/recording -run '^$' \
 cell 的 `term.Snapshot` 当作可恢复状态。完整 x/vt checkpoint 与 offset
 selector 元数据索引由 [Issue #35](https://github.com/Duang777/drove/issues/35)
 继续跟踪。
+
+## 12. 原生恢复与进程组停止
+
+Claude `session_id` 与 Codex `session_id` / `thread_id` 被归一为一个最多 256
+字节的私有 vendor reference。它只在 `agent.signal` 已写入 SQLite 后更新
+session 私有投影。失败的持久化不会让会话变成可恢复。
+
+`drove resume <agent-id>` 对 `stopped`、未连接、已有已提交 reference 且 adapter
+支持恢复的会话生效：
+
+| Vendor | 原生命令 |
+| --- | --- |
+| Claude | `claude --resume <ref>` |
+| Codex | `codex resume <ref>` |
+
+恢复先追加私有 `agent.resumed`，再执行 typed `Stopped -> Starting`，最后复用
+普通 Start 的 PTY 激活、terminal actor、Detector 和退出仲裁。恢复投影只接受紧邻
+同 Agent `agent.resumed` 的这条迁移。公开 Status 只返回派生的 `resumable`；
+Hub、WebSocket、REST replay、CLI、错误和日志都不返回 reference。
+
+`session.auto_resume_on_start=true` 只消费重启前非终态且已有 reference 的一次性
+候选。daemon 先绑定 listener 并进入 `Accept`，再按创建时间顺序恢复。用户主动
+停止的会话仍只支持手工恢复。
+
+PTY 启动的直接子进程是独立 session 和进程组 leader。主动关闭按以下顺序执行：
+
+```text
+拒绝新写入
+-> SIGTERM(-PID)
+-> 等待 session.termination_grace_seconds
+-> 进程组仍存在时 SIGKILL(-PID)
+-> 回收直接子进程
+-> 关闭 PTY master
+-> 等待输出、output-end 和 exit 回调排空
+```
+
+默认宽限是 5 秒。Manager 保留按 Agent ID 串行关闭，避免改变既有持久化顺序。
+`scripts/verify-issue16.sh` 重复运行聚焦 race 测试，并执行全量 race、vet、Go
+构建、Web 类型检查、Web 构建和 diff whitespace 检查。

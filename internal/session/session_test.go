@@ -660,7 +660,8 @@ func TestStatusDerivesResumableFromCommittedStateAndCapability(t *testing.T) {
 }
 
 func TestResumeUsesNativeCommandAndKeepsAgentID(t *testing.T) {
-	manager, st := newTestManager(t)
+	const terminationGrace = 3 * time.Second
+	manager, st := newTestManager(t, WithTerminationGrace(terminationGrace))
 	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
 	var started pty.Config
 	manager.startPTY = func(config pty.Config) (launchedSession, error) {
@@ -682,6 +683,13 @@ func TestResumeUsesNativeCommandAndKeepsAgentID(t *testing.T) {
 		started.Args[0] != "--resume" ||
 		started.Args[1] != "vendor-ref" {
 		t.Fatalf("resume command = %q %q", started.Command, started.Args)
+	}
+	if started.TerminationGrace != terminationGrace {
+		t.Fatalf(
+			"termination grace = %v, want %v",
+			started.TerminationGrace,
+			terminationGrace,
+		)
 	}
 
 	persisted, err := st.Replay(string(managed.agent.ID()))
@@ -1662,11 +1670,14 @@ func waitForDetachedState(t *testing.T, manager *Manager, id agent.ID, want agen
 	}
 }
 
-func newTestManager(t *testing.T) (*Manager, *store.Store) {
+func newTestManager(
+	t *testing.T,
+	options ...ManagerOption,
+) (*Manager, *store.Store) {
 	t.Helper()
 
 	st := newTestStore(t)
-	manager := NewManager(adapter.NewRegistry(), event.NewHub(0), st, 0)
+	manager := NewManager(adapter.NewRegistry(), event.NewHub(0), st, 0, options...)
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)

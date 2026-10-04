@@ -43,6 +43,8 @@
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 →
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
+- Manager 把同一 `terminationGrace` 传给新建和恢复的 PTY；关闭顺序仍按 Agent ID
+  串行，不在 session 层复制信号升级逻辑。
 - `Replay(sessionID)`：从 store 读取事件流供回放；仍保留的 `output.chunk` 附件被编码进
   Base64 payload，已过期的附件只返回 offset/len metadata。
 - `Manager` 长期持有一个 recording archive，使 tail、timeline、Blocked lookup 和

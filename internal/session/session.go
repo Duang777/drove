@@ -164,6 +164,7 @@ type Manager struct {
 	clock            observationClock
 	newCredential    signalCredentialSource
 	startPTY         func(pty.Config) (launchedSession, error)
+	terminationGrace time.Duration
 	injectionEnabled bool
 	injectionDataDir string
 	injectionRelay   string
@@ -193,6 +194,13 @@ type BootstrapResult struct {
 type StartupResumeResult struct {
 	AgentID agent.ID
 	Err     error
+}
+
+// WithTerminationGrace sets the PTY process-group shutdown grace period.
+func WithTerminationGrace(grace time.Duration) ManagerOption {
+	return func(manager *Manager) {
+		manager.terminationGrace = grace
+	}
 }
 
 // NewManager 创建从 initialSeq 继续提交事件的 Manager。
@@ -430,11 +438,12 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 	managed := plan.managed
 	running := plan.running
 	sess, err := m.startPTY(pty.Config{
-		Command: plan.command,
-		Args:    plan.args,
-		Env:     plan.env,
-		Dir:     plan.dir,
-		Size:    plan.ptySize,
+		Command:          plan.command,
+		Args:             plan.args,
+		Env:              plan.env,
+		Dir:              plan.dir,
+		Size:             plan.ptySize,
+		TerminationGrace: m.terminationGrace,
 		OnOutput: func(chunk []byte, offset uint64) {
 			<-running.callbacksReady
 			_ = running.output.Feed(chunk, offset)

@@ -14,7 +14,10 @@
 - `Config.OnOutputEnd` 在最后一个输出块后调用一次；它与 `Config.OnExit` 没有顺序保证。
 - `Config.OnOutput`、`Config.OnOutputEnd` 与 `Config.OnExit` 在读取和等待
   goroutine 启动前固定，运行中不得替换。
-- 主动停止由 `Close` 回收资源；自然退出在读取结束后关闭 PTY master。`Close` 幂等，并等待读取、进程退出和全部回调完成。
+- `creack/pty` 为子进程创建独立 session；主动停止先向 PID 对应的进程组发送
+  SIGTERM，等待 `Config.TerminationGrace`，超时再发送 SIGKILL。默认宽限 5 秒。
+- PTY master 只在直接子进程已回收后关闭；`Close` 幂等，并等待读取、进程退出和
+  全部回调完成。自然退出仍在读取结束后关闭 master。
 - 进程退出码经 `WaitCh` 返回，供状态机迁移到 `Stopped`/`Done`。
 
 ## 约束

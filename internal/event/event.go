@@ -350,7 +350,7 @@ func NewAgentResizedDraft(
 	}, nil
 }
 
-// NewAgentResumedDraft constructs an uncommitted native resume event.
+// NewAgentResumedDraft stores the full payload but exposes only its version.
 func NewAgentResumedDraft(sessionID, agentID, payload string) Draft {
 	return Draft{
 		typ:           TypeAgentResumed,
@@ -467,7 +467,7 @@ type AgentResumedPayloadV1 struct {
 	VendorSessionRef string `json:"vendor_session_ref"`
 }
 
-// Validate rejects unsupported or unsafe native resume metadata.
+// Validate requires version 1 and a bounded printable ASCII reference.
 func (p AgentResumedPayloadV1) Validate() error {
 	if p.Version != 1 {
 		return fmt.Errorf("event: unsupported agent.resumed payload version %d", p.Version)
