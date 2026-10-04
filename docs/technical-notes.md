@@ -787,6 +787,12 @@ seek、播放和返回 live。桌面、375 px 和 320 px 视口都没有页面�
 目录在紧凑 header 中省略显示，并通过 `title` 保留完整路径。宽 replay 终端只在自身
 viewport 内滚动。
 
+验收截图使用同一真实会话。桌面视口是 1440x1000，移动视口是 320x900：
+
+![桌面端实时终端与回放控制](assets/terminal-playback-desktop.png)
+
+![320px 移动端实时终端与回放控制](assets/terminal-playback-mobile.png)
+
 单元测试还覆盖以下边界：
 
 - REST 和 WebSocket 响应从 `unknown` 开始严格解码，sequence 和 offset 进入领域层
