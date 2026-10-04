@@ -629,7 +629,7 @@ func (p SignalPayloadV1) VendorSessionReference() string {
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
 func (p SignalPayloadV1) Validate() error {
-	return validateSignalPayload(p, 1, false, false)
+	return validateSignalPayload(p, 1, false, false, false)
 }
 
 // SignalPayloadV2 adds the non-authoritative notify source.
@@ -637,7 +637,7 @@ type SignalPayloadV2 SignalPayloadV1
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
 func (p SignalPayloadV2) Validate() error {
-	return validateSignalPayload(SignalPayloadV1(p), 2, true, false)
+	return validateSignalPayload(SignalPayloadV1(p), 2, true, false, false)
 }
 
 // ScreenAttributionPayload is bounded static metadata for one screen rule edge.
@@ -682,11 +682,18 @@ type SignalPayloadV3 struct {
 // Validate rejects malformed or mismatched screen signal attribution.
 func (p SignalPayloadV3) Validate() error {
 	base := p.SignalPayloadV1
-	if err := validateSignalPayload(base, 3, true, true); err != nil {
+	if err := validateSignalPayload(base, 3, true, true, false); err != nil {
 		return err
 	}
+	return validateSignalScreenAttribution(base, p.Screen)
+}
+
+func validateSignalScreenAttribution(
+	base SignalPayloadV1,
+	screen *ScreenAttributionPayload,
+) error {
 	if base.Source == "screen" {
-		if p.Screen == nil {
+		if screen == nil {
 			return errors.New("event: screen signal requires screen attribution")
 		}
 		if base.Scope != "root" || base.VendorEvent != "screen_rule" {
@@ -695,26 +702,76 @@ func (p SignalPayloadV3) Validate() error {
 		if !ascii(base.Vendor) {
 			return errors.New("event: screen signal vendor must be a stable ASCII token")
 		}
-		if err := p.Screen.Validate(); err != nil {
+		if err := screen.Validate(); err != nil {
 			return err
 		}
 		if base.Evidence != "" {
 			return errors.New("event: screen signal evidence belongs in its attribution")
 		}
-		if !strings.HasPrefix(p.Screen.Rule, base.Vendor+".") {
+		if !strings.HasPrefix(screen.Rule, base.Vendor+".") {
 			return errors.New("event: screen rule must belong to its vendor")
 		}
-		if !screenKindMatchesEdge(base.Kind, p.Screen.Edge) {
+		if !screenKindMatchesEdge(base.Kind, screen.Edge) {
 			return errors.New("event: screen signal kind and edge are incompatible")
 		}
-		if knownScreenRule(p.Screen.Rule) &&
-			!knownScreenRuleMatchesKind(p.Screen.Rule, base.Kind) {
+		if knownScreenRule(screen.Rule) &&
+			!knownScreenRuleMatchesKind(screen.Rule, base.Kind) {
 			return errors.New("event: known screen rule has an incompatible kind")
 		}
-	} else if p.Screen != nil {
+	} else if screen != nil {
 		return errors.New("event: only screen signals may contain screen attribution")
 	}
 	return nil
+}
+
+// TerminalAttributionPayload identifies a redacted committed terminal location.
+type TerminalAttributionPayload struct {
+	Protocol      string `json:"protocol"`
+	OutputOffset  uint64 `json:"output_offset"`
+	LastOutputSeq uint64 `json:"last_output_seq"`
+}
+
+// Validate rejects unsupported protocols and incomplete committed locations.
+func (p TerminalAttributionPayload) Validate() error {
+	if p.Protocol != "osc9" {
+		return fmt.Errorf("event: invalid terminal protocol %q", p.Protocol)
+	}
+	if p.OutputOffset == 0 {
+		return errors.New("event: terminal output_offset must be positive")
+	}
+	if p.LastOutputSeq == 0 {
+		return errors.New("event: terminal last_output_seq must be positive")
+	}
+	return nil
+}
+
+// SignalPayloadV4 adds optional typed terminal attribution.
+type SignalPayloadV4 struct {
+	SignalPayloadV1
+	Screen   *ScreenAttributionPayload   `json:"screen,omitempty"`
+	Terminal *TerminalAttributionPayload `json:"terminal,omitempty"`
+}
+
+// Validate rejects malformed or mismatched terminal signal attribution.
+func (p SignalPayloadV4) Validate() error {
+	base := p.SignalPayloadV1
+	terminalNotify := p.Terminal != nil
+	if err := validateSignalPayload(base, 4, true, true, terminalNotify); err != nil {
+		return err
+	}
+	if err := validateSignalScreenAttribution(base, p.Screen); err != nil {
+		return err
+	}
+	if p.Terminal == nil {
+		return nil
+	}
+	if base.Source != "notify" {
+		return errors.New("event: only notify signals may contain terminal attribution")
+	}
+	if base.Scope != "root" {
+		return errors.New("event: terminal notify signal must target root scope")
+	}
+	return p.Terminal.Validate()
 }
 
 func validateSignalPayload(
@@ -722,6 +779,7 @@ func validateSignalPayload(
 	version int,
 	allowNotify bool,
 	allowScreen bool,
+	terminalNotify bool,
 ) error {
 	if p.Version != version {
 		return fmt.Errorf("event: unsupported signal payload version %d", p.Version)
@@ -735,6 +793,9 @@ func validateSignalPayload(
 	}
 	if !validSource {
 		return fmt.Errorf("event: invalid signal source %q", p.Source)
+	}
+	if terminalNotify && p.Source != "notify" {
+		return errors.New("event: terminal attribution requires notify source")
 	}
 	legacyTransitional := p.Kind == "" && p.Outcome == "" && p.Evidence != ""
 	if !legacyTransitional && !oneOf(
@@ -807,14 +868,21 @@ func validateSignalPayload(
 			return errors.New("event: delivered or screen signal vendor is required")
 		}
 	}
-	if p.Source == "hook" || p.Source == "notify" {
+	if p.Source == "hook" || p.Source == "notify" && !terminalNotify {
 		if !canonicalUUID(p.DeliveryID) {
 			return errors.New("event: delivered signal delivery_id must be a canonical UUID")
+		}
+	} else if p.Source == "notify" && terminalNotify {
+		if p.DeliveryID != "" {
+			return errors.New("event: terminal notify signal cannot contain delivery_id")
 		}
 	} else if p.DeliveryID != "" {
 		return errors.New("event: only delivered signals may contain delivery_id")
 	}
-	if p.Source == "notify" && p.Kind != "turn_stopped" {
+	if p.Source == "notify" && terminalNotify && p.Kind != "permission_requested" {
+		return fmt.Errorf("event: terminal notify source cannot report kind %q", p.Kind)
+	}
+	if p.Source == "notify" && !terminalNotify && p.Kind != "turn_stopped" {
 		return fmt.Errorf("event: notify source cannot report kind %q", p.Kind)
 	}
 	if !legacyTransitional &&
@@ -880,7 +948,7 @@ type StateEvidencePayloadV1 struct {
 
 // Validate rejects malformed transition evidence.
 func (p StateEvidencePayloadV1) Validate() error {
-	return validateStateEvidencePayload(p, 1, false, false)
+	return validateStateEvidencePayload(p, 1, false, false, false)
 }
 
 // StateEvidencePayloadV2 adds transition evidence from a notify candidate.
@@ -888,7 +956,7 @@ type StateEvidencePayloadV2 StateEvidencePayloadV1
 
 // Validate rejects malformed transition evidence.
 func (p StateEvidencePayloadV2) Validate() error {
-	return validateStateEvidencePayload(StateEvidencePayloadV1(p), 2, true, false)
+	return validateStateEvidencePayload(StateEvidencePayloadV1(p), 2, true, false, false)
 }
 
 // StateEvidencePayloadV3 adds optional typed screen attribution.
@@ -900,23 +968,64 @@ type StateEvidencePayloadV3 struct {
 // Validate rejects malformed or mismatched transition attribution.
 func (p StateEvidencePayloadV3) Validate() error {
 	base := p.StateEvidencePayloadV1
-	if err := validateStateEvidencePayload(base, 3, true, true); err != nil {
+	if err := validateStateEvidencePayload(base, 3, true, true, false); err != nil {
 		return err
 	}
+	return validateStateScreenAttribution(base, p.Screen)
+}
+
+func validateStateScreenAttribution(
+	base StateEvidencePayloadV1,
+	screen *ScreenAttributionPayload,
+) error {
 	if base.Source == "screen" {
-		if p.Screen == nil {
+		if screen == nil {
 			return errors.New("event: screen state evidence requires screen attribution")
 		}
-		if err := p.Screen.Validate(); err != nil {
+		if err := screen.Validate(); err != nil {
 			return err
 		}
-		if base.Event != p.Screen.Rule {
+		if base.Event != screen.Rule {
 			return errors.New("event: screen state evidence event must match its rule")
 		}
-	} else if p.Screen != nil {
+	} else if screen != nil {
 		return errors.New("event: only screen state evidence may contain screen attribution")
 	}
 	return nil
+}
+
+// StateEvidencePayloadV4 adds optional typed terminal attribution.
+type StateEvidencePayloadV4 struct {
+	StateEvidencePayloadV1
+	Screen   *ScreenAttributionPayload   `json:"screen,omitempty"`
+	Terminal *TerminalAttributionPayload `json:"terminal,omitempty"`
+}
+
+// Validate rejects malformed or mismatched terminal state attribution.
+func (p StateEvidencePayloadV4) Validate() error {
+	base := p.StateEvidencePayloadV1
+	terminalNotify := p.Terminal != nil
+	if err := validateStateEvidencePayload(
+		base,
+		4,
+		true,
+		true,
+		terminalNotify,
+	); err != nil {
+		return err
+	}
+	if err := validateStateScreenAttribution(base, p.Screen); err != nil {
+		return err
+	}
+	if p.Terminal == nil {
+		return nil
+	}
+	if base.Source != "notify" {
+		return errors.New(
+			"event: only notify state evidence may contain terminal attribution",
+		)
+	}
+	return p.Terminal.Validate()
 }
 
 func validateStateEvidencePayload(
@@ -924,6 +1033,7 @@ func validateStateEvidencePayload(
 	version int,
 	allowNotify bool,
 	allowScreen bool,
+	terminalNotify bool,
 ) error {
 	if p.Version != version {
 		return fmt.Errorf("event: unsupported state evidence version %d", p.Version)
@@ -946,6 +1056,11 @@ func validateStateEvidencePayload(
 	if !validSource {
 		return fmt.Errorf("event: invalid state evidence source %q", p.Source)
 	}
+	if terminalNotify && p.Source != "notify" {
+		return errors.New(
+			"event: terminal attribution requires notify state evidence",
+		)
+	}
 	if p.Event == "" || len(p.Event) > 64 || !ascii(p.Event) {
 		return errors.New("event: state evidence event must contain 1 to 64 ASCII bytes")
 	}
@@ -953,10 +1068,16 @@ func validateStateEvidencePayload(
 		p.Confidence < 0 || p.Confidence > 1 {
 		return fmt.Errorf("event: invalid state evidence confidence %v", p.Confidence)
 	}
-	if p.Source == "hook" || p.Source == "notify" {
+	if p.Source == "hook" || p.Source == "notify" && !terminalNotify {
 		if !canonicalUUID(p.DeliveryID) {
 			return errors.New(
 				"event: delivered state evidence delivery_id must be a canonical UUID",
+			)
+		}
+	} else if p.Source == "notify" && terminalNotify {
+		if p.DeliveryID != "" {
+			return errors.New(
+				"event: terminal notify state evidence cannot contain delivery_id",
 			)
 		}
 	} else if p.DeliveryID != "" {

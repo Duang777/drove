@@ -316,7 +316,10 @@ func newTerminalAcceptanceHarness(
 	manager.mu.Unlock()
 	commitTestState(t, manager, target, agent.StateStarting, "acceptance start")
 
-	running, _, _, err := manager.prepareManagedRuntime(managed, manager.reg.For(vendor))
+	running, _, _, err := manager.prepareManagedRuntime(
+		managed,
+		manager.reg.For(vendor),
+	)
 	if err != nil {
 		t.Fatalf("prepare acceptance runtime: %v", err)
 	}
@@ -332,6 +335,7 @@ func newTerminalAcceptanceHarness(
 		mustInitialTerminalSize(t),
 		process,
 		running.classifier,
+		nil,
 		running.observer,
 		vendor,
 		terminalClock,

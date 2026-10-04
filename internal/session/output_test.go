@@ -18,6 +18,7 @@ import (
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
 )
@@ -315,19 +316,24 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		"",
 	)
 	terminalClock := newTerminalTestClock(time.Unix(1, 0).UTC())
-	running.terminal = newTerminalTestActor(
+	normalizer := &countingTerminalNormalizer{}
+	running.terminal = newTerminalTestActorWithNormalizer(
 		t,
 		"generic",
 		terminalClock,
 		&terminalTestProcess{},
 		observer,
+		normalizer,
 	)
 	defer running.terminal.Close()
 	manager.sessions[a.ID()] = running
 	subscription := hub.Subscribe(1)
 	defer hub.Unsubscribe(subscription)
 
-	err = running.output.Feed([]byte("line\n"), 0)
+	err = running.output.Feed(
+		[]byte("\x1b]9;Approval requested: private command\x07"),
+		0,
+	)
 	if !errors.Is(err, storageErr) {
 		t.Fatalf("feed error = %v, want storage error", err)
 	}
@@ -339,6 +345,9 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 	terminalClock.mu.Unlock()
 	if timerCount != 0 {
 		t.Fatalf("terminal timers after failed store = %d, want 0", timerCount)
+	}
+	if got := normalizer.calls.Load(); got != 0 {
+		t.Fatalf("terminal normalizer calls after failed store = %d, want 0", got)
 	}
 	select {
 	case published := <-subscription.C():
@@ -378,6 +387,7 @@ func TestOutputProcessorScreenEvidenceReferencesCommittedOutput(t *testing.T) {
 		mustInitialTerminalSize(t),
 		terminalProcess,
 		running.classifier,
+		nil,
 		running.observer,
 		running.vendor,
 		clock,
@@ -436,6 +446,182 @@ func TestOutputProcessorScreenEvidenceReferencesCommittedOutput(t *testing.T) {
 	waitForState(t, manager, id, agent.StateBlocked)
 }
 
+func TestOutputProcessorDeliversActivityBeforeCodexOSC9(t *testing.T) {
+	manager, st := newTestManager(t)
+	manager.detectConfig.PermissionConfirmation = time.Millisecond
+	id := agent.ID("codex-osc9-ordering")
+	target := agent.New(
+		id,
+		agent.WithName("codex-osc9-ordering"),
+		agent.WithVendor("codex"),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = newManagedAgent(target)
+	manager.mu.Unlock()
+	commitTestState(t, manager, target, agent.StateStarting, "test start")
+	commitTestState(t, manager, target, agent.StateWorking, "test working")
+
+	entry := manager.reg.For("codex")
+	running := attachTestRuntime(t, manager, target, entry, true)
+	terminalActor, err := newTerminalActor(
+		mustInitialTerminalSize(t),
+		&terminalTestProcess{},
+		running.classifier,
+		entry.TerminalNotificationNormalizer,
+		running.observer,
+		running.vendor,
+		manager.clock,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new terminal actor: %v", err)
+	}
+	running.terminal = terminalActor
+
+	const secret = "private-command-and-path"
+	subscription := manager.hub.Subscribe(32)
+	defer manager.hub.Unsubscribe(subscription)
+	output := []byte("working\x1b]9;Approval requested: " + secret + "\x07")
+	if err := running.output.Feed(output, 0); err != nil {
+		t.Fatalf("feed output: %v", err)
+	}
+
+	stored, err := st.Replay(string(id))
+	if err != nil {
+		t.Fatalf("store replay: %v", err)
+	}
+	assertOSC9SecretAbsentFromRows(t, secret, stored)
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	assertOSC9SecretAbsentFromRows(t, secret, rows)
+	sanitizedOutput := joinOutputRows(t, rows)
+	if len(sanitizedOutput) != len(output) {
+		t.Fatalf("sanitized output length = %d, want %d", len(sanitizedOutput), len(output))
+	}
+	if !bytes.Contains(sanitizedOutput, []byte("Approval requested: ")) ||
+		bytes.Contains(sanitizedOutput, []byte(secret)) {
+		t.Fatalf("sanitized replay output = %q", sanitizedOutput)
+	}
+	var activitySeq, terminalSeq uint64
+	for _, row := range rows {
+		if row.Type != string(event.TypeAgentSignal) {
+			continue
+		}
+		switch signalPayloadVersion(row.Payload) {
+		case 1:
+			var payload event.SignalPayloadV1
+			if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+				t.Fatalf("decode activity signal: %v", err)
+			}
+			if payload.VendorEvent == string(detect.KindOutputActivity) {
+				activitySeq = row.Seq
+			}
+		case 4:
+			var payload event.SignalPayloadV4
+			if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+				t.Fatalf("decode terminal signal: %v", err)
+			}
+			if err := payload.Validate(); err != nil {
+				t.Fatalf("validate terminal signal: %v", err)
+			}
+			terminalSeq = row.Seq
+		}
+	}
+	if activitySeq == 0 || terminalSeq <= activitySeq {
+		t.Fatalf("activity seq=%d terminal seq=%d", activitySeq, terminalSeq)
+	}
+
+	waitForState(t, manager, id, agent.StateBlocked)
+	for {
+		select {
+		case streamed := <-subscription.C():
+			if strings.Contains(streamed.Payload, secret) {
+				t.Fatalf("Hub event payload contains OSC body: %+v", streamed)
+			}
+			if streamed.Type != event.TypeOutputChunk {
+				continue
+			}
+			payload, decodeErr := event.DecodeOutputChunkPayload(streamed.Payload)
+			if decodeErr != nil {
+				t.Fatalf("decode Hub output: %v", decodeErr)
+			}
+			data, decodeErr := payload.DecodeData()
+			if decodeErr != nil {
+				t.Fatalf("decode Hub output data: %v", decodeErr)
+			}
+			if bytes.Contains(data, []byte(secret)) {
+				t.Fatalf("Hub output contains OSC body: %q", data)
+			}
+		default:
+			goto hubDrained
+		}
+	}
+
+hubDrained:
+	tail, err := manager.TailRaw(context.Background(), string(id), nil)
+	if err != nil {
+		t.Fatalf("open raw tail: %v", err)
+	}
+	defer tail.Close()
+	for {
+		item, nextErr := tail.Next()
+		if nextErr != nil {
+			t.Fatalf("read raw tail: %v", nextErr)
+		}
+		switch typed := item.(type) {
+		case recording.RawOutput:
+			if bytes.Contains(typed.Data, []byte(secret)) {
+				t.Fatalf("raw tail contains OSC body: %q", typed.Data)
+			}
+		case recording.CaughtUp:
+			goto tailCaughtUp
+		}
+	}
+
+tailCaughtUp:
+	rows, err = manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay blocked state: %v", err)
+	}
+	assertOSC9SecretAbsentFromRows(t, secret, rows)
+	foundStateV4 := false
+	for _, row := range rows {
+		if row.Type != string(event.TypeStateChanged) ||
+			row.To != string(agent.StateBlocked) {
+			continue
+		}
+		var payload event.StateEvidencePayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			t.Fatalf("decode terminal state evidence: %v", err)
+		}
+		if err := payload.Validate(); err != nil {
+			t.Fatalf("validate terminal state evidence: %v", err)
+		}
+		foundStateV4 = payload.Terminal != nil &&
+			payload.Terminal.Protocol == "osc9"
+	}
+	if !foundStateV4 {
+		t.Fatal("terminal state evidence v4 was not committed")
+	}
+
+	explanation, err := manager.Explain(context.Background(), id, ExplainOptions{})
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	encoded, err := json.Marshal(explanation)
+	if err != nil {
+		t.Fatalf("encode explanation: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(secret)) {
+		t.Fatalf("explanation contains OSC body: %s", encoded)
+	}
+}
+
 func TestOutputProcessorOrdinaryErrorCreatesNoScreenEdge(t *testing.T) {
 	manager, _ := newTestManager(t)
 	clock := newTerminalTestClock(time.Unix(20, 0).UTC())
@@ -458,6 +644,7 @@ func TestOutputProcessorOrdinaryErrorCreatesNoScreenEdge(t *testing.T) {
 		mustInitialTerminalSize(t),
 		&terminalTestProcess{},
 		running.classifier,
+		nil,
 		running.observer,
 		running.vendor,
 		clock,
@@ -926,6 +1113,53 @@ func joinOutputRows(t *testing.T, rows []store.EventRow) []byte {
 	return output
 }
 
+func assertOSC9SecretAbsentFromRows(
+	t *testing.T,
+	secret string,
+	rows []store.EventRow,
+) {
+	t.Helper()
+
+	secretBytes := []byte(secret)
+	for _, row := range rows {
+		for _, value := range []string{
+			row.Type,
+			row.SessionID,
+			row.AgentID,
+			row.From,
+			row.To,
+			row.Reason,
+			row.Payload,
+		} {
+			if strings.Contains(value, secret) {
+				t.Fatalf("event at seq %d contains OSC body: %+v", row.Seq, row)
+			}
+		}
+		if bytes.Contains(row.OutputAttachment, secretBytes) {
+			t.Fatalf(
+				"event attachment at seq %d contains OSC body: %q",
+				row.Seq,
+				row.OutputAttachment,
+			)
+		}
+		if row.Type != string(event.TypeOutputChunk) ||
+			len(row.OutputAttachment) != 0 {
+			continue
+		}
+		payload, err := event.DecodeOutputChunkPayload(row.Payload)
+		if err != nil {
+			t.Fatalf("decode output chunk at seq %d: %v", row.Seq, err)
+		}
+		data, err := payload.DecodeData()
+		if err != nil {
+			t.Fatalf("decode output data at seq %d: %v", row.Seq, err)
+		}
+		if bytes.Contains(data, secretBytes) {
+			t.Fatalf("hydrated output at seq %d contains OSC body: %q", row.Seq, data)
+		}
+	}
+}
+
 func assertTokenAbsentFromRows(t *testing.T, token string, rows []store.EventRow) {
 	t.Helper()
 
@@ -1034,6 +1268,17 @@ func waitForTerminalSnapshot(t *testing.T, actor *terminalActor) {
 
 type countingOutputClock struct {
 	calls atomic.Int64
+}
+
+type countingTerminalNormalizer struct {
+	calls atomic.Int64
+}
+
+func (n *countingTerminalNormalizer) NormalizeOSC9(
+	term.OSC9Frame,
+) (detect.Signal, bool, error) {
+	n.calls.Add(1)
+	return detect.Signal{}, false, nil
 }
 
 func (c *countingOutputClock) Now() time.Time {

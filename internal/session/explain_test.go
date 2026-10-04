@@ -27,6 +27,11 @@ func TestManagerExplainDecodesKnownPayloadVersions(t *testing.T) {
 		LastOutputSeq: 9,
 		Evidence:      "approval prompt",
 	}
+	terminal := &event.TerminalAttributionPayload{
+		Protocol:      "osc9",
+		OutputOffset:  20,
+		LastOutputSeq: 19,
+	}
 
 	rows := []store.EventRow{
 		explainSignalRow(t, 1, id, base, event.SignalPayloadV1{
@@ -82,6 +87,24 @@ func TestManagerExplainDecodesKnownPayloadVersions(t *testing.T) {
 					Event: "claude.approval_prompt", Confidence: 1,
 				},
 				Screen: screen,
+			}),
+		explainSignalRow(t, 7, id, base.Add(6*time.Second), event.SignalPayloadV4{
+			SignalPayloadV1: event.SignalPayloadV1{
+				Version: 4, Source: "notify", Kind: "permission_requested",
+				Vendor: "codex", VendorEvent: "tui_notification", Scope: "root",
+				Notification: "approval-requested", Evidence: "approval requested",
+				Confidence: 1, ReceivedAt: base.Add(6 * time.Second).Format(time.RFC3339Nano),
+				Outcome: "candidate",
+			},
+			Terminal: terminal,
+		}),
+		explainStateRow(t, 8, id, base.Add(7*time.Second), "working", "blocked",
+			event.StateEvidencePayloadV4{
+				StateEvidencePayloadV1: event.StateEvidencePayloadV1{
+					Version: 4, Source: "notify",
+					Event: "tui_notification", Confidence: 1,
+				},
+				Terminal: terminal,
 			}),
 	}
 	for _, row := range rows {
@@ -141,6 +164,21 @@ func TestManagerExplainDecodesKnownPayloadVersions(t *testing.T) {
 		got.Rule != screen.Rule ||
 		got.Evidence != screen.Evidence {
 		t.Fatalf("v3 state evidence = %+v", got)
+	}
+	if got := explanation.Events[6]; got.Source != agent.EvidenceNotify ||
+		got.Kind != detect.KindPermissionRequested ||
+		got.Protocol != "osc9" ||
+		got.OutputOffset != terminal.OutputOffset ||
+		got.LastOutputSeq != terminal.LastOutputSeq ||
+		got.Evidence != "approval requested" {
+		t.Fatalf("v4 signal = %+v", got)
+	}
+	if got := explanation.Events[7]; got.Source != agent.EvidenceNotify ||
+		got.Protocol != "osc9" ||
+		got.OutputOffset != terminal.OutputOffset ||
+		got.LastOutputSeq != terminal.LastOutputSeq ||
+		got.Evidence != "tui_notification" {
+		t.Fatalf("v4 state evidence = %+v", got)
 	}
 }
 

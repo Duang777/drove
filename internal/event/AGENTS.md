@@ -24,6 +24,8 @@
   字段是原始绝对工作目录，Hub 只能发布公开版本。
 - v3 增加可选的 typed screen attribution；生产 writer 只对 screen 来源写 v3，
   其他来源继续写原版本。screen attribution 只保存稳定静态元数据和已提交输出位置。
+- v4 增加可选的 typed terminal attribution；terminal notify 不使用 delivery ID，
+  只保存协议、已提交 output offset 和最终输出序号。
 - `agent.resized` v1 记录成功生效的行列和当时的 exclusive output offset；
   attachment 身份不进入事件。
 - 事件带 `Seq` 全局递增序号与 `Timestamp`，是回放（`internal/session`）的排序依据。

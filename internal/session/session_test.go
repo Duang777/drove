@@ -2025,6 +2025,7 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 		mustInitialTerminalSize(t),
 		&terminalTestProcess{},
 		running.classifier,
+		nil,
 		running.observer,
 		running.vendor,
 		manager.clock,
@@ -2109,7 +2110,7 @@ func TestManagerCloseClosesAttachedTerminalActor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new committed chunk: %v", err)
 	}
-	if err := terminalActor.FeedCommitted(context.Background(), chunk); !errors.Is(
+	if _, err := terminalActor.FeedCommitted(context.Background(), chunk); !errors.Is(
 		err,
 		errTerminalActorClosed,
 	) {
@@ -2193,6 +2194,7 @@ func attachTestRuntime(
 	manager *Manager,
 	a *agent.Agent,
 	entry adapter.Entry,
+	terminalNotifications ...bool,
 ) *runningSession {
 	t.Helper()
 
@@ -2200,7 +2202,13 @@ func attachTestRuntime(
 	if !ok {
 		t.Fatalf("managed agent %q is not registered", a.ID())
 	}
-	running, _, _, err := manager.prepareManagedRuntime(managed, entry)
+	notificationsEnabled := len(terminalNotifications) > 0 &&
+		terminalNotifications[0]
+	running, _, _, err := manager.prepareManagedRuntimeWithTerminalNotifications(
+		managed,
+		entry,
+		notificationsEnabled,
+	)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}

@@ -469,6 +469,27 @@ func decodeStateAttribution(row store.EventRow) (string, string, error) {
 			rule = payload.Screen.Rule
 		}
 		return payload.Source, rule, nil
+	case 4:
+		var payload event.StateEvidencePayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return "", "", fmt.Errorf(
+				"recording: decode state evidence at seq %d: %w",
+				row.Seq,
+				err,
+			)
+		}
+		if err := payload.Validate(); err != nil {
+			return "", "", fmt.Errorf(
+				"recording: validate state evidence at seq %d: %w",
+				row.Seq,
+				err,
+			)
+		}
+		rule := ""
+		if payload.Screen != nil {
+			rule = payload.Screen.Rule
+		}
+		return payload.Source, rule, nil
 	default:
 		return "", "", nil
 	}

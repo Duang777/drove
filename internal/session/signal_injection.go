@@ -46,11 +46,12 @@ type signalInjectionFile interface {
 }
 
 type injectionResult struct {
-	mode   agent.SignalInjectionMode
-	status agent.SignalInjectionStatus
-	reason agent.SignalInjectionReason
-	args   []string
-	dir    string
+	mode                  agent.SignalInjectionMode
+	status                agent.SignalInjectionStatus
+	reason                agent.SignalInjectionReason
+	args                  []string
+	dir                   string
+	terminalNotifications bool
 }
 
 // WithSignalInjection configures session-only vendor signal injection.
@@ -178,6 +179,7 @@ func (m *Manager) prepareSignalInjection(
 	result.status = agent.InjectionInjected
 	result.reason = agent.InjectionReasonSessionConfig
 	result.args = append([]string(nil), plan.Args...)
+	result.terminalNotifications = plan.TerminalNotifications
 	return result, nil
 }
 

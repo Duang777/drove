@@ -432,9 +432,21 @@ The authority table is:
 | `off` or `fallback` | approval `cleared`, current Blocked | 500 ms Working candidate |
 | `off` or `fallback` | idle or interrupt `present` | 1 s Idle candidate |
 
-An opposing edge, authoritative hook activity, process fact, or incompatible
-state cancels the relevant candidate. Cancellation does not cancel an
-unrelated candidate.
+An opposing edge, a conflicting authoritative hook, a process fact, or an
+incompatible state cancels the relevant candidate. Cancellation does not cancel
+an unrelated candidate.
+
+After hook activation, the cancellation rules are:
+
+| Hook signal | Screen candidates |
+| --- | --- |
+| root turn start, root tool activity, human-input resolution, human-input requirement, or subagent start | cancel all because the hook establishes the current root state |
+| root permission request | cancel before arming the permission candidate |
+| root turn stop, turn failure, interrupt, or idle prompt | cancel before arming the Idle candidate |
+| permission resolution, repeated session start, observed/task/session-end facts, subagent tool activity, or subagent stop | preserve |
+
+The first accepted hook still cancels every fallback candidate when it changes
+the session from awaiting or fallback authority to active hook authority.
 
 Screen rules never produce Done. Screen confidence does not bypass the table.
 

@@ -138,6 +138,7 @@ type runningSession struct {
 	process        processSession
 	observer       *observationActor
 	classifier     *adapter.ScreenClassifier
+	terminalNotice adapter.TerminalNotificationNormalizer
 	terminal       *terminalActor
 	output         *outputProcessor
 	callbacksReady chan struct{}
@@ -396,7 +397,11 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			cleanupErr,
 		)
 	}
-	running, processEnv, _, err := m.prepareManagedRuntime(managed, entry)
+	running, processEnv, _, err := m.prepareManagedRuntimeWithTerminalNotifications(
+		managed,
+		entry,
+		injection.terminalNotifications,
+	)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)
@@ -522,6 +527,7 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 		plan.terminalSize,
 		sess,
 		running.classifier,
+		running.terminalNotice,
 		running.observer,
 		running.vendor,
 		m.clock,
@@ -645,11 +651,13 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	running, processEnv, _, err := m.prepareManagedRuntimeAtOffset(
-		managed,
-		entry,
-		initialOutputOffset,
-	)
+	running, processEnv, _, err := m.
+		prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+			managed,
+			entry,
+			initialOutputOffset,
+			injection.terminalNotifications,
+		)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)

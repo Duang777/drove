@@ -17,6 +17,7 @@ import (
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
+	"github.com/Duang777/drove/internal/term"
 )
 
 const (
@@ -156,13 +157,45 @@ func (m *Manager) prepareManagedRuntime(
 	managed *managedAgent,
 	entry adapter.Entry,
 ) (*runningSession, []string, string, error) {
-	return m.prepareManagedRuntimeAtOffset(managed, entry, 0)
+	return m.prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+		managed,
+		entry,
+		0,
+		false,
+	)
+}
+
+func (m *Manager) prepareManagedRuntimeWithTerminalNotifications(
+	managed *managedAgent,
+	entry adapter.Entry,
+	terminalNotifications bool,
+) (*runningSession, []string, string, error) {
+	return m.prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+		managed,
+		entry,
+		0,
+		terminalNotifications,
+	)
 }
 
 func (m *Manager) prepareManagedRuntimeAtOffset(
 	managed *managedAgent,
 	entry adapter.Entry,
 	initialOutputOffset uint64,
+) (*runningSession, []string, string, error) {
+	return m.prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+		managed,
+		entry,
+		initialOutputOffset,
+		false,
+	)
+}
+
+func (m *Manager) prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+	managed *managedAgent,
+	entry adapter.Entry,
+	initialOutputOffset uint64,
+	terminalNotifications bool,
 ) (*runningSession, []string, string, error) {
 	if managed == nil || managed.agent == nil {
 		return nil, nil, "", errors.New("session: managed Agent is required")
@@ -182,6 +215,25 @@ func (m *Manager) prepareManagedRuntimeAtOffset(
 			err,
 		)
 	}
+	var (
+		terminalNotice    adapter.TerminalNotificationNormalizer
+		terminalSanitizer *term.OSC9Sanitizer
+	)
+	if terminalNotifications {
+		if !entry.SupportsTerminalNotifications() {
+			return nil, nil, "", errors.New(
+				"session: injected terminal notifications have no adapter normalizer",
+			)
+		}
+		terminalSanitizer, err = entry.NewOSC9Sanitizer()
+		if err != nil {
+			return nil, nil, "", fmt.Errorf(
+				"session: create terminal notification sanitizer: %w",
+				err,
+			)
+		}
+		terminalNotice = entry.TerminalNotificationNormalizer
+	}
 
 	observer, err := newManagedObservationActor(
 		managed,
@@ -196,18 +248,20 @@ func (m *Manager) prepareManagedRuntimeAtOffset(
 	running := &runningSession{
 		observer:       observer,
 		classifier:     classifier,
+		terminalNotice: terminalNotice,
 		callbacksReady: make(chan struct{}),
 		signalReady:    make(chan struct{}),
 		processExited:  make(chan struct{}),
 		vendor:         a.Vendor(),
 	}
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
-		running.output = newOutputProcessorAtOffset(
+		running.output = newOutputProcessorAtOffsetWithSanitizer(
 			m,
 			a.ID(),
 			running,
 			"",
 			initialOutputOffset,
+			terminalSanitizer,
 		)
 		return running, nil, "", nil
 	}
@@ -224,12 +278,13 @@ func (m *Manager) prepareManagedRuntimeAtOffset(
 	}
 	running.signalDigest = digest
 	running.hasSignalToken = true
-	running.output = newOutputProcessorAtOffset(
+	running.output = newOutputProcessorAtOffsetWithSanitizer(
 		m,
 		a.ID(),
 		running,
 		token,
 		initialOutputOffset,
+		terminalSanitizer,
 	)
 	environment := []string{
 		SignalAgentIDEnv + "=" + string(a.ID()),

@@ -1,8 +1,8 @@
 # 配置 Agent 状态 hooks
 
-Drove 通过 Claude Code command hooks 和 Codex notify 接收状态信号。默认路径
-只修改 Drove 启动的子进程，不修改厂商持久配置，也不代替你接受 workspace、
-project 或 hook trust。
+Drove 通过 Claude Code command hooks、Codex legacy notify 和 approval-only
+OSC 9 接收状态信号。默认路径只修改 Drove 启动的子进程，不修改厂商持久配置，
+也不代替你接受 workspace、project 或 hook trust。
 
 ## 默认会话注入
 
@@ -10,8 +10,10 @@ project 或 hook trust。
 
 - Claude：在 `<data_dir>/sessions/<agent-id>/claude-settings.json` 写入仅含
   hooks 的 `0600` 临时文件，并通过 `--settings` 加载。进程退出后删除目录。
-- Codex：通过 `-c notify=[...]` 注入 argv relay，不创建配置文件。notify 只
-  证明 turn 已结束，因此只能确认 Idle，不能把会话标记为 `hook_active`。
+- Codex：通过四个 `-c` 参数原子注入 argv relay、`approval-requested`
+  allowlist、`osc9` method 和 `always` condition，不创建配置文件。legacy notify
+  只证明 turn 已结束，因此只能确认 Idle；OSC 9 只提供等待审批的 Blocked
+  候选。两者都不能把会话标记为 `hook_active`。
 
 用户或项目配置仍按厂商规则生效。Claude 会合并各层 hooks；相同 command 会
 去重。`disableAllHooks` 和 managed policy 仍可阻止注入的 hook。Codex 已手工
@@ -32,9 +34,10 @@ project 或 hook trust。
 }
 ```
 
-调用方显式传入的 Claude `--bare`、Claude `--settings` 或 Codex
-`-c notify=...` 由调用方拥有。Drove 不覆盖这些参数，并把本次注入记录为
-`skipped`。会话 API 通过
+调用方显式传入的 Claude `--bare`、Claude `--settings`，或 Codex 的
+`notify`、`tui.notifications`、`tui.notification_method`、
+`tui.notification_condition` 中任一配置，由调用方拥有。Drove 不覆盖这些参数，
+并把整组 Codex 注入记录为 `skipped`。会话 API 通过
 `signal_injection`、`signal_injection_status` 和 `signal_injection_reason`
 报告启动结果；`hook_status` 单独报告运行时权威状态。
 
@@ -42,8 +45,11 @@ project 或 hook trust。
 为 `relay_unavailable`。`required` 仍会等待手工配置的原生 hook，并在 5 秒内
 没有收到合法 hook 时停止会话。
 
-Codex 的 OSC 9 通知和屏幕模型由 Issue #14 跟踪。Drove 不注入未文档化的
-session trust hash，也不使用 trust bypass。
+完整 Codex 注入成功后，Drove 只扫描已提交的 direct 或单层 tmux OSC 9。固定
+审批分类前缀保留，command、path、server name 和未知正文在 Store、Hub、回放与
+raw tail 前等长打码。该能力由 [Issue #40](https://github.com/Duang777/drove/issues/40)
+和 [spec 012](../specs/012-codex-osc9-notifications/spec.md) 定义。Drove 不注入
+未文档化的 session trust hash，也不使用 trust bypass。
 
 持久安装器是延期的可选能力。它只适用于需要让 Drove 之外的厂商进程也上报
 状态的场景。
@@ -339,8 +345,9 @@ drove up claude --hooks required
 
 - `auto` 是 Claude 和 Codex 的默认值。Drove 先尝试会话注入，再等待 5 秒；
   如果未收到合法原生 hook，则启用终端启发式。Claude 通常通过注入的
-  `SessionStart` 激活。Codex notify 不激活 hooks，后续合法原生 hook 仍可成为
-  权威信号源。
+  `SessionStart` 激活。Codex legacy notify 和 OSC 9 都不激活 hooks；进入
+  fallback 后，前者提供 Idle 候选，后者提供经 750 ms 确认的 Blocked 候选。
+  后续合法原生 hook 仍可成为权威信号源。
 - `off` 不注入 relay 环境，并立即启用终端启发式。
 - `required` 只接受原生 hook 权威。如果 5 秒内没有合法 hook，Drove 会停止
   会话并返回错误；Codex notify 不能满足该策略。
@@ -393,8 +400,10 @@ text 或 capability token。
   状态，Drove 没有写入该文件。
 
 自动化测试还覆盖全部受支持事件、hook 与 fallback 的 Blocked 恢复、timer
-竞态、持久化失败和重启恢复。
+竞态、持久化失败和重启恢复。OSC 9 测试还覆盖 direct BEL、direct ST、Codex
+单层 tmux passthrough、任意分块，以及 Store attachment、Hub、公开 replay、
+raw tail 和 explain 的正文脱敏。
 
-Codex TUI 会在绘制首屏前查询终端能力。当前 PTY 桥接器按行交付输出，不能
-完成该终端查询握手。真实 Codex notify 因此通过 oneshot 路径验证；TUI 屏幕
-处理和 OSC 解析继续由 Issue #14 跟踪。
+OSC 9 framing 与三个审批前缀来自 Codex CLI `rust-v0.160.0` 源码提交
+`a956835d020762cb2b570053af06f643a11c0ecc`。仓库中的 direct 和 tmux fixture
+是带合成脱敏正文的源码派生测试向量，不宣称是现场终端录制。

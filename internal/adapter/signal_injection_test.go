@@ -40,6 +40,25 @@ func TestInjectSignalsValidatesLaunchPaths(t *testing.T) {
 	}
 }
 
+func TestInjectSignalsRejectsTerminalNotificationsOnHookChannel(t *testing.T) {
+	_, err := injectSignals(
+		signalInjectorFunc(func(SignalInjectionRequest) (SignalInjectionPlan, error) {
+			return SignalInjectionPlan{
+				Channel:               SignalChannelHook,
+				TerminalNotifications: true,
+			}, nil
+		}),
+		SignalInjectionRequest{
+			Mode:       agent.RunModeInteractive,
+			RelayPath:  "/tmp/drove",
+			SessionDir: "/tmp/session",
+		},
+	)
+	if err == nil {
+		t.Fatal("hook plan enabled terminal notifications")
+	}
+}
+
 func TestShellCommandQuotesEveryArgument(t *testing.T) {
 	got := shellCommand(
 		"/tmp/drove cli",
@@ -49,4 +68,12 @@ func TestShellCommandQuotesEveryArgument(t *testing.T) {
 	if got != want {
 		t.Fatalf("shell command = %q, want %q", got, want)
 	}
+}
+
+type signalInjectorFunc func(SignalInjectionRequest) (SignalInjectionPlan, error)
+
+func (f signalInjectorFunc) InjectSignals(
+	request SignalInjectionRequest,
+) (SignalInjectionPlan, error) {
+	return f(request)
 }
