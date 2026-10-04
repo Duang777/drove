@@ -97,7 +97,10 @@ func (a *Archive) Timeline(ctx context.Context, sessionID string) (Timeline, err
 
 	cursor := Origin
 	var currentState agent.State
+	var previous store.EventRow
 	for _, row := range rows {
+		predecessor := previous
+		previous = row
 		if result.AgentID == "" {
 			result.AgentID = row.AgentID
 		}
@@ -137,8 +140,9 @@ func (a *Archive) Timeline(ctx context.Context, sessionID string) (Timeline, err
 
 		from := agent.State(row.From)
 		to := agent.State(row.To)
+		resumeTransition := validResumeTimelineTransition(predecessor, row, from, to)
 		if !agent.Valid(from) || !agent.Valid(to) ||
-			!agent.CanRecoverTransition(from, to) {
+			(!resumeTransition && !agent.CanRecoverTransition(from, to)) {
 			return Timeline{}, fmt.Errorf(
 				"recording: invalid state transition at seq %d: %q -> %q",
 				row.Seq,
@@ -214,6 +218,25 @@ func (a *Archive) Timeline(ctx context.Context, sessionID string) (Timeline, err
 		})
 	}
 	return result, nil
+}
+
+func validResumeTimelineTransition(
+	predecessor store.EventRow,
+	row store.EventRow,
+	from agent.State,
+	to agent.State,
+) bool {
+	if from != agent.StateStopped ||
+		to != agent.StateStarting ||
+		predecessor.Seq+1 != row.Seq ||
+		predecessor.Type != string(event.TypeAgentResumed) ||
+		predecessor.Reason != "requested" ||
+		predecessor.SessionID != row.SessionID ||
+		predecessor.AgentID != row.AgentID {
+		return false
+	}
+	_, err := event.DecodeAgentResumedPayload(predecessor.Payload)
+	return err == nil
 }
 
 // Blocked returns one one-based Blocked occurrence from a captured timeline.

@@ -167,7 +167,7 @@ func newSnapshotTestRuntime(
 		process: process,
 		vendor:  "generic",
 	}
-	running.output = newOutputProcessor(manager, id, running, "", nil)
+	running.output = newOutputProcessor(manager, id, running, "")
 	running.terminal = newTerminalTestActor(
 		t,
 		"generic",

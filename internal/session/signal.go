@@ -156,6 +156,45 @@ func isLoopbackHost(host string) bool {
 func (m *Manager) prepareManagedRuntime(
 	managed *managedAgent,
 	entry adapter.Entry,
+) (*runningSession, []string, string, error) {
+	return m.prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+		managed,
+		entry,
+		0,
+		false,
+	)
+}
+
+func (m *Manager) prepareManagedRuntimeWithTerminalNotifications(
+	managed *managedAgent,
+	entry adapter.Entry,
+	terminalNotifications bool,
+) (*runningSession, []string, string, error) {
+	return m.prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+		managed,
+		entry,
+		0,
+		terminalNotifications,
+	)
+}
+
+func (m *Manager) prepareManagedRuntimeAtOffset(
+	managed *managedAgent,
+	entry adapter.Entry,
+	initialOutputOffset uint64,
+) (*runningSession, []string, string, error) {
+	return m.prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+		managed,
+		entry,
+		initialOutputOffset,
+		false,
+	)
+}
+
+func (m *Manager) prepareManagedRuntimeAtOffsetWithTerminalNotifications(
+	managed *managedAgent,
+	entry adapter.Entry,
+	initialOutputOffset uint64,
 	terminalNotifications bool,
 ) (*runningSession, []string, string, error) {
 	if managed == nil || managed.agent == nil {
@@ -216,11 +255,12 @@ func (m *Manager) prepareManagedRuntime(
 		vendor:         a.Vendor(),
 	}
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
-		running.output = newOutputProcessor(
+		running.output = newOutputProcessorAtOffsetWithSanitizer(
 			m,
 			a.ID(),
 			running,
 			"",
+			initialOutputOffset,
 			terminalSanitizer,
 		)
 		return running, nil, "", nil
@@ -238,11 +278,12 @@ func (m *Manager) prepareManagedRuntime(
 	}
 	running.signalDigest = digest
 	running.hasSignalToken = true
-	running.output = newOutputProcessor(
+	running.output = newOutputProcessorAtOffsetWithSanitizer(
 		m,
 		a.ID(),
 		running,
 		token,
+		initialOutputOffset,
 		terminalSanitizer,
 	)
 	environment := []string{

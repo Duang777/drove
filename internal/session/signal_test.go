@@ -184,7 +184,9 @@ func TestStartRejectsInvalidHookPolicyBeforePersistence(t *testing.T) {
 }
 
 func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
-	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	manager, st := newSignalTestManager(t, "http://127.0.0.1:7373")
+	subscription := manager.hub.Subscribe(64)
+	defer manager.hub.Unsubscribe(subscription)
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Hooks:   agent.HooksAuto,
@@ -333,8 +335,38 @@ func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		if audit.Version != 1 || audit.Source == "" || audit.VendorEvent == "" {
 			t.Fatalf("audit = %+v", audit)
 		}
-		if audit.Vendor == "claude" && audit.VendorSessionRef != "vendor-session" {
-			t.Fatalf("hook audit session reference = %q", audit.VendorSessionRef)
+		if audit.VendorSessionReference() != "" {
+			t.Fatalf("public hook audit exposed session reference = %q", audit.VendorSessionReference())
+		}
+	}
+
+	persisted, err := st.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay persisted events: %v", err)
+	}
+	storedReference := false
+	for _, row := range persisted {
+		if row.Type == string(event.TypeAgentSignal) &&
+			strings.Contains(row.Payload, `"vendor_session_ref":"vendor-session"`) {
+			storedReference = true
+			break
+		}
+	}
+	if !storedReference {
+		t.Fatal("persisted signal history lost the vendor session reference")
+	}
+
+	for range rows {
+		select {
+		case published := <-subscription.C():
+			if published.Type == event.TypeAgentSignal &&
+				(strings.Contains(published.Payload, "vendor_session_ref") ||
+					strings.Contains(published.Payload, "vendor_session_id") ||
+					strings.Contains(published.Payload, "vendor-session")) {
+				t.Fatalf("Hub signal exposed private session reference: %+v", published)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for published event")
 		}
 	}
 }
@@ -760,7 +792,6 @@ func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 	running, _, _, err := manager.prepareManagedRuntime(
 		managed,
 		manager.reg.For("claude"),
-		false,
 	)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)

@@ -89,9 +89,10 @@ type terminalActor struct {
 	clock      observationClock
 	fail       func(error)
 
-	requests chan terminalRequest
-	stop     chan struct{}
-	done     chan struct{}
+	initialOutputOffset uint64
+	requests            chan terminalRequest
+	stop                chan struct{}
+	done                chan struct{}
 
 	replyErrors chan error
 	replyDone   chan struct{}
@@ -127,6 +128,30 @@ func newTerminalActor(
 	clock observationClock,
 	fail func(error),
 ) (*terminalActor, error) {
+	return newTerminalActorAtOffset(
+		size,
+		process,
+		classifier,
+		normalizer,
+		observer,
+		vendor,
+		clock,
+		fail,
+		0,
+	)
+}
+
+func newTerminalActorAtOffset(
+	size term.Size,
+	process terminalProcess,
+	classifier *adapter.ScreenClassifier,
+	normalizer adapter.TerminalNotificationNormalizer,
+	observer terminalObserver,
+	vendor string,
+	clock observationClock,
+	fail func(error),
+	initialOutputOffset uint64,
+) (*terminalActor, error) {
 	if process == nil || classifier == nil {
 		return nil, errors.New(
 			"session: terminal actor requires process and classifier",
@@ -143,19 +168,20 @@ func newTerminalActor(
 		return nil, fmt.Errorf("session: create terminal controller: %w", err)
 	}
 	actor := &terminalActor{
-		controller:  controller,
-		classifier:  classifier,
-		normalizer:  normalizer,
-		process:     process,
-		observer:    observer,
-		vendor:      vendor,
-		clock:       clock,
-		fail:        fail,
-		requests:    make(chan terminalRequest, terminalInboxSize),
-		stop:        make(chan struct{}),
-		done:        make(chan struct{}),
-		replyErrors: make(chan error, 1),
-		replyDone:   make(chan struct{}),
+		controller:          controller,
+		classifier:          classifier,
+		normalizer:          normalizer,
+		process:             process,
+		observer:            observer,
+		vendor:              vendor,
+		clock:               clock,
+		fail:                fail,
+		initialOutputOffset: initialOutputOffset,
+		requests:            make(chan terminalRequest, terminalInboxSize),
+		stop:                make(chan struct{}),
+		done:                make(chan struct{}),
+		replyErrors:         make(chan error, 1),
+		replyDone:           make(chan struct{}),
 	}
 	if normalizer != nil {
 		actor.osc9 = term.NewOSC9Scanner()
@@ -309,7 +335,7 @@ func (a *terminalActor) submit(
 
 func (a *terminalActor) run() {
 	defer close(a.done)
-	state := terminalActorState{}
+	state := terminalActorState{nextOutputOffset: a.initialOutputOffset}
 	var timer observationTimer
 	var timerC <-chan time.Time
 	controllerReplyErrors := a.controller.Errors()

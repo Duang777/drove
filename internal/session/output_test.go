@@ -200,7 +200,6 @@ func TestOutputProcessorDefersActivityUntilBufferedBytesCommit(t *testing.T) {
 		id,
 		running,
 		testSignalToken,
-		nil,
 	)
 
 	first := []byte(testSignalToken[:8])
@@ -315,7 +314,6 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		a.ID(),
 		running,
 		"",
-		nil,
 	)
 	terminalClock := newTerminalTestClock(time.Unix(1, 0).UTC())
 	normalizer := &countingTerminalNormalizer{}
@@ -992,7 +990,7 @@ func TestOutputProcessorPostApplyResizeCommitFailureFailsStop(t *testing.T) {
 	id := agent.ID("resize-commit-failure")
 	process := &terminalTestProcess{}
 	running := &runningSession{process: process, vendor: "generic"}
-	running.output = newOutputProcessor(manager, id, running, "", nil)
+	running.output = newOutputProcessor(manager, id, running, "")
 	running.terminal = newTerminalTestActor(
 		t,
 		"generic",
@@ -1096,7 +1094,6 @@ func attachOutputOnlyRuntime(
 		id,
 		running,
 		token,
-		nil,
 	)
 	manager.mu.Lock()
 	manager.sessions[id] = running

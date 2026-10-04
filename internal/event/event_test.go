@@ -180,6 +180,53 @@ func TestAgentResumedPayloadAndDraft(t *testing.T) {
 	}
 }
 
+func TestAgentSignalDraftKeepsSessionReferencePrivate(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		reference string
+		payload   string
+	}{
+		{
+			name:      "current",
+			reference: "vendor-session-1",
+			payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root",` +
+				`"vendor_session_ref":"vendor-session-1","confidence":1,` +
+				`"received_at":"2026-10-04T10:00:00Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000",` +
+				`"outcome":"observed"}`,
+		},
+		{
+			name:      "legacy",
+			reference: "旧会话",
+			payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_id":"旧会话",` +
+				`"confidence":1,"received_at":"2026-10-04T10:00:00Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000",` +
+				`"outcome":"observed"}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			committed, err := Commit(
+				11,
+				time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC),
+				NewAgentSignalDraft("agent-1", "agent-1", test.payload),
+			)
+			if err != nil {
+				t.Fatalf("commit signal draft: %v", err)
+			}
+			if strings.Contains(committed.Payload, test.reference) ||
+				strings.Contains(committed.Payload, "vendor_session_ref") ||
+				strings.Contains(committed.Payload, "vendor_session_id") {
+				t.Fatalf("public signal payload exposed session reference: %s", committed.Payload)
+			}
+			if !strings.Contains(committed.StoredPayload(), test.reference) {
+				t.Fatalf("stored signal payload lost session reference: %s", committed.StoredPayload())
+			}
+		})
+	}
+}
+
 func TestPrivateSessionLifecycleDraftSeparatesStoredPayload(t *testing.T) {
 	const (
 		publicPayload = `{"version":2,"name":"agent"}`
@@ -439,6 +486,13 @@ func TestSignalPayloadVendorSessionReferenceCompatibility(t *testing.T) {
 	}
 	if got := legacy.VendorSessionReference(); got != "legacy-session" {
 		t.Fatalf("legacy session reference = %q", got)
+	}
+	legacy.VendorSessionID = "旧会话 "
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("validate pre-upgrade legacy payload: %v", err)
+	}
+	if got := legacy.VendorSessionReference(); got != "旧会话 " {
+		t.Fatalf("pre-upgrade legacy session reference = %q", got)
 	}
 
 	for _, ref := range []string{" leading", "trailing ", "line\nbreak", strings.Repeat("x", 257)} {

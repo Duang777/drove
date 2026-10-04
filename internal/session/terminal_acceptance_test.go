@@ -319,7 +319,6 @@ func newTerminalAcceptanceHarness(
 	running, _, _, err := manager.prepareManagedRuntime(
 		managed,
 		manager.reg.For(vendor),
-		false,
 	)
 	if err != nil {
 		t.Fatalf("prepare acceptance runtime: %v", err)

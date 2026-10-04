@@ -15,7 +15,9 @@
 - `Hub` 内部用注册表 + buffered channel 扇出；订阅者需在注册时声明 buffer 大小，Hub 不阻塞发布者（慢订阅者被丢弃并计数，见 `Dropped`）。
 - `Hub.PublishBatch` 先校验整个连续批次，再向订阅者发布；全局序号由 `internal/session` 的 Committer 独占分配。
 - `agent.signal` 与新 `state_changed` payload 使用版本化、可校验的脱敏元数据；
-  v1 覆盖 Phase 1A 来源，v2 增加非权威 notify 来源，恢复层跳过未知审计版本。
+  v1 覆盖 Phase 1A 来源，v2 增加非权威 notify 来源，恢复层跳过未知审计版本。opaque
+  vendor session ref 仅保留在 SQLite payload，Hub 与其它公开事件视图会删除当前和
+  legacy 字段。
 - `agent.resumed` 记录显式原生恢复；SQLite 载荷保留 opaque vendor ref 供恢复校验，
   Hub 与其它公开事件视图只暴露版本号。
 - `session_lifecycle(created)` 可分别携带公开 payload 与私有持久 payload；当前私有

@@ -380,20 +380,26 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		agent.ID(r.PathValue("id")),
 	)
 	if err != nil {
-		switch {
-		case errors.Is(err, session.ErrUnknownAgent):
-			writeErr(w, http.StatusNotFound, err.Error())
-		case errors.Is(err, session.ErrResumeConflict):
-			writeErr(w, http.StatusConflict, err.Error())
-		case errors.Is(err, session.ErrManagerClosed),
-			errors.Is(err, session.ErrEventCommitterUnavailable):
-			writeErr(w, http.StatusServiceUnavailable, err.Error())
-		default:
-			writeErr(w, http.StatusInternalServerError, err.Error())
-		}
+		writeResumeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+func writeResumeError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, session.ErrUnknownAgent):
+		writeErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, session.ErrResumeConflict):
+		writeErr(w, http.StatusConflict, err.Error())
+	case errors.Is(err, session.ErrHookRequired),
+		errors.Is(err, session.ErrSignalOriginUnavailable),
+		errors.Is(err, session.ErrManagerClosed),
+		errors.Is(err, session.ErrEventCommitterUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+	default:
+		writeErr(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 const maxInputRequestBytes = 6*session.MaxInputBytes + 1024

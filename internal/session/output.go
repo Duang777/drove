@@ -58,10 +58,11 @@ type outputProcessor struct {
 	id      agent.ID
 	running *runningSession
 
-	redactor  streamingRedactor
-	sanitizer *term.OSC9Sanitizer
-	requests  chan outputRequest
-	done      chan struct{}
+	redactor            streamingRedactor
+	sanitizer           *term.OSC9Sanitizer
+	initialOutputOffset uint64
+	requests            chan outputRequest
+	done                chan struct{}
 
 	admissionMu sync.RWMutex
 	closing     bool
@@ -94,16 +95,44 @@ func newOutputProcessor(
 	id agent.ID,
 	running *runningSession,
 	signalToken string,
+) *outputProcessor {
+	return newOutputProcessorAtOffset(manager, id, running, signalToken, 0)
+}
+
+func newOutputProcessorAtOffset(
+	manager *Manager,
+	id agent.ID,
+	running *runningSession,
+	signalToken string,
+	initialOutputOffset uint64,
+) *outputProcessor {
+	return newOutputProcessorAtOffsetWithSanitizer(
+		manager,
+		id,
+		running,
+		signalToken,
+		initialOutputOffset,
+		nil,
+	)
+}
+
+func newOutputProcessorAtOffsetWithSanitizer(
+	manager *Manager,
+	id agent.ID,
+	running *runningSession,
+	signalToken string,
+	initialOutputOffset uint64,
 	sanitizer *term.OSC9Sanitizer,
 ) *outputProcessor {
 	processor := &outputProcessor{
-		manager:   manager,
-		id:        id,
-		running:   running,
-		redactor:  newStreamingRedactor([]byte(signalToken)),
-		sanitizer: sanitizer,
-		requests:  make(chan outputRequest, outputInboxSize),
-		done:      make(chan struct{}),
+		manager:             manager,
+		id:                  id,
+		running:             running,
+		redactor:            newStreamingRedactor([]byte(signalToken)),
+		sanitizer:           sanitizer,
+		initialOutputOffset: initialOutputOffset,
+		requests:            make(chan outputRequest, outputInboxSize),
+		done:                make(chan struct{}),
 	}
 	go processor.run()
 	return processor
@@ -288,6 +317,7 @@ func (p *outputProcessor) run() {
 	state := outputProcessorState{
 		redactor:             p.redactor,
 		sanitizer:            p.sanitizer,
+		nextOutputOffset:     p.initialOutputOffset,
 		effectiveSize:        initialSize,
 		attachments:          make(map[AttachmentID]*attachmentState),
 		acceptingAttachments: true,

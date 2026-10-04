@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -205,6 +206,75 @@ func TestEventTailPreservesEnvelopesAndCancellationIsIndependent(t *testing.T) {
 	live := nextEventRecord(t, second)
 	if live.Event.Seq != 2 || live.Event.Payload != "failed" || live.Historical {
 		t.Fatalf("live event = %+v", live)
+	}
+}
+
+func TestEventTailRedactsPrivateSessionMetadata(t *testing.T) {
+	st := openTailStore(t)
+	base := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	appendTailRows(t, st, 0, []store.EventRow{
+		tailEventRow(
+			1,
+			base,
+			"s1",
+			event.TypeSessionLifecycle,
+			"created",
+			`{"version":2,"name":"agent","vendor":"claude","working_dir":"/private/project"}`,
+		),
+		tailEventRow(
+			2,
+			base.Add(time.Second),
+			"s1",
+			event.TypeAgentSignal,
+			"observed",
+			`{"version":1,"source":"hook","kind":"session_started","vendor":"claude",`+
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_ref":"vendor-ref",`+
+				`"confidence":1,"received_at":"2026-10-04T12:00:01Z",`+
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		),
+		tailEventRow(
+			3,
+			base.Add(2*time.Second),
+			"s1",
+			event.TypeAgentResumed,
+			"requested",
+			`{"version":1,"vendor_session_ref":"vendor-ref"}`,
+		),
+	})
+	tail, err := NewArchive(st, newTailClock(3)).TailEvents(
+		context.Background(),
+		"s1",
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("tail events: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = tail.Close()
+	})
+
+	records := []EventRecord{
+		nextEventRecord(t, tail),
+		nextEventRecord(t, tail),
+		nextEventRecord(t, tail),
+	}
+	for _, private := range []string{
+		"/private/project",
+		"vendor-ref",
+		"working_dir",
+		"vendor_session_ref",
+		"vendor_session_id",
+	} {
+		for _, record := range records {
+			if strings.Contains(record.Event.Payload, private) {
+				t.Fatalf(
+					"event %d exposed private value %q in %s",
+					record.Event.Seq,
+					private,
+					record.Event.Payload,
+				)
+			}
+		}
 	}
 }
 

@@ -204,6 +204,29 @@ func TestHandleResumeReturnsExistingAgentAndMapsConflicts(t *testing.T) {
 	}
 }
 
+func TestWriteResumeErrorMapsUnavailableHookAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "required hook", err: session.ErrHookRequired},
+		{name: "missing callback origin", err: session.ErrSignalOriginUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			writeResumeError(response, test.err)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					http.StatusServiceUnavailable,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
 func TestHandleExplainReturnsAttachedTypedResponse(t *testing.T) {
 	server, manager, _ := newTestServer(t)
 	status, err := manager.Start(context.Background(), session.StartRequest{
