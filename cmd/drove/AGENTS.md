@@ -2,7 +2,9 @@
 
 ## 职责
 
-**CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log / stop / version），所有会话操作都经 `internal/client` 与常驻 daemon 通信；daemon 未运行时自动拉起（docker 式体验）。
+**CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log /
+explain / stop / version），所有会话操作都经 `internal/client` 与常驻 daemon
+通信；daemon 未运行时自动拉起（docker 式体验）。
 
 ## 关键设计
 
@@ -20,6 +22,9 @@
 - `drove ps` 列出全部会话；`drove log <id>` 默认只向 stdout 回放终端字节，
   `--plain` 使用流式清洗器移除跨事件控制序列；旧 `output` 事件补一个换行，
   已过期的 `output.chunk` 不输出占位文本；`drove stop <id>` 停止（幂等）。
+- `drove explain <id>` 按时间顺序打印类型化决策；`--limit` 限制最近事件数，
+  `--json` 保持 stdout 仅含响应 JSON。只有 attached snapshot 存在时才打印
+  `ephemeral redacted current screen` 标签和受限行视图。
 - 每次命令从 DataDir 读取控制令牌后调用 `client.EnsureDaemon`；仅网络不可达时后台拉起 `droved`，认证失败直接返回。
 - `version` 子命令输出 `internal/version` 注入信息。
 

@@ -450,7 +450,9 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
 		return nil, errors.Join(startErr, commitErr, closeErr, cleanupErr)
 	}
+	m.mu.Lock()
 	running.terminal = terminalActor
+	m.mu.Unlock()
 
 	// 4. 状态推进：进程活着 -> Working。
 	started, err := processObservation(

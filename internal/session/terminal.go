@@ -52,9 +52,10 @@ type terminalRequest struct {
 }
 
 type terminalResult struct {
-	snapshot  term.Snapshot
-	available bool
-	err       error
+	snapshot   term.Snapshot
+	capturedAt time.Time
+	available  bool
+	err        error
 }
 
 type terminalActor struct {
@@ -77,16 +78,17 @@ type terminalActor struct {
 }
 
 type terminalActorState struct {
-	nextOutputOffset  uint64
-	lastOutputSeq     uint64
-	dirty             bool
-	ended             bool
-	processExited     bool
-	controllerClosed  bool
-	snapshot          term.Snapshot
-	snapshotAvailable bool
-	replyErr          error
-	failure           error
+	nextOutputOffset   uint64
+	lastOutputSeq      uint64
+	dirty              bool
+	ended              bool
+	processExited      bool
+	controllerClosed   bool
+	snapshot           term.Snapshot
+	snapshotCapturedAt time.Time
+	snapshotAvailable  bool
+	replyErr           error
+	failure            error
 }
 
 func newTerminalActor(
@@ -153,13 +155,22 @@ func (a *terminalActor) FeedCommitted(
 }
 
 func (a *terminalActor) Snapshot() (term.Snapshot, bool) {
+	snapshot, _, available := a.snapshotWithCapturedAt()
+	return snapshot, available
+}
+
+func (a *terminalActor) snapshotWithCapturedAt() (
+	term.Snapshot,
+	time.Time,
+	bool,
+) {
 	result, err := a.submit(context.Background(), terminalRequest{
 		operation: terminalSnapshot,
 	})
 	if err != nil || result.err != nil {
-		return term.Snapshot{}, false
+		return term.Snapshot{}, time.Time{}, false
 	}
-	return result.snapshot, result.available
+	return result.snapshot, result.capturedAt, result.available
 }
 
 func (a *terminalActor) MarkProcessExited() {
@@ -343,8 +354,9 @@ func (a *terminalActor) handle(
 
 	case terminalSnapshot:
 		return terminalResult{
-			snapshot:  state.snapshot,
-			available: state.snapshotAvailable && !state.processExited,
+			snapshot:   state.snapshot,
+			capturedAt: state.snapshotCapturedAt,
+			available:  state.snapshotAvailable && !state.processExited,
 		}
 
 	case terminalProcessExited:
@@ -438,6 +450,7 @@ func (a *terminalActor) sample(
 		return fmt.Errorf("session: snapshot terminal: %w", err)
 	}
 	state.snapshot = snapshot
+	state.snapshotCapturedAt = at.UTC()
 	state.snapshotAvailable = !state.processExited
 	if state.processExited {
 		return nil

@@ -16,6 +16,8 @@
 - Store 启用并验证 `foreign_keys` 与 `secure_delete`。
 - `output.chunk` envelope 与附件在同一事务中追加；`ScanEvents` 不加载附件，
   `Replay` 通过 left join 返回仍保留的附件。
+- `RecentEvents` 在 SQLite 内按会话和事件类型过滤、倒序截取有限尾部，再按
+  `seq` 升序返回；它只读 event envelope，绝不联接或加载输出附件。
 - `PruneOutputAttachments` 只删除截止时间前的 `output.chunk` 附件，保留所有 event
   envelope，并在每次清理后执行 `wal_checkpoint(TRUNCATE)`。
 

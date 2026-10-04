@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -72,6 +74,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDelete)
+	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
 	mux.HandleFunc("GET /ws", s.handleWS)
@@ -139,6 +142,52 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+func (s *Server) handleExplain(w http.ResponseWriter, r *http.Request) {
+	limit, err := parseExplainLimit(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	explanation, err := s.opts.Manager.Explain(
+		r.Context(),
+		agent.ID(r.PathValue("id")),
+		session.ExplainOptions{Limit: limit},
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrInvalidExplainLimit):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, session.ErrUnknownAgent):
+			writeErr(w, http.StatusNotFound, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, explanation)
+}
+
+func parseExplainLimit(r *http.Request) (int, error) {
+	query := r.URL.Query()
+	for key := range query {
+		if key != "limit" {
+			return 0, fmt.Errorf("unsupported query parameter %q", key)
+		}
+	}
+	values, exists := query["limit"]
+	if !exists {
+		return 0, nil
+	}
+	if len(values) != 1 || values[0] == "" {
+		return 0, errors.New("limit must be one positive integer")
+	}
+	limit, err := strconv.Atoi(values[0])
+	if err != nil || limit <= 0 {
+		return 0, errors.New("limit must be one positive integer")
+	}
+	return limit, nil
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {

@@ -692,6 +692,174 @@ func TestReplayScopedBySession(t *testing.T) {
 	}
 }
 
+func TestRecentEventsFiltersBeforeLimitAndReturnsChronologicalEnvelopes(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	base := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	relevant := []EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeStateChanged),
+			SessionID: "s1",
+			AgentID:   "s1",
+			From:      "working",
+			To:        "blocked",
+			Reason:    "signal",
+			Payload:   `{"version":1}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1}`,
+		},
+	}
+	for _, row := range relevant {
+		if err := s.AppendEvent(row); err != nil {
+			t.Fatalf("append relevant seq %d: %v", row.Seq, err)
+		}
+	}
+	for seq := uint64(3); seq <= 52; seq++ {
+		if err := s.AppendEvent(EventRow{
+			Seq:              seq,
+			Timestamp:        base.Add(time.Duration(seq) * time.Second),
+			Type:             string(event.TypeOutputChunk),
+			SessionID:        "s1",
+			AgentID:          "s1",
+			Payload:          `{"version":1,"offset":1,"len":1}`,
+			OutputAttachment: []byte("x"),
+		}); err != nil {
+			t.Fatalf("append output seq %d: %v", seq, err)
+		}
+	}
+	if err := s.AppendEvent(EventRow{
+		Seq:       53,
+		Timestamp: base.Add(53 * time.Second),
+		Type:      string(event.TypeAgentSignal),
+		SessionID: "s2",
+		AgentID:   "s2",
+		Payload:   `{"version":1}`,
+	}); err != nil {
+		t.Fatalf("append other session signal: %v", err)
+	}
+
+	rows, err := s.RecentEvents(
+		context.Background(),
+		"s1",
+		[]event.Type{event.TypeAgentSignal, event.TypeStateChanged},
+		2,
+	)
+	if err != nil {
+		t.Fatalf("query recent events: %v", err)
+	}
+	if len(rows) != 2 || rows[0].Seq != 1 || rows[1].Seq != 2 {
+		t.Fatalf("recent rows = %+v, want relevant seqs [1 2]", rows)
+	}
+	for index, row := range rows {
+		if row.OutputAttachment != nil {
+			t.Fatalf("row %d loaded output attachment: %q", index, row.OutputAttachment)
+		}
+		if !row.Timestamp.Equal(relevant[index].Timestamp) {
+			t.Fatalf(
+				"row %d timestamp = %v, want %v",
+				index,
+				row.Timestamp,
+				relevant[index].Timestamp,
+			)
+		}
+	}
+}
+
+func TestRecentEventsNeverHydratesOutputAttachments(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.AppendEvent(EventRow{
+		Seq:              1,
+		Timestamp:        time.Now().UTC(),
+		Type:             string(event.TypeOutputChunk),
+		SessionID:        "s1",
+		AgentID:          "s1",
+		Payload:          `{"version":1,"offset":6,"len":6}`,
+		OutputAttachment: []byte("secret"),
+	}); err != nil {
+		t.Fatalf("append output chunk: %v", err)
+	}
+	rows, err := s.RecentEvents(
+		context.Background(),
+		"s1",
+		[]event.Type{event.TypeOutputChunk},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("query recent output: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("recent row count = %d, want 1", len(rows))
+	}
+	if rows[0].OutputAttachment != nil {
+		t.Fatalf("recent query hydrated output attachment: %q", rows[0].OutputAttachment)
+	}
+}
+
+func TestRecentEventsValidatesArguments(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	tests := []struct {
+		name      string
+		sessionID string
+		types     []event.Type
+		limit     int
+	}{
+		{name: "missing session", types: []event.Type{event.TypeAgentSignal}, limit: 1},
+		{name: "missing types", sessionID: "s1", limit: 1},
+		{name: "invalid type", sessionID: "s1", types: []event.Type{"unknown"}, limit: 1},
+		{
+			name:      "duplicate type",
+			sessionID: "s1",
+			types:     []event.Type{event.TypeAgentSignal, event.TypeAgentSignal},
+			limit:     1,
+		},
+		{
+			name:      "zero limit",
+			sessionID: "s1",
+			types:     []event.Type{event.TypeAgentSignal},
+		},
+		{
+			name:      "negative limit",
+			sessionID: "s1",
+			types:     []event.Type{event.TypeAgentSignal},
+			limit:     -1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := s.RecentEvents(
+				context.Background(),
+				test.sessionID,
+				test.types,
+				test.limit,
+			); err == nil {
+				t.Fatal("RecentEvents accepted invalid arguments")
+			}
+		})
+	}
+}
+
 func TestLastSeq(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(path)

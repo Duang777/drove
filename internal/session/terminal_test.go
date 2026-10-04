@@ -52,9 +52,12 @@ func TestTerminalActorUsesFixedSampleWindow(t *testing.T) {
 	timer.fire(clock.Now())
 	observer.WaitForCount(t, 1)
 
-	snapshot, available := actor.Snapshot()
+	snapshot, capturedAt, available := actor.snapshotWithCapturedAt()
 	if !available {
 		t.Fatal("sampled snapshot is unavailable")
+	}
+	if want := time.Unix(100, 0).UTC().Add(100 * time.Millisecond); !capturedAt.Equal(want) {
+		t.Fatalf("snapshot captured at %v, want %v", capturedAt, want)
 	}
 	row, ok := snapshot.Row(30)
 	if !ok || row != "Esc to cancel" {

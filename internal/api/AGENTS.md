@@ -13,6 +13,7 @@
   - `DELETE /api/v1/agents/{id}`：停止会话
   - `POST /api/v1/agents/{id}/input`：向已连接 PTY 写入一段受限 UTF-8 文本
   - `POST /api/v1/agents/{id}/signal`：接收 loopback vendor hook relay
+  - `GET  /api/v1/agents/{id}/explain`：返回受限决策尾部与可选 attached screen
   - `GET  /api/v1/agents/{id}/events`：回放事件流（REST，JSON 数组）
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
 - 所有 REST 与 WebSocket 请求必须先通过本地 Bearer 令牌认证；WebSocket 还要求 Origin 缺失或与配置的本地 Origin 精确匹配。

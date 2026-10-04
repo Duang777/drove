@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/spf13/cobra"
@@ -58,6 +59,7 @@ func newRootCmd() *cobra.Command {
 		newUpCmd(),
 		newPSCmd(),
 		newLogCmd(),
+		newExplainCmd(),
 		newSendCmd(),
 		newHookCmd(),
 		newStopCmd(),
@@ -187,6 +189,136 @@ func newLogCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&plain, "plain", false, "移除终端控制序列")
 	return cmd
+}
+
+func newExplainCmd() *cobra.Command {
+	var limit int
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "explain <agent-id>",
+		Short: "解释 Agent 当前状态与最近决策",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("limit") &&
+				(limit <= 0 || limit > session.MaxExplainLimit) {
+				return fmt.Errorf(
+					"%w: must be between 1 and %d",
+					session.ErrInvalidExplainLimit,
+					session.MaxExplainLimit,
+				)
+			}
+			ctx := cmd.Context()
+			c, err := newClient(ctx)
+			if err != nil {
+				return err
+			}
+			explanation, err := c.Explain(
+				ctx,
+				args[0],
+				session.ExplainOptions{Limit: limit},
+			)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(explanation); err != nil {
+					return fmt.Errorf("encode explanation: %w", err)
+				}
+				return nil
+			}
+			return writeExplanation(cmd.OutOrStdout(), *explanation)
+		},
+	}
+	cmd.Flags().IntVar(&limit, "limit", 0, "最近决策数量（默认 50，最大 200）")
+	cmd.Flags().BoolVar(&asJSON, "json", false, "输出 JSON")
+	return cmd
+}
+
+func writeExplanation(w io.Writer, explanation session.Explanation) error {
+	if _, err := fmt.Fprintf(
+		w,
+		"agent %s state=%s hook_status=%s attached=%t\n",
+		explanation.AgentID,
+		explanation.State,
+		explanation.HookStatus,
+		explanation.Attached,
+	); err != nil {
+		return fmt.Errorf("write explanation header: %w", err)
+	}
+	for _, item := range explanation.Events {
+		var line strings.Builder
+		fmt.Fprintf(
+			&line,
+			"%d %s %s",
+			item.Seq,
+			item.Timestamp.UTC().Format(time.RFC3339Nano),
+			item.Type,
+		)
+		if item.Source != "" {
+			fmt.Fprintf(&line, " source=%s", item.Source)
+		}
+		if item.Kind != "" {
+			fmt.Fprintf(&line, " kind=%s", item.Kind)
+		}
+		if item.Outcome != "" {
+			fmt.Fprintf(&line, " outcome=%s", item.Outcome)
+		}
+		if item.Rule != "" {
+			fmt.Fprintf(&line, " rule=%s", item.Rule)
+		}
+		if item.Edge != "" {
+			fmt.Fprintf(&line, " edge=%s", item.Edge)
+		}
+		if item.Region != "" {
+			fmt.Fprintf(&line, " region=%s", item.Region)
+		}
+		if item.Evidence != "" {
+			fmt.Fprintf(&line, " evidence=%q", item.Evidence)
+		}
+		if item.SuppressionReason != "" {
+			fmt.Fprintf(
+				&line,
+				" suppression_reason=%q",
+				item.SuppressionReason,
+			)
+		}
+		if item.From != "" || item.To != "" {
+			fmt.Fprintf(&line, " transition=%s->%s", item.From, item.To)
+		}
+		if item.Reason != "" {
+			fmt.Fprintf(&line, " reason=%q", item.Reason)
+		}
+		if item.UnsupportedVersion != nil {
+			fmt.Fprintf(
+				&line,
+				" unsupported_version=%d",
+				*item.UnsupportedVersion,
+			)
+		}
+		if _, err := fmt.Fprintln(w, line.String()); err != nil {
+			return fmt.Errorf("write explanation event at seq %d: %w", item.Seq, err)
+		}
+	}
+	if explanation.Screen == nil {
+		return nil
+	}
+	if _, err := fmt.Fprintln(w, "ephemeral redacted current screen"); err != nil {
+		return fmt.Errorf("write explanation screen label: %w", err)
+	}
+	if _, err := fmt.Fprintf(
+		w,
+		"captured_at=%s truncated=%t\n",
+		explanation.Screen.CapturedAt.UTC().Format(time.RFC3339Nano),
+		explanation.Screen.Truncated,
+	); err != nil {
+		return fmt.Errorf("write explanation screen metadata: %w", err)
+	}
+	for _, row := range explanation.Screen.Rows {
+		if _, err := fmt.Fprintln(w, row); err != nil {
+			return fmt.Errorf("write explanation screen row: %w", err)
+		}
+	}
+	return nil
 }
 
 func writeLogRows(w io.Writer, rows []store.EventRow, plain bool) error {

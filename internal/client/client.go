@@ -127,6 +127,25 @@ func (c *Client) Replay(ctx context.Context, id string) ([]store.EventRow, error
 	return out, nil
 }
 
+// Explain returns the daemon's typed, bounded explanation for one Agent.
+func (c *Client) Explain(
+	ctx context.Context,
+	id string,
+	options session.ExplainOptions,
+) (*session.Explanation, error) {
+	path := "/api/v1/agents/" + url.PathEscape(id) + "/explain"
+	if options.Limit != 0 {
+		query := url.Values{}
+		query.Set("limit", fmt.Sprintf("%d", options.Limit))
+		path += "?" + query.Encode()
+	}
+	var out session.Explanation
+	if err := c.getJSON(ctx, path, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // EnsureDaemon 确保 daemon 可达；不可达时使用同一配置自动拉起，然后等待就绪。
 func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)

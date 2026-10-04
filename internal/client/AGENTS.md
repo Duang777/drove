@@ -6,7 +6,8 @@
 
 ## 关键设计
 
-- `Client` 封装 REST 调用（List / Start / Status / Stop / SendInput / Replay），基址来自 Config.APIBind。
+- `Client` 封装 REST 调用（List / Start / Status / Stop / SendInput / Replay /
+  Explain），基址来自 Config.APIBind；Explain 仅编码路径、可选 limit 并解码类型化响应。
 - 每次请求从配置的数据目录读取控制令牌并发送 Bearer 认证，避免令牌轮换后持有过期值。
 - `HookRelay` 是独立的 hook 回调路径，校验精确的 loopback session URL，
   使用内存 token，并为一次投递生成可重试的 delivery ID。

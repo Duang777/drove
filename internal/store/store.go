@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -357,6 +358,115 @@ func (s *Store) Replay(sessionID string) ([]EventRow, error) {
 		return nil, fmt.Errorf("store: iterate: %w", err)
 	}
 	return out, nil
+}
+
+// RecentEvents returns the newest matching event envelopes in chronological
+// order. It never loads output attachments.
+func (s *Store) RecentEvents(
+	ctx context.Context,
+	sessionID string,
+	types []event.Type,
+	limit int,
+) ([]EventRow, error) {
+	if sessionID == "" {
+		return nil, errors.New("store: recent events require a session ID")
+	}
+	if len(types) == 0 {
+		return nil, errors.New("store: recent events require at least one event type")
+	}
+	if limit <= 0 {
+		return nil, errors.New("store: recent events limit must be positive")
+	}
+
+	typeNames := make([]string, len(types))
+	seen := make(map[event.Type]struct{}, len(types))
+	for index, typ := range types {
+		if !validEventType(typ) {
+			return nil, fmt.Errorf("store: recent events contain invalid type %q", typ)
+		}
+		if _, exists := seen[typ]; exists {
+			return nil, fmt.Errorf("store: recent events contain duplicate type %q", typ)
+		}
+		seen[typ] = struct{}{}
+		typeNames[index] = string(typ)
+	}
+	encodedTypes, err := json.Marshal(typeNames)
+	if err != nil {
+		return nil, fmt.Errorf("store: encode recent event types: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload
+		 FROM (
+			SELECT seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload
+			FROM events
+			WHERE session_id = ?
+			  AND type IN (SELECT value FROM json_each(?))
+			ORDER BY seq DESC
+			LIMIT ?
+		 )
+		 ORDER BY seq ASC`,
+		sessionID,
+		string(encodedTypes),
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("store: query recent events: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]EventRow, 0, limit)
+	for rows.Next() {
+		var row EventRow
+		var rawSeq int64
+		var timestamp string
+		if err := rows.Scan(
+			&rawSeq,
+			&timestamp,
+			&row.Type,
+			&row.SessionID,
+			&row.AgentID,
+			&row.From,
+			&row.To,
+			&row.Reason,
+			&row.Payload,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan recent event: %w", err)
+		}
+		if rawSeq <= 0 {
+			return nil, fmt.Errorf("store: invalid recent event seq %d", rawSeq)
+		}
+		row.Seq = uint64(rawSeq)
+		row.Timestamp, err = time.Parse(time.RFC3339Nano, timestamp)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"store: parse recent event timestamp at seq %d: %w",
+				row.Seq,
+				err,
+			)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate recent events: %w", err)
+	}
+	return out, nil
+}
+
+func validEventType(typ event.Type) bool {
+	switch typ {
+	case event.TypeStateChanged,
+		event.TypeOutput,
+		event.TypeOutputChunk,
+		event.TypeError,
+		event.TypeSessionLifecycle,
+		event.TypeAgentInput,
+		event.TypeAgentSignal:
+		return true
+	default:
+		return false
+	}
 }
 
 // LastSeq 返回当前最大事件序号（回放续接用）。

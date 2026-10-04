@@ -36,6 +36,9 @@
   幂等关闭 terminal/observation actor → 清空运行中会话索引。
 - `Replay(sessionID)`：从 store 读取事件流供回放；仍保留的 `output.chunk` 附件被编码进
   Base64 payload，已过期的附件只返回 offset/len metadata。
+- `Explain(ctx, id, options)`：读取最多 200 条 `agent.signal` / `state_changed`
+  envelope，解码为不透传原始 payload 的类型化摘要；仅同一 attached terminal actor
+  可提供带采样时间的临时受限 screen view，退出认领或 detach 后不再返回 screen。
 - `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
 - 输出处理器校验 PTY 源偏移，跨回调等长替换 signal token，并把不超过 32 KiB 的
   `output.chunk` 作为一个回调批次提交；Store 成功且 Hub 发布后，才用 receipt 中的
@@ -59,4 +62,5 @@
 - 事件必须经 Committer **先落库、再改投影、最后发布**；Store 失败后 Manager 通过 `Fatal()` 触发 daemon fail-stop。
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
 - 临时注入路径必须二次校验并拒绝 symlink；adapter 不得直接操作文件系统。
-- 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`。
+- 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`、
+  `ExplainOptions`、`ExplainEvent`、`ExplainScreen`、`Explanation`。

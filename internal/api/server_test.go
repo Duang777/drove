@@ -132,6 +132,171 @@ func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 	}
 }
 
+func TestHandleExplainReturnsAttachedTypedResponse(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "explain-attached",
+		Command: "/bin/cat",
+		Mode:    agent.RunModeInteractive,
+		Hooks:   agent.HooksOff,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if _, err := manager.SendInput(agent.ID(status.AgentID), []byte("screen\n")); err != nil {
+		t.Fatalf("send input: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		explanation, explainErr := manager.Explain(
+			context.Background(),
+			agent.ID(status.AgentID),
+			session.ExplainOptions{},
+		)
+		if explainErr != nil {
+			t.Fatalf("wait for screen: %v", explainErr)
+		}
+		if explanation.Screen != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("attached screen was not sampled")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/agents/"+status.AgentID+"/explain?limit=1",
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("response = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	var explanation session.Explanation
+	if err := json.NewDecoder(rec.Body).Decode(&explanation); err != nil {
+		t.Fatalf("decode explanation: %v", err)
+	}
+	if explanation.AgentID != status.AgentID ||
+		!explanation.Attached ||
+		explanation.HookStatus != "off" ||
+		len(explanation.Events) != 1 ||
+		explanation.Screen == nil ||
+		len(explanation.Screen.Rows) == 0 {
+		t.Fatalf("explanation = %+v", explanation)
+	}
+}
+
+func TestHandleExplainReturnsDetachedHistoryAndUnknownVersion(t *testing.T) {
+	server, manager, st := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "explain-detached",
+		Command: "/bin/sh",
+		Args:    []string{"-c", "exit 0"},
+		Mode:    agent.RunModeOneshot,
+		Hooks:   agent.HooksOff,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitForDetachedAPIStatus(t, manager, agent.ID(status.AgentID))
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if err := st.AppendEvent(store.EventRow{
+		Seq:       lastSeq + 1,
+		Timestamp: time.Now().UTC(),
+		Type:      string(event.TypeAgentSignal),
+		SessionID: status.AgentID,
+		AgentID:   status.AgentID,
+		Payload:   `{"version":91,"secret":"not-forwarded"}`,
+	}); err != nil {
+		t.Fatalf("append unknown signal: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/agents/"+status.AgentID+"/explain",
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("response = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	var explanation session.Explanation
+	if err := json.NewDecoder(rec.Body).Decode(&explanation); err != nil {
+		t.Fatalf("decode explanation: %v", err)
+	}
+	last := explanation.Events[len(explanation.Events)-1]
+	if explanation.Attached ||
+		explanation.Screen != nil ||
+		explanation.HookStatus != "detached" ||
+		last.UnsupportedVersion == nil ||
+		*last.UnsupportedVersion != 91 ||
+		strings.Contains(rec.Body.String(), "not-forwarded") {
+		t.Fatalf("detached explanation = %+v; body=%s", explanation, rec.Body.String())
+	}
+}
+
+func TestHandleExplainValidatesLimitAgentAndAuthentication(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	for _, rawQuery := range []string{
+		"limit=0",
+		"limit=-1",
+		"limit=word",
+		"limit=",
+		"limit=1&limit=2",
+		"other=1",
+		fmt.Sprintf("limit=%d", session.MaxExplainLimit+1),
+	} {
+		req := httptest.NewRequest(
+			http.MethodGet,
+			"/api/v1/agents/missing/explain?"+rawQuery,
+			nil,
+		)
+		rec := httptest.NewRecorder()
+		serveAuthorized(server, rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf(
+				"query %q response = %d %q, want 400",
+				rawQuery,
+				rec.Code,
+				rec.Body.String(),
+			)
+		}
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/agents/missing/explain?limit=1",
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown agent response = %d %q, want 404", rec.Code, rec.Body.String())
+	}
+
+	unauthorized := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/agents/missing/explain",
+		nil,
+	)
+	unauthorizedResponse := httptest.NewRecorder()
+	server.mux.ServeHTTP(unauthorizedResponse, unauthorized)
+	if unauthorizedResponse.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"unauthorized response = %d %q, want 401",
+			unauthorizedResponse.Code,
+			unauthorizedResponse.Body.String(),
+		)
+	}
+}
+
 func TestHandleInputWritesAndAuditsWithoutContent(t *testing.T) {
 	server, manager, _ := newTestServer(t)
 	status, err := manager.Start(context.Background(), session.StartRequest{
@@ -774,6 +939,29 @@ func waitForSignalTokenFile(t *testing.T, path string) string {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("signal token file %q missing", path)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForDetachedAPIStatus(
+	t *testing.T,
+	manager *session.Manager,
+	id agent.ID,
+) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		status, err := manager.Status(id)
+		if err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		if status.PID == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("agent remained attached: %+v", status)
 		}
 		time.Sleep(time.Millisecond)
 	}

@@ -5,15 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/config"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
@@ -494,6 +498,186 @@ func TestLogCommandExposesPlainFlag(t *testing.T) {
 	flag := newLogCmd().Flags().Lookup("plain")
 	if flag == nil || flag.DefValue != "false" {
 		t.Fatalf("--plain flag = %+v, want default false", flag)
+	}
+}
+
+func TestExplainCommandIsRegisteredWithFlags(t *testing.T) {
+	command, _, err := newRootCmd().Find([]string{"explain"})
+	if err != nil {
+		t.Fatalf("find explain command: %v", err)
+	}
+	if command.Name() != "explain" {
+		t.Fatalf("command = %q, want explain", command.Name())
+	}
+	for name, wantDefault := range map[string]string{
+		"limit": "0",
+		"json":  "false",
+	} {
+		flag := command.Flags().Lookup(name)
+		if flag == nil || flag.DefValue != wantDefault {
+			t.Fatalf("--%s flag = %+v, want default %q", name, flag, wantDefault)
+		}
+	}
+}
+
+func TestWriteExplanationShowsDecisionsAndAttachedScreen(t *testing.T) {
+	capturedAt := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	explanation := session.Explanation{
+		AgentID:    "agent-1",
+		State:      agent.StateWorking,
+		HookStatus: detect.HookActive,
+		Attached:   true,
+		Events: []session.ExplainEvent{
+			{
+				Seq:               10,
+				Timestamp:         capturedAt.Add(-time.Second),
+				Type:              event.TypeAgentSignal,
+				Source:            agent.EvidenceScreen,
+				Kind:              detect.KindHumanInputRequired,
+				Outcome:           detect.OutcomeSuppressed,
+				Rule:              "claude.approval_prompt",
+				Edge:              agent.ScreenEdgePresent,
+				Region:            "viewport.bottom",
+				Evidence:          "approval prompt",
+				SuppressionReason: "detector authority rejected this signal",
+			},
+			{
+				Seq:       11,
+				Timestamp: capturedAt,
+				Type:      event.TypeStateChanged,
+				Source:    agent.EvidenceScreen,
+				Rule:      "claude.approval_prompt",
+				From:      agent.StateBlocked,
+				To:        agent.StateWorking,
+				Reason:    "approval resolved",
+			},
+		},
+		Screen: &session.ExplainScreen{
+			CapturedAt: capturedAt,
+			Rows:       []string{"first", "second"},
+			Truncated:  true,
+		},
+	}
+
+	var output bytes.Buffer
+	if err := writeExplanation(&output, explanation); err != nil {
+		t.Fatalf("write explanation: %v", err)
+	}
+	text := output.String()
+	firstIndex := strings.Index(text, "10 2026-10-04T09:59:59Z agent.signal")
+	secondIndex := strings.Index(text, "11 2026-10-04T10:00:00Z state_changed")
+	if firstIndex < 0 || secondIndex <= firstIndex {
+		t.Fatalf("events are not chronological:\n%s", text)
+	}
+	for _, fragment := range []string{
+		"source=screen",
+		"kind=human_input_required",
+		"outcome=suppressed",
+		"rule=claude.approval_prompt",
+		`suppression_reason="detector authority rejected this signal"`,
+		"transition=blocked->working",
+		"ephemeral redacted current screen\n",
+		"captured_at=2026-10-04T10:00:00Z truncated=true",
+		"first\nsecond\n",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("output missing %q:\n%s", fragment, text)
+		}
+	}
+}
+
+func TestWriteExplanationOmitsDetachedScreenPlaceholder(t *testing.T) {
+	var output bytes.Buffer
+	if err := writeExplanation(&output, session.Explanation{
+		AgentID:    "agent-1",
+		State:      agent.StateStopped,
+		HookStatus: detect.HookDetached,
+		Events:     []session.ExplainEvent{},
+	}); err != nil {
+		t.Fatalf("write explanation: %v", err)
+	}
+	if strings.Contains(output.String(), "screen") {
+		t.Fatalf("detached output contains screen placeholder: %q", output.String())
+	}
+}
+
+func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".drove")
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch r.URL.EscapedPath() {
+		case "/api/v1/agents":
+			_, _ = io.WriteString(w, "[]")
+		case "/api/v1/agents/agent%2Fone/explain":
+			if r.URL.RawQuery != "limit=7" {
+				t.Errorf("query = %q, want limit=7", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(session.Explanation{
+				AgentID:    "agent/one",
+				State:      agent.StateBlocked,
+				HookStatus: detect.HookOff,
+				Attached:   false,
+				Events:     []session.ExplainEvent{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	cfg := config.Defaults()
+	cfg.DataDir = dataDir
+	cfg.APIBind = strings.TrimPrefix(server.URL, "http://")
+	cfg.DBPath = ""
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	command := newExplainCmd()
+	command.SetArgs([]string{"agent/one", "--limit", "7", "--json"})
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute explain: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	decoder := json.NewDecoder(&stdout)
+	var explanation session.Explanation
+	if err := decoder.Decode(&explanation); err != nil {
+		t.Fatalf("decode stdout: %v; output=%q", err, stdout.String())
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		t.Fatalf("stdout contains non-JSON data: %q", stdout.String())
+	}
+	if explanation.AgentID != "agent/one" || explanation.State != agent.StateBlocked {
+		t.Fatalf("explanation = %+v", explanation)
+	}
+}
+
+func TestExplainCommandRejectsInvalidExplicitLimitBeforeClientSetup(t *testing.T) {
+	for _, limit := range []string{"0", "-1", "201"} {
+		command := newExplainCmd()
+		command.SetArgs([]string{"agent-1", "--limit", limit})
+		if err := command.Execute(); !errors.Is(err, session.ErrInvalidExplainLimit) {
+			t.Fatalf("limit %s error = %v, want ErrInvalidExplainLimit", limit, err)
+		}
 	}
 }
 

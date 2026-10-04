@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/session"
 )
 
 func TestSendInputPostsDataAndAcceptsNoContent(t *testing.T) {
@@ -86,6 +88,61 @@ func TestSendInputReturnsServerError(t *testing.T) {
 	err := c.SendInput(context.Background(), "agent", []byte("continue\n"))
 	if err == nil || !strings.Contains(err.Error(), "409 Conflict") {
 		t.Fatalf("send input error = %v, want 409 context", err)
+	}
+}
+
+func TestExplainEncodesPathAndOptionalLimit(t *testing.T) {
+	tests := []struct {
+		name      string
+		options   session.ExplainOptions
+		wantQuery string
+	}{
+		{name: "default omits limit"},
+		{
+			name:      "explicit limit",
+			options:   session.ExplainOptions{Limit: 17},
+			wantQuery: "limit=17",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("method = %s, want GET", r.Method)
+				}
+				if got := r.URL.EscapedPath(); got != "/api/v1/agents/agent%2Fone/explain" {
+					t.Errorf("path = %q, want escaped agent path", got)
+				}
+				if r.URL.RawQuery != test.wantQuery {
+					t.Errorf("query = %q, want %q", r.URL.RawQuery, test.wantQuery)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{
+					"agent_id":"agent/one",
+					"state":"blocked",
+					"hook_status":"off",
+					"attached":false,
+					"events":[{"seq":9,"timestamp":"2026-10-04T10:00:00Z","type":"agent.signal","unsupported_version":7}]
+				}`)
+			}))
+			defer server.Close()
+
+			c := New(strings.TrimPrefix(server.URL, "http://"))
+			explanation, err := c.Explain(
+				context.Background(),
+				"agent/one",
+				test.options,
+			)
+			if err != nil {
+				t.Fatalf("explain: %v", err)
+			}
+			if explanation.AgentID != "agent/one" ||
+				len(explanation.Events) != 1 ||
+				explanation.Events[0].UnsupportedVersion == nil ||
+				*explanation.Events[0].UnsupportedVersion != 7 {
+				t.Fatalf("explanation = %+v", explanation)
+			}
+		})
 	}
 }
 
