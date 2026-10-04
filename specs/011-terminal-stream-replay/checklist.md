@@ -115,4 +115,4 @@
 - [x] `make build` passes.
 - [x] Web typecheck and build pass.
 - [x] Every implementation commit is pushed before the next begins.
-- [ ] Issues #19 and #25 contain final evidence and are closed.
+- [x] Issues #19 and #25 contain final evidence and are closed.
