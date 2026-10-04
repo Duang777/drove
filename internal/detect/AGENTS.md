@@ -13,6 +13,9 @@ Observation 计算不可变 Decision；goroutine、队列和真实计时器由 s
   approval clearance 和 Claude interrupt 两个 screen 例外。
 - Codex legacy notify 是非权威来源：不激活 hook、不满足 `required`，只在
   `fallback` 中生成可取消的 Idle 候选；`awaiting_hook` 与 `hook_active` 会抑制它。
+- Codex terminal notify 复用同一非权威来源，但只建立 permission 候选；它不使用
+  delivery ID，依赖 terminal actor 的 committed offset/sequence 顺序，并由 approval
+  cleared screen edge 取消快速完成的候选。
 - Detector State 持有 delivery ID 去重、按 purpose + stable rule 分键的候选、
   每键独立 generation/deadline、Blocked 输出恢复和 hook 状态；只有已提交
   Decision 可以修改它。

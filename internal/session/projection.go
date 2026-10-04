@@ -361,6 +361,15 @@ func (p *recoveryProjector) applySignal(row store.EventRow) error {
 			return projectionWrapError(row, "validate signal payload", err)
 		}
 		payload = versioned.SignalPayloadV1
+	case 4:
+		var versioned event.SignalPayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &versioned); err != nil {
+			return projectionWrapError(row, "decode signal payload", err)
+		}
+		if err := versioned.Validate(); err != nil {
+			return projectionWrapError(row, "validate signal payload", err)
+		}
+		payload = versioned.SignalPayloadV1
 	default:
 		p.report.UnknownSignalPayloadVersions++
 		return nil
@@ -433,9 +442,58 @@ func parseStateEvidence(row store.EventRow) (*agent.Evidence, bool, error) {
 			)
 		}
 		return screenAgentEvidence(payload, row)
+	case 4:
+		var payload event.StateEvidencePayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return nil, false, projectionWrapError(row, "decode state evidence", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return nil, false, projectionWrapError(row, "validate state evidence", err)
+		}
+		if payload.Terminal != nil {
+			return terminalAgentEvidence(payload, row)
+		}
+		if payload.Source == string(agent.EvidenceScreen) {
+			return screenAgentEvidence(event.StateEvidencePayloadV3{
+				StateEvidencePayloadV1: payload.StateEvidencePayloadV1,
+				Screen:                 payload.Screen,
+			}, row)
+		}
+		return agentEvidence(
+			payload.Source,
+			payload.Event,
+			payload.Confidence,
+			payload.DeliveryID,
+			row,
+		)
 	default:
 		return nil, false, nil
 	}
+}
+
+func terminalAgentEvidence(
+	payload event.StateEvidencePayloadV4,
+	row store.EventRow,
+) (*agent.Evidence, bool, error) {
+	terminal, err := agent.NewTerminalAttribution(
+		payload.Terminal.Protocol,
+		payload.Terminal.OutputOffset,
+		payload.Terminal.LastOutputSeq,
+	)
+	if err != nil {
+		return nil, false, projectionWrapError(row, "validate terminal attribution", err)
+	}
+	evidence := &agent.Evidence{
+		Source:     agent.EvidenceSource(payload.Source),
+		Event:      payload.Event,
+		Confidence: payload.Confidence,
+		DeliveryID: payload.DeliveryID,
+		Terminal:   &terminal,
+	}
+	if err := evidence.Validate(); err != nil {
+		return nil, false, projectionWrapError(row, "validate agent evidence", err)
+	}
+	return evidence, true, nil
 }
 
 func screenAgentEvidence(

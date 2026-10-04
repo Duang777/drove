@@ -90,10 +90,16 @@ func TestCodexSessionInjectionChangesOnlyProcessArguments(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	args := waitForCapturedArgs(t, capture)
-	if len(args) != 3 ||
+	if len(args) != 9 ||
 		args[0] != "-c" ||
 		!strings.HasPrefix(args[1], "notify=[") ||
-		args[2] != "--caller-arg" {
+		args[2] != "-c" ||
+		args[3] != `tui.notifications=["approval-requested"]` ||
+		args[4] != "-c" ||
+		args[5] != `tui.notification_method="osc9"` ||
+		args[6] != "-c" ||
+		args[7] != `tui.notification_condition="always"` ||
+		args[8] != "--caller-arg" {
 		t.Fatalf("args = %#v", args)
 	}
 	if status.SignalInjectionStatus != agent.InjectionInjected ||

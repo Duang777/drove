@@ -356,6 +356,21 @@ func encodeSignalAudit(
 		payload.ExitCode = signal.Process.ExitCode
 		payload.ExitKind = string(signal.Process.ExitKind)
 	}
+	if signal.Terminal != nil {
+		payload.Version = 4
+		versioned := event.SignalPayloadV4{
+			SignalPayloadV1: payload,
+			Terminal:        terminalAttributionPayload(signal.Terminal),
+		}
+		if err := versioned.Validate(); err != nil {
+			return nil, fmt.Errorf("session: validate signal audit: %w", err)
+		}
+		encoded, err := json.Marshal(versioned)
+		if err != nil {
+			return nil, fmt.Errorf("session: encode signal audit: %w", err)
+		}
+		return encoded, nil
+	}
 	if signal.Source == detect.SourceScreen {
 		payload.Version = 3
 		versioned := event.SignalPayloadV3{
@@ -406,5 +421,18 @@ func screenAttributionPayload(
 		OutputOffset:  screen.OutputOffset,
 		LastOutputSeq: screen.LastOutputSeq,
 		Evidence:      screen.Evidence,
+	}
+}
+
+func terminalAttributionPayload(
+	terminal *agent.TerminalAttribution,
+) *event.TerminalAttributionPayload {
+	if terminal == nil {
+		return nil
+	}
+	return &event.TerminalAttributionPayload{
+		Protocol:      terminal.Protocol,
+		OutputOffset:  terminal.OutputOffset,
+		LastOutputSeq: terminal.LastOutputSeq,
 	}
 }

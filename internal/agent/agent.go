@@ -177,13 +177,52 @@ func (a ScreenAttribution) Validate() error {
 	return nil
 }
 
+// TerminalAttribution identifies a redacted signal in committed terminal output.
+type TerminalAttribution struct {
+	Protocol      string `json:"protocol"`
+	OutputOffset  uint64 `json:"output_offset"`
+	LastOutputSeq uint64 `json:"last_output_seq"`
+}
+
+// NewTerminalAttribution validates one committed terminal location.
+func NewTerminalAttribution(
+	protocol string,
+	outputOffset uint64,
+	lastOutputSeq uint64,
+) (TerminalAttribution, error) {
+	attribution := TerminalAttribution{
+		Protocol:      protocol,
+		OutputOffset:  outputOffset,
+		LastOutputSeq: lastOutputSeq,
+	}
+	if err := attribution.Validate(); err != nil {
+		return TerminalAttribution{}, err
+	}
+	return attribution, nil
+}
+
+// Validate rejects unsupported protocols and incomplete committed locations.
+func (a TerminalAttribution) Validate() error {
+	if a.Protocol != "osc9" {
+		return fmt.Errorf("agent: invalid terminal protocol %q", a.Protocol)
+	}
+	if a.OutputOffset == 0 {
+		return errors.New("agent: terminal output offset must be positive")
+	}
+	if a.LastOutputSeq == 0 {
+		return errors.New("agent: terminal last output sequence must be positive")
+	}
+	return nil
+}
+
 // Evidence is the bounded, redacted explanation for one state transition.
 type Evidence struct {
-	Source     EvidenceSource     `json:"source"`
-	Event      string             `json:"event"`
-	Confidence float64            `json:"confidence"`
-	DeliveryID string             `json:"delivery_id,omitempty"`
-	Screen     *ScreenAttribution `json:"screen,omitempty"`
+	Source     EvidenceSource       `json:"source"`
+	Event      string               `json:"event"`
+	Confidence float64              `json:"confidence"`
+	DeliveryID string               `json:"delivery_id,omitempty"`
+	Screen     *ScreenAttribution   `json:"screen,omitempty"`
+	Terminal   *TerminalAttribution `json:"terminal,omitempty"`
 }
 
 // Validate checks that evidence can be stored in a versioned state payload.
@@ -207,11 +246,18 @@ func (e Evidence) Validate() error {
 		e.Confidence < 0 || e.Confidence > 1 {
 		return fmt.Errorf("agent: invalid evidence confidence %v", e.Confidence)
 	}
-	if e.Source == EvidenceHook || e.Source == EvidenceNotify {
+	if e.Source == EvidenceHook ||
+		e.Source == EvidenceNotify && e.Terminal == nil {
 		parsed, err := uuid.Parse(e.DeliveryID)
 		if err != nil || parsed.String() != e.DeliveryID {
 			return errors.New(
 				"agent: delivered evidence ID must be a canonical UUID",
+			)
+		}
+	} else if e.Source == EvidenceNotify {
+		if e.DeliveryID != "" {
+			return errors.New(
+				"agent: terminal notify evidence cannot contain a delivery ID",
 			)
 		}
 	} else if e.DeliveryID != "" {
@@ -229,6 +275,16 @@ func (e Evidence) Validate() error {
 		}
 	} else if e.Screen != nil {
 		return errors.New("agent: only screen evidence may contain screen attribution")
+	}
+	if e.Terminal != nil {
+		if e.Source != EvidenceNotify {
+			return errors.New(
+				"agent: only notify evidence may contain terminal attribution",
+			)
+		}
+		if err := e.Terminal.Validate(); err != nil {
+			return fmt.Errorf("agent: terminal evidence attribution: %w", err)
+		}
 	}
 	return nil
 }
@@ -629,6 +685,10 @@ func cloneEvidence(evidence *Evidence) *Evidence {
 	if evidence.Screen != nil {
 		screen := *evidence.Screen
 		copy.Screen = &screen
+	}
+	if evidence.Terminal != nil {
+		terminal := *evidence.Terminal
+		copy.Terminal = &terminal
 	}
 	return &copy
 }

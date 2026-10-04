@@ -124,6 +124,7 @@ type Signal struct {
 	Timer            TimerRef
 	Process          *ProcessFact
 	Screen           *agent.ScreenAttribution
+	Terminal         *agent.TerminalAttribution
 }
 
 // NewHookSignal validates and copies a normalized vendor hook signal.
@@ -140,6 +141,28 @@ func NewHookSignal(signal Signal) (Signal, error) {
 
 // NewNotifySignal validates a non-authoritative vendor notification.
 func NewNotifySignal(signal Signal) (Signal, error) {
+	if signal.Terminal != nil {
+		return Signal{}, errors.New(
+			"detect: relay notify cannot contain terminal attribution",
+		)
+	}
+	signal.Version = signalVersion
+	signal.Source = SourceNotify
+	signal.Process = nil
+	signal.Timer = TimerRef{}
+	if err := signal.validate(); err != nil {
+		return Signal{}, err
+	}
+	return cloneSignal(signal), nil
+}
+
+// NewTerminalNotifySignal validates a redacted notification from committed output.
+func NewTerminalNotifySignal(signal Signal) (Signal, error) {
+	if signal.Terminal == nil {
+		return Signal{}, errors.New(
+			"detect: terminal notify requires terminal attribution",
+		)
+	}
 	signal.Version = signalVersion
 	signal.Source = SourceNotify
 	signal.Process = nil
@@ -243,6 +266,9 @@ func (s Signal) validate() error {
 	if s.Source != SourceScreen && s.Screen != nil {
 		return errors.New("detect: only screen signals may contain screen attribution")
 	}
+	if s.Source != SourceNotify && s.Terminal != nil {
+		return errors.New("detect: only notify signals may contain terminal attribution")
+	}
 
 	switch s.Source {
 	case SourceHook:
@@ -262,15 +288,27 @@ func (s Signal) validate() error {
 		if s.Vendor == "" {
 			return errors.New("detect: notify signal vendor is required")
 		}
-		if !canonicalUUID(s.DeliveryID) {
-			return errors.New("detect: notify delivery ID must be a canonical UUID")
-		}
-		if s.Scope != ScopeRoot || s.Kind != KindTurnStopped {
+		if s.Terminal == nil {
+			if !canonicalUUID(s.DeliveryID) {
+				return errors.New("detect: notify delivery ID must be a canonical UUID")
+			}
+			if s.Scope != ScopeRoot || s.Kind != KindTurnStopped {
+				return fmt.Errorf(
+					"detect: notify source cannot report %q at scope %q",
+					s.Kind,
+					s.Scope,
+				)
+			}
+		} else if s.DeliveryID != "" {
+			return errors.New("detect: terminal notify cannot contain a delivery ID")
+		} else if s.Scope != ScopeRoot || s.Kind != KindPermissionRequested {
 			return fmt.Errorf(
-				"detect: notify source cannot report %q at scope %q",
+				"detect: terminal notify cannot report %q at scope %q",
 				s.Kind,
 				s.Scope,
 			)
+		} else if err := s.Terminal.Validate(); err != nil {
+			return fmt.Errorf("detect: terminal attribution: %w", err)
 		}
 		if s.Process != nil || !s.Timer.zero() {
 			return errors.New("detect: notify signal contains foreign metadata")
@@ -483,6 +521,10 @@ func cloneSignal(signal Signal) Signal {
 	if signal.Screen != nil {
 		screen := *signal.Screen
 		signal.Screen = &screen
+	}
+	if signal.Terminal != nil {
+		terminal := *signal.Terminal
+		signal.Terminal = &terminal
 	}
 	return signal
 }
@@ -941,18 +983,21 @@ func (d *Detector) decideNotify(
 	current agent.Snapshot,
 	signal Signal,
 ) (Decision, error) {
-	if state.data.policy == agent.HooksOff {
+	terminalNotify := signal.Terminal != nil
+	if state.data.policy == agent.HooksOff && !terminalNotify {
 		return Decision{}, ErrHooksDisabled
 	}
-	if outcome, duplicate := state.data.deliveries[signal.DeliveryID]; duplicate {
-		return Decision{
-			owner:            state.owner,
-			expectedRevision: state.data.revision,
-			signal:           cloneSignal(signal),
-			outcome:          outcome,
-			duplicate:        true,
-			timer:            TimerPlan{Action: TimerKeep},
-		}, nil
+	if signal.DeliveryID != "" {
+		if outcome, duplicate := state.data.deliveries[signal.DeliveryID]; duplicate {
+			return Decision{
+				owner:            state.owner,
+				expectedRevision: state.data.revision,
+				signal:           cloneSignal(signal),
+				outcome:          outcome,
+				duplicate:        true,
+				timer:            TimerPlan{Action: TimerKeep},
+			}, nil
+		}
 	}
 
 	decision := newDecision(state, signal, OutcomeObserved)
@@ -963,6 +1008,21 @@ func (d *Detector) decideNotify(
 		state.data.status == HookAwaiting,
 		state.data.status == HookActive:
 		decision.outcome = OutcomeSuppressed
+	case terminalNotify &&
+		(state.data.policy == agent.HooksOff || state.data.status == HookFallback):
+		if current.State == agent.StateWorking || current.State == agent.StateIdle {
+			cancelCandidate(&decision, candidateKey{purpose: CandidateHookIdle})
+			cancelCandidate(&decision, candidateKey{purpose: CandidateHeuristicBlocked})
+			cancelCandidate(&decision, candidateKey{purpose: CandidateFallbackIdle})
+			cancelCandidatesByPurpose(&decision, CandidateScreen)
+			armCandidate(
+				&decision,
+				candidateKey{purpose: CandidateHookPermission},
+				signal.ReceivedAt.Add(d.config.PermissionConfirmation),
+				signal,
+			)
+			decision.outcome = OutcomeCandidate
+		}
 	case state.data.status == HookFallback:
 		if current.State == agent.StateWorking || current.State == agent.StateBlocked {
 			armCandidate(
@@ -976,12 +1036,14 @@ func (d *Detector) decideNotify(
 	default:
 		decision.outcome = OutcomeSuppressed
 	}
-	rememberDelivery(
-		&decision.next,
-		signal.DeliveryID,
-		decision.outcome,
-		d.config.DeliveryRememberCount,
-	)
+	if signal.DeliveryID != "" {
+		rememberDelivery(
+			&decision.next,
+			signal.DeliveryID,
+			decision.outcome,
+			d.config.DeliveryRememberCount,
+		)
+	}
 	return decision, nil
 }
 
@@ -1191,6 +1253,9 @@ func (d *Detector) decideScreen(
 	signal Signal,
 ) (Decision, error) {
 	decision := newDecision(state, signal, OutcomeSuppressed)
+	if isApprovalClearance(signal) {
+		cancelCandidate(&decision, candidateKey{purpose: CandidateHookPermission})
+	}
 	key := candidateKey{
 		purpose: CandidateScreen,
 		rule:    signal.Screen.Rule,
@@ -1285,13 +1350,25 @@ func (d *Detector) decideTimer(
 			}
 		}
 	case CandidateHookPermission:
-		transition(
-			&decision,
-			current,
-			agent.StateBlocked,
-			"hook permission request confirmed",
-			"",
-		)
+		if candidate.signal.Source == SourceNotify &&
+			candidate.signal.Terminal != nil {
+			transitionWithEvidence(
+				&decision,
+				current,
+				agent.StateBlocked,
+				"notify permission request confirmed",
+				"",
+				evidence(candidate.signal),
+			)
+		} else {
+			transition(
+				&decision,
+				current,
+				agent.StateBlocked,
+				"hook permission request confirmed",
+				"",
+			)
+		}
 	case CandidateHookIdle:
 		if candidate.signal.Source == SourceNotify {
 			transitionWithEvidence(
@@ -1422,6 +1499,10 @@ func evidence(signal Signal) agent.Evidence {
 		screen := *signal.Screen
 		result.Event = screen.Rule
 		result.Screen = &screen
+	}
+	if signal.Terminal != nil {
+		terminal := *signal.Terminal
+		result.Terminal = &terminal
 	}
 	return result
 }

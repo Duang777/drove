@@ -252,6 +252,225 @@ func TestActiveHookAndRequiredPolicySuppressNotify(t *testing.T) {
 	}
 }
 
+func TestTerminalNotifyValidatesAndCopiesAttribution(t *testing.T) {
+	attribution, err := agent.NewTerminalAttribution("osc9", 120, 9)
+	if err != nil {
+		t.Fatalf("new terminal attribution: %v", err)
+	}
+	signal, err := NewTerminalNotifySignal(Signal{
+		Kind:         KindPermissionRequested,
+		Vendor:       "codex",
+		VendorEvent:  "tui_notification",
+		Scope:        ScopeRoot,
+		Notification: "approval-requested",
+		Evidence:     "approval requested",
+		Confidence:   1,
+		ReceivedAt:   testTime,
+		Terminal:     &attribution,
+	})
+	if err != nil {
+		t.Fatalf("new terminal notify: %v", err)
+	}
+	attribution.OutputOffset = 999
+	if signal.Terminal.OutputOffset != 120 {
+		t.Fatalf("terminal offset = %d, want copied 120", signal.Terminal.OutputOffset)
+	}
+	if _, err := NewNotifySignal(signal); err == nil {
+		t.Fatal("legacy notify constructor accepted terminal attribution")
+	}
+	if _, err := NewTerminalNotifySignal(Signal{
+		Kind:        KindPermissionRequested,
+		Vendor:      "codex",
+		VendorEvent: "tui_notification",
+		Scope:       ScopeRoot,
+		Confidence:  1,
+		ReceivedAt:  testTime,
+	}); err == nil {
+		t.Fatal("terminal notify constructor accepted missing attribution")
+	}
+}
+
+func TestTerminalNotifyConfirmsFallbackBlocked(t *testing.T) {
+	detector := newTestDetector(t)
+	state := NewState(agent.HooksAuto)
+	target := newTestAgent(t, agent.StateStarting, agent.RunModeInteractive)
+
+	started := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		processObservation(t, KindProcessStarted, &ProcessFact{HookAvailable: true}),
+	)
+	decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, started.Timer().Ref, started.Timer().Deadline),
+	)
+
+	notified := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, terminalNotifySignal(t, testTime.Add(6*time.Second))),
+	)
+	_, outcome, _ := notified.Signal()
+	timer := notified.Timer()
+	if outcome != OutcomeCandidate ||
+		timer.Action != TimerArm ||
+		timer.Ref.Purpose != CandidateHookPermission ||
+		timer.Deadline.Sub(testTime) != 6750*time.Millisecond {
+		t.Fatalf("notify outcome=%s timer=%+v", outcome, timer)
+	}
+
+	decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, timer.Ref, timer.Deadline),
+	)
+	evidence := target.LastTransition()
+	if target.State() != agent.StateBlocked ||
+		evidence == nil ||
+		evidence.Source != agent.EvidenceNotify ||
+		evidence.Event != "tui_notification" ||
+		evidence.DeliveryID != "" ||
+		evidence.Terminal == nil ||
+		evidence.Terminal.OutputOffset != 120 {
+		t.Fatalf("state=%s evidence=%+v", target.State(), evidence)
+	}
+}
+
+func TestTerminalNotifyAuthority(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy agent.HookPolicy
+		setup  func(*testing.T, *Detector, *State, *agent.Agent)
+		want   Outcome
+	}{
+		{
+			name:   "hooks off",
+			policy: agent.HooksOff,
+			want:   OutcomeCandidate,
+		},
+		{
+			name:   "awaiting",
+			policy: agent.HooksAuto,
+			setup: func(
+				t *testing.T,
+				detector *Detector,
+				state *State,
+				target *agent.Agent,
+			) {
+				decideAndApply(
+					t,
+					detector,
+					state,
+					target,
+					processObservation(
+						t,
+						KindProcessStarted,
+						&ProcessFact{HookAvailable: true},
+					),
+				)
+			},
+			want: OutcomeSuppressed,
+		},
+		{
+			name:   "active",
+			policy: agent.HooksAuto,
+			setup:  activateHook,
+			want:   OutcomeSuppressed,
+		},
+		{
+			name:   "required",
+			policy: agent.HooksRequired,
+			want:   OutcomeSuppressed,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			detector := newTestDetector(t)
+			state := NewState(test.policy)
+			target := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+			if test.setup != nil {
+				test.setup(t, detector, &state, target)
+			}
+			decision := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, terminalNotifySignal(t, testTime)),
+			)
+			_, outcome, _ := decision.Signal()
+			if outcome != test.want {
+				t.Fatalf("outcome = %s, want %s", outcome, test.want)
+			}
+		})
+	}
+}
+
+func TestApprovalClearanceCancelsTerminalPermissionCandidate(t *testing.T) {
+	detector := newTestDetector(t)
+	state := NewState(agent.HooksOff)
+	target := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+
+	notified := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, terminalNotifySignal(t, testTime)),
+	)
+	timer := notified.Timer()
+	if timer.Ref.Purpose != CandidateHookPermission {
+		t.Fatalf("permission timer = %+v", timer)
+	}
+
+	cleared := screenSignal(
+		t,
+		KindHumanInputResolved,
+		"codex.approval_prompt",
+		agent.ScreenEdgeCleared,
+		testTime.Add(100*time.Millisecond),
+	)
+	decision := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, cleared),
+	)
+	_, outcome, _ := decision.Signal()
+	if outcome != OutcomeSuppressed ||
+		decision.Timer().Action != TimerCancel ||
+		target.State() != agent.StateWorking {
+		t.Fatalf(
+			"clearance outcome=%s timer=%+v state=%s",
+			outcome,
+			decision.Timer(),
+			target.State(),
+		)
+	}
+
+	stale := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, timer.Ref, timer.Deadline),
+	)
+	_, outcome, _ = stale.Signal()
+	if outcome != OutcomeStale || target.State() != agent.StateWorking {
+		t.Fatalf("stale outcome=%s state=%s", outcome, target.State())
+	}
+}
+
 func TestHookPermissionAndIdleTimersAreCancelable(t *testing.T) {
 	detector := newTestDetector(t)
 	state := NewState(agent.HooksAuto)
@@ -1268,6 +1487,29 @@ func notifySignal(t *testing.T, label string, at time.Time) Signal {
 	})
 	if err != nil {
 		t.Fatalf("new notify signal: %v", err)
+	}
+	return signal
+}
+
+func terminalNotifySignal(t *testing.T, at time.Time) Signal {
+	t.Helper()
+	attribution, err := agent.NewTerminalAttribution("osc9", 120, 9)
+	if err != nil {
+		t.Fatalf("new terminal attribution: %v", err)
+	}
+	signal, err := NewTerminalNotifySignal(Signal{
+		Kind:         KindPermissionRequested,
+		Vendor:       "codex",
+		VendorEvent:  "tui_notification",
+		Scope:        ScopeRoot,
+		Notification: "approval-requested",
+		Evidence:     "approval requested",
+		Confidence:   1,
+		ReceivedAt:   at,
+		Terminal:     &attribution,
+	})
+	if err != nil {
+		t.Fatalf("new terminal notify signal: %v", err)
 	}
 	return signal
 }

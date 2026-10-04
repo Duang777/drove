@@ -42,6 +42,9 @@ type ExplainEvent struct {
 	Rule               string               `json:"rule,omitempty"`
 	Edge               agent.ScreenEdge     `json:"edge,omitempty"`
 	Region             string               `json:"region,omitempty"`
+	Protocol           string               `json:"protocol,omitempty"`
+	OutputOffset       uint64               `json:"output_offset,omitempty"`
+	LastOutputSeq      uint64               `json:"last_output_seq,omitempty"`
 	Evidence           string               `json:"evidence,omitempty"`
 	SuppressionReason  string               `json:"suppression_reason,omitempty"`
 	From               agent.State          `json:"from,omitempty"`
@@ -221,6 +224,17 @@ func decodeExplainSignal(row store.EventRow, summary *ExplainEvent) error {
 		}
 		applyExplainSignal(summary, payload.SignalPayloadV1)
 		applyExplainScreen(summary, payload.Screen)
+	case 4:
+		var payload event.SignalPayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return explainPayloadError(row, "decode signal", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return explainPayloadError(row, "validate signal", err)
+		}
+		applyExplainSignal(summary, payload.SignalPayloadV1)
+		applyExplainScreen(summary, payload.Screen)
+		applyExplainTerminal(summary, payload.Terminal)
 	default:
 		summary.UnsupportedVersion = &version
 	}
@@ -267,6 +281,17 @@ func decodeExplainStateEvidence(
 		}
 		applyExplainStateEvidence(summary, payload.StateEvidencePayloadV1)
 		applyExplainScreen(summary, payload.Screen)
+	case 4:
+		var payload event.StateEvidencePayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return explainPayloadError(row, "decode state evidence", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return explainPayloadError(row, "validate state evidence", err)
+		}
+		applyExplainStateEvidence(summary, payload.StateEvidencePayloadV1)
+		applyExplainScreen(summary, payload.Screen)
+		applyExplainTerminal(summary, payload.Terminal)
 	default:
 		summary.UnsupportedVersion = &version
 	}
@@ -331,6 +356,18 @@ func applyExplainScreen(
 	summary.Edge = agent.ScreenEdge(screen.Edge)
 	summary.Region = screen.Region
 	summary.Evidence = screen.Evidence
+}
+
+func applyExplainTerminal(
+	summary *ExplainEvent,
+	terminal *event.TerminalAttributionPayload,
+) {
+	if terminal == nil {
+		return
+	}
+	summary.Protocol = terminal.Protocol
+	summary.OutputOffset = terminal.OutputOffset
+	summary.LastOutputSeq = terminal.LastOutputSeq
 }
 
 func explainScreen(

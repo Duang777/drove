@@ -12,6 +12,7 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
+	"github.com/Duang777/drove/internal/term"
 )
 
 // Runner 描述如何拉起某厂商的 agent。
@@ -55,12 +56,18 @@ type HookNormalizer interface {
 	NormalizeHook(HookInput) (detect.Signal, error)
 }
 
+// TerminalNotificationNormalizer converts a framed terminal notice to a signal.
+type TerminalNotificationNormalizer interface {
+	NormalizeOSC9(term.OSC9Frame) (detect.Signal, bool, error)
+}
+
 // Entry 是注册表中的一个实现。
 type Entry struct {
-	Runner         Runner
-	HookNormalizer HookNormalizer
-	SignalInjector SignalInjector
-	screenRules    screenRuleProvider
+	Runner                         Runner
+	HookNormalizer                 HookNormalizer
+	SignalInjector                 SignalInjector
+	TerminalNotificationNormalizer TerminalNotificationNormalizer
+	screenRules                    screenRuleProvider
 }
 
 // NewScreenClassifier constructs independent screen-rule state for one session.
@@ -86,6 +93,21 @@ func (e Entry) NormalizeHook(input HookInput) (detect.Signal, error) {
 		return detect.Signal{}, ErrUnsupportedHook
 	}
 	return e.HookNormalizer.NormalizeHook(input)
+}
+
+// SupportsTerminalNotifications reports whether the adapter understands OSC 9.
+func (e Entry) SupportsTerminalNotifications() bool {
+	return e.TerminalNotificationNormalizer != nil
+}
+
+// NormalizeOSC9 interprets one framed OSC 9 notification.
+func (e Entry) NormalizeOSC9(
+	frame term.OSC9Frame,
+) (detect.Signal, bool, error) {
+	if e.TerminalNotificationNormalizer == nil {
+		return detect.Signal{}, false, nil
+	}
+	return e.TerminalNotificationNormalizer.NormalizeOSC9(frame)
 }
 
 // SupportsResume reports whether the exact runner supports native resume.
@@ -148,12 +170,14 @@ func NewRegistry() *Registry {
 		claudeRunner{},
 		claudeHookDecoder{},
 		claudeSignalInjector{},
+		nil,
 		claudeScreenRules,
 	)
 	r.register(
 		codexRunner{},
 		codexHookDecoder{},
 		codexSignalInjector{},
+		codexOSC9Normalizer{},
 		codexScreenRules,
 	)
 	r.generic = Entry{Runner: genericRunner{}}
@@ -165,6 +189,7 @@ func (r *Registry) register(
 	runner Runner,
 	normalizer HookNormalizer,
 	injector SignalInjector,
+	terminalNormalizer TerminalNotificationNormalizer,
 	screenRules screenRuleProvider,
 ) {
 	v := runner.Vendor()
@@ -172,10 +197,11 @@ func (r *Registry) register(
 		panic(fmt.Sprintf("adapter: duplicate vendor %q", v))
 	}
 	r.entries[v] = Entry{
-		Runner:         runner,
-		HookNormalizer: normalizer,
-		SignalInjector: injector,
-		screenRules:    screenRules,
+		Runner:                         runner,
+		HookNormalizer:                 normalizer,
+		SignalInjector:                 injector,
+		TerminalNotificationNormalizer: terminalNormalizer,
+		screenRules:                    screenRules,
 	}
 }
 

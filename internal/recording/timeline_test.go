@@ -186,6 +186,32 @@ func TestTimelineRejectsMalformedKnownEvidenceButPreservesUnknownVersion(t *test
 	}
 }
 
+func TestDecodeStateAttributionAcceptsTerminalV4(t *testing.T) {
+	payload, err := json.Marshal(event.StateEvidencePayloadV4{
+		StateEvidencePayloadV1: event.StateEvidencePayloadV1{
+			Version: 4, Source: "notify", Event: "tui_notification", Confidence: 1,
+		},
+		Terminal: &event.TerminalAttributionPayload{
+			Protocol:      "osc9",
+			OutputOffset:  10,
+			LastOutputSeq: 9,
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal terminal evidence: %v", err)
+	}
+	source, rule, err := decodeStateAttribution(store.EventRow{
+		Seq:     10,
+		Payload: string(payload),
+	})
+	if err != nil {
+		t.Fatalf("decode terminal evidence: %v", err)
+	}
+	if source != "notify" || rule != "" {
+		t.Fatalf("attribution = (%q, %q)", source, rule)
+	}
+}
+
 func timelineFixtureRows(t *testing.T, base time.Time) []store.EventRow {
 	t.Helper()
 	screen := &event.ScreenAttributionPayload{
@@ -247,7 +273,7 @@ func timelineFixtureRows(t *testing.T, base time.Time) []store.EventRow {
 			From:      string(agent.StateBlocked),
 			To:        string(agent.StateWorking),
 			Reason:    "future evidence",
-			Payload:   `{"version":4,"source":"future","rule":"private"}`,
+			Payload:   `{"version":5,"source":"future","rule":"private"}`,
 		},
 		timelineStateRow(
 			t,
