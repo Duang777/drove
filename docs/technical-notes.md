@@ -458,3 +458,45 @@ signal、state、error、input audit 和旧 `output` event。20 轮 race 验证�
 - 过期回放保留 metadata，截止时间及更新附件仍可读取；
 - `secure_delete=ON`，零删除和实际删除都完成 WAL truncate checkpoint；
 - 清理后投影可恢复，下一会话从恢复后的全局序号继续。
+
+## 9. Terminal actor 32-session benchmark
+
+2026-10-04 在以下环境运行：
+
+- Go `go1.24.13 darwin/arm64`
+- macOS `26.5.1` (`25F80`)
+- CPU `Apple M5 Pro`
+- `github.com/charmbracelet/x/vt`
+  `v0.0.0-20261004011457-ad85c59fdf4e`
+
+`BenchmarkTerminalActor32` 同时启动 32 个真实 terminal actor。每个 actor
+在一秒目标窗口内接收恰好 1 MiB committed bytes；输入包含清屏、光标移动、
+覆盖、宽字符和光标显隐。每轮总计 32 MiB，并在 output end 后检查全部 32 个
+最终 screen marker。
+
+```bash
+go test ./internal/session -race -run '^$' \
+  -bench '^BenchmarkTerminalActor32$' -benchmem -benchtime=1x -count=1
+go test ./internal/session -run '^$' \
+  -bench BenchmarkTerminalActor32 -benchmem -count=5
+```
+
+无 race 五轮结果：
+
+| 指标 | 结果 |
+| --- | ---: |
+| 平均时长 | 1.026781392 s/op |
+| 时长范围 | 1.005694500-1.078678583 s/op |
+| 平均聚合吞吐 | 31.19 MiB/s |
+| 聚合吞吐范围 | 29.67-31.82 MiB/s |
+| committed bytes | 33,554,432 B/op |
+| 平均分配字节 | 4,211,035,230 B/op |
+| 平均分配次数 | 33,541,001 allocs/op |
+| 峰值 goroutine | 99 |
+| actor inbox 最大观测深度 | 1 |
+| inbox backpressure | 未触发 |
+| 最终 screen marker | 32/32 通过 |
+
+race 单轮为 3.185080333 s/op、10.05 MiB/s、4,642,279,720 B/op 和
+33,552,058 allocs/op；字节核算、最终 screen marker 和 race detector 均通过。
+该基准不设置 CI 延迟阈值，数据只作为当前固定依赖和硬件环境下的基线。
