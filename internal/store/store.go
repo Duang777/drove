@@ -27,12 +27,14 @@ type EventRow struct {
 	Reason    string
 	Payload   string
 
-	OutputAttachment []byte `json:"-"`
+	OutputAttachment        []byte `json:"-"`
+	OutputAttachmentPresent bool   `json:"-"`
 }
 
 // Store 封装 SQLite 存储。
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	readers *sql.DB
 }
 
 const schemaVersion = 2
@@ -67,6 +69,14 @@ func Open(path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	readers, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("store: open reader pool for %q: %w", path, err)
+	}
+	readers.SetMaxOpenConns(4)
+	readers.SetMaxIdleConns(4)
+	s.readers = readers
 	return s, nil
 }
 
@@ -327,7 +337,8 @@ func (s *Store) ScanEvents(ctx context.Context, visit func(EventRow) error) (uin
 func (s *Store) Replay(sessionID string) ([]EventRow, error) {
 	rows, err := s.db.Query(
 		`SELECT e.seq, e.ts, e.type, e.session_id, e.agent_id, e.from_state,
-		        e.to_state, e.reason, e.payload, o.data
+		        e.to_state, e.reason, e.payload, o.data,
+		        CASE WHEN o.event_seq IS NULL THEN 0 ELSE 1 END
 		 FROM events AS e
 		 LEFT JOIN output_chunks AS o ON o.event_seq = e.seq
 		 WHERE e.session_id = ?
@@ -343,10 +354,13 @@ func (s *Store) Replay(sessionID string) ([]EventRow, error) {
 	for rows.Next() {
 		var r EventRow
 		var ts string
+		var attachmentPresent int
 		if err := rows.Scan(&r.Seq, &ts, &r.Type, &r.SessionID, &r.AgentID,
-			&r.From, &r.To, &r.Reason, &r.Payload, &r.OutputAttachment); err != nil {
+			&r.From, &r.To, &r.Reason, &r.Payload, &r.OutputAttachment,
+			&attachmentPresent); err != nil {
 			return nil, fmt.Errorf("store: scan: %w", err)
 		}
+		r.OutputAttachmentPresent = attachmentPresent == 1
 		t, err := time.Parse(time.RFC3339Nano, ts)
 		if err != nil {
 			return nil, fmt.Errorf("store: parse ts: %w", err)
@@ -462,7 +476,8 @@ func validEventType(typ event.Type) bool {
 		event.TypeError,
 		event.TypeSessionLifecycle,
 		event.TypeAgentInput,
-		event.TypeAgentSignal:
+		event.TypeAgentSignal,
+		event.TypeAgentResized:
 		return true
 	default:
 		return false
@@ -522,5 +537,16 @@ func (s *Store) PruneOutputAttachments(
 
 // Close 关闭数据库。
 func (s *Store) Close() error {
-	return s.db.Close()
+	var readerErr error
+	if s.readers != nil {
+		readerErr = s.readers.Close()
+	}
+	writerErr := s.db.Close()
+	if readerErr != nil || writerErr != nil {
+		return fmt.Errorf(
+			"store: close: %w",
+			errors.Join(readerErr, writerErr),
+		)
+	}
+	return nil
 }

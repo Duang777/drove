@@ -78,6 +78,60 @@ func TestCommitSealsDraft(t *testing.T) {
 	}
 }
 
+func TestAgentResizedPayloadValidationAndCommit(t *testing.T) {
+	payload := AgentResizedPayloadV1{
+		Version:      AgentResizedPayloadVersion,
+		Rows:         50,
+		Columns:      160,
+		OutputOffset: 98304,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal resize payload: %v", err)
+	}
+	decoded, err := DecodeAgentResizedPayload(string(encoded))
+	if err != nil {
+		t.Fatalf("decode resize payload: %v", err)
+	}
+	if decoded != payload {
+		t.Fatalf("decoded resize payload = %+v, want %+v", decoded, payload)
+	}
+
+	committed, err := Commit(
+		10,
+		time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC),
+		Draft{
+			typ:       TypeAgentResized,
+			sessionID: "agent-1",
+			agentID:   "agent-1",
+			payload:   string(encoded),
+		},
+	)
+	if err != nil {
+		t.Fatalf("commit resize event: %v", err)
+	}
+	if committed.Type != TypeAgentResized || committed.Payload != string(encoded) {
+		t.Fatalf("committed resize event = %+v", committed)
+	}
+
+	for _, invalid := range []AgentResizedPayloadV1{
+		{Version: 2, Rows: 50, Columns: 160},
+		{Version: 1, Columns: 160},
+		{Version: 1, Rows: 50},
+	} {
+		invalidJSON, err := json.Marshal(invalid)
+		if err != nil {
+			t.Fatalf("marshal invalid payload: %v", err)
+		}
+		if _, err := DecodeAgentResizedPayload(string(invalidJSON)); err == nil {
+			t.Fatalf("decode accepted invalid resize payload %+v", invalid)
+		}
+	}
+	if _, err := DecodeAgentResizedPayload(`{"version":1`); err == nil {
+		t.Fatal("decode accepted malformed resize payload")
+	}
+}
+
 func TestOutputChunkDraftCopiesPrivateAttachment(t *testing.T) {
 	data := []byte("prompt\x00without newline")
 	draft, err := NewOutputChunkDraft("agent-1", "agent-1", 17, data)
