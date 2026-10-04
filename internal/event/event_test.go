@@ -140,6 +140,46 @@ func TestAgentResizedPayloadValidationAndCommit(t *testing.T) {
 	}
 }
 
+func TestAgentResumedPayloadAndDraft(t *testing.T) {
+	payload := AgentResumedPayloadV1{
+		Version:          1,
+		VendorSessionRef: "vendor-session-1",
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate payload: %v", err)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+	at := time.Date(2026, time.October, 4, 14, 0, 0, 0, time.UTC)
+	committed, err := Commit(
+		10,
+		at,
+		NewAgentResumedDraft("agent-1", "agent-1", string(encoded)),
+	)
+	if err != nil {
+		t.Fatalf("commit resumed draft: %v", err)
+	}
+	if committed.Type != TypeAgentResumed ||
+		committed.Reason != "requested" ||
+		committed.Payload != `{"version":1}` ||
+		committed.StoredPayload() != string(encoded) ||
+		strings.Contains(committed.Payload, "vendor-session-1") {
+		t.Fatalf("committed event = %+v", committed)
+	}
+
+	for _, ref := range []string{"", " leading", strings.Repeat("a", 257)} {
+		invalid := AgentResumedPayloadV1{
+			Version:          1,
+			VendorSessionRef: ref,
+		}
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("reference %q passed validation", ref)
+		}
+	}
+}
+
 func TestOutputChunkDraftCopiesPrivateAttachment(t *testing.T) {
 	data := []byte("prompt\x00without newline")
 	draft, err := NewOutputChunkDraft("agent-1", "agent-1", 17, data)

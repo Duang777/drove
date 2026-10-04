@@ -40,6 +40,7 @@ type Status struct {
 	SignalInjectionStatus agent.SignalInjectionStatus `json:"signal_injection_status"`
 	SignalInjectionReason agent.SignalInjectionReason `json:"signal_injection_reason"`
 	LastTransition        *agent.Evidence             `json:"last_transition,omitempty"`
+	Resumable             bool                        `json:"resumable"`
 }
 
 // StartRequest 描述启动一个新 agent 会话的参数。
@@ -103,6 +104,8 @@ var (
 	ErrInputWrite = errors.New("session: input write failed")
 	// ErrInputAudit 表示输入已送达，但审计事件持久化失败。
 	ErrInputAudit = errors.New("session: input delivered but audit failed")
+	// ErrResumeConflict means the Agent cannot begin a native resume now.
+	ErrResumeConflict = errors.New("session: agent cannot be resumed")
 )
 
 type stopCause uint8
@@ -117,6 +120,11 @@ type processSession interface {
 	Write([]byte) (int, error)
 	Close() error
 	PID() int
+}
+
+type launchedSession interface {
+	processSession
+	Resize(rows, columns uint16) error
 }
 
 type runningSession struct {
@@ -155,6 +163,7 @@ type Manager struct {
 	detectConfig     detect.Config
 	clock            observationClock
 	newCredential    signalCredentialSource
+	startPTY         func(pty.Config) (launchedSession, error)
 	injectionEnabled bool
 	injectionDataDir string
 	injectionRelay   string
@@ -165,6 +174,7 @@ type Manager struct {
 	mu       sync.RWMutex
 	agents   map[agent.ID]*managedAgent
 	sessions map[agent.ID]*runningSession
+	resuming map[agent.ID]struct{}
 	closed   bool
 
 	starts    sync.WaitGroup
@@ -177,6 +187,12 @@ type BootstrapResult struct {
 	Manager  *Manager
 	Hub      *event.Hub
 	Recovery RecoveryReport
+}
+
+// StartupResumeResult reports one automatic native resume attempt.
+type StartupResumeResult struct {
+	AgentID agent.ID
+	Err     error
 }
 
 // NewManager 创建从 initialSeq 继续提交事件的 Manager。
@@ -194,10 +210,14 @@ func NewManager(
 		committer:     newCommitter(initialSeq, st, hub),
 		agents:        make(map[agent.ID]*managedAgent),
 		sessions:      make(map[agent.ID]*runningSession),
+		resuming:      make(map[agent.ID]struct{}),
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
 		newCredential: generateSignalCredential,
-		injectionFS:   defaultSignalInjectionFS(),
+		startPTY: func(config pty.Config) (launchedSession, error) {
+			return pty.Start(config)
+		},
+		injectionFS: defaultSignalInjectionFS(),
 	}
 	for _, option := range options {
 		option(manager)
@@ -377,13 +397,44 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.sessions[id] = running
 	m.mu.Unlock()
 
-	// 3. 创建 PTY 会话。回调等待状态和会话登记完成后再进入 Manager。
-	sess, err := pty.Start(pty.Config{
-		Command: cmdName,
-		Args:    injection.args,
-		Env:     processEnv,
-		Dir:     req.Dir,
-		Size:    initialPTYSize,
+	if err := m.activate(ctx, activation{
+		id:           id,
+		managed:      managed,
+		running:      running,
+		command:      cmdName,
+		args:         injection.args,
+		env:          processEnv,
+		dir:          req.Dir,
+		terminalSize: terminalSize,
+		ptySize:      initialPTYSize,
+	}); err != nil {
+		return nil, err
+	}
+	return m.Status(id)
+}
+
+type activation struct {
+	id           agent.ID
+	managed      *managedAgent
+	running      *runningSession
+	command      string
+	args         []string
+	env          []string
+	dir          string
+	terminalSize term.Size
+	ptySize      pty.Size
+}
+
+func (m *Manager) activate(ctx context.Context, plan activation) error {
+	id := plan.id
+	managed := plan.managed
+	running := plan.running
+	sess, err := m.startPTY(pty.Config{
+		Command: plan.command,
+		Args:    plan.args,
+		Env:     plan.env,
+		Dir:     plan.dir,
+		Size:    plan.ptySize,
 		OnOutput: func(chunk []byte, offset uint64) {
 			<-running.callbacksReady
 			_ = running.output.Feed(chunk, offset)
@@ -421,7 +472,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-		return nil, errors.Join(startErr, commitErr, outputErr, cleanupErr)
+		return errors.Join(startErr, commitErr, outputErr, cleanupErr)
 	}
 
 	m.mu.Lock()
@@ -429,7 +480,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.mu.Unlock()
 
 	terminalActor, err := newTerminalActor(
-		terminalSize,
+		plan.terminalSize,
 		sess,
 		running.classifier,
 		running.observer,
@@ -460,7 +511,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		closeErr := sess.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-		return nil, errors.Join(
+		return errors.Join(
 			startErr,
 			commitErr,
 			outputErr,
@@ -487,18 +538,181 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		close(running.callbacksReady)
 		_ = sess.Close()
 		running.observer.Close()
-		return nil, err
+		return err
 	}
 	close(running.signalReady)
 	close(running.callbacksReady)
-	if err := m.waitForRequiredHook(ctx, a, running); err != nil {
+	if err := m.waitForRequiredHook(ctx, managed.agent, running); err != nil {
 		m.invalidateSignal(id, running)
 		m.requestStop(id, running, stopCauseShutdown)
 		closeErr := sess.Close()
-		return nil, errors.Join(err, closeErr)
+		return errors.Join(err, closeErr)
+	}
+	return nil
+}
+
+// Resume starts a vendor-native process under an existing stopped Agent ID.
+func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
+	if beginErr := m.beginStart(); beginErr != nil {
+		return nil, fmt.Errorf("session: resume: %w", beginErr)
+	}
+	defer m.endStart()
+
+	managed, entry, ref, err := m.reserveResume(id)
+	if err != nil {
+		return nil, err
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			m.releaseResume(id)
+		}
+	}()
+
+	target := managed.agent
+	command, err := entry.ResumeCommand(
+		adapter.CreationMeta{Mode: target.RunMode()},
+		ref,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("%w: agent %q has no valid native resume command", ErrResumeConflict, id)
+	}
+	terminalSize, err := initialTerminalSize()
+	if err != nil {
+		return nil, fmt.Errorf("session: initial terminal size: %w", err)
+	}
+	initialPTYSize, err := toPTYSize(terminalSize)
+	if err != nil {
+		return nil, fmt.Errorf("session: initial PTY size: %w", err)
+	}
+	injection, err := m.prepareSignalInjection(
+		id,
+		entry,
+		target.Vendor(),
+		target.HookPolicy(),
+		target.RunMode(),
+		command.Args,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	running, processEnv, _, err := m.prepareManagedRuntime(managed, entry)
+	if err != nil {
+		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
+		return nil, errors.Join(err, cleanupErr)
+	}
+	running.injectionDir = injection.dir
+
+	resumedPayload, err := json.Marshal(event.AgentResumedPayloadV1{
+		Version:          1,
+		VendorSessionRef: ref,
+	})
+	if err != nil {
+		running.observer.Close()
+		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
+		return nil, errors.Join(
+			fmt.Errorf("session: encode resume metadata: %w", err),
+			cleanupErr,
+		)
+	}
+	if _, err := m.committer.CommitAgent(
+		ctx,
+		target,
+		agent.ResumeToStarting("session resume", agent.Evidence{
+			Source:     agent.EvidenceSession,
+			Event:      "session_resume",
+			Confidence: 1,
+		}),
+		[]event.Draft{event.NewAgentResumedDraft(
+			string(id),
+			string(id),
+			string(resumedPayload),
+		)},
+	); err != nil {
+		running.observer.Close()
+		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
+		return nil, errors.Join(
+			fmt.Errorf("session: persist resume: %w", err),
+			cleanupErr,
+		)
 	}
 
+	m.mu.Lock()
+	m.sessions[id] = running
+	delete(m.resuming, id)
+	m.mu.Unlock()
+	reserved = false
+
+	if err := m.activate(ctx, activation{
+		id:           id,
+		managed:      managed,
+		running:      running,
+		command:      command.Name,
+		args:         injection.args,
+		env:          processEnv,
+		terminalSize: terminalSize,
+		ptySize:      initialPTYSize,
+	}); err != nil {
+		return nil, err
+	}
 	return m.Status(id)
+}
+
+func (m *Manager) reserveResume(
+	id agent.ID,
+) (*managedAgent, adapter.Entry, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	managed, ok := m.agents[id]
+	if !ok {
+		return nil, adapter.Entry{}, "", fmt.Errorf("%w: %q", ErrUnknownAgent, id)
+	}
+	if _, attached := m.sessions[id]; attached {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q is attached",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if _, reserved := m.resuming[id]; reserved {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q is already resuming",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if managed.agent.State() != agent.StateStopped {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q is not stopped",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	ref := managed.vendorSessionReference()
+	if ref == "" {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q has no vendor session reference",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	entry, ok := m.reg.Lookup(managed.agent.Vendor())
+	if !ok || !entry.SupportsResume() {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q vendor does not support native resume",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	m.resuming[id] = struct{}{}
+	return managed, entry, ref, nil
+}
+
+func (m *Manager) releaseResume(id agent.ID) {
+	m.mu.Lock()
+	delete(m.resuming, id)
+	m.mu.Unlock()
 }
 
 func initialTerminalSize() (term.Size, error) {
@@ -617,12 +831,14 @@ func (m *Manager) Stop(id agent.ID) error {
 
 // Status 返回某 agent 的当前状态。
 func (m *Manager) Status(id agent.ID) (*Status, error) {
-	a, ok := m.agent(id)
+	managed, ok := m.managed(id)
 	if !ok {
 		return nil, fmt.Errorf("session: unknown agent %q", id)
 	}
+	a := managed.agent
 	m.mu.RLock()
 	sess, _ := m.sessions[id]
+	_, reserved := m.resuming[id]
 	var process processSession
 	hookStatus := detect.HookDetached
 	if sess != nil {
@@ -631,6 +847,15 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 			hookStatus = sess.observer.Snapshot().HookStatus()
 		}
 	}
+	state := a.State()
+	ref := managed.vendorSessionReference()
+	entry, exactVendor := m.reg.Lookup(a.Vendor())
+	resumable := state == agent.StateStopped &&
+		sess == nil &&
+		!reserved &&
+		ref != "" &&
+		exactVendor &&
+		entry.SupportsResume()
 	m.mu.RUnlock()
 
 	st := &Status{
@@ -638,13 +863,14 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		Name:           a.Name(),
 		Vendor:         a.Vendor(),
 		Mode:           a.RunMode(),
-		State:          a.State(),
+		State:          state,
 		CreatedAt:      a.CreatedAt(),
 		UpdatedAt:      a.UpdatedAt(),
 		LastError:      a.LastError(),
 		HookPolicy:     a.HookPolicy(),
 		HookStatus:     hookStatus,
 		LastTransition: a.LastTransition(),
+		Resumable:      resumable,
 	}
 	st.SignalInjection = a.SignalInjection()
 	st.SignalInjectionStatus, st.SignalInjectionReason = a.SignalInjectionResult()
@@ -679,6 +905,43 @@ func (m *Manager) List() []*Status {
 	return out
 }
 
+// ResumeOnStart attempts each recovery-marked Agent once in creation order.
+func (m *Manager) ResumeOnStart(ctx context.Context) []StartupResumeResult {
+	type candidate struct {
+		id        agent.ID
+		createdAt time.Time
+	}
+	m.mu.Lock()
+	candidates := make([]candidate, 0)
+	for id, managed := range m.agents {
+		if !managed.resumeOnStart {
+			continue
+		}
+		managed.resumeOnStart = false
+		candidates = append(candidates, candidate{
+			id:        id,
+			createdAt: managed.agent.CreatedAt(),
+		})
+	}
+	m.mu.Unlock()
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].createdAt.Equal(candidates[j].createdAt) {
+			return candidates[i].id < candidates[j].id
+		}
+		return candidates[i].createdAt.Before(candidates[j].createdAt)
+	})
+
+	results := make([]StartupResumeResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		_, err := m.Resume(ctx, candidate.id)
+		results = append(results, StartupResumeResult{
+			AgentID: candidate.id,
+			Err:     err,
+		})
+	}
+	return results
+}
+
 // Replay 返回某会话的事件流（来自 store，按 seq 升序）。
 func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 	rows, err := m.store.Replay(sessionID)
@@ -686,6 +949,18 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 		return nil, err
 	}
 	for i := range rows {
+		if rows[i].Type == string(event.TypeAgentResumed) {
+			payload, err := event.RedactAgentResumedPayload(rows[i].Payload)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"session: redact agent.resumed payload at seq %d: %w",
+					rows[i].Seq,
+					err,
+				)
+			}
+			rows[i].Payload = payload
+			continue
+		}
 		if rows[i].Type != string(event.TypeOutputChunk) {
 			continue
 		}

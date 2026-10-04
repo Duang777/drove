@@ -6,7 +6,8 @@
 
 ## 关键设计
 
-- `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
+- `Manager` 持有：`agents`（ID→session-owned managed Agent）、`sessions`
+  （ID→运行中 PTY）、原生恢复预留、event Hub、store、adapter Registry。
 - 每个运行中会话持有一个 terminal actor、一个 observation actor、一个 recording actor、
   Detector State 和 signal token 的 SHA-256 digest；token 只授权该 Agent 的
   signal endpoint，并在启动失败或退出认领时失效。
@@ -24,6 +25,9 @@
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →
   等待 required hook。
+- `Resume(ctx, id)` 在同一 Agent ID 下预留一次恢复，提交私有 `agent.resumed` 与 typed
+  `Stopped -> Starting` 后复用 Start 的 PTY 激活路径；`Status.Resumable` 只由已停止、
+  未连接、未预留、有已提交 ref 且 exact adapter 支持恢复的会话派生。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
@@ -64,6 +68,8 @@
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
   `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。
+- 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
+  只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。
 - 信号与状态证据 reader 同时接受 v1、v2 和 typed screen v3；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。

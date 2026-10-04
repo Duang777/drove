@@ -135,6 +135,74 @@ func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 	}
 }
 
+func TestHandleResumeReturnsExistingAgentAndMapsConflicts(t *testing.T) {
+	binDir := t.TempDir()
+	claudePath := filepath.Join(binDir, "claude")
+	if err := os.WriteFile(
+		claudePath,
+		[]byte("#!/bin/sh\nexec /bin/sh -c 'while :; do sleep 1; done'\n"),
+		0o700,
+	); err != nil {
+		t.Fatalf("write claude shim: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	server, manager := newResumableTestServer(t)
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/agent-1/resume",
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resume response = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	var status session.Status
+	if err := json.NewDecoder(rec.Body).Decode(&status); err != nil {
+		t.Fatalf("decode resume status: %v", err)
+	}
+	if status.AgentID != "agent-1" ||
+		status.State != agent.StateWorking ||
+		status.Resumable ||
+		status.PID <= 0 {
+		t.Fatalf("resumed status = %+v", status)
+	}
+
+	conflict := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/agent-1/resume",
+		nil,
+	)
+	conflictResponse := httptest.NewRecorder()
+	serveAuthorized(server, conflictResponse, conflict)
+	if conflictResponse.Code != http.StatusConflict {
+		t.Fatalf(
+			"conflict response = %d %q, want 409",
+			conflictResponse.Code,
+			conflictResponse.Body.String(),
+		)
+	}
+
+	unknown := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/missing/resume",
+		nil,
+	)
+	unknownResponse := httptest.NewRecorder()
+	serveAuthorized(server, unknownResponse, unknown)
+	if unknownResponse.Code != http.StatusNotFound {
+		t.Fatalf(
+			"unknown response = %d %q, want 404",
+			unknownResponse.Code,
+			unknownResponse.Body.String(),
+		)
+	}
+	if err := manager.Stop("agent-1"); err != nil {
+		t.Fatalf("stop resumed agent: %v", err)
+	}
+}
+
 func TestHandleExplainReturnsAttachedTypedResponse(t *testing.T) {
 	server, manager, _ := newTestServer(t)
 	status, err := manager.Start(context.Background(), session.StartRequest{
@@ -1722,6 +1790,84 @@ func newBrowserTestServer(t *testing.T, server *Server) *httptest.Server {
 	handler = server.Handler(BrowserAccess, host)
 	httpServer.Start()
 	return httpServer
+}
+
+func newResumableTestServer(t *testing.T) (*Server, *session.Manager) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "drove.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "observed",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_ref":"vendor-ref",` +
+				`"confidence":1,"received_at":"2026-10-04T15:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("seed resumable session: %v", err)
+	}
+	result, err := session.Bootstrap(
+		context.Background(),
+		adapter.NewRegistry(),
+		st,
+	)
+	if err != nil {
+		t.Fatalf("bootstrap resumable session: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := result.Manager.Close(); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+		result.Hub.Close()
+		if err := st.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	dataDir := t.TempDir()
+	if err := os.WriteFile(
+		auth.TokenPath(dataDir),
+		[]byte(testControlToken),
+		0o600,
+	); err != nil {
+		t.Fatalf("write control token: %v", err)
+	}
+	credentials, err := auth.Open(dataDir, auth.DefaultOptions())
+	if err != nil {
+		t.Fatalf("open auth controller: %v", err)
+	}
+	return NewServer(ServerOptions{
+		Manager: result.Manager,
+		Hub:     result.Hub,
+		Auth:    credentials,
+	}), result.Manager
 }
 
 func waitForSignalTokenFile(t *testing.T, path string) string {

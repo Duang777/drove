@@ -39,6 +39,8 @@ const (
 	TypeAgentSignal Type = "agent.signal"
 	// TypeAgentResized 表示已成功应用到 PTY 和终端模型的尺寸。
 	TypeAgentResized Type = "agent.resized"
+	// TypeAgentResumed marks an explicit native resume attempt.
+	TypeAgentResumed Type = "agent.resumed"
 )
 
 // Event 是不可变事件。公开字段供序列化，私有字段保存持久化附件。
@@ -101,7 +103,8 @@ const (
 	// OutputChunkPayloadVersion 是当前 output.chunk payload 版本。
 	OutputChunkPayloadVersion = 1
 	// MaxOutputChunkBytes 是单个 output.chunk 可携带的最大解码字节数。
-	MaxOutputChunkBytes = 32 * 1024
+	MaxOutputChunkBytes       = 32 * 1024
+	agentResumedPublicPayload = `{"version":1}`
 )
 
 // OutputChunkPayloadV1 是 output.chunk 的版本 1 传输载荷。
@@ -347,6 +350,18 @@ func NewAgentResizedDraft(
 	}, nil
 }
 
+// NewAgentResumedDraft constructs an uncommitted native resume event.
+func NewAgentResumedDraft(sessionID, agentID, payload string) Draft {
+	return Draft{
+		typ:           TypeAgentResumed,
+		sessionID:     sessionID,
+		agentID:       agentID,
+		reason:        "requested",
+		payload:       agentResumedPublicPayload,
+		storedPayload: payload,
+	}
+}
+
 // Commit seals a copied draft with its durable sequence and timestamp.
 func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	if seq == 0 {
@@ -363,7 +378,8 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		TypeSessionLifecycle,
 		TypeAgentInput,
 		TypeAgentSignal,
-		TypeAgentResized:
+		TypeAgentResized,
+		TypeAgentResumed:
 	default:
 		return Event{}, fmt.Errorf("event: invalid draft type %q", draft.typ)
 	}
@@ -401,6 +417,14 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		}
 		storedPayload = draft.storedPayload
 		outputAttachment = append([]byte(nil), draft.outputAttachment...)
+	} else if draft.typ == TypeAgentResumed {
+		if _, err := DecodeAgentResumedPayload(draft.storedPayload); err != nil {
+			return Event{}, err
+		}
+		if draft.payload != agentResumedPublicPayload {
+			return Event{}, errors.New("event: invalid public agent.resumed payload")
+		}
+		storedPayload = draft.storedPayload
 	} else if len(draft.outputAttachment) != 0 || draft.storedPayload != "" {
 		return Event{}, errors.New("event: non-output chunk draft contains private output data")
 	}
@@ -435,6 +459,50 @@ func (e Event) StoredPayload() string {
 // OutputAttachment 返回事件私有输出附件的副本。
 func (e Event) OutputAttachment() []byte {
 	return append([]byte(nil), e.outputAttachment...)
+}
+
+// AgentResumedPayloadV1 identifies the opaque vendor session selected for resume.
+type AgentResumedPayloadV1 struct {
+	Version          int    `json:"version"`
+	VendorSessionRef string `json:"vendor_session_ref"`
+}
+
+// Validate rejects unsupported or unsafe native resume metadata.
+func (p AgentResumedPayloadV1) Validate() error {
+	if p.Version != 1 {
+		return fmt.Errorf("event: unsupported agent.resumed payload version %d", p.Version)
+	}
+	if p.VendorSessionRef == "" ||
+		len(p.VendorSessionRef) > 256 ||
+		!ascii(p.VendorSessionRef) {
+		return errors.New(
+			"event: vendor_session_ref must contain 1 to 256 printable ASCII bytes without surrounding whitespace",
+		)
+	}
+	return nil
+}
+
+// DecodeAgentResumedPayload validates a persisted native resume payload.
+func DecodeAgentResumedPayload(raw string) (AgentResumedPayloadV1, error) {
+	var payload AgentResumedPayloadV1
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return AgentResumedPayloadV1{}, fmt.Errorf(
+			"event: decode agent.resumed payload: %w",
+			err,
+		)
+	}
+	if err := payload.Validate(); err != nil {
+		return AgentResumedPayloadV1{}, err
+	}
+	return payload, nil
+}
+
+// RedactAgentResumedPayload validates a persisted payload and removes its reference.
+func RedactAgentResumedPayload(raw string) (string, error) {
+	if _, err := DecodeAgentResumedPayload(raw); err != nil {
+		return "", err
+	}
+	return agentResumedPublicPayload, nil
 }
 
 // SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.

@@ -5,11 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -327,6 +330,152 @@ func TestRunStopsLiveSessionBeforeClosingStore(t *testing.T) {
 	}
 	if status.State != agent.StateStopped || status.PID != 0 {
 		t.Fatalf("restored status = %+v, want stopped without PID", status)
+	}
+}
+
+func TestRunAutoResumesOnlyAfterAPIEntersAccept(t *testing.T) {
+	curlPath, err := exec.LookPath("curl")
+	if err != nil {
+		t.Fatalf("find curl: %v", err)
+	}
+	dataDir := shortDaemonDataDir(t)
+	dbPath := filepath.Join(dataDir, "drove.db")
+	addr := reserveAddress(t)
+	controlToken, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	base := time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "starting",
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "observed",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_ref":"vendor-ref",` +
+				`"confidence":1,"received_at":"2026-10-04T15:00:02Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       4,
+			Timestamp: base.Add(3 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "starting",
+			To:        "working",
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		_ = st.Close()
+		t.Fatalf("seed interrupted session: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close seeded store: %v", err)
+	}
+
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "accepted.json")
+	script := fmt.Sprintf(
+		"#!/bin/sh\n%s -fsS -H %s %s > %s || exit 23\nexec /bin/sh -c 'while :; do sleep 1; done'\n",
+		strconv.Quote(curlPath),
+		strconv.Quote("Authorization: Bearer "+controlToken),
+		strconv.Quote("http://"+addr+"/api/v1/agents"),
+		strconv.Quote(marker),
+	)
+	if err := os.WriteFile(filepath.Join(binDir, "claude"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write claude shim: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- New(&config.Config{
+			DataDir:        dataDir,
+			DBPath:         dbPath,
+			APIBind:        addr,
+			EventBuffer:    16,
+			ConsoleOrigins: []string{"http://localhost:5173"},
+			Session: config.SessionConfig{
+				AutoResumeOnStart: true,
+			},
+		}).Run(ctx)
+	}()
+	t.Cleanup(cancel)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, readErr := os.ReadFile(marker)
+		if readErr == nil && len(raw) > 0 {
+			var statuses []*session.Status
+			if decodeErr := json.Unmarshal(raw, &statuses); decodeErr == nil {
+				if len(statuses) != 1 || statuses[0].AgentID != "agent-1" {
+					t.Fatalf("readiness marker statuses = %+v", statuses)
+				}
+				break
+			}
+		}
+		if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+			t.Fatalf("read readiness marker: %v", readErr)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("resumed process could not call the accepting API")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	waitForAPI(t, addr, controlToken)
+
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("daemon run: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not stop")
+	}
+
+	st, err = store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	replayed, err := st.Replay("agent-1")
+	if err != nil {
+		t.Fatalf("replay auto-resumed session: %v", err)
+	}
+	hasResume := false
+	for _, row := range replayed {
+		hasResume = hasResume || row.Type == string(event.TypeAgentResumed)
+	}
+	if !hasResume {
+		t.Fatalf("auto-resume history has no agent.resumed event: %+v", replayed)
 	}
 }
 

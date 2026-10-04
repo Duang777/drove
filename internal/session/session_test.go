@@ -624,6 +624,183 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	}
 }
 
+func TestStatusDerivesResumableFromCommittedStateAndCapability(t *testing.T) {
+	manager, _ := newTestManager(t)
+	claude := addStoppedAgent(t, manager, "claude-agent", "claude", "vendor-ref")
+	generic := addStoppedAgent(t, manager, "generic-agent", "generic", "vendor-ref")
+	missingRef := addStoppedAgent(t, manager, "missing-ref", "codex", "")
+
+	for _, test := range []struct {
+		id   agent.ID
+		want bool
+	}{
+		{id: claude.agent.ID(), want: true},
+		{id: generic.agent.ID(), want: false},
+		{id: missingRef.agent.ID(), want: false},
+	} {
+		status, err := manager.Status(test.id)
+		if err != nil {
+			t.Fatalf("status %q: %v", test.id, err)
+		}
+		if status.Resumable != test.want {
+			t.Fatalf("status %q resumable = %t, want %t", test.id, status.Resumable, test.want)
+		}
+	}
+
+	manager.mu.Lock()
+	manager.resuming[claude.agent.ID()] = struct{}{}
+	manager.mu.Unlock()
+	status, err := manager.Status(claude.agent.ID())
+	if err != nil {
+		t.Fatalf("status reserved agent: %v", err)
+	}
+	if status.Resumable {
+		t.Fatal("reserved agent is resumable")
+	}
+}
+
+func TestResumeUsesNativeCommandAndKeepsAgentID(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+
+	status, err := manager.Resume(context.Background(), managed.agent.ID())
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if status.AgentID != string(managed.agent.ID()) ||
+		status.State != agent.StateWorking ||
+		status.Resumable {
+		t.Fatalf("resumed status = %+v", status)
+	}
+	if started.Command != "claude" ||
+		len(started.Args) != 2 ||
+		started.Args[0] != "--resume" ||
+		started.Args[1] != "vendor-ref" {
+		t.Fatalf("resume command = %q %q", started.Command, started.Args)
+	}
+
+	persisted, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay persisted resume: %v", err)
+	}
+	if len(persisted) == 0 || !strings.Contains(persisted[0].Payload, "vendor-ref") {
+		t.Fatalf("persisted resume payload = %+v, want internal reference", persisted)
+	}
+	rows, err := manager.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("manager replay resume: %v", err)
+	}
+	if len(rows) != 4 ||
+		rows[0].Type != string(event.TypeAgentResumed) ||
+		rows[0].Payload != `{"version":1}` ||
+		strings.Contains(rows[0].Payload, "vendor-ref") ||
+		rows[1].From != string(agent.StateStopped) ||
+		rows[1].To != string(agent.StateStarting) ||
+		rows[2].Type != string(event.TypeAgentSignal) ||
+		rows[3].From != string(agent.StateStarting) ||
+		rows[3].To != string(agent.StateWorking) {
+		t.Fatalf("resume history = %+v", rows)
+	}
+}
+
+func TestResumeFailureReturnsAgentToResumableStoppedState(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "codex", "thread-ref")
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		return nil, errors.New("exec unavailable")
+	}
+
+	status, err := manager.Resume(context.Background(), managed.agent.ID())
+	if err == nil || !strings.Contains(err.Error(), "start pty") {
+		t.Fatalf("resume error = %v, want PTY startup error", err)
+	}
+	if status != nil {
+		t.Fatalf("resume status = %+v, want nil", status)
+	}
+	current, err := manager.Status(managed.agent.ID())
+	if err != nil {
+		t.Fatalf("status after failure: %v", err)
+	}
+	if current.State != agent.StateStopped || !current.Resumable || current.PID != 0 {
+		t.Fatalf("status after failed resume = %+v", current)
+	}
+
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay failed resume: %v", err)
+	}
+	if len(rows) != 5 ||
+		rows[0].Type != string(event.TypeAgentResumed) ||
+		rows[1].To != string(agent.StateStarting) ||
+		rows[2].Type != string(event.TypeAgentSignal) ||
+		rows[3].Type != string(event.TypeError) ||
+		rows[4].To != string(agent.StateStopped) {
+		t.Fatalf("failed resume history = %+v", rows)
+	}
+}
+
+func TestResumeRejectsUnknownUnsupportedAndReservedAgents(t *testing.T) {
+	manager, _ := newTestManager(t)
+	if _, err := manager.Resume(context.Background(), "missing"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("unknown resume error = %v, want ErrUnknownAgent", err)
+	}
+	generic := addStoppedAgent(t, manager, "generic-agent", "generic", "vendor-ref")
+	if _, err := manager.Resume(context.Background(), generic.agent.ID()); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("unsupported resume error = %v, want ErrResumeConflict", err)
+	}
+	claude := addStoppedAgent(t, manager, "claude-agent", "claude", "vendor-ref")
+	manager.mu.Lock()
+	manager.resuming[claude.agent.ID()] = struct{}{}
+	manager.mu.Unlock()
+	if _, err := manager.Resume(context.Background(), claude.agent.ID()); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("reserved resume error = %v, want ErrResumeConflict", err)
+	}
+}
+
+func TestResumeOnStartRunsEligibleAgentsInCreationOrderOnce(t *testing.T) {
+	manager, _ := newTestManager(t)
+	older := addStoppedAgent(t, manager, "older", "claude", "older-ref")
+	time.Sleep(time.Millisecond)
+	newer := addStoppedAgent(t, manager, "newer", "codex", "newer-ref")
+	manual := addStoppedAgent(t, manager, "manual", "claude", "manual-ref")
+	older.resumeOnStart = true
+	newer.resumeOnStart = true
+	var commands []string
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		commands = append(commands, strings.Join(append([]string{config.Command}, config.Args...), " "))
+		return &fakeProcessSession{}, nil
+	}
+
+	results := manager.ResumeOnStart(context.Background())
+	if len(results) != 2 ||
+		results[0].AgentID != older.agent.ID() ||
+		results[0].Err != nil ||
+		results[1].AgentID != newer.agent.ID() ||
+		results[1].Err != nil {
+		t.Fatalf("startup resume results = %+v", results)
+	}
+	if len(commands) != 2 ||
+		commands[0] != "claude --resume older-ref" ||
+		commands[1] != "codex resume newer-ref" {
+		t.Fatalf("startup resume commands = %#v", commands)
+	}
+	if second := manager.ResumeOnStart(context.Background()); len(second) != 0 {
+		t.Fatalf("second startup resume results = %+v, want none", second)
+	}
+	manualStatus, err := manager.Status(manual.agent.ID())
+	if err != nil {
+		t.Fatalf("manual status: %v", err)
+	}
+	if !manualStatus.Resumable {
+		t.Fatalf("manual status = %+v, want resumable", manualStatus)
+	}
+}
+
 func TestNormalizeRunMode(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1498,6 +1675,42 @@ func newTestManager(t *testing.T) (*Manager, *store.Store) {
 	return manager, st
 }
 
+func addStoppedAgent(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+	vendor string,
+	ref string,
+) *managedAgent {
+	t.Helper()
+	target := agent.New(
+		id,
+		agent.WithName(string(id)),
+		agent.WithVendor(vendor),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	prepared, err := target.Prepare(agent.MoveTo(
+		agent.StateStopped,
+		"test stopped",
+		agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_stop", Confidence: 1,
+		},
+	))
+	if err != nil {
+		t.Fatalf("prepare stopped agent: %v", err)
+	}
+	if err := target.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply stopped agent: %v", err)
+	}
+	managed := newManagedAgent(target)
+	managed.setVendorSessionReference(ref)
+	manager.mu.Lock()
+	manager.agents[id] = managed
+	manager.mu.Unlock()
+	return managed
+}
+
 func attachTestRuntime(
 	t *testing.T,
 	manager *Manager,
@@ -1567,6 +1780,10 @@ func (s *fakeProcessSession) Close() error {
 
 func (s *fakeProcessSession) PID() int {
 	return 1
+}
+
+func (s *fakeProcessSession) Resize(uint16, uint16) error {
+	return nil
 }
 
 type cancelAfterAppendStore struct {

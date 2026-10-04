@@ -11,6 +11,7 @@
   - `POST /api/v1/agents`：启动会话（JSON body → StartRequest）
   - `GET  /api/v1/agents/{id}`：单会话状态
   - `DELETE /api/v1/agents/{id}`：停止会话
+  - `POST /api/v1/agents/{id}/resume`：在同一 Agent ID 下执行厂商原生恢复
   - `POST /api/v1/agents/{id}/input`：向已连接 PTY 写入一段受限 UTF-8 文本
   - `POST /api/v1/agents/{id}/signal`：接收 loopback vendor hook relay
   - `GET  /api/v1/agents/{id}/explain`：返回受限决策尾部与可选 attached screen

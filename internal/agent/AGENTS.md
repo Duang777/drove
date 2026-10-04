@@ -16,6 +16,8 @@ Agent 的**抽象与状态机**。这是全项目唯一的状态权威（source 
   screen 来源携带经过校验和复制的稳定规则、edge、region、输出偏移、最终输出序号
   与静态 evidence，不携带屏幕文本。
 - `Prepare` 在持久化前校验 typed change 并绑定 revision，`ApplyCommitted` 只在事件提交后应用；陈旧或外部 Agent 的 change 不得覆盖当前状态。
+- `ResumeToStarting` 是唯一允许 `Stopped -> Starting` 的 typed change；普通迁移表继续把
+  `Stopped` 视为终态。
 - `Agent.Transition` 是包独立使用时的同步便利入口；会话编排必须使用 plan/apply 两阶段接口。
 - Agent 本身**不产生事件**；事件由上层（session/event 包）负责落库与扇出。
 

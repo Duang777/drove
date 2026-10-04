@@ -33,6 +33,11 @@ type StorageConfig struct {
 	OutputRetentionDays int `json:"output_retention_days"`
 }
 
+// SessionConfig controls daemon-start session behavior.
+type SessionConfig struct {
+	AutoResumeOnStart bool `json:"auto_resume_on_start"`
+}
+
 // Config 是 Drove 的运行时配置。
 type Config struct {
 	// DataDir 存放 SQLite 事件日志与工作区数据。
@@ -51,6 +56,8 @@ type Config struct {
 	Agents map[string]AgentConfig `json:"agents,omitempty"`
 	// Storage controls retention for raw attachment data.
 	Storage StorageConfig `json:"storage"`
+	// Session controls restart behavior for persisted sessions.
+	Session SessionConfig `json:"session"`
 }
 
 // Defaults 返回安全默认配置。

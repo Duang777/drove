@@ -285,6 +285,33 @@ func TestLoadResolvedParsesOutputRetentionAndIgnoresFutureStorageFields(t *testi
 	}
 }
 
+func TestLoadResolvedParsesSessionResumeSettings(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DROVE_DATA_DIR", "")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"data_dir": "/tmp/drove",
+		"api_bind": "127.0.0.1:7373",
+		"event_buffer": 16,
+		"console_origins": ["http://localhost:5173"],
+		"session": {
+			"auto_resume_on_start": true
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, _, err := LoadResolved(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.Session.AutoResumeOnStart {
+		t.Fatal("auto_resume_on_start = false, want true")
+	}
+	if Defaults().Session.AutoResumeOnStart {
+		t.Fatal("default auto_resume_on_start = true, want false")
+	}
+}
+
 func TestValidateRejectsNegativeOutputRetention(t *testing.T) {
 	cfg := Defaults()
 	cfg.DataDir = filepath.Join(t.TempDir(), "data")

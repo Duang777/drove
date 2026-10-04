@@ -797,7 +797,7 @@ func TestOutputProcessorPostApplyResizeCommitFailureFailsStop(t *testing.T) {
 		hub:       hub,
 		committer: committer,
 		clock:     systemObservationClock{},
-		agents:    make(map[agent.ID]*agent.Agent),
+		agents:    make(map[agent.ID]*managedAgent),
 		sessions:  make(map[agent.ID]*runningSession),
 	}
 	id := agent.ID("resize-commit-failure")

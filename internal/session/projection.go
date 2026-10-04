@@ -33,6 +33,8 @@ type recoveryProjector struct {
 	sessions      map[string]*sessionDraft
 	lastSeq       uint64
 	gapGeneration uint64
+	lastResumeSeq uint64
+	lastResumeID  string
 	report        RecoveryReport
 }
 
@@ -100,6 +102,8 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 		return p.applySignal(row)
 	case event.TypeAgentResized:
 		return p.applyResize(row)
+	case event.TypeAgentResumed:
+		return p.applyResume(row)
 	case event.TypeOutput, event.TypeOutputChunk:
 		if row.SessionID == "" {
 			return nil
@@ -237,7 +241,15 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 	if !agent.Valid(to) {
 		return projectionError(row, "invalid to state %q", row.To)
 	}
-	if !agent.CanRecoverTransition(from, to) {
+	isResume := from == agent.StateStopped && to == agent.StateStarting
+	if isResume &&
+		(p.lastResumeSeq+1 != row.Seq || p.lastResumeID != row.SessionID) {
+		return projectionError(
+			row,
+			"stopped -> starting requires an immediately preceding same-Agent agent.resumed event",
+		)
+	}
+	if !isResume && !agent.CanRecoverTransition(from, to) {
 		return projectionError(row, "invalid state transition %s -> %s", from, to)
 	}
 	evidence, known, err := parseStateEvidence(row)
@@ -270,6 +282,26 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 	draft.updatedAt = row.Timestamp
 	draft.lastStateGapGeneration = p.gapGeneration
 	draft.hasState = true
+	return nil
+}
+
+func (p *recoveryProjector) applyResume(row store.EventRow) error {
+	if row.SessionID == "" {
+		return projectionError(row, "agent.resumed event has empty session ID")
+	}
+	if err := validateAgentID(row); err != nil {
+		return err
+	}
+	if row.Reason != "requested" {
+		return projectionError(row, "agent.resumed event has invalid reason %q", row.Reason)
+	}
+	payload, err := event.DecodeAgentResumedPayload(row.Payload)
+	if err != nil {
+		return projectionWrapError(row, "validate agent.resumed payload", err)
+	}
+	p.lastResumeSeq = row.Seq
+	p.lastResumeID = row.SessionID
+	p.draft(row).vendorSessionRef = payload.VendorSessionRef
 	return nil
 }
 

@@ -248,7 +248,7 @@ func newAttachmentTestRuntime(
 		&recordingTerminalObserver{},
 	)
 	manager.mu.Lock()
-	manager.agents[id] = target
+	manager.agents[id] = newManagedAgent(target)
 	manager.sessions[id] = running
 	manager.mu.Unlock()
 	return manager, id, running, process
