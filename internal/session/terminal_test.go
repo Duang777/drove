@@ -130,6 +130,61 @@ func TestTerminalActorProcessExitFencesTrailingScreens(t *testing.T) {
 	}
 }
 
+func TestTerminalActorReturnsCommittedOSC9Observations(t *testing.T) {
+	clock := newTerminalTestClock(time.Unix(350, 0).UTC())
+	entry := adapter.NewRegistry().For("codex")
+	actor := newTerminalTestActorWithNormalizer(
+		t,
+		"codex",
+		clock,
+		&terminalTestProcess{},
+		&recordingTerminalObserver{},
+		entry.TerminalNotificationNormalizer,
+	)
+	t.Cleanup(func() {
+		if err := actor.Close(); err != nil {
+			t.Errorf("close actor: %v", err)
+		}
+	})
+
+	first := []byte("\x1b]9;Approval requested: private command\x07")
+	chunk, err := term.NewCommittedChunk(
+		first,
+		uint64(len(first)),
+		9,
+		clock.Now(),
+	)
+	if err != nil {
+		t.Fatalf("new committed chunk: %v", err)
+	}
+	observations, err := actor.FeedCommitted(context.Background(), chunk)
+	if err != nil {
+		t.Fatalf("feed committed chunk: %v", err)
+	}
+	if len(observations) != 1 {
+		t.Fatalf("observations = %d, want 1", len(observations))
+	}
+
+	actor.MarkProcessExited()
+	second := []byte("\x1b]9;Approval requested: trailing secret\x07")
+	chunk, err = term.NewCommittedChunk(
+		second,
+		uint64(len(first)+len(second)),
+		10,
+		clock.Now(),
+	)
+	if err != nil {
+		t.Fatalf("new trailing chunk: %v", err)
+	}
+	observations, err = actor.FeedCommitted(context.Background(), chunk)
+	if err != nil {
+		t.Fatalf("feed trailing chunk: %v", err)
+	}
+	if len(observations) != 0 {
+		t.Fatalf("post-exit observations = %d, want 0", len(observations))
+	}
+}
+
 func TestTerminalActorWritesQueryRepliesDirectly(t *testing.T) {
 	clock := newTerminalTestClock(time.Unix(400, 0).UTC())
 	process := &terminalTestProcess{}
@@ -327,6 +382,24 @@ func newTerminalTestActor(
 	process terminalProcess,
 	observer terminalObserver,
 ) *terminalActor {
+	return newTerminalTestActorWithNormalizer(
+		t,
+		vendor,
+		clock,
+		process,
+		observer,
+		nil,
+	)
+}
+
+func newTerminalTestActorWithNormalizer(
+	t *testing.T,
+	vendor string,
+	clock observationClock,
+	process terminalProcess,
+	observer terminalObserver,
+	normalizer adapter.TerminalNotificationNormalizer,
+) *terminalActor {
 	t.Helper()
 	size, err := initialTerminalSize()
 	if err != nil {
@@ -340,6 +413,7 @@ func newTerminalTestActor(
 		size,
 		process,
 		classifier,
+		normalizer,
 		observer,
 		vendor,
 		clock,
@@ -373,7 +447,7 @@ func feedTerminalTestChunk(
 	if err != nil {
 		t.Fatalf("new committed chunk: %v", err)
 	}
-	if err := actor.FeedCommitted(context.Background(), chunk); err != nil {
+	if _, err := actor.FeedCommitted(context.Background(), chunk); err != nil {
 		t.Fatalf("feed committed chunk: %v", err)
 	}
 }

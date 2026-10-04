@@ -92,6 +92,11 @@ func injectSignals(
 			plan.Channel,
 		)
 	}
+	if plan.TerminalNotifications && plan.Channel != SignalChannelNotify {
+		return SignalInjectionPlan{}, errors.New(
+			"adapter: terminal notifications require the notify channel",
+		)
+	}
 	seen := make(map[string]struct{}, len(plan.Files))
 	for i := range plan.Files {
 		file := &plan.Files[i]

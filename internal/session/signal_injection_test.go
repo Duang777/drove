@@ -14,6 +14,7 @@ import (
 
 	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -115,6 +116,59 @@ func TestCodexSessionInjectionChangesOnlyProcessArguments(t *testing.T) {
 	}
 }
 
+func TestCodexSessionInjectionEnablesOSC9Observation(t *testing.T) {
+	dataDir := t.TempDir()
+	command := filepath.Join(t.TempDir(), "codex-output")
+	if err := os.WriteFile(
+		command,
+		[]byte(
+			"#!/bin/sh\n"+
+				"sleep 0.05\n"+
+				"printf '\\033]9;Approval requested: private-command\\007'\n"+
+				"sleep 5\n",
+		),
+		0o700,
+	); err != nil {
+		t.Fatalf("write output command: %v", err)
+	}
+	manager := newInjectionTestManager(t, dataDir, "/bin/echo", nil)
+	manager.detectConfig.HookActivation = time.Millisecond
+	manager.detectConfig.PermissionConfirmation = time.Millisecond
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "codex",
+		Command: command,
+		Hooks:   agent.HooksAuto,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	waitForHookStatus(t, manager, id, detect.HookFallback)
+	waitForState(t, manager, id, agent.StateBlocked)
+
+	rows, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if strings.Contains(row.Payload, "private-command") {
+			t.Fatalf("event payload contains OSC body: %+v", row)
+		}
+		if row.Type == string(event.TypeAgentSignal) &&
+			signalPayloadVersion(row.Payload) == 4 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("terminal signal v4 was not committed")
+	}
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+}
+
 func TestSessionInjectionOffAndConflictPreserveCallerArguments(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -182,6 +236,47 @@ func TestSessionInjectionConflictIsReportedWithoutMaterialization(t *testing.T) 
 		result.args[0] != "--settings=/tmp/caller.json" ||
 		result.dir != "" {
 		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestCodexInjectionEnablesTerminalNotificationsOnlyOnSuccess(t *testing.T) {
+	manager := newInjectionTestManager(t, t.TempDir(), "/bin/echo", nil)
+	id := agent.ID("550e8400-e29b-41d4-a716-446655440000")
+	entry := manager.reg.For("codex")
+
+	injected, err := manager.prepareSignalInjection(
+		id,
+		entry,
+		"codex",
+		agent.HooksAuto,
+		agent.RunModeInteractive,
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("prepare injected plan: %v", err)
+	}
+	if injected.status != agent.InjectionInjected ||
+		!injected.terminalNotifications {
+		t.Fatalf("injected result = %+v", injected)
+	}
+
+	conflict, err := manager.prepareSignalInjection(
+		id,
+		entry,
+		"codex",
+		agent.HooksAuto,
+		agent.RunModeInteractive,
+		nil,
+		[]string{"-c", `tui.notification_method="other"`},
+	)
+	if err != nil {
+		t.Fatalf("prepare conflicting plan: %v", err)
+	}
+	if conflict.status != agent.InjectionSkipped ||
+		conflict.reason != agent.InjectionReasonArgumentConflict ||
+		conflict.terminalNotifications {
+		t.Fatalf("conflicting result = %+v", conflict)
 	}
 }
 

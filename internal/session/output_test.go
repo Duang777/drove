@@ -315,19 +315,24 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		"",
 	)
 	terminalClock := newTerminalTestClock(time.Unix(1, 0).UTC())
-	running.terminal = newTerminalTestActor(
+	normalizer := &countingTerminalNormalizer{}
+	running.terminal = newTerminalTestActorWithNormalizer(
 		t,
 		"generic",
 		terminalClock,
 		&terminalTestProcess{},
 		observer,
+		normalizer,
 	)
 	defer running.terminal.Close()
 	manager.sessions[a.ID()] = running
 	subscription := hub.Subscribe(1)
 	defer hub.Unsubscribe(subscription)
 
-	err = running.output.Feed([]byte("line\n"), 0)
+	err = running.output.Feed(
+		[]byte("\x1b]9;Approval requested: private command\x07"),
+		0,
+	)
 	if !errors.Is(err, storageErr) {
 		t.Fatalf("feed error = %v, want storage error", err)
 	}
@@ -339,6 +344,9 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 	terminalClock.mu.Unlock()
 	if timerCount != 0 {
 		t.Fatalf("terminal timers after failed store = %d, want 0", timerCount)
+	}
+	if got := normalizer.calls.Load(); got != 0 {
+		t.Fatalf("terminal normalizer calls after failed store = %d, want 0", got)
 	}
 	select {
 	case published := <-subscription.C():
@@ -378,6 +386,7 @@ func TestOutputProcessorScreenEvidenceReferencesCommittedOutput(t *testing.T) {
 		mustInitialTerminalSize(t),
 		terminalProcess,
 		running.classifier,
+		nil,
 		running.observer,
 		running.vendor,
 		clock,
@@ -436,6 +445,120 @@ func TestOutputProcessorScreenEvidenceReferencesCommittedOutput(t *testing.T) {
 	waitForState(t, manager, id, agent.StateBlocked)
 }
 
+func TestOutputProcessorDeliversActivityBeforeCodexOSC9(t *testing.T) {
+	manager, _ := newTestManager(t)
+	manager.detectConfig.PermissionConfirmation = time.Millisecond
+	id := agent.ID("codex-osc9-ordering")
+	target := agent.New(
+		id,
+		agent.WithName("codex-osc9-ordering"),
+		agent.WithVendor("codex"),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = newManagedAgent(target)
+	manager.mu.Unlock()
+	commitTestState(t, manager, target, agent.StateStarting, "test start")
+	commitTestState(t, manager, target, agent.StateWorking, "test working")
+
+	entry := manager.reg.For("codex")
+	running := attachTestRuntime(t, manager, target, entry)
+	terminalActor, err := newTerminalActor(
+		mustInitialTerminalSize(t),
+		&terminalTestProcess{},
+		running.classifier,
+		entry.TerminalNotificationNormalizer,
+		running.observer,
+		running.vendor,
+		manager.clock,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new terminal actor: %v", err)
+	}
+	running.terminal = terminalActor
+
+	const secret = "private-command-and-path"
+	output := []byte("working\x1b]9;Approval requested: " + secret + "\x07")
+	if err := running.output.Feed(output, 0); err != nil {
+		t.Fatalf("feed output: %v", err)
+	}
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var activitySeq, terminalSeq uint64
+	for _, row := range rows {
+		if strings.Contains(row.Payload, secret) {
+			t.Fatalf("event payload contains OSC body at seq %d", row.Seq)
+		}
+		if row.Type != string(event.TypeAgentSignal) {
+			continue
+		}
+		switch signalPayloadVersion(row.Payload) {
+		case 1:
+			var payload event.SignalPayloadV1
+			if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+				t.Fatalf("decode activity signal: %v", err)
+			}
+			if payload.VendorEvent == string(detect.KindOutputActivity) {
+				activitySeq = row.Seq
+			}
+		case 4:
+			var payload event.SignalPayloadV4
+			if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+				t.Fatalf("decode terminal signal: %v", err)
+			}
+			if err := payload.Validate(); err != nil {
+				t.Fatalf("validate terminal signal: %v", err)
+			}
+			terminalSeq = row.Seq
+		}
+	}
+	if activitySeq == 0 || terminalSeq <= activitySeq {
+		t.Fatalf("activity seq=%d terminal seq=%d", activitySeq, terminalSeq)
+	}
+
+	waitForState(t, manager, id, agent.StateBlocked)
+	rows, err = manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay blocked state: %v", err)
+	}
+	foundStateV4 := false
+	for _, row := range rows {
+		if row.Type != string(event.TypeStateChanged) ||
+			row.To != string(agent.StateBlocked) {
+			continue
+		}
+		var payload event.StateEvidencePayloadV4
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			t.Fatalf("decode terminal state evidence: %v", err)
+		}
+		if err := payload.Validate(); err != nil {
+			t.Fatalf("validate terminal state evidence: %v", err)
+		}
+		foundStateV4 = payload.Terminal != nil &&
+			payload.Terminal.Protocol == "osc9"
+	}
+	if !foundStateV4 {
+		t.Fatal("terminal state evidence v4 was not committed")
+	}
+
+	explanation, err := manager.Explain(context.Background(), id, ExplainOptions{})
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	encoded, err := json.Marshal(explanation)
+	if err != nil {
+		t.Fatalf("encode explanation: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(secret)) {
+		t.Fatalf("explanation contains OSC body: %s", encoded)
+	}
+}
+
 func TestOutputProcessorOrdinaryErrorCreatesNoScreenEdge(t *testing.T) {
 	manager, _ := newTestManager(t)
 	clock := newTerminalTestClock(time.Unix(20, 0).UTC())
@@ -458,6 +581,7 @@ func TestOutputProcessorOrdinaryErrorCreatesNoScreenEdge(t *testing.T) {
 		mustInitialTerminalSize(t),
 		&terminalTestProcess{},
 		running.classifier,
+		nil,
 		running.observer,
 		running.vendor,
 		clock,
@@ -1034,6 +1158,17 @@ func waitForTerminalSnapshot(t *testing.T, actor *terminalActor) {
 
 type countingOutputClock struct {
 	calls atomic.Int64
+}
+
+type countingTerminalNormalizer struct {
+	calls atomic.Int64
+}
+
+func (n *countingTerminalNormalizer) NormalizeOSC9(
+	term.OSC9Frame,
+) (detect.Signal, bool, error) {
+	n.calls.Add(1)
+	return detect.Signal{}, false, nil
 }
 
 func (c *countingOutputClock) Now() time.Time {

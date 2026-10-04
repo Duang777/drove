@@ -1764,6 +1764,7 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 		mustInitialTerminalSize(t),
 		&terminalTestProcess{},
 		running.classifier,
+		nil,
 		running.observer,
 		running.vendor,
 		manager.clock,
@@ -1848,7 +1849,7 @@ func TestManagerCloseClosesAttachedTerminalActor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new committed chunk: %v", err)
 	}
-	if err := terminalActor.FeedCommitted(context.Background(), chunk); !errors.Is(
+	if _, err := terminalActor.FeedCommitted(context.Background(), chunk); !errors.Is(
 		err,
 		errTerminalActorClosed,
 	) {

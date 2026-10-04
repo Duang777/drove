@@ -332,6 +332,7 @@ func newTerminalAcceptanceHarness(
 		mustInitialTerminalSize(t),
 		process,
 		running.classifier,
+		nil,
 		running.observer,
 		vendor,
 		terminalClock,

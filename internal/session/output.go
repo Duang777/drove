@@ -469,6 +469,7 @@ func (p *outputProcessor) commitAndObserve(
 		)
 	}
 
+	var terminalObservations []detect.Observation
 	if p.running.terminal != nil {
 		chunk, err := term.NewCommittedChunk(
 			output,
@@ -479,10 +480,11 @@ func (p *outputProcessor) commitAndObserve(
 		if err != nil {
 			return p.failTerminal(state, "create committed chunk", err, true)
 		}
-		if err := p.running.terminal.FeedCommitted(
+		terminalObservations, err = p.running.terminal.FeedCommitted(
 			context.Background(),
 			chunk,
-		); err != nil {
+		)
+		if err != nil {
 			return p.failTerminal(state, "feed committed output", err, true)
 		}
 	}
@@ -501,6 +503,17 @@ func (p *outputProcessor) commitAndObserve(
 		}
 	}
 	state.pendingActivity = 0
+	for _, observation := range terminalObservations {
+		if !p.canObserve() {
+			break
+		}
+		if err := p.running.observer.Deliver(
+			context.Background(),
+			observation,
+		); err != nil {
+			break
+		}
+	}
 	return nil
 }
 

@@ -73,6 +73,7 @@ type terminalResult struct {
 	snapshot     term.Snapshot
 	capturedAt   time.Time
 	outputOffset uint64
+	observations []detect.Observation
 	available    bool
 	err          error
 }
@@ -80,6 +81,8 @@ type terminalResult struct {
 type terminalActor struct {
 	controller *term.Controller
 	classifier *adapter.ScreenClassifier
+	normalizer adapter.TerminalNotificationNormalizer
+	osc9       *term.OSC9Scanner
 	process    terminalProcess
 	observer   terminalObserver
 	vendor     string
@@ -118,6 +121,7 @@ func newTerminalActor(
 	size term.Size,
 	process terminalProcess,
 	classifier *adapter.ScreenClassifier,
+	normalizer adapter.TerminalNotificationNormalizer,
 	observer terminalObserver,
 	vendor string,
 	clock observationClock,
@@ -141,6 +145,7 @@ func newTerminalActor(
 	actor := &terminalActor{
 		controller:  controller,
 		classifier:  classifier,
+		normalizer:  normalizer,
 		process:     process,
 		observer:    observer,
 		vendor:      vendor,
@@ -151,6 +156,9 @@ func newTerminalActor(
 		done:        make(chan struct{}),
 		replyErrors: make(chan error, 1),
 		replyDone:   make(chan struct{}),
+	}
+	if normalizer != nil {
+		actor.osc9 = term.NewOSC9Scanner()
 	}
 	go actor.forwardReplies()
 	go actor.run()
@@ -190,15 +198,15 @@ func (a *terminalActor) forwardReplies() {
 func (a *terminalActor) FeedCommitted(
 	ctx context.Context,
 	chunk term.CommittedChunk,
-) error {
+) ([]detect.Observation, error) {
 	result, err := a.submit(ctx, terminalRequest{
 		operation: terminalFeed,
 		chunk:     chunk,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return result.err
+	return append([]detect.Observation(nil), result.observations...), result.err
 }
 
 func (a *terminalActor) Snapshot() (term.Snapshot, bool) {
@@ -423,11 +431,15 @@ func (a *terminalActor) handle(
 		}
 		state.nextOutputOffset = request.chunk.OutputOffset()
 		state.lastOutputSeq = request.chunk.LastSeq()
+		observations, err := a.decodeNotifications(state, request.chunk)
+		if err != nil {
+			return terminalResult{err: err}
+		}
 		if !state.dirty {
 			state.dirty = true
 			a.armSampleTimer(timer, timerC)
 		}
-		return terminalResult{}
+		return terminalResult{observations: observations}
 
 	case terminalSnapshot:
 		return terminalResult{
@@ -440,6 +452,9 @@ func (a *terminalActor) handle(
 	case terminalProcessExited:
 		state.processExited = true
 		state.snapshotAvailable = false
+		if a.osc9 != nil {
+			a.osc9.Reset()
+		}
 		return terminalResult{}
 
 	case terminalEndOutput:
@@ -454,6 +469,9 @@ func (a *terminalActor) handle(
 			)}
 		}
 		state.ended = true
+		if a.osc9 != nil {
+			a.osc9.Reset()
+		}
 		if *timer != nil {
 			stopAndDrainTimer(*timer)
 			*timerC = nil
@@ -506,6 +524,38 @@ func (a *terminalActor) handle(
 			request.operation,
 		)}
 	}
+}
+
+func (a *terminalActor) decodeNotifications(
+	state *terminalActorState,
+	chunk term.CommittedChunk,
+) ([]detect.Observation, error) {
+	if state.processExited || a.osc9 == nil || a.normalizer == nil {
+		return nil, nil
+	}
+	frames := a.osc9.Feed(chunk)
+	observations := make([]detect.Observation, 0, len(frames))
+	for _, frame := range frames {
+		signal, matched, err := a.normalizer.NormalizeOSC9(frame)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"session: normalize terminal notification: %w",
+				err,
+			)
+		}
+		if !matched {
+			continue
+		}
+		observation, err := detect.ObserveSignal(signal)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"session: create terminal notification observation: %w",
+				err,
+			)
+		}
+		observations = append(observations, observation)
+	}
+	return observations, nil
 }
 
 func (a *terminalActor) armSampleTimer(
