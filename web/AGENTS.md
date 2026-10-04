@@ -4,7 +4,7 @@
 
 **Drove Web 控制台前端**（TS + React + Vite），通过 daemon 的 REST / WebSocket 展示 agent 状态并支持交互（启动 / 停止 / 事件回放）。
 
-## 当前实现（MVP 骨架）
+## 当前实现
 
 | 模块 | 职责 |
 |---|---|
@@ -14,6 +14,8 @@
 | `src/hooks/useAgentEvents.ts` | React hook：订阅事件流 + 本地投影（`latestAgentState`） |
 | `src/components/` | AgentList / AgentCard / StatusBadge / EventLog |
 | `src/App.tsx` | 布局 + 5s 轮询刷新 agent 列表 + 实时事件面板 |
+| `src/auth/login.ts` | 启动前从 `/login#code` 同源兑换 HttpOnly cookie 并清除 fragment |
+| `src/styles.css` | 无框架的生产控制台样式与 320px+ 响应式布局 |
 
 ## 关键设计
 
@@ -22,13 +24,15 @@
   `data_b64`。
 - **本地投影仅是视图**：前端从事件流推导的状态只是展示用，权威状态永远以 daemon 为准（刷新列表纠正）。
 - **Dev 代理**：`vite.config.ts` 将 `/api`、`/ws` 代理到 loopback daemon，并在每次 HTTP 请求与 WebSocket upgrade 时从 DataDir 读取控制令牌注入 Bearer 认证。
+- **生产托管**：Vite 输出到 `internal/webui/dist`，由 Go embed 打包进 daemon；生产
+  浏览器请求只使用同源 cookie，不读取控制令牌。
 
 ## 约束
 
 - 禁止在组件中直接 import daemon 内部结构；类型一律经 `src/api/types.ts`。
 - 事件流消费必须走 `EventStream` 类（含重连与清理）；不得在组件内手写裸 WebSocket。
 - 组件卸载必须清理订阅（`useAgentEvents` 已内置）。
-- 新增依赖需说明用途；样式沿用现有类名风格，不引入 UI 框架（保持骨架轻量）。
+- 新增依赖需说明用途；样式使用单一全局 CSS，不引入 UI 框架。
 
 ## 常用命令
 
@@ -36,5 +40,5 @@
 npm install        # 安装依赖
 npm run dev        # 本地开发（需 daemon 已运行）
 npm run typecheck  # TS 严格检查
-npm run build      # 产出 dist/
+npm run build      # 更新 ../internal/webui/dist/
 ```

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net"
@@ -32,9 +33,11 @@ type ServerOptions struct {
 	Hub *event.Hub
 	// Auth owns control-plane credentials and their revocation lifecycle.
 	Auth *auth.Controller
+	// Web contains the embedded browser console production build.
+	Web fs.FS
 	// EventBuffer 是每个 WS 订阅的缓冲行数。
 	EventBuffer int
-	// AllowedOrigins 是 WebSocket 可接受的精确 Origin。
+	// AllowedOrigins contains the exact browser origins accepted by REST and WebSocket.
 	AllowedOrigins []string
 }
 
@@ -42,6 +45,7 @@ type ServerOptions struct {
 type Server struct {
 	opts           ServerOptions
 	mux            http.Handler
+	web            http.Handler
 	allowedOrigins map[string]struct{}
 }
 
@@ -67,11 +71,17 @@ func NewServer(opts ServerOptions) *Server {
 		allowedOrigins[origin] = struct{}{}
 	}
 	s := &Server{opts: opts, allowedOrigins: allowedOrigins}
+	if opts.Web != nil {
+		s.web = http.FileServer(http.FS(opts.Web))
+	}
 	controlMux := http.NewServeMux()
 	s.routes(controlMux)
 	rootMux := http.NewServeMux()
 	rootMux.HandleFunc("POST /api/v1/agents/{id}/signal", s.handleSignal)
-	rootMux.Handle("/", s.authenticate(controlMux))
+	rootMux.HandleFunc("POST /api/v1/auth/login", s.handleExchangeLogin)
+	rootMux.Handle("/api/", s.authenticate(controlMux))
+	rootMux.Handle("/ws", s.authenticate(controlMux))
+	rootMux.HandleFunc("/", s.handleWeb)
 	s.mux = rootMux
 	return s
 }
@@ -84,6 +94,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
+	mux.HandleFunc("POST /api/v1/auth/login-code", s.handleIssueLoginCode)
 	mux.HandleFunc("POST /api/v1/auth/token/rotate", s.handleRotateToken)
 	mux.HandleFunc("GET /ws", s.handleWS)
 }
@@ -249,11 +260,120 @@ func (s *Server) handleRotateToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleIssueLoginCode(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != LocalAccess {
+		writeErr(w, http.StatusForbidden, "login code requires local access")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	code, err := s.opts.Auth.IssueLoginCode()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, loginCodeResponse{Code: code})
+}
+
+func (s *Server) handleExchangeLogin(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != BrowserAccess {
+		writeErr(w, http.StatusForbidden, "browser login requires browser access")
+		return
+	}
+	if !s.hasAllowedOrigin(r) {
+		writeErr(w, http.StatusForbidden, "origin required")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writeErr(w, http.StatusUnsupportedMediaType, "content type must be application/json")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, maxLoginRequestBytes)
+	var request loginExchangeRequest
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeErr(w, http.StatusRequestEntityTooLarge, "request body exceeds maximum size")
+			return
+		}
+		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "request body must contain one JSON object")
+		return
+	}
+
+	cookie, _, err := s.opts.Auth.ExchangeLoginCode(request.Code)
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "invalid login code")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    cookie,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	})
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != BrowserAccess || s.web == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	w.Header().Set(
+		"Content-Security-Policy",
+		fmt.Sprintf("default-src 'self'; connect-src 'self' ws://%s wss://%s; "+
+			"img-src 'self' data:; object-src 'none'; base-uri 'none'; "+
+			"frame-ancestors 'none'; form-action 'none'", r.Host, r.Host),
+	)
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+
+	switch {
+	case r.URL.Path == "/" || r.URL.Path == "/login":
+		cloned := r.Clone(r.Context())
+		urlCopy := *r.URL
+		urlCopy.Path = "/"
+		cloned.URL = &urlCopy
+		w.Header().Set("Cache-Control", "no-store")
+		s.web.ServeHTTP(w, cloned)
+	case strings.HasPrefix(r.URL.Path, "/assets/"):
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		s.web.ServeHTTP(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
 const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
 const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 4096
+const maxLoginRequestBytes = 4096
 
 type inputRequest struct {
 	Data string `json:"data"`
+}
+
+type loginCodeResponse struct {
+	Code string `json:"code"`
+}
+
+type loginExchangeRequest struct {
+	Code string `json:"code"`
 }
 
 type signalRequest struct {
@@ -476,6 +596,10 @@ func (s *Server) originAllowed(r *http.Request) bool {
 	}
 	_, allowed := s.allowedOrigins[origins[0]]
 	return allowed
+}
+
+func (s *Server) hasAllowedOrigin(r *http.Request) bool {
+	return len(r.Header.Values("Origin")) == 1 && s.originAllowed(r)
 }
 
 func requiresOrigin(r *http.Request) bool {

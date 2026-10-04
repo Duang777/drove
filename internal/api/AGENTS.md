@@ -15,8 +15,12 @@
   - `POST /api/v1/agents/{id}/signal`：接收 loopback vendor hook relay
   - `GET  /api/v1/agents/{id}/explain`：返回受限决策尾部与可选 attached screen
   - `GET  /api/v1/agents/{id}/events`：回放事件流（REST，JSON 数组）
+  - `POST /api/v1/auth/login-code`：仅允许 Unix socket 签发一次性浏览器登录码
+  - `POST /api/v1/auth/login`：浏览器同源兑换 HttpOnly cookie
   - `POST /api/v1/auth/token/rotate`：仅允许 Unix socket 调用的控制令牌轮换
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
+- 浏览器 listener 从嵌入文件系统提供 `/`、`/login` 和哈希静态资源；Unix listener
+  不提供前端。
 - 每个 listener 先绑定访问类型和精确 Host 白名单；所有路由（含 signal 与静态资源）都
   在认证前校验 Host，浏览器边界对任何已携带的 Origin 做精确白名单校验。
 - 控制 REST 与 WebSocket 接受 Bearer 或浏览器 cookie；cookie 认证的非安全请求和

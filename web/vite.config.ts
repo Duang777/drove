@@ -74,7 +74,8 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: 'dist',
-    sourcemap: true,
+    outDir: '../internal/webui/dist',
+    emptyOutDir: true,
+    sourcemap: false,
   },
 })

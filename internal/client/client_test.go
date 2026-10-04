@@ -112,6 +112,43 @@ func TestRotateTokenUsesAuthenticatedPost(t *testing.T) {
 	}
 }
 
+func TestIssueLoginCodeUsesAuthenticatedPost(t *testing.T) {
+	dataDir := t.TempDir()
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/auth/login-code" {
+			t.Errorf("path = %q, want login-code endpoint", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":"one-time-code"}`)
+	}))
+	defer server.Close()
+
+	c := New(
+		strings.TrimPrefix(server.URL, "http://"),
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	code, err := c.IssueLoginCode(context.Background())
+	if err != nil {
+		t.Fatalf("issue login code: %v", err)
+	}
+	if code != "one-time-code" {
+		t.Fatalf("code = %q, want one-time-code", code)
+	}
+}
+
 func TestSendInputReturnsServerError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, `{"error":"session: agent is not attached to a PTY"}`, http.StatusConflict)

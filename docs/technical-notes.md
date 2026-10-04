@@ -43,13 +43,12 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - daemon 按 API、会话、Hub、store 的依赖顺序关闭，并等待 PTY 回调结束。
 - REST 管理接口和 WebSocket 实时事件流。
 - CLI 的 `init`、`up`、`ps`、`log`、`stop`、`version` 命令。
-- React 控制台骨架、REST 客户端和 WebSocket 自动重连。
+- daemon 内嵌的 React 控制台、同源 cookie 登录、REST 客户端和 WebSocket 自动重连。
 
 ### 尚未形成完整产品闭环
 
 - 没有可用的交互式 TUI。代码使用 Cobra，不包含 Bubble Tea 依赖。
 - WebSocket 输入控制已接通；终端 attach 和 resize 端点尚未实现。
-- Web 控制台没有接入样式系统，现有 Tailwind 类不会生成 CSS。
 - Web 控制台没有可达的回放入口。
 - ACP 仍是文档中的预留项。
 - CI 只验证 Go，不验证 Web 构建或类型检查。
@@ -330,11 +329,12 @@ interactive，`drove up --oneshot` 保留旧的单次执行方式。adapter 负�
 - 隔离数据库实测中，interactive 短进程退出为 `stopped`，oneshot 短进程退出为 `done`，两者都清除了 PID。
 - 使用同一数据库重启后，两个 mode 均正确恢复，历史 `done` 按既有规则追加 `done -> stopped`，事件最大序号从 8 增至 9。
 
-### P1：Web 控制台目前是无样式骨架
+### P1：Web 控制台剩余功能断点
 
-组件大量使用 Tailwind class，但项目没有 Tailwind 依赖、配置或 CSS 入口。Vite 构建产物只有 HTML 和 JS，没有 CSS 文件。
+控制台已改用无框架全局 CSS，Vite 生产构建包含 CSS 并提交到
+`internal/webui/dist`，由 daemon 同源托管。
 
-另外还有两个功能断点：
+仍有两个功能断点：
 
 - 选择 `generic` 后只发送 `{vendor: "generic"}`，后端会拒绝，因为 generic 必须提供 command。
 - `EventLog` 支持 `replayID`，但 `App` 从不传入该属性，因此界面无法进入回放模式。
@@ -344,7 +344,6 @@ interactive，`drove up --oneshot` 保留旧的单次执行方式。adapter 负�
 - `StateIdle` 有迁移规则，但没有任何运行时信号会进入该状态。
 - `StateHint.Confidence` 被记录，但没有使用。
 - WebSocket 没有文档所说的定时 ping。客户端断开且没有新事件时，服务端订阅可能继续存活。
-- `CheckOrigin` 无条件返回 true。默认只绑定 localhost 时风险有限，但配置为外部地址后需要安全策略。
 - API 已将无效 runner mode 映射为 400；其他请求校验错误仍可能返回 500。
 - 前端直接断言 REST 和 WebSocket JSON 类型，没有边界校验。
 

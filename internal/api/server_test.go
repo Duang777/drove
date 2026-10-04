@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -1005,6 +1006,220 @@ func TestCookieAuthenticationRequiresOriginForUnsafeRequests(t *testing.T) {
 	}
 }
 
+func TestBrowserLoginExchangesOneTimeCodeForPrivateCookie(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	local := server.Handler(LocalAccess, "drove.local")
+	browser := server.Handler(BrowserAccess, "127.0.0.1:7373")
+
+	issue := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/login-code",
+		nil,
+	)
+	issue.Host = "drove.local"
+	issue.Header.Set("Authorization", "Bearer "+testControlToken)
+	issueResponse := httptest.NewRecorder()
+	local.ServeHTTP(issueResponse, issue)
+	if issueResponse.Code != http.StatusCreated {
+		t.Fatalf(
+			"issue response = %d %q, want 201",
+			issueResponse.Code,
+			issueResponse.Body.String(),
+		)
+	}
+	if issueResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("login code cache control = %q", issueResponse.Header().Get("Cache-Control"))
+	}
+	var issued loginCodeResponse
+	if err := json.NewDecoder(issueResponse.Body).Decode(&issued); err != nil {
+		t.Fatalf("decode login code: %v", err)
+	}
+	if issued.Code == "" {
+		t.Fatal("issued empty login code")
+	}
+
+	exchangeBody := `{"code":"` + issued.Code + `"}`
+	exchange := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/login",
+		strings.NewReader(exchangeBody),
+	)
+	exchange.Host = "127.0.0.1:7373"
+	exchange.Header.Set("Content-Type", "application/json")
+	exchange.Header.Set("Origin", "http://localhost:5173")
+	exchangeResponse := httptest.NewRecorder()
+	browser.ServeHTTP(exchangeResponse, exchange)
+	if exchangeResponse.Code != http.StatusNoContent {
+		t.Fatalf(
+			"exchange response = %d %q, want 204",
+			exchangeResponse.Code,
+			exchangeResponse.Body.String(),
+		)
+	}
+	if exchangeResponse.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("login exchange cache control = %q", exchangeResponse.Header().Get("Cache-Control"))
+	}
+	cookies := exchangeResponse.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("cookies = %+v, want one session cookie", cookies)
+	}
+	cookie := cookies[0]
+	if cookie.Name != sessionCookieName ||
+		cookie.Value == "" ||
+		!cookie.HttpOnly ||
+		cookie.SameSite != http.SameSiteStrictMode ||
+		cookie.Path != "/" {
+		t.Fatalf("session cookie = %+v", cookie)
+	}
+
+	list := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	list.Host = "127.0.0.1:7373"
+	list.AddCookie(cookie)
+	listResponse := httptest.NewRecorder()
+	browser.ServeHTTP(listResponse, list)
+	if listResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"cookie list response = %d %q, want 200",
+			listResponse.Code,
+			listResponse.Body.String(),
+		)
+	}
+
+	reuse := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/auth/login",
+		strings.NewReader(exchangeBody),
+	)
+	reuse.Host = "127.0.0.1:7373"
+	reuse.Header.Set("Content-Type", "application/json")
+	reuse.Header.Set("Origin", "http://localhost:5173")
+	reuseResponse := httptest.NewRecorder()
+	browser.ServeHTTP(reuseResponse, reuse)
+	if reuseResponse.Code != http.StatusUnauthorized {
+		t.Fatalf(
+			"reused code response = %d %q, want 401",
+			reuseResponse.Code,
+			reuseResponse.Body.String(),
+		)
+	}
+}
+
+func TestBrowserLoginRequiresExactOriginAndValidJSON(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	browser := server.Handler(BrowserAccess, "127.0.0.1:7373")
+
+	for _, test := range []struct {
+		name        string
+		origin      string
+		contentType string
+		body        string
+		wantStatus  int
+	}{
+		{
+			name:        "missing origin",
+			contentType: "application/json",
+			body:        `{"code":"unused"}`,
+			wantStatus:  http.StatusForbidden,
+		},
+		{
+			name:        "cross origin",
+			origin:      "https://example.com",
+			contentType: "application/json",
+			body:        `{"code":"unused"}`,
+			wantStatus:  http.StatusForbidden,
+		},
+		{
+			name:        "wrong content type",
+			origin:      "http://localhost:5173",
+			contentType: "text/plain",
+			body:        `{"code":"unused"}`,
+			wantStatus:  http.StatusUnsupportedMediaType,
+		},
+		{
+			name:        "unknown field",
+			origin:      "http://localhost:5173",
+			contentType: "application/json",
+			body:        `{"code":"unused","extra":true}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "trailing object",
+			origin:      "http://localhost:5173",
+			contentType: "application/json",
+			body:        `{"code":"unused"} {}`,
+			wantStatus:  http.StatusBadRequest,
+		},
+		{
+			name:        "oversized body",
+			origin:      "http://localhost:5173",
+			contentType: "application/json",
+			body:        `{"code":"` + strings.Repeat("x", maxLoginRequestBytes) + `"}`,
+			wantStatus:  http.StatusRequestEntityTooLarge,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/auth/login",
+				strings.NewReader(test.body),
+			)
+			req.Host = "127.0.0.1:7373"
+			req.Header.Set("Content-Type", test.contentType)
+			if test.origin != "" {
+				req.Header.Set("Origin", test.origin)
+			}
+			rec := httptest.NewRecorder()
+			browser.ServeHTTP(rec, req)
+			if rec.Code != test.wantStatus {
+				t.Fatalf(
+					"response = %d %q, want %d",
+					rec.Code,
+					rec.Body.String(),
+					test.wantStatus,
+				)
+			}
+		})
+	}
+}
+
+func TestEmbeddedWebIsPublicOnlyOnBrowserAccess(t *testing.T) {
+	server, _, _ := newTestServer(t)
+	browser := server.Handler(BrowserAccess, "127.0.0.1:7373")
+
+	for _, path := range []string{"/", "/login", "/assets/app.js"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Host = "127.0.0.1:7373"
+		rec := httptest.NewRecorder()
+		browser.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf(
+				"path %q response = %d %q, want 200",
+				path,
+				rec.Code,
+				rec.Body.String(),
+			)
+		}
+		if rec.Header().Get("Content-Security-Policy") == "" ||
+			rec.Header().Get("X-Frame-Options") != "DENY" ||
+			rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("path %q security headers = %v", path, rec.Header())
+		}
+	}
+
+	localRequest := httptest.NewRequest(http.MethodGet, "/", nil)
+	localRequest.Host = "drove.local"
+	localResponse := httptest.NewRecorder()
+	server.Handler(LocalAccess, "drove.local").
+		ServeHTTP(localResponse, localRequest)
+	if localResponse.Code != http.StatusNotFound {
+		t.Fatalf(
+			"local web response = %d %q, want 404",
+			localResponse.Code,
+			localResponse.Body.String(),
+		)
+	}
+}
+
 func TestRotateTokenKeepsOldBearerOnlyForGracePeriod(t *testing.T) {
 	server, _, _ := newTestServerWithOptions(t, true, auth.Options{
 		RotationGrace: 40 * time.Millisecond,
@@ -1262,9 +1477,13 @@ func newTestServerWithOptions(
 		t.Fatalf("open auth controller: %v", err)
 	}
 	return NewServer(ServerOptions{
-		Manager:        manager,
-		Hub:            hub,
-		Auth:           credentials,
+		Manager: manager,
+		Hub:     hub,
+		Auth:    credentials,
+		Web: fstest.MapFS{
+			"index.html":    {Data: []byte("<!doctype html><title>Drove</title>")},
+			"assets/app.js": {Data: []byte("export {}")},
+		},
 		AllowedOrigins: []string{"http://localhost:5173"},
 	}), manager, st
 }

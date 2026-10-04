@@ -33,11 +33,11 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | 能力 | 状态 | 在哪里 |
 | --- | --- | --- |
 | 每个 agent 一个 PTY，由 `droved` 持有 | 已落地 | `internal/pty` |
-| `init` `up` `ps` `log` `explain` `stop` `send` `hook` `version` | 已落地 | `cmd/drove` |
+| `init` `up` `ps` `log` `explain` `stop` `send` `hook` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
 | Claude / Codex 按会话注入状态上报 | 已落地 | [#15](https://github.com/Duang777/drove/issues/15) |
 | 原始终端字节，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` 回放字节，`--plain` 去掉控制序列 | 已落地 | |
-| 只监听 loopback，REST / WebSocket 使用本地令牌 | 已落地 | |
+| Unix 本地控制面、Host / Origin 防护、cookie 登录和令牌轮换 | 已落地 | [#21](https://github.com/Duang777/drove/issues/21) |
 | WebSocket 事件流，以及带 `request_id` 的输入 | 已落地 | |
 | Web 开发骨架：列表、启动、停止、实时事件 | 已落地 | `web/` |
 | 终端屏幕仿真、查询应答、屏幕规则和 `drove explain` | 已落地 | [#14](https://github.com/Duang777/drove/issues/14)，[spec 010](specs/010-terminal-screen-detection/spec.md) |
@@ -209,6 +209,7 @@ ACP 没有注册。`drove up acp` 会去执行一个名叫 `acp` 的程序，而
 {
   "data_dir": "/home/you/.drove",
   "api_bind": "127.0.0.1:7373",
+  "disable_tcp": false,
   "event_buffer": 1024,
   "console_origins": [
     "http://localhost:5173",
@@ -219,6 +220,9 @@ ACP 没有注册。`drove up acp` 会去执行一个名叫 `acp` 的程序，而
   }
 }
 ```
+
+`disable_tcp=true` 会关闭浏览器 listener，但 Unix socket 与 CLI 仍可用；此时
+`drove web` 会直接报错。
 
 `agents.<vendor>.signal_injection` 只接受 `auto` 或 `off`。这是厂商默认注入开关。`off|auto|required` 是单次 `drove up --hooks` 的会话策略，不写在这个字段里。
 
@@ -233,9 +237,20 @@ ACP 没有注册。`drove up acp` 会去执行一个名叫 `acp` 的程序，而
 
 控制令牌是 256 位随机值，十六进制写在 `<data_dir>/control.token`，权限 `0600`。首次启动 daemon 时生成。配置文件本身是 `0644`。
 
-## Web 开发骨架
+## Web 控制台
 
-daemon 不托管前端。Vite 开发服务器把 `/api` 和 `/ws` 代理到 `api_bind`，并从 `control.token` 注入 Bearer。先让 daemon 起来，否则令牌文件还不存在：
+daemon 内嵌并同源托管生产前端。运行下面的命令会经 Unix socket 签发一次性登录码，
+再打开带 fragment 的本地地址。页面兑换 HttpOnly、SameSite=Strict cookie 后会清除
+fragment；浏览器 JavaScript 不读取 `control.token`。
+
+```bash
+drove web
+```
+
+页面可以列出、启动、停止会话，并显示 WebSocket 事件。`output.chunk` 只显示 offset 和
+长度，不画终端。回放字节仍用 `drove log`。
+
+前端开发服务器继续把 `/api` 和 `/ws` 代理到 daemon，并由 Vite 进程读取控制令牌：
 
 ```bash
 drove ps
@@ -244,7 +259,8 @@ npm install
 npm run dev
 ```
 
-打开 `http://127.0.0.1:5173`。页面可以列出、启动、停止会话，并显示 WebSocket 事件。`output.chunk` 只显示 offset 和长度，不画终端。页面上的类名还没有接入样式构建。回放字节用 `drove log`。
+`npm run build` 把生产资源写入并更新 `internal/webui/dist/`。生成资源需要与前端源码一同
+提交，保证只安装 Go 工具链的干净 checkout 也能构建完整 daemon。
 
 实时终端、回放拖动和塔台网格属于 [#20](https://github.com/Duang777/drove/issues/20) 和 [#26](https://github.com/Duang777/drove/issues/26)。产品方向把 #20 定为 Web 优先。
 
@@ -256,7 +272,7 @@ npm run dev
 2. [#25](https://github.com/Duang777/drove/issues/25) 回放时间线
 3. [#20](https://github.com/Duang777/drove/issues/20) Web 实时终端与回放
 4. [#26](https://github.com/Duang777/drove/issues/26) 塔台网格
-5. [#21](https://github.com/Duang777/drove/issues/21) unix socket、Host 校验、cookie、令牌轮换
+5. [#21](https://github.com/Duang777/drove/issues/21) 已落地：unix socket、Host 校验、cookie、令牌轮换
 6. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准 / 拒绝 / 回复
 7. [#16](https://github.com/Duang777/drove/issues/16) 原生 resume 与更温和的停止
 
@@ -273,8 +289,14 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 这是一个单用户、本机控制面。
 
 - `api_bind` 必须是 loopback。非 loopback 地址在配置校验时被拒绝。
-- REST 和 WebSocket 需要 `Authorization: Bearer`，令牌来自 `control.token`。比较是常量时间的。
-- WebSocket 没有 `Origin` 时放行（CLI）。有且仅有一个 `Origin` 时，必须精确匹配 `console_origins`。
+- CLI 默认经 `<data_dir>/run/droved.sock` 调用 daemon；socket 目录为 `0700`，socket
+  为 `0600`，Darwin / Linux 会拒绝不同 UID 的 peer。
+- 浏览器只使用 loopback TCP。所有请求先精确校验 Host；携带 Origin 的请求必须精确
+  匹配允许列表，cookie 认证的写请求和 WebSocket 不允许缺少 Origin。
+- 控制 API 接受 `control.token` Bearer 或 HttpOnly cookie。`drove token rotate` 原子
+  替换令牌，上一代只在 30 秒宽限期内有效，已有 WebSocket 随后收到 policy close。
+- 静态前端和一次性登录兑换无需既有 cookie；兑换端点强制 Origin，登录码使用一次即
+  失效。
 - `/signal` 只接受 loopback 和该会话的 token，不接受控制面令牌。
 - 同一 OS 用户能读到令牌文件。令牌不防本机上的其他进程，也不防 agent 自己。
 - 输入审计不保存正文。原始输出可能含有源码和密钥，默认 30 天后删除附件。

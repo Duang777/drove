@@ -3,7 +3,7 @@
 ## 职责
 
 **CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log /
-explain / stop / token rotate / version），所有会话操作都经 `internal/client` 与常驻 daemon
+explain / stop / token rotate / web / version），所有会话操作都经 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
 
 ## 关键设计
@@ -29,6 +29,8 @@ explain / stop / token rotate / version），所有会话操作都经 `internal/
   `client.EnsureDaemon`；仅 socket 不可达时后台拉起 `droved`，认证失败直接返回。
 - `drove token rotate` 经 Unix socket 请求 daemon 原子轮换令牌；命令本身不读取或
   输出令牌值。
+- `drove web` 经 Unix socket 签发一次性 code，把 code 放在 `/login` URL fragment
+  中交给系统浏览器；成功输出不得包含 fragment。`disable_tcp=true` 时拒绝签发。
 - `version` 子命令输出 `internal/version` 注入信息。
 
 ## 约束

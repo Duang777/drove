@@ -23,6 +23,7 @@ import (
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/version"
+	"github.com/Duang777/drove/internal/webui"
 )
 
 // Daemon 是常驻服务。
@@ -168,6 +169,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		Manager:        mgr,
 		Hub:            hub,
 		Auth:           credentials,
+		Web:            webui.FS(),
 		EventBuffer:    d.cfg.EventBuffer,
 		AllowedOrigins: allowedOrigins,
 	})

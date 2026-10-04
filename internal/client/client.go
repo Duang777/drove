@@ -142,6 +142,42 @@ func (c *Client) RotateToken(ctx context.Context) error {
 	return drain(resp.Body)
 }
 
+// IssueLoginCode creates a one-time browser login code over local transport.
+func (c *Client) IssueLoginCode(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/api/v1/auth/login-code",
+		nil,
+	)
+	if err != nil {
+		return "", err
+	}
+	if err := c.authorize(req, false); err != nil {
+		return "", err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return "", ErrDaemonUnreachable
+	}
+	defer resp.Body.Close()
+	if err := c.responseError(resp, "/api/v1/auth/login-code"); err != nil {
+		return "", err
+	}
+	var response loginCodeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", fmt.Errorf("client: decode login code: %w", err)
+	}
+	if response.Code == "" {
+		return "", errors.New("client: daemon returned an empty login code")
+	}
+	return response.Code, nil
+}
+
+type loginCodeResponse struct {
+	Code string `json:"code"`
+}
+
 type inputRequest struct {
 	Data string `json:"data"`
 }

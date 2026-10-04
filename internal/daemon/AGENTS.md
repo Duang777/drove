@@ -14,6 +14,8 @@
   TCP 可由配置关闭。
 - Unix listener 只接受 `drove.local` Host；TCP listener 从实际端口派生
   `127.0.0.1`、`localhost` 和 `[::1]` Host 与同源 Origin 白名单。
+- 浏览器 listener 同源提供 `internal/webui` 的嵌入式生产构建；运行时不依赖源码目录
+  或 Node。
 - 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
 - Store 打开后、投影恢复前执行一次严格的输出附件保留清理；首次失败中止启动。

@@ -8,8 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -64,6 +68,7 @@ func newRootCmd() *cobra.Command {
 		newHookCmd(),
 		newStopCmd(),
 		newTokenCmd(),
+		newWebCmd(),
 		newVersionCmd(),
 	)
 	return root
@@ -410,6 +415,101 @@ func newTokenCmd() *cobra.Command {
 		},
 	})
 	return token
+}
+
+var launchBrowser = openBrowser
+
+func newWebCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "web",
+		Short: "打开 Web 控制台",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, configPath, err := config.LoadResolved("")
+			if err != nil {
+				return err
+			}
+			if cfg.DisableTCP {
+				return errors.New("web console is unavailable while disable_tcp is true")
+			}
+			c := client.NewLocal(
+				cfg.DataDir,
+				client.WithTokenFile(auth.TokenPath(cfg.DataDir)),
+			)
+			if err := c.EnsureDaemon(cmd.Context(), configPath); err != nil {
+				return err
+			}
+			code, err := c.IssueLoginCode(cmd.Context())
+			if err != nil {
+				return err
+			}
+			browserURL, err := newBrowserURL(cfg.APIBind, code)
+			if err != nil {
+				return err
+			}
+			if err := launchBrowser(browserURL.login); err != nil {
+				return fmt.Errorf("open browser: %w", err)
+			}
+			_, err = fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"opened Drove console at %s\n",
+				browserURL.public,
+			)
+			return err
+		},
+	}
+}
+
+type browserURL struct {
+	login  string
+	public string
+}
+
+func newBrowserURL(address, code string) (browserURL, error) {
+	if _, _, err := net.SplitHostPort(address); err != nil {
+		return browserURL{}, fmt.Errorf("invalid browser address %q: %w", address, err)
+	}
+	if code == "" {
+		return browserURL{}, errors.New("browser login code is empty")
+	}
+	loginURL := url.URL{
+		Scheme:   "http",
+		Host:     address,
+		Path:     "/login",
+		Fragment: code,
+	}
+	publicURL := loginURL
+	publicURL.Fragment = ""
+	return browserURL{
+		login:  loginURL.String(),
+		public: publicURL.String(),
+	}, nil
+}
+
+func openBrowser(rawURL string) error {
+	var command string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		command = "open"
+		args = []string{rawURL}
+	case "linux":
+		command = "xdg-open"
+		args = []string{rawURL}
+	case "windows":
+		command = "rundll32"
+		args = []string{"url.dll,FileProtocolHandler", rawURL}
+	default:
+		return fmt.Errorf("unsupported platform %q", runtime.GOOS)
+	}
+	process := exec.Command(command, args...)
+	if err := process.Start(); err != nil {
+		return err
+	}
+	go func() {
+		_ = process.Wait()
+	}()
+	return nil
 }
 
 func newSendCmd() *cobra.Command {
