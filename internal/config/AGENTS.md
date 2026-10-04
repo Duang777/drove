@@ -14,6 +14,8 @@
 - `Agents` 保存 vendor-keyed 启动配置；`signal_injection` 只接受 `auto|off`，
   adapter 能力默认值由 composition root 解析，config 不包含厂商分支。
 - `Validate()` 在启动早期校验；API 只允许 loopback 监听，WebSocket Origin 只允许配置的本地 HTTP Origin。
+- `disable_tcp=true` 只关闭供浏览器使用的 loopback TCP listener；daemon 的 Unix
+  socket 控制面始终启用。
 
 ## 约束
 

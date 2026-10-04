@@ -9,12 +9,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
 
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/session"
 )
 
@@ -29,9 +31,10 @@ const (
 
 // HookRelayConfig identifies one session-scoped signal endpoint.
 type HookRelayConfig struct {
-	AgentID   string
-	SignalURL string
-	Token     string
+	AgentID    string
+	SignalURL  string
+	SocketPath string
+	Token      string
 }
 
 // HookRelay forwards vendor hook documents using a session capability.
@@ -59,10 +62,23 @@ func NewHookRelay(config HookRelayConfig) (*HookRelay, error) {
 	if err := validateSignalURL(config.SignalURL, config.AgentID); err != nil {
 		return nil, err
 	}
+	if config.SocketPath != "" &&
+		(!filepath.IsAbs(config.SocketPath) || strings.ContainsRune(config.SocketPath, 0)) {
+		return nil, errors.New("client: signal socket path must be absolute")
+	}
+	transport := http.DefaultTransport
+	signalURL := config.SignalURL
+	if config.SocketPath != "" {
+		transport = localipc.TransportSocket(config.SocketPath)
+		parsed, _ := url.Parse(signalURL)
+		parsed.Host = localipc.Authority
+		signalURL = parsed.String()
+	}
 	return &HookRelay{
-		signalURL: config.SignalURL,
+		signalURL: signalURL,
 		token:     config.Token,
 		client: &http.Client{
+			Transport: transport,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},

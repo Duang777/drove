@@ -564,6 +564,23 @@ func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 			duplicateResponse.Body.String(),
 		)
 	}
+	localRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/"+status.AgentID+"/signal",
+		strings.NewReader(body),
+	)
+	localRequest.RemoteAddr = ""
+	localRequest.Header.Set("Content-Type", "application/json")
+	localRequest.Header.Set("Authorization", "Bearer "+token)
+	localResponse := httptest.NewRecorder()
+	server.Handler(LocalAccess).ServeHTTP(localResponse, localRequest)
+	if localResponse.Code != http.StatusNoContent {
+		t.Fatalf(
+			"local response = %d %q, want 204",
+			localResponse.Code,
+			localResponse.Body.String(),
+		)
+	}
 
 	for _, test := range []struct {
 		name       string
@@ -609,6 +626,22 @@ func TestSignalEndpointUsesSessionCredentialAndLoopbackOnly(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestLoopbackRemoteOnlyAcceptsLoopbackIP(t *testing.T) {
+	for _, remoteAddr := range []string{
+		"127.0.0.1:43210",
+		"[::1]:43210",
+	} {
+		if !isLoopbackRemote(remoteAddr) {
+			t.Fatalf("remote address %q was not treated as local", remoteAddr)
+		}
+	}
+	for _, remoteAddr := range []string{"", "@", "192.0.2.10:43210"} {
+		if isLoopbackRemote(remoteAddr) {
+			t.Fatalf("remote address %q was treated as loopback IP", remoteAddr)
+		}
 	}
 }
 

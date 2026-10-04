@@ -10,7 +10,10 @@ import (
 	"github.com/Duang777/drove/internal/session"
 )
 
-func signalInjectionOption(cfg *config.Config) session.ManagerOption {
+func signalInjectionOption(
+	cfg *config.Config,
+	socketPath string,
+) session.ManagerOption {
 	modes := make(map[string]agent.SignalInjectionMode, len(cfg.Agents))
 	for vendor, settings := range cfg.Agents {
 		if settings.SignalInjection != "" {
@@ -18,9 +21,10 @@ func signalInjectionOption(cfg *config.Config) session.ManagerOption {
 		}
 	}
 	return session.WithSignalInjection(session.SignalInjectionOptions{
-		DataDir:   cfg.DataDir,
-		RelayPath: resolveDroveCLI(),
-		Modes:     modes,
+		DataDir:    cfg.DataDir,
+		RelayPath:  resolveDroveCLI(),
+		SocketPath: socketPath,
+		Modes:      modes,
 	})
 }
 

@@ -25,7 +25,8 @@ explain / stop / version），所有会话操作都经 `internal/client` 与常�
 - `drove explain <id>` 按时间顺序打印类型化决策；`--limit` 限制最近事件数，
   `--json` 保持 stdout 仅含响应 JSON。只有 attached snapshot 存在时才打印
   `ephemeral redacted current screen` 标签和受限行视图。
-- 每次命令从 DataDir 读取控制令牌后调用 `client.EnsureDaemon`；仅网络不可达时后台拉起 `droved`，认证失败直接返回。
+- 每次命令经 DataDir 下的 Unix socket 调用 daemon，并从同一目录读取控制令牌后调用
+  `client.EnsureDaemon`；仅 socket 不可达时后台拉起 `droved`，认证失败直接返回。
 - `version` 子命令输出 `internal/version` 注入信息。
 
 ## 约束

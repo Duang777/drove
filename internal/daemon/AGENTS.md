@@ -7,8 +7,11 @@
 ## 关键设计
 
 - `Daemon.Run(ctx)`：校验配置并确保本地控制令牌 → 打开 store → 构建
-  Hub/Registry/Manager → 恢复投影 → 打开 loopback listener → 把实际 signal origin
-  一次性配置给 Manager → 启动 API server → 阻塞直到 ctx 取消或收到 SIGINT/SIGTERM。
+  Hub/Registry/Manager → 恢复投影 → 打开 Unix socket 和可选 loopback TCP listener
+  → 把 signal origin 一次性配置给 Manager → 启动 API server → 阻塞直到 ctx
+  取消或收到 SIGINT/SIGTERM。
+- 所有 listener 必须在任一 Serve goroutine 启动前创建成功；Unix listener 始终启用，
+  TCP 可由配置关闭。
 - 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
 - Store 打开后、投影恢复前执行一次严格的输出附件保留清理；首次失败中止启动。

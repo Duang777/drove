@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -27,8 +26,6 @@ import (
 
 // ServerOptions 配置 API server。
 type ServerOptions struct {
-	// Bind 是监听地址（如 127.0.0.1:7373）。
-	Bind string
 	// Manager 处理会话逻辑。
 	Manager *session.Manager
 	// Hub 提供实时事件流。
@@ -44,10 +41,21 @@ type ServerOptions struct {
 // Server 是 HTTP/WS 服务。
 type Server struct {
 	opts           ServerOptions
-	http           *http.Server
 	mux            http.Handler
 	allowedOrigins map[string]struct{}
 }
+
+// Access identifies the transport boundary that accepted a request.
+type Access uint8
+
+const (
+	// LocalAccess is a same-UID Unix socket request.
+	LocalAccess Access = iota + 1
+	// BrowserAccess is a loopback TCP request.
+	BrowserAccess
+)
+
+type accessContextKey struct{}
 
 // NewServer 创建 Server（路由已注册）。
 func NewServer(opts ServerOptions) *Server {
@@ -62,10 +70,6 @@ func NewServer(opts ServerOptions) *Server {
 	rootMux.HandleFunc("POST /api/v1/agents/{id}/signal", s.handleSignal)
 	rootMux.Handle("/", s.authenticate(controlMux))
 	s.mux = rootMux
-	s.http = &http.Server{
-		Handler:           s.mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
 	return s
 }
 
@@ -92,14 +96,12 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 	})
 }
 
-// Serve 开始监听并服务。
-func (s *Server) Serve(ln net.Listener) error {
-	return s.http.Serve(ln)
-}
-
-// Shutdown 优雅关闭。
-func (s *Server) Shutdown(ctx context.Context) error {
-	return s.http.Shutdown(ctx)
+// Handler returns the route tree bound to one accepted transport.
+func (s *Server) Handler(access Access) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), accessContextKey{}, access)
+		s.mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // -- handlers --
@@ -269,7 +271,7 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
-	if !isLoopbackRemote(r.RemoteAddr) {
+	if requestAccess(r) != LocalAccess && !isLoopbackRemote(r.RemoteAddr) {
 		writeErr(w, http.StatusForbidden, "signal endpoint accepts loopback requests only")
 		return
 	}
@@ -404,6 +406,11 @@ func isLoopbackRemote(remoteAddr string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+func requestAccess(r *http.Request) Access {
+	access, _ := r.Context().Value(accessContextKey{}).(Access)
+	return access
 }
 
 // -- helpers --

@@ -8,11 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/Duang777/drove/internal/localipc"
 )
 
 func TestHookRelayPostsVersionedEnvelopeWithSessionToken(t *testing.T) {
@@ -93,6 +96,54 @@ func TestHookRelayPreservesInLimitPayloadSize(t *testing.T) {
 	}
 	if requestBodyBytes > MaxHookPayloadBytes+4096 {
 		t.Fatalf("request body size = %d, exceeds endpoint limit", requestBodyBytes)
+	}
+}
+
+func TestHookRelayUsesUnixSocket(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "drove-hook-")
+	if err != nil {
+		t.Fatalf("create data directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove data directory: %v", err)
+		}
+	})
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	var received signalRequest
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != localipc.Authority {
+			t.Errorf("host = %q, want %q", r.Host, localipc.Authority)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	relay, err := NewHookRelay(HookRelayConfig{
+		AgentID:    "agent-1",
+		SignalURL:  "http://127.0.0.1:7373/api/v1/agents/agent-1/signal",
+		SocketPath: localipc.SocketPath(dataDir),
+		Token:      "session-token",
+	})
+	if err != nil {
+		t.Fatalf("new relay: %v", err)
+	}
+	if err := relay.Forward(context.Background(), "claude", []byte(`{}`)); err != nil {
+		t.Fatalf("forward over Unix socket: %v", err)
+	}
+	if received.Vendor != "claude" {
+		t.Fatalf("request = %+v", received)
 	}
 }
 

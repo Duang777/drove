@@ -17,9 +17,9 @@
   - `GET  /api/v1/agents/{id}/events`：回放事件流（REST，JSON 数组）
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
 - 所有 REST 与 WebSocket 请求必须先通过本地 Bearer 令牌认证；WebSocket 还要求 Origin 缺失或与配置的本地 Origin 精确匹配。
-- signal endpoint 是唯一例外：它只接受 loopback，并使用目标会话的内存 token，
-  不接受控制面 token；请求 envelope 必须严格校验，只有已提交或重复的 delivery
-  返回 204。
+- signal endpoint 是唯一例外：它只接受 loopback TCP 或已由 listener 校验的本机
+  Unix peer，并使用目标会话的内存 token，不接受控制面 token；请求 envelope
+  必须严格校验，只有已提交或重复的 delivery 返回 204。
 - 每个 WebSocket 连接只有一个读协程和一个写协程；写协程独占事件、ack/error、ping/pong 和 close 帧。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload
   含 Base64 正文，过期回放只含 offset/len 元数据。

@@ -19,6 +19,7 @@ import (
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -602,7 +603,15 @@ func TestWriteExplanationOmitsDetachedScreenPlaceholder(t *testing.T) {
 }
 
 func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
-	home := t.TempDir()
+	home, err := os.MkdirTemp("/tmp", "drove-explain-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
 	t.Setenv("HOME", home)
 	dataDir := filepath.Join(home, ".drove")
 	token, err := auth.Ensure(dataDir)
@@ -610,7 +619,11 @@ func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
 		t.Fatalf("ensure control token: %v", err)
 	}
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
@@ -631,12 +644,16 @@ func TestExplainCommandJSONKeepsStdoutMachineClean(t *testing.T) {
 		default:
 			http.NotFound(w, r)
 		}
-	}))
-	defer server.Close()
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
 
 	cfg := config.Defaults()
 	cfg.DataDir = dataDir
-	cfg.APIBind = strings.TrimPrefix(server.URL, "http://")
 	cfg.DBPath = ""
 	rawConfig, err := json.Marshal(cfg)
 	if err != nil {

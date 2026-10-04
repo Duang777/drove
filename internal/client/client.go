@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -51,6 +52,21 @@ func New(baseURL string, options ...Option) *Client {
 	client := &Client{
 		baseURL: "http://" + baseURL,
 		hc:      &http.Client{Timeout: 10 * time.Second},
+	}
+	for _, option := range options {
+		option(client)
+	}
+	return client
+}
+
+// NewLocal creates a client that reaches the daemon over its Unix socket.
+func NewLocal(dataDir string, options ...Option) *Client {
+	client := &Client{
+		baseURL: "http://" + localipc.Authority,
+		hc: &http.Client{
+			Transport: localipc.Transport(dataDir),
+			Timeout:   10 * time.Second,
+		},
 	}
 	for _, option := range options {
 		option(client)

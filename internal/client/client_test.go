@@ -12,8 +12,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/localipc"
 	"github.com/Duang777/drove/internal/session"
 )
 
@@ -266,5 +268,54 @@ func TestListFailsBeforeRequestWhenTokenFileIsInvalid(t *testing.T) {
 	}
 	if calls.Load() != 0 {
 		t.Fatalf("server calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestLocalClientUsesUnixSocketWithoutTCP(t *testing.T) {
+	dataDir, err := os.MkdirTemp("/tmp", "drove-client-")
+	if err != nil {
+		t.Fatalf("create data directory: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dataDir); err != nil {
+			t.Errorf("remove data directory: %v", err)
+		}
+	})
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Host != localipc.Authority {
+			t.Errorf("host = %q, want %q", r.Host, localipc.Authority)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write([]byte("[]"))
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	localClient := NewLocal(
+		dataDir,
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	statuses, err := localClient.List(ctx)
+	if err != nil {
+		t.Fatalf("list over Unix socket: %v", err)
+	}
+	if len(statuses) != 0 {
+		t.Fatalf("statuses = %+v, want empty", statuses)
 	}
 }

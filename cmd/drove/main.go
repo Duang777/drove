@@ -74,7 +74,10 @@ func newClient(ctx context.Context) (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	c := client.New(cfg.APIBind, client.WithTokenFile(auth.TokenPath(cfg.DataDir)))
+	c := client.NewLocal(
+		cfg.DataDir,
+		client.WithTokenFile(auth.TokenPath(cfg.DataDir)),
+	)
 	if err := c.EnsureDaemon(ctx, configPath); err != nil {
 		return nil, err
 	}
@@ -470,9 +473,10 @@ func forwardHook(
 	args []string,
 ) error {
 	relay, err := client.NewHookRelay(client.HookRelayConfig{
-		AgentID:   os.Getenv(session.SignalAgentIDEnv),
-		SignalURL: os.Getenv(session.SignalURLEnv),
-		Token:     os.Getenv(session.SignalTokenEnv),
+		AgentID:    os.Getenv(session.SignalAgentIDEnv),
+		SignalURL:  os.Getenv(session.SignalURLEnv),
+		SocketPath: os.Getenv(session.SignalSocketEnv),
+		Token:      os.Getenv(session.SignalTokenEnv),
 	})
 	if err != nil {
 		return err

@@ -25,6 +25,7 @@ const testSignalToken = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	manager.signalSocketPath = "/tmp/drove-test.sock"
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Hooks:   agent.HooksAuto,
@@ -32,7 +33,7 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 		Command: "/bin/sh",
 		Args: []string{
 			"-c",
-			`printf '%s|%s|%s\n' "$DROVE_AGENT_ID" "$DROVE_SIGNAL_URL" "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
+			`printf '%s|%s|%s|%s\n' "$DROVE_AGENT_ID" "$DROVE_SIGNAL_URL" "$DROVE_SIGNAL_SOCKET" "$DROVE_SIGNAL_TOKEN"; exec /bin/cat`,
 		},
 	})
 	if err != nil {
@@ -65,7 +66,7 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	}
 
 	parts := strings.Split(envLine, "|")
-	if len(parts) != 3 {
+	if len(parts) != 4 {
 		t.Fatalf("environment line = %q", envLine)
 	}
 	if parts[0] != status.AgentID {
@@ -75,9 +76,12 @@ func TestStartInjectsIsolatedHookRelayEnvironment(t *testing.T) {
 	if parts[1] != wantURL {
 		t.Fatalf("signal URL = %q, want %q", parts[1], wantURL)
 	}
+	if parts[2] != "/tmp/drove-test.sock" {
+		t.Fatalf("signal socket = %q, want injected path", parts[2])
+	}
 	wantMask := string(newStreamingRedactor([]byte(testSignalToken)).mask)
-	if parts[2] != wantMask {
-		t.Fatalf("persisted signal token = %q, want redaction", parts[2])
+	if parts[3] != wantMask {
+		t.Fatalf("persisted signal token = %q, want redaction", parts[3])
 	}
 	token := attachedSignalToken(t, manager, agent.ID(status.AgentID))
 	tokenBytes, decodeErr := base64.RawURLEncoding.DecodeString(token)

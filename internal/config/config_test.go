@@ -104,10 +104,38 @@ func TestDefaultsUseLoopbackBindAndLocalConsoleOrigins(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("validate defaults: %v", err)
 	}
+	if cfg.DisableTCP {
+		t.Fatal("TCP is disabled by default")
+	}
 	if len(cfg.ConsoleOrigins) != 2 ||
 		cfg.ConsoleOrigins[0] != "http://localhost:5173" ||
 		cfg.ConsoleOrigins[1] != "http://127.0.0.1:5173" {
 		t.Fatalf("console origins = %#v", cfg.ConsoleOrigins)
+	}
+}
+
+func TestLoadResolvedCanDisableTCP(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DROVE_DATA_DIR", "")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"data_dir": "/tmp/drove",
+		"api_bind": "127.0.0.1:7373",
+		"disable_tcp": true,
+		"event_buffer": 16,
+		"console_origins": ["http://localhost:5173"]
+	}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, _, err := LoadResolved(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if !cfg.DisableTCP {
+		t.Fatal("TCP remains enabled")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate config: %v", err)
 	}
 }
 
