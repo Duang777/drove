@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -322,64 +323,6 @@ func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 	}
 }
 
-func TestDetectorFallbackConfidenceAndBlockedRecovery(t *testing.T) {
-	manager, _ := newSignalTestManager(t, "")
-	manager.detectConfig.HeuristicConfirmation = 5 * time.Millisecond
-	status, err := manager.Start(context.Background(), StartRequest{
-		Vendor:  "claude",
-		Command: "/bin/cat",
-		Hooks:   agent.HooksOff,
-	})
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	id := agent.ID(status.AgentID)
-
-	feedTestOutput(t, manager, id, "Error: low confidence")
-	if got, _ := manager.Status(id); got.State != agent.StateWorking {
-		t.Fatalf("low-confidence hint changed state to %s", got.State)
-	}
-	feedTestOutput(t, manager, id, "Waiting for your input")
-	waitForState(t, manager, id, agent.StateBlocked)
-	feedTestOutput(t, manager, id, "resuming first line")
-	if got, _ := manager.Status(id); got.State != agent.StateBlocked {
-		t.Fatalf("one activity line changed state to %s", got.State)
-	}
-	feedTestOutput(t, manager, id, "resuming second line")
-	if got, _ := manager.Status(id); got.State != agent.StateWorking {
-		t.Fatalf("sustained output left state at %s", got.State)
-	}
-}
-
-func TestActiveHookSuppressesHeuristicStateChanges(t *testing.T) {
-	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
-	status, err := manager.Start(context.Background(), StartRequest{
-		Vendor:  "claude",
-		Command: "/bin/cat",
-		Hooks:   agent.HooksAuto,
-	})
-	if err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	id := agent.ID(status.AgentID)
-	token := attachedSignalToken(t, manager, id)
-	if err := deliverTestHook(manager,
-		context.Background(),
-		id,
-		"Bearer "+token,
-		"claude",
-		testDeliveryID("delivery-start"),
-		claudeHook("SessionStart"),
-	); err != nil {
-		t.Fatalf("activate hook: %v", err)
-	}
-
-	feedTestOutput(t, manager, id, "Waiting for your input")
-	if got, _ := manager.Status(id); got.State != agent.StateWorking {
-		t.Fatalf("active hook allowed heuristic state %s", got.State)
-	}
-}
-
 func TestHookIdleConfirmationAndBlockedRecovery(t *testing.T) {
 	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
 	manager.detectConfig.StopConfirmation = 5 * time.Millisecond
@@ -527,6 +470,78 @@ func TestRequiredHookPolicyRejectsUnprovisionedOrInactiveSessions(t *testing.T) 
 			t.Fatal("required start did not return after activation")
 		}
 	})
+}
+
+func TestRequiredCodexStartupAnswersTerminalQueryBeforeHookActivation(t *testing.T) {
+	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	manager.detectConfig.HookActivation = 2 * time.Second
+	result := make(chan struct {
+		status *Status
+		err    error
+	}, 1)
+	go func() {
+		status, err := manager.Start(context.Background(), StartRequest{
+			Vendor:  "codex",
+			Name:    "codex-query-startup",
+			Command: "/bin/sh",
+			Args: []string{
+				"-c",
+				`stty raw -echo; printf '\033[6n'; dd bs=1 count=6 >/dev/null 2>&1; printf 'QUERY_OK\n'; sleep 30`,
+			},
+			Hooks: agent.HooksRequired,
+		})
+		result <- struct {
+			status *Status
+			err    error
+		}{status: status, err: err}
+	}()
+
+	id, token := waitForAttachedSignalToken(t, manager)
+	waitForOutputContains(t, manager, id, "QUERY_OK")
+	select {
+	case started := <-result:
+		t.Fatalf("start returned before hook activation: %+v", started)
+	default:
+	}
+
+	if err := deliverTestHook(
+		manager,
+		context.Background(),
+		id,
+		"Bearer "+token,
+		"codex",
+		testDeliveryID("codex-query-startup"),
+		[]byte(`{"hook_event_name":"SessionStart","session_id":"vendor-session"}`),
+	); err != nil {
+		t.Fatalf("activate required hook: %v", err)
+	}
+
+	select {
+	case started := <-result:
+		if started.err != nil || started.status == nil ||
+			started.status.AgentID != string(id) {
+			t.Fatalf("start result = %+v", started)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("required start did not return after query reply and hook activation")
+	}
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type == string(event.TypeAgentInput) {
+			t.Fatalf("terminal query reply created input audit: %+v", row)
+		}
+		if row.Type == string(event.TypeOutputChunk) &&
+			bytes.Contains(outputChunkData(t, row), []byte("\x1b[1;1R")) {
+			t.Fatalf("terminal query reply entered durable output: %+v", row)
+		}
+	}
+	if err := manager.Stop(id); err != nil {
+		t.Fatalf("stop query child: %v", err)
+	}
 }
 
 func TestUnknownHookEventDoesNotActivatePolicy(t *testing.T) {
@@ -1054,6 +1069,29 @@ func waitForState(t *testing.T, manager *Manager, id agent.ID, want agent.State)
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("state = %s, want %s", status.State, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func waitForOutputContains(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+	want string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		rows, err := manager.Replay(string(id))
+		if err != nil {
+			t.Fatalf("replay output: %v", err)
+		}
+		if bytes.Contains(joinOutputRows(t, rows), []byte(want)) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("output did not contain %q", want)
 		}
 		time.Sleep(time.Millisecond)
 	}

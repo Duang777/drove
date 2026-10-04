@@ -1,6 +1,6 @@
 // Package adapter 提供跨厂商 agent 的统一接入抽象。
 //
-// 本包是唯一允许出现厂商专属逻辑（命令、参数、状态启发式）的地方。
+// 本包是唯一允许出现厂商专属逻辑（命令、参数、屏幕规则）的地方。
 package adapter
 
 import (
@@ -11,18 +11,7 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
-	"github.com/Duang777/drove/internal/term"
 )
-
-// OutputHint is the bounded classification of one sanitized terminal line.
-type OutputHint struct {
-	// Kind is heuristic evidence, not a direct Agent state.
-	Kind detect.Kind
-	// Confidence 置信度 0~1（供上层结合其它信号决策）。
-	Confidence float64
-	// Evidence is a redacted explanation suitable for audit.
-	Evidence string
-}
 
 // Runner 描述如何拉起某厂商的 agent。
 type Runner interface {
@@ -30,12 +19,6 @@ type Runner interface {
 	Vendor() string
 	// Command 返回指定运行模式的可执行文件与参数（不含环境变量透传）。
 	Command(mode agent.RunMode) (name string, args []string)
-}
-
-// Heuristic 从输出行推断状态信号。
-type Heuristic interface {
-	// Classify 返回状态提示；ok=false 表示该行无可信信号。
-	Classify(line string) (OutputHint, bool)
 }
 
 // HookInput is the transport-neutral input to a vendor hook normalizer.
@@ -53,18 +36,9 @@ type HookNormalizer interface {
 // Entry 是注册表中的一个实现。
 type Entry struct {
 	Runner         Runner
-	Heuristic      Heuristic
 	HookNormalizer HookNormalizer
 	SignalInjector SignalInjector
 	screenRules    screenRuleProvider
-}
-
-// Classify sanitizes terminal control sequences before invoking the vendor heuristic.
-func (e Entry) Classify(line string) (OutputHint, bool) {
-	if e.Heuristic == nil {
-		return OutputHint{}, false
-	}
-	return e.Heuristic.Classify(term.StripString(line))
 }
 
 // NewScreenClassifier constructs independent screen-rule state for one session.
@@ -119,26 +93,23 @@ func NewRegistry() *Registry {
 	r := &Registry{entries: make(map[string]Entry)}
 	r.register(
 		claudeRunner{},
-		claudeHeuristic{},
 		claudeHookDecoder{},
 		claudeSignalInjector{},
 		claudeScreenRules,
 	)
 	r.register(
 		codexRunner{},
-		codexHeuristic{},
 		codexHookDecoder{},
 		codexSignalInjector{},
 		codexScreenRules,
 	)
-	r.generic = Entry{Runner: genericRunner{}, Heuristic: nil}
+	r.generic = Entry{Runner: genericRunner{}}
 	return r
 }
 
 // register 注册一个实现（panic 防重复注册，属开发期错误）。
 func (r *Registry) register(
 	runner Runner,
-	heuristic Heuristic,
 	normalizer HookNormalizer,
 	injector SignalInjector,
 	screenRules screenRuleProvider,
@@ -149,7 +120,6 @@ func (r *Registry) register(
 	}
 	r.entries[v] = Entry{
 		Runner:         runner,
-		Heuristic:      heuristic,
 		HookNormalizer: normalizer,
 		SignalInjector: injector,
 		screenRules:    screenRules,

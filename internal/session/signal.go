@@ -161,6 +161,13 @@ func (m *Manager) prepareRuntime(
 	if policy == agent.HooksRequired && !entry.SupportsHooks() {
 		return nil, nil, "", fmt.Errorf("%w: %q", ErrHookUnsupported, a.Vendor())
 	}
+	classifier, err := entry.NewScreenClassifier()
+	if err != nil {
+		return nil, nil, "", fmt.Errorf(
+			"session: create screen classifier: %w",
+			err,
+		)
+	}
 
 	observer, err := newObservationActor(
 		a,
@@ -174,12 +181,14 @@ func (m *Manager) prepareRuntime(
 	}
 	running := &runningSession{
 		observer:       observer,
+		classifier:     classifier,
 		callbacksReady: make(chan struct{}),
 		signalReady:    make(chan struct{}),
+		processExited:  make(chan struct{}),
 		vendor:         a.Vendor(),
 	}
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
-		running.output = newOutputProcessor(m, a.ID(), running, entry, "")
+		running.output = newOutputProcessor(m, a.ID(), running, "")
 		return running, nil, "", nil
 	}
 
@@ -195,7 +204,7 @@ func (m *Manager) prepareRuntime(
 	}
 	running.signalDigest = digest
 	running.hasSignalToken = true
-	running.output = newOutputProcessor(m, a.ID(), running, entry, token)
+	running.output = newOutputProcessor(m, a.ID(), running, token)
 	return running, []string{
 		SignalAgentIDEnv + "=" + string(a.ID()),
 		SignalURLEnv + "=" + signalURL,
@@ -231,6 +240,8 @@ func (m *Manager) waitForRequiredHook(
 	case <-running.observer.Active():
 		return nil
 	case <-running.observer.RequiredFailed():
+		return ErrHookRequired
+	case <-running.processExited:
 		return ErrHookRequired
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %v", ErrHookRequired, ctx.Err())

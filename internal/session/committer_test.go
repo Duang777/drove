@@ -173,7 +173,7 @@ func TestTypedCommitterSealsDraftsAndAppliesAgentAfterStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commit agent: %v", err)
 	}
-	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 2}) {
+	if receipt.FirstSeq != 1 || receipt.LastSeq != 2 || receipt.Timestamp.IsZero() {
 		t.Fatalf("receipt = %+v", receipt)
 	}
 	if a.State() != agent.StateStarting ||
@@ -300,7 +300,7 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commit decision: %v", err)
 	}
-	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 2}) {
+	if receipt.FirstSeq != 1 || receipt.LastSeq != 2 || receipt.Timestamp.IsZero() {
 		t.Fatalf("receipt = %+v", receipt)
 	}
 	if a.State() != agent.StateBlocked ||
@@ -661,7 +661,7 @@ func TestCommitterRejectsInvalidAgentChangeWithoutFailing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("commit after validation rejection: %v", err)
 	}
-	if receipt != (commitReceipt{FirstSeq: 1, LastSeq: 1}) {
+	if receipt.FirstSeq != 1 || receipt.LastSeq != 1 || receipt.Timestamp.IsZero() {
 		t.Fatalf("receipt = %+v, want sequence 1", receipt)
 	}
 }

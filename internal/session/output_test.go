@@ -2,8 +2,10 @@ package session
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,7 +13,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
@@ -174,56 +175,6 @@ func TestOutputProcessorSplitsUTF8ChunksWithContiguousOffsets(t *testing.T) {
 	}
 }
 
-func TestOutputProcessorDerivesBoundedPlainLinesAtEnd(t *testing.T) {
-	manager, _ := newTestManager(t)
-	heuristic := &recordingHeuristic{}
-	entry := adapter.Entry{Heuristic: heuristic}
-	id := agent.ID("derived-lines")
-	a := agent.New(
-		id,
-		agent.WithName("derived-lines"),
-		agent.WithVendor("test"),
-		agent.WithRunMode(agent.RunModeInteractive),
-		agent.WithHookPolicy(agent.HooksOff),
-	)
-	manager.mu.Lock()
-	manager.agents[id] = a
-	manager.mu.Unlock()
-	commitTestState(t, manager, a, agent.StateStarting, "test start")
-	commitTestState(t, manager, a, agent.StateWorking, "test working")
-	running := attachTestRuntime(t, manager, a, entry)
-
-	first := []byte("old\x1b]0;hidden\x1b")
-	second := append([]byte{'\\'}, bytes.Repeat([]byte("n"), maxDerivedLineBytes+17)...)
-	second = append(second, '\n')
-	second = append(second, []byte("final\r")...)
-	if err := running.output.Feed(first, 0); err != nil {
-		t.Fatalf("feed first control fragment: %v", err)
-	}
-	if err := running.output.Feed(second, uint64(len(first))); err != nil {
-		t.Fatalf("feed second control fragment: %v", err)
-	}
-	if err := running.output.End(uint64(len(first) + len(second))); err != nil {
-		t.Fatalf("end output: %v", err)
-	}
-
-	lines := heuristic.Lines()
-	if len(lines) != 2 {
-		t.Fatalf("derived lines = %d, want 2: %q", len(lines), lines)
-	}
-	if lines[0] != strings.Repeat("n", maxDerivedLineBytes) {
-		t.Fatalf("bounded line length = %d, want %d", len(lines[0]), maxDerivedLineBytes)
-	}
-	if lines[1] != "final" {
-		t.Fatalf("final line = %q, want final", lines[1])
-	}
-	for _, line := range lines {
-		if strings.Contains(line, "hidden") || strings.ContainsRune(line, '\x1b') {
-			t.Fatalf("derived line retained terminal control text: %q", line)
-		}
-	}
-}
-
 func TestOutputProcessorDefersActivityUntilBufferedBytesCommit(t *testing.T) {
 	manager, _ := newTestManager(t)
 	id := agent.ID("pending-activity")
@@ -244,7 +195,6 @@ func TestOutputProcessorDefersActivityUntilBufferedBytesCommit(t *testing.T) {
 		manager,
 		id,
 		running,
-		manager.reg.For("generic"),
 		testSignalToken,
 	)
 
@@ -350,7 +300,6 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		observer.Close()
 		committer.Close()
 	})
-	heuristic := &recordingHeuristic{}
 	running := &runningSession{
 		process:  &fakeProcessSession{},
 		observer: observer,
@@ -360,9 +309,17 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		manager,
 		a.ID(),
 		running,
-		adapter.Entry{Heuristic: heuristic},
 		"",
 	)
+	terminalClock := newTerminalTestClock(time.Unix(1, 0).UTC())
+	running.terminal = newTerminalTestActor(
+		t,
+		"generic",
+		terminalClock,
+		&terminalTestProcess{},
+		observer,
+	)
+	defer running.terminal.Close()
 	manager.sessions[a.ID()] = running
 	subscription := hub.Subscribe(1)
 	defer hub.Unsubscribe(subscription)
@@ -374,8 +331,11 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 	if got := clock.Calls(); got != 0 {
 		t.Fatalf("observation clock calls = %d, want 0", got)
 	}
-	if lines := heuristic.Lines(); len(lines) != 0 {
-		t.Fatalf("heuristic lines after failed store = %q", lines)
+	terminalClock.mu.Lock()
+	timerCount := len(terminalClock.timers)
+	terminalClock.mu.Unlock()
+	if timerCount != 0 {
+		t.Fatalf("terminal timers after failed store = %d, want 0", timerCount)
 	}
 	select {
 	case published := <-subscription.C():
@@ -389,6 +349,241 @@ func TestOutputProcessorStoreFailurePrecedesPublicationAndObservation(t *testing
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for fatal store error")
+	}
+}
+
+func TestOutputProcessorScreenEvidenceReferencesCommittedOutput(t *testing.T) {
+	manager, _ := newTestManager(t)
+	clock := newTerminalTestClock(time.Unix(10, 0).UTC())
+	manager.clock = clock
+	id := agent.ID("screen-ordering")
+	a := agent.New(
+		id,
+		agent.WithName("screen-ordering"),
+		agent.WithVendor("claude"),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.mu.Unlock()
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
+	commitTestState(t, manager, a, agent.StateWorking, "test working")
+	running := attachTestRuntime(t, manager, a, manager.reg.For("claude"))
+	terminalProcess := &terminalTestProcess{}
+	terminalActor, err := newTerminalActor(
+		mustInitialTerminalSize(t),
+		terminalProcess,
+		running.classifier,
+		running.observer,
+		running.vendor,
+		clock,
+		func(actorErr error) {
+			manager.failTerminalActor(id, actorErr)
+		},
+	)
+	if err != nil {
+		t.Fatalf("new terminal actor: %v", err)
+	}
+	running.terminal = terminalActor
+
+	output := []byte("\x1b[2J\x1b[30;1HDo you want to proceed?\r\nEsc to cancel")
+	if err := running.output.Feed(output, 0); err != nil {
+		t.Fatalf("feed output: %v", err)
+	}
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay before sample: %v", err)
+	}
+	var outputSeq uint64
+	for _, row := range rows {
+		if row.Type == string(event.TypeOutputChunk) {
+			outputSeq = row.Seq
+		}
+		if signalPayloadVersion(row.Payload) == 3 {
+			t.Fatalf("screen signal committed before sample: %+v", row)
+		}
+	}
+	if outputSeq == 0 {
+		t.Fatal("output did not commit before terminal sampling")
+	}
+
+	clock.advance(terminalSampleWait)
+	clock.timerAt(t, 0).fire(clock.Now())
+	screenRow, payload := waitForScreenSignal(t, manager, id)
+	if screenRow.Seq <= outputSeq {
+		t.Fatalf("screen seq = %d, output seq = %d", screenRow.Seq, outputSeq)
+	}
+	if payload.Screen == nil ||
+		payload.Screen.OutputOffset != uint64(len(output)) ||
+		payload.Screen.LastOutputSeq != outputSeq {
+		t.Fatalf("screen attribution = %+v, output seq = %d", payload.Screen, outputSeq)
+	}
+	if got := a.State(); got != agent.StateWorking {
+		t.Fatalf("state before screen confirmation = %s, want working", got)
+	}
+
+	screenTimer := clock.timerAt(t, 1)
+	if delay, _ := screenTimer.state(); delay != 750*time.Millisecond {
+		t.Fatalf("screen confirmation delay = %s, want 750ms", delay)
+	}
+	clock.advance(750 * time.Millisecond)
+	screenTimer.fire(clock.Now())
+	waitForState(t, manager, id, agent.StateBlocked)
+}
+
+func TestOutputProcessorOrdinaryErrorCreatesNoScreenEdge(t *testing.T) {
+	manager, _ := newTestManager(t)
+	clock := newTerminalTestClock(time.Unix(20, 0).UTC())
+	manager.clock = clock
+	id := agent.ID("ordinary-error")
+	a := agent.New(
+		id,
+		agent.WithName("ordinary-error"),
+		agent.WithVendor("claude"),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	manager.mu.Lock()
+	manager.agents[id] = a
+	manager.mu.Unlock()
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
+	commitTestState(t, manager, a, agent.StateWorking, "test working")
+	running := attachTestRuntime(t, manager, a, manager.reg.For("claude"))
+	terminalActor, err := newTerminalActor(
+		mustInitialTerminalSize(t),
+		&terminalTestProcess{},
+		running.classifier,
+		running.observer,
+		running.vendor,
+		clock,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new terminal actor: %v", err)
+	}
+	running.terminal = terminalActor
+
+	output := []byte("\x1b[2J\x1b[30;1HError: compilation failed")
+	if err := running.output.Feed(output, 0); err != nil {
+		t.Fatalf("feed ordinary error: %v", err)
+	}
+	clock.advance(terminalSampleWait)
+	clock.timerAt(t, 0).fire(clock.Now())
+	waitForTerminalSnapshot(t, terminalActor)
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	for _, row := range rows {
+		if signalPayloadVersion(row.Payload) == 3 {
+			t.Fatalf("ordinary error created screen edge: %+v", row)
+		}
+	}
+	if got := a.State(); got != agent.StateWorking {
+		t.Fatalf("ordinary error changed state to %s", got)
+	}
+}
+
+func TestOutputProcessorCommittedFeedFailurePreservesOutputAndFailsClosed(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("terminal-feed-failure")
+	running := attachOutputOnlyRuntime(manager, id, "")
+	terminalActor := newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(30, 0).UTC()),
+		&terminalTestProcess{},
+		&recordingTerminalObserver{},
+	)
+	if err := terminalActor.Close(); err != nil {
+		t.Fatalf("close terminal actor: %v", err)
+	}
+	running.terminal = terminalActor
+
+	output := []byte("durable before terminal failure")
+	err := running.output.Feed(output, 0)
+	if !errors.Is(err, errTerminalActorClosed) {
+		t.Fatalf("feed error = %v, want terminal actor closed", err)
+	}
+
+	rows, replayErr := manager.Replay(string(id))
+	if replayErr != nil {
+		t.Fatalf("replay: %v", replayErr)
+	}
+	if got := joinOutputRows(t, rows); !bytes.Equal(got, output) {
+		t.Fatalf("durable output = %q, want %q", got, output)
+	}
+	errorRows := 0
+	for _, row := range rows {
+		if row.Type == string(event.TypeError) {
+			errorRows++
+		}
+	}
+	if errorRows != 1 {
+		t.Fatalf("error rows = %d, want 1", errorRows)
+	}
+	select {
+	case fatal := <-manager.Fatal():
+		if !errors.Is(fatal, errTerminalActorClosed) {
+			t.Fatalf("fatal error = %v, want terminal actor closed", fatal)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for terminal fail-stop")
+	}
+}
+
+func TestOutputProcessorPersistsQueryReplyFailureWithoutInputAudit(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("terminal-reply-failure")
+	running := attachOutputOnlyRuntime(manager, id, "")
+	terminalActor := newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(40, 0).UTC()),
+		&terminalTestProcess{writeLimit: 1},
+		&recordingTerminalObserver{},
+	)
+	running.terminal = terminalActor
+
+	query := []byte("\x1b[6n")
+	if err := running.output.Feed(query, 0); err != nil {
+		t.Fatalf("feed query: %v", err)
+	}
+	err := running.output.End(uint64(len(query)))
+	if !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("end output error = %v, want short write", err)
+	}
+
+	rows, replayErr := manager.Replay(string(id))
+	if replayErr != nil {
+		t.Fatalf("replay: %v", replayErr)
+	}
+	var outputRows, errorRows, inputRows int
+	for _, row := range rows {
+		switch row.Type {
+		case string(event.TypeOutputChunk):
+			outputRows++
+		case string(event.TypeError):
+			errorRows++
+		case string(event.TypeAgentInput):
+			inputRows++
+		}
+	}
+	if outputRows != 1 || errorRows != 1 || inputRows != 0 {
+		t.Fatalf(
+			"rows output=%d error=%d input=%d, want 1/1/0",
+			outputRows,
+			errorRows,
+			inputRows,
+		)
+	}
+	select {
+	case fatal := <-manager.Fatal():
+		t.Fatalf("query reply failure triggered fail-stop: %v", fatal)
+	default:
 	}
 }
 
@@ -456,7 +651,6 @@ func attachOutputOnlyRuntime(
 		manager,
 		id,
 		running,
-		manager.reg.For("generic"),
 		token,
 	)
 	manager.mu.Lock()
@@ -526,22 +720,61 @@ func countOutputActivity(rows []store.EventRow) int {
 	return count
 }
 
-type recordingHeuristic struct {
-	mu    sync.Mutex
-	lines []string
+func waitForScreenSignal(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+) (store.EventRow, event.SignalPayloadV3) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		rows, err := manager.Replay(string(id))
+		if err != nil {
+			t.Fatalf("replay screen signal: %v", err)
+		}
+		for _, row := range rows {
+			if row.Type != string(event.TypeAgentSignal) ||
+				signalPayloadVersion(row.Payload) != 3 {
+				continue
+			}
+			var payload event.SignalPayloadV3
+			if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+				t.Fatalf("decode screen signal: %v", err)
+			}
+			if err := payload.Validate(); err != nil {
+				t.Fatalf("validate screen signal: %v", err)
+			}
+			return row, payload
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for screen signal")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
-func (h *recordingHeuristic) Classify(line string) (adapter.OutputHint, bool) {
-	h.mu.Lock()
-	h.lines = append(h.lines, line)
-	h.mu.Unlock()
-	return adapter.OutputHint{}, false
+func signalPayloadVersion(payload string) int {
+	var version struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(payload), &version); err != nil {
+		return 0
+	}
+	return version.Version
 }
 
-func (h *recordingHeuristic) Lines() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return append([]string(nil), h.lines...)
+func waitForTerminalSnapshot(t *testing.T, actor *terminalActor) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, available := actor.Snapshot(); available {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for terminal snapshot")
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 type countingOutputClock struct {

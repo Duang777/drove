@@ -8,7 +8,9 @@ Observation 计算不可变 Decision；goroutine、队列和真实计时器由 s
 ## 关键设计
 
 - hook 只有在当前会话持久化首个合法信号并应用 Decision 后才成为权威。
-- `auto` 在 hook 激活前使用启发式，`off` 只使用启发式，`required` 只使用 hook。
+- `auto` 在 hook 激活前使用 screen evidence 与无文本 output activity，`off`
+  使用同一 fallback，`required` 等待 hook；激活后的 hook 只接受规范定义的
+  approval clearance 和 Claude interrupt 两个 screen 例外。
 - Codex legacy notify 是非权威来源：不激活 hook、不满足 `required`，只在
   `fallback` 中生成可取消的 Idle 候选；`awaiting_hook` 与 `hook_active` 会抑制它。
 - Detector State 持有 delivery ID 去重、按 purpose + stable rule 分键的候选、
@@ -18,7 +20,8 @@ Observation 计算不可变 Decision；goroutine、队列和真实计时器由 s
   purpose、rule 和 generation，陈旧触发只记录 `stale`，不得消费其他候选。
 - Detector 不修改 Agent、不运行 goroutine，也不写 Store。session actor 负责串行
   提交 signal、可选 error 和可选 state_changed。
-- 进程启动、失败和退出也是 Observation，并拥有高于 hook 和启发式的优先级。
+- 进程启动、失败和退出也是 Observation，并拥有高于 hook 和 screen evidence
+  的优先级。
 
 ## 约束
 

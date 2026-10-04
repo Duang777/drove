@@ -18,8 +18,6 @@ func TestDefaultConfigMatchesPhaseOneTiming(t *testing.T) {
 		config.StopConfirmation != time.Second ||
 		config.PermissionConfirmation != 750*time.Millisecond ||
 		config.HeuristicConfirmation != 750*time.Millisecond ||
-		config.HeuristicRecoveryWindow != time.Second ||
-		config.HeuristicRecoveryLines != 2 ||
 		config.FallbackIdleAfter != 60*time.Second ||
 		config.HeuristicConfidence != 0.85 ||
 		config.DeliveryRememberCount != 1024 {
@@ -344,7 +342,7 @@ func TestSubagentStopNeverChangesRootState(t *testing.T) {
 	}
 }
 
-func TestFallbackBlockedRecoveryAndSilence(t *testing.T) {
+func TestFallbackOutputRefreshesSilenceButCannotRecoverBlocked(t *testing.T) {
 	detector := newTestDetector(t)
 	state := NewState(agent.HooksOff)
 	target := newTestAgent(t, agent.StateStarting, agent.RunModeInteractive)
@@ -358,6 +356,16 @@ func TestFallbackBlockedRecoveryAndSilence(t *testing.T) {
 	)
 	if decision.Timer().Deadline.Sub(testTime) != 60*time.Second {
 		t.Fatalf("initial silence timer = %+v", decision.Timer())
+	}
+
+	outputAt := testTime.Add(500 * time.Millisecond)
+	output, err := ObserveOutput("claude", outputAt)
+	if err != nil {
+		t.Fatalf("working output: %v", err)
+	}
+	decision = decideAndApply(t, detector, &state, target, output)
+	if decision.Timer().Deadline.Sub(outputAt) != 60*time.Second {
+		t.Fatalf("refreshed silence timer = %+v", decision.Timer())
 	}
 
 	hint := heuristicSignal(t, KindHeuristicBlocked, 0.85, testTime.Add(time.Second))
@@ -390,28 +398,15 @@ func TestFallbackBlockedRecoveryAndSilence(t *testing.T) {
 	}
 	decision = decideAndApply(t, detector, &state, target, first)
 	if _, ok := decision.Change(); ok {
-		t.Fatal("one output observation recovered Blocked")
+		t.Fatal("output activity recovered Blocked")
 	}
 	second, err := ObserveOutput("claude", firstAt.Add(500*time.Millisecond))
 	if err != nil {
 		t.Fatalf("second output: %v", err)
 	}
 	decision = decideAndApply(t, detector, &state, target, second)
-	if target.State() != agent.StateWorking ||
-		decision.Timer().Deadline.Sub(firstAt.Add(500*time.Millisecond)) != 60*time.Second {
-		t.Fatalf("recovery state = %s, timer = %+v", target.State(), decision.Timer())
-	}
-
-	silenceTimer := decision.Timer()
-	decideAndApply(
-		t,
-		detector,
-		&state,
-		target,
-		timerObservation(t, silenceTimer.Ref, silenceTimer.Deadline),
-	)
-	if target.State() != agent.StateIdle {
-		t.Fatalf("state after silence = %s, want idle", target.State())
+	if _, ok := decision.Change(); ok || target.State() != agent.StateBlocked {
+		t.Fatalf("state after output activity = %s, decision = %+v", target.State(), decision)
 	}
 }
 

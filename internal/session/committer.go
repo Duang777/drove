@@ -64,8 +64,9 @@ type commitResult struct {
 }
 
 type commitReceipt struct {
-	FirstSeq uint64
-	LastSeq  uint64
+	FirstSeq  uint64
+	LastSeq   uint64
+	Timestamp time.Time
 }
 
 func newEventsOperation(drafts []event.Draft) eventsOperation {
@@ -206,6 +207,12 @@ func (c *committer) submit(ctx context.Context, operation commitOperation) (comm
 
 func (c *committer) Fatal() <-chan error {
 	return c.fatal
+}
+
+func (c *committer) Fail(err error) {
+	if err != nil {
+		c.poison(err)
+	}
 }
 
 func (c *committer) Close() {
@@ -375,8 +382,9 @@ func (c *committer) execute(
 	}
 	return newLastSeq, commitResult{
 		receipt: commitReceipt{
-			FirstSeq: committed[0].Seq,
-			LastSeq:  committed[len(committed)-1].Seq,
+			FirstSeq:  committed[0].Seq,
+			LastSeq:   committed[len(committed)-1].Seq,
+			Timestamp: committed[len(committed)-1].Timestamp,
 		},
 	}
 }

@@ -122,9 +122,12 @@ type runningSession struct {
 	inputMu        sync.Mutex
 	process        processSession
 	observer       *observationActor
+	classifier     *adapter.ScreenClassifier
+	terminal       *terminalActor
 	output         *outputProcessor
 	callbacksReady chan struct{}
 	signalReady    chan struct{}
+	processExited  chan struct{}
 	signalDigest   signalTokenDigest
 	hasSignalToken bool
 	vendor         string
@@ -378,6 +381,9 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		OnOutputEnd: func(offset uint64) {
 			<-running.callbacksReady
 			_ = running.output.End(offset)
+			if running.terminal != nil {
+				_ = running.terminal.Close()
+			}
 		},
 		OnExit: func(info pty.ExitInfo) {
 			<-running.callbacksReady
@@ -410,6 +416,42 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	running.process = sess
 	m.mu.Unlock()
 
+	terminalActor, err := newTerminalActor(
+		terminalSize,
+		sess,
+		running.classifier,
+		running.observer,
+		running.vendor,
+		m.clock,
+		func(actorErr error) {
+			m.failTerminalActor(id, actorErr)
+		},
+	)
+	if err != nil {
+		startErr := fmt.Errorf("session: initialize terminal: %w", err)
+		observation, observationErr := processObservation(
+			detect.KindProcessStartFailed,
+			m.clock.Now(),
+			&detect.ProcessFact{
+				ExitKind:     detect.ExitStartupFailed,
+				ErrorMessage: startErr.Error(),
+			},
+		)
+		commitErr := observationErr
+		if observationErr == nil {
+			commitErr = running.observer.Terminate(observation)
+		}
+		m.detach(id, running)
+		running.output.failed = true
+		close(running.signalReady)
+		close(running.callbacksReady)
+		closeErr := sess.Close()
+		running.observer.Close()
+		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
+		return nil, errors.Join(startErr, commitErr, closeErr, cleanupErr)
+	}
+	running.terminal = terminalActor
+
 	// 4. 状态推进：进程活着 -> Working。
 	started, err := processObservation(
 		detect.KindProcessStarted,
@@ -428,14 +470,13 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, err
 	}
 	close(running.signalReady)
+	close(running.callbacksReady)
 	if err := m.waitForRequiredHook(ctx, a, running); err != nil {
 		m.invalidateSignal(id, running)
 		m.requestStop(id, running, stopCauseShutdown)
-		close(running.callbacksReady)
 		closeErr := sess.Close()
 		return nil, errors.Join(err, closeErr)
 	}
-	close(running.callbacksReady)
 
 	return m.Status(id)
 }
@@ -481,6 +522,18 @@ func (m *Manager) Close() error {
 					closeErrors,
 					fmt.Errorf("session: close agent %q: %w", item.id, err),
 				)
+			}
+			if item.session.terminal != nil {
+				if err := item.session.terminal.Close(); err != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf(
+							"session: close terminal for agent %q: %w",
+							item.id,
+							err,
+						),
+					)
+				}
 			}
 			if item.session.observer != nil {
 				item.session.observer.Close()
@@ -730,6 +783,12 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	if !ok {
 		return
 	}
+	if running.processExited != nil {
+		defer close(running.processExited)
+	}
+	if running.terminal != nil {
+		running.terminal.MarkProcessExited()
+	}
 	defer m.detach(id, running)
 	defer m.finalizeSignalInjection(id, running)
 	if running.observer == nil {
@@ -794,6 +853,21 @@ func processObservation(
 // Fatal 返回运行时持久化或投影失败通知。
 func (m *Manager) Fatal() <-chan error {
 	return m.committer.Fatal()
+}
+
+func (m *Manager) failTerminalActor(id agent.ID, cause error) {
+	if cause == nil {
+		return
+	}
+	message := fmt.Sprintf("session: terminal actor for %q: %v", id, cause)
+	if len(message) > 512 {
+		message = message[:512]
+	}
+	_, commitErr := m.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{event.NewErrorDraft(string(id), string(id), message)},
+	)
+	m.committer.Fail(errors.Join(cause, commitErr))
 }
 
 // agent 返回 agent 实例。

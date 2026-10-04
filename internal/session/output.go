@@ -3,27 +3,22 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"unicode/utf8"
 
-	"github.com/Duang777/drove/internal/adapter"
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/term"
 )
 
-const maxDerivedLineBytes = 64 * 1024
-
 type outputProcessor struct {
 	manager *Manager
 	id      agent.ID
 	running *runningSession
-	entry   adapter.Entry
 
 	redactor streamingRedactor
-	stripper term.Stripper
-	line     []byte
 
 	nextSourceOffset uint64
 	nextOutputOffset uint64
@@ -36,14 +31,12 @@ func newOutputProcessor(
 	manager *Manager,
 	id agent.ID,
 	running *runningSession,
-	entry adapter.Entry,
 	signalToken string,
 ) *outputProcessor {
 	return &outputProcessor{
 		manager:  manager,
 		id:       id,
 		running:  running,
-		entry:    entry,
 		redactor: newStreamingRedactor([]byte(signalToken)),
 	}
 }
@@ -89,9 +82,14 @@ func (p *outputProcessor) End(offset uint64) error {
 			return err
 		}
 	}
-	p.consumePlain(p.stripper.Flush())
-	p.deliverLine(p.line)
-	p.line = nil
+	if p.running.terminal != nil {
+		if err := p.running.terminal.EndOutput(
+			context.Background(),
+			p.nextOutputOffset,
+		); err != nil {
+			return p.failTerminal("end output", err, false)
+		}
+	}
 	return nil
 }
 
@@ -134,12 +132,30 @@ func (p *outputProcessor) commitAndObserve(output []byte) error {
 		drafts = append(drafts, draft)
 		offset += uint64(len(chunk))
 	}
-	if _, err := p.manager.committer.CommitEvents(context.Background(), drafts); err != nil {
+	receipt, err := p.manager.committer.CommitEvents(context.Background(), drafts)
+	if err != nil {
 		p.failed = true
 		return fmt.Errorf("session: commit output at offset %d: %w", p.nextOutputOffset, err)
 	}
 
 	p.nextOutputOffset = offset
+	if p.running.terminal != nil {
+		chunk, err := term.NewCommittedChunk(
+			output,
+			p.nextOutputOffset,
+			receipt.LastSeq,
+			receipt.Timestamp,
+		)
+		if err != nil {
+			return p.failTerminal("create committed chunk", err, true)
+		}
+		if err := p.running.terminal.FeedCommitted(
+			context.Background(),
+			chunk,
+		); err != nil {
+			return p.failTerminal("feed committed output", err, true)
+		}
+	}
 	for range p.pendingActivity {
 		if !p.canObserve() {
 			break
@@ -153,65 +169,34 @@ func (p *outputProcessor) commitAndObserve(output []byte) error {
 		}
 	}
 	p.pendingActivity = 0
-
-	if p.canObserve() {
-		p.consumePlain(p.stripper.Feed(output))
-	}
 	return nil
 }
 
-func (p *outputProcessor) consumePlain(data []byte) {
-	for len(data) > 0 {
-		index := bytes.IndexByte(data, '\n')
-		if index < 0 {
-			p.appendLine(data)
-			return
-		}
-		p.appendLine(data[:index])
-		p.deliverLine(p.line)
-		p.line = p.line[:0]
-		data = data[index+1:]
+func (p *outputProcessor) failTerminal(
+	operation string,
+	cause error,
+	fatal bool,
+) error {
+	p.failed = true
+	terminalErr := fmt.Errorf("session: terminal %s: %w", operation, cause)
+	_, commitErr := p.manager.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{event.NewErrorDraft(
+			string(p.id),
+			string(p.id),
+			terminalErr.Error(),
+		)},
+	)
+	if commitErr != nil {
+		return errors.Join(
+			terminalErr,
+			fmt.Errorf("session: persist terminal error: %w", commitErr),
+		)
 	}
-}
-
-func (p *outputProcessor) appendLine(data []byte) {
-	p.line = append(p.line, data...)
-	if len(p.line) > maxDerivedLineBytes {
-		p.line = append(p.line[:0], p.line[len(p.line)-maxDerivedLineBytes:]...)
+	if fatal {
+		p.manager.committer.Fail(terminalErr)
 	}
-}
-
-func (p *outputProcessor) deliverLine(line []byte) {
-	if !p.canObserve() {
-		return
-	}
-	if len(line) > 0 && line[len(line)-1] == '\r' {
-		line = line[:len(line)-1]
-	}
-	if len(line) == 0 {
-		return
-	}
-	hint, ok := p.entry.Classify(string(line))
-	if !ok {
-		return
-	}
-	signal, err := detect.NewHeuristicSignal(detect.Signal{
-		Kind:        hint.Kind,
-		Vendor:      p.running.vendor,
-		VendorEvent: "terminal_hint",
-		Scope:       detect.ScopeRoot,
-		Evidence:    hint.Evidence,
-		Confidence:  hint.Confidence,
-		ReceivedAt:  p.manager.clock.Now(),
-	})
-	if err != nil {
-		return
-	}
-	observation, err := detect.ObserveSignal(signal)
-	if err != nil {
-		return
-	}
-	_ = p.running.observer.Deliver(context.Background(), observation)
+	return terminalErr
 }
 
 func (p *outputProcessor) canObserve() bool {

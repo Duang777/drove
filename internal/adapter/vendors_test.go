@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/Duang777/drove/internal/agent"
-	"github.com/Duang777/drove/internal/detect"
 )
 
 func TestRegistryDefaults(t *testing.T) {
@@ -20,48 +19,10 @@ func TestRegistryDefaults(t *testing.T) {
 			t.Fatalf("vendor %q not registered", v)
 		}
 	}
-	// 未知厂商回退 generic（无启发式）。
+	// 未知厂商回退 generic。
 	e := r.For("unknown-vendor")
-	if e.Heuristic != nil {
-		t.Fatal("unknown vendor should fall back to nil heuristic")
-	}
 	if e.Runner.Vendor() != "generic" {
 		t.Fatalf("fallback vendor = %q, want generic", e.Runner.Vendor())
-	}
-}
-
-func TestClaudeHeuristic(t *testing.T) {
-	h := claudeHeuristic{}
-	cases := []struct {
-		line string
-		kind detect.Kind
-		ok   bool
-	}{
-		{"Waiting for your input…", detect.KindHeuristicBlocked, true},
-		{"Error: something failed", detect.KindHeuristicBlocked, true},
-		{"Task complete!", detect.KindTaskCompleted, true},
-		{"Processing file foo.go", "", false},
-	}
-	for _, c := range cases {
-		got, ok := h.Classify(c.line)
-		if ok != c.ok {
-			t.Errorf("Classify(%q) ok = %v, want %v", c.line, ok, c.ok)
-			continue
-		}
-		if ok && got.Kind != c.kind {
-			t.Errorf("Classify(%q) kind = %s, want %s", c.line, got.Kind, c.kind)
-		}
-	}
-}
-
-func TestCodexHeuristic(t *testing.T) {
-	h := codexHeuristic{}
-	if got, ok := h.Classify("Waiting for user input"); !ok ||
-		got.Kind != detect.KindHeuristicBlocked {
-		t.Errorf("codex blocked hint failed: %+v, %v", got, ok)
-	}
-	if _, ok := h.Classify("Running tests…"); ok {
-		t.Error("codex heuristic should ignore normal output")
 	}
 }
 

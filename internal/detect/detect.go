@@ -503,29 +503,25 @@ func canonicalUUID(value string) bool {
 
 // Config contains internal Detector timing and memory limits.
 type Config struct {
-	HookActivation          time.Duration
-	StopConfirmation        time.Duration
-	PermissionConfirmation  time.Duration
-	HeuristicConfirmation   time.Duration
-	HeuristicRecoveryWindow time.Duration
-	HeuristicRecoveryLines  int
-	FallbackIdleAfter       time.Duration
-	HeuristicConfidence     float64
-	DeliveryRememberCount   int
+	HookActivation         time.Duration
+	StopConfirmation       time.Duration
+	PermissionConfirmation time.Duration
+	HeuristicConfirmation  time.Duration
+	FallbackIdleAfter      time.Duration
+	HeuristicConfidence    float64
+	DeliveryRememberCount  int
 }
 
 // DefaultConfig returns the fixed Phase 1A Detector settings.
 func DefaultConfig() Config {
 	return Config{
-		HookActivation:          5 * time.Second,
-		StopConfirmation:        time.Second,
-		PermissionConfirmation:  750 * time.Millisecond,
-		HeuristicConfirmation:   750 * time.Millisecond,
-		HeuristicRecoveryWindow: time.Second,
-		HeuristicRecoveryLines:  2,
-		FallbackIdleAfter:       60 * time.Second,
-		HeuristicConfidence:     0.85,
-		DeliveryRememberCount:   1024,
+		HookActivation:         5 * time.Second,
+		StopConfirmation:       time.Second,
+		PermissionConfirmation: 750 * time.Millisecond,
+		HeuristicConfirmation:  750 * time.Millisecond,
+		FallbackIdleAfter:      60 * time.Second,
+		HeuristicConfidence:    0.85,
+		DeliveryRememberCount:  1024,
 	}
 }
 
@@ -542,8 +538,6 @@ func New(config Config) (*Detector, error) {
 		config.StopConfirmation <= 0 ||
 		config.PermissionConfirmation <= 0 ||
 		config.HeuristicConfirmation <= 0 ||
-		config.HeuristicRecoveryWindow <= 0 ||
-		config.HeuristicRecoveryLines <= 0 ||
 		config.FallbackIdleAfter <= 0 ||
 		math.IsNaN(config.HeuristicConfidence) ||
 		math.IsInf(config.HeuristicConfidence, 0) ||
@@ -567,12 +561,6 @@ func fillConfigDefaults(config *Config, defaults Config) {
 	}
 	if config.HeuristicConfirmation == 0 {
 		config.HeuristicConfirmation = defaults.HeuristicConfirmation
-	}
-	if config.HeuristicRecoveryWindow == 0 {
-		config.HeuristicRecoveryWindow = defaults.HeuristicRecoveryWindow
-	}
-	if config.HeuristicRecoveryLines == 0 {
-		config.HeuristicRecoveryLines = defaults.HeuristicRecoveryLines
 	}
 	if config.FallbackIdleAfter == 0 {
 		config.FallbackIdleAfter = defaults.FallbackIdleAfter
@@ -659,9 +647,8 @@ type stateData struct {
 	candidates           map[candidateKey]candidateState
 	candidateGenerations map[candidateKey]uint64
 
-	recentOutput []time.Time
-	deliveries   map[string]Outcome
-	deliveryIDs  []string
+	deliveries  map[string]Outcome
+	deliveryIDs []string
 }
 
 // State is the committed Detector projection for one attached session.
@@ -741,7 +728,6 @@ func cloneStateData(data stateData) stateData {
 	}
 	data.candidates = candidates
 	data.candidateGenerations = maps.Clone(data.candidateGenerations)
-	data.recentOutput = append([]time.Time(nil), data.recentOutput...)
 	data.deliveryIDs = append([]string(nil), data.deliveryIDs...)
 	deliveries := make(map[string]Outcome, len(data.deliveries))
 	maps.Copy(deliveries, data.deliveries)
@@ -1119,25 +1105,6 @@ func (d *Detector) decideHeuristic(
 	}
 
 	cancelCandidate(&decision, candidateKey{purpose: CandidateHeuristicBlocked})
-	if current.State == agent.StateBlocked {
-		pruneOutput(&decision.next, signal.ReceivedAt, d.config.HeuristicRecoveryWindow)
-		decision.next.recentOutput = append(decision.next.recentOutput, signal.ReceivedAt)
-		if len(decision.next.recentOutput) >= d.config.HeuristicRecoveryLines {
-			decision.next.recentOutput = nil
-			transition(
-				&decision,
-				current,
-				agent.StateWorking,
-				"sustained fallback output",
-				"",
-			)
-			armFallbackIdle(&decision, agent.Snapshot{
-				State: agent.StateWorking,
-			}, signal.ReceivedAt, d.config.FallbackIdleAfter)
-		}
-		return decision, nil
-	}
-	decision.next.recentOutput = nil
 	armFallbackIdle(&decision, current, signal.ReceivedAt, d.config.FallbackIdleAfter)
 	return decision, nil
 }
@@ -1686,17 +1653,6 @@ func screenCandidateTarget(signal Signal, current agent.State) (agent.State, boo
 		}
 	}
 	return "", false
-}
-
-func pruneOutput(data *stateData, at time.Time, window time.Duration) {
-	cutoff := at.Add(-window)
-	kept := data.recentOutput[:0]
-	for _, observedAt := range data.recentOutput {
-		if !observedAt.Before(cutoff) && !observedAt.After(at) {
-			kept = append(kept, observedAt)
-		}
-	}
-	data.recentOutput = kept
 }
 
 func rememberDelivery(data *stateData, id string, outcome Outcome, limit int) {

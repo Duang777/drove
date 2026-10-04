@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/term"
 )
 
 func TestReplayHydratesRetainedOutputAndLeavesExpiredMetadata(t *testing.T) {
@@ -1234,93 +1236,6 @@ func TestUserStopOneshotEndsStoppedWithoutProcessError(t *testing.T) {
 	}
 }
 
-func TestInteractiveIgnoresDoneHint(t *testing.T) {
-	manager, _ := newTestManager(t)
-	id := agent.ID("interactive-agent")
-	a := agent.New(
-		id,
-		agent.WithName("interactive-agent"),
-		agent.WithVendor("claude"),
-		agent.WithRunMode(agent.RunModeInteractive),
-	)
-	manager.mu.Lock()
-	manager.agents[id] = a
-	manager.mu.Unlock()
-	commitTestState(t, manager, a, agent.StateStarting, "test start")
-	commitTestState(t, manager, a, agent.StateWorking, "test working")
-	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
-
-	feedTestOutput(t, manager, id, "Task complete!")
-
-	if got := a.State(); got != agent.StateWorking {
-		t.Fatalf("interactive state = %s, want working", got)
-	}
-}
-
-func TestOutputProcessorSanitizesOnlyHeuristicView(t *testing.T) {
-	manager, _ := newTestManager(t)
-	manager.detectConfig.HeuristicConfirmation = 5 * time.Millisecond
-	id := agent.ID("ansi-agent")
-	a := agent.New(
-		id,
-		agent.WithName("ansi-agent"),
-		agent.WithVendor("claude"),
-		agent.WithRunMode(agent.RunModeInteractive),
-	)
-	manager.mu.Lock()
-	manager.agents[id] = a
-	manager.mu.Unlock()
-	commitTestState(t, manager, a, agent.StateStarting, "test start")
-	commitTestState(t, manager, a, agent.StateWorking, "test working")
-	attachTestRuntime(t, manager, a, manager.reg.For("claude"))
-
-	subscription := manager.hub.Subscribe(4)
-	defer manager.hub.Unsubscribe(subscription)
-	raw := "Waiting \x1b[2K\x1b[1Gfor your input"
-	feedTestOutput(t, manager, id, raw)
-
-	waitForState(t, manager, id, agent.StateBlocked)
-	rows, err := manager.Replay(string(id))
-	if err != nil {
-		t.Fatalf("replay: %v", err)
-	}
-	var persistedOutput []byte
-	for _, row := range rows {
-		if row.Type == string(event.TypeOutputChunk) {
-			payload, decodeErr := event.DecodeOutputChunkPayload(row.Payload)
-			if decodeErr != nil {
-				t.Fatalf("decode persisted output: %v", decodeErr)
-			}
-			persistedOutput, decodeErr = payload.DecodeData()
-			if decodeErr != nil {
-				t.Fatalf("decode persisted data: %v", decodeErr)
-			}
-		}
-	}
-	if string(persistedOutput) != raw+"\n" {
-		t.Fatalf("persisted output = %q, want raw %q", persistedOutput, raw+"\n")
-	}
-	select {
-	case streamed := <-subscription.C():
-		if streamed.Type != event.TypeOutputChunk {
-			t.Fatalf("streamed event = %+v, want output chunk", streamed)
-		}
-		payload, decodeErr := event.DecodeOutputChunkPayload(streamed.Payload)
-		if decodeErr != nil {
-			t.Fatalf("decode streamed output: %v", decodeErr)
-		}
-		data, decodeErr := payload.DecodeData()
-		if decodeErr != nil {
-			t.Fatalf("decode streamed data: %v", decodeErr)
-		}
-		if string(data) != raw+"\n" {
-			t.Fatalf("streamed data = %q, want %q", data, raw+"\n")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for streamed output")
-	}
-}
-
 func commitTestState(
 	t *testing.T,
 	manager *Manager,
@@ -1445,19 +1360,41 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 	a := agent.New(
 		id,
 		agent.WithName("trailing-output"),
-		agent.WithVendor("generic"),
+		agent.WithVendor("claude"),
 		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
 	)
 	manager.mu.Lock()
 	manager.agents[id] = a
 	manager.mu.Unlock()
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
-	running := attachTestRuntime(t, manager, a, manager.reg.For("generic"))
+	running := attachTestRuntime(t, manager, a, manager.reg.For("claude"))
+	terminalActor, err := newTerminalActor(
+		mustInitialTerminalSize(t),
+		&terminalTestProcess{},
+		running.classifier,
+		running.observer,
+		running.vendor,
+		manager.clock,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("new terminal actor: %v", err)
+	}
+	running.terminal = terminalActor
+	defer terminalActor.Close()
 
 	manager.onExit(id, running, pty.ExitInfo{Code: 0})
-	if err := running.output.Feed([]byte("final output"), 0); err != nil {
+	output := []byte("\x1b[2J\x1b[30;1HDo you want to proceed?\r\nEsc to cancel")
+	if err := running.output.Feed(output, 0); err != nil {
 		t.Fatalf("feed trailing output: %v", err)
+	}
+	if err := running.output.End(uint64(len(output))); err != nil {
+		t.Fatalf("end trailing output: %v", err)
+	}
+	if _, available := terminalActor.Snapshot(); available {
+		t.Fatal("terminal snapshot remained available after process exit")
 	}
 
 	rows, err := manager.Replay(string(id))
@@ -1480,9 +1417,12 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 			if decodeErr != nil {
 				t.Fatalf("decode output data: %v", decodeErr)
 			}
-			if string(data) == "final output" {
+			if bytes.Equal(data, output) {
 				outputIndex = index
 			}
+		}
+		if signalPayloadVersion(row.Payload) == 3 {
+			t.Fatalf("trailing screen produced a screen signal: %+v", row)
 		}
 	}
 	if stoppedIndex < 0 || outputIndex <= stoppedIndex {
@@ -1492,6 +1432,37 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 			outputIndex,
 			rows,
 		)
+	}
+}
+
+func TestManagerCloseClosesAttachedTerminalActor(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("close-terminal")
+	running := &runningSession{process: &fakeProcessSession{}}
+	terminalActor := newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(1_000, 0).UTC()),
+		&terminalTestProcess{},
+		&recordingTerminalObserver{},
+	)
+	running.terminal = terminalActor
+	manager.mu.Lock()
+	manager.sessions[id] = running
+	manager.mu.Unlock()
+
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close manager: %v", err)
+	}
+	chunk, err := term.NewCommittedChunk([]byte("x"), 1, 1, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("new committed chunk: %v", err)
+	}
+	if err := terminalActor.FeedCommitted(context.Background(), chunk); !errors.Is(
+		err,
+		errTerminalActorClosed,
+	) {
+		t.Fatalf("feed after manager close = %v, want actor closed", err)
 	}
 }
 
@@ -1546,21 +1517,6 @@ func attachTestRuntime(
 	manager.sessions[a.ID()] = running
 	manager.mu.Unlock()
 	return running
-}
-
-func feedTestOutput(t *testing.T, manager *Manager, id agent.ID, line string) {
-	t.Helper()
-
-	manager.mu.RLock()
-	running := manager.sessions[id]
-	manager.mu.RUnlock()
-	if running == nil || running.output == nil {
-		t.Fatalf("agent %q has no output processor", id)
-	}
-	data := append([]byte(line), '\n')
-	if err := running.output.Feed(data, running.output.nextSourceOffset); err != nil {
-		t.Fatalf("feed output for agent %q: %v", id, err)
-	}
 }
 
 func outputChunkData(t *testing.T, row store.EventRow) []byte {
