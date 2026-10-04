@@ -703,6 +703,216 @@ func TestActiveHookScreenAuthority(t *testing.T) {
 	})
 }
 
+func TestActiveHookUnrelatedSignalsPreserveScreenCandidates(t *testing.T) {
+	tests := []struct {
+		name       string
+		start      agent.State
+		screenKind Kind
+		rule       string
+		edge       agent.ScreenEdge
+		hookKind   Kind
+		hookScope  Scope
+		hookEvent  string
+		want       agent.State
+	}{
+		{
+			name:       "subagent activity preserves approval clearance",
+			start:      agent.StateBlocked,
+			screenKind: KindHumanInputResolved,
+			rule:       "claude.approval_prompt",
+			edge:       agent.ScreenEdgeCleared,
+			hookKind:   KindToolActivity,
+			hookScope:  ScopeSubagent,
+			hookEvent:  "PreToolUse",
+			want:       agent.StateWorking,
+		},
+		{
+			name:       "subagent stop preserves interrupt",
+			start:      agent.StateWorking,
+			screenKind: KindInterrupted,
+			rule:       "claude.interrupted",
+			edge:       agent.ScreenEdgePresent,
+			hookKind:   KindSubagentStopped,
+			hookScope:  ScopeSubagent,
+			hookEvent:  "SubagentStop",
+			want:       agent.StateIdle,
+		},
+		{
+			name:       "permission resolution preserves interrupt",
+			start:      agent.StateWorking,
+			screenKind: KindInterrupted,
+			rule:       "claude.interrupted",
+			edge:       agent.ScreenEdgePresent,
+			hookKind:   KindPermissionResolved,
+			hookScope:  ScopeRoot,
+			hookEvent:  "PermissionResolved",
+			want:       agent.StateIdle,
+		},
+		{
+			name:       "repeated session start preserves interrupt",
+			start:      agent.StateWorking,
+			screenKind: KindInterrupted,
+			rule:       "claude.interrupted",
+			edge:       agent.ScreenEdgePresent,
+			hookKind:   KindSessionStarted,
+			hookScope:  ScopeRoot,
+			hookEvent:  "SessionStart",
+			want:       agent.StateIdle,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			detector := newTestDetector(t)
+			state := NewState(agent.HooksAuto)
+			target := newTestAgent(t, test.start, agent.RunModeInteractive)
+			activateHook(t, detector, &state, target)
+
+			screen := screenSignal(
+				t,
+				test.screenKind,
+				test.rule,
+				test.edge,
+				testTime.Add(time.Second),
+			)
+			screenDecision := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, screen),
+			)
+			screenTimer := screenDecision.Timer()
+
+			hook := hookSignal(t, test.name, test.hookKind, test.hookScope)
+			hook.VendorEvent = test.hookEvent
+			hook.ReceivedAt = screen.ReceivedAt.Add(200 * time.Millisecond)
+			hookDecision := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, hook),
+			)
+			if hookDecision.Timer().Action != TimerArm ||
+				hookDecision.Timer().Ref != screenTimer.Ref ||
+				!hookDecision.Timer().Deadline.Equal(screenTimer.Deadline) {
+				t.Fatalf(
+					"timer after unrelated hook = %+v, want %+v",
+					hookDecision.Timer(),
+					screenTimer,
+				)
+			}
+
+			decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				timerObservation(t, screenTimer.Ref, screenTimer.Deadline),
+			)
+			if target.State() != test.want {
+				t.Fatalf("state = %s, want %s", target.State(), test.want)
+			}
+		})
+	}
+}
+
+func TestActiveHookConflictingSignalsCancelScreenCandidates(t *testing.T) {
+	tests := []struct {
+		name       string
+		start      agent.State
+		screenKind Kind
+		rule       string
+		edge       agent.ScreenEdge
+		hookKind   Kind
+		hookEvent  string
+	}{
+		{
+			name:       "turn start",
+			start:      agent.StateBlocked,
+			screenKind: KindHumanInputResolved,
+			rule:       "claude.approval_prompt",
+			edge:       agent.ScreenEdgeCleared,
+			hookKind:   KindTurnStarted,
+			hookEvent:  "UserPromptSubmit",
+		},
+		{
+			name:       "human input required",
+			start:      agent.StateWorking,
+			screenKind: KindInterrupted,
+			rule:       "claude.interrupted",
+			edge:       agent.ScreenEdgePresent,
+			hookKind:   KindHumanInputRequired,
+			hookEvent:  "Notification",
+		},
+		{
+			name:       "permission request",
+			start:      agent.StateWorking,
+			screenKind: KindInterrupted,
+			rule:       "claude.interrupted",
+			edge:       agent.ScreenEdgePresent,
+			hookKind:   KindPermissionRequested,
+			hookEvent:  "PermissionRequest",
+		},
+		{
+			name:       "turn stopped",
+			start:      agent.StateBlocked,
+			screenKind: KindHumanInputResolved,
+			rule:       "claude.approval_prompt",
+			edge:       agent.ScreenEdgeCleared,
+			hookKind:   KindTurnStopped,
+			hookEvent:  "Stop",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			detector := newTestDetector(t)
+			state := NewState(agent.HooksAuto)
+			target := newTestAgent(t, test.start, agent.RunModeInteractive)
+			activateHook(t, detector, &state, target)
+
+			screen := screenSignal(
+				t,
+				test.screenKind,
+				test.rule,
+				test.edge,
+				testTime.Add(time.Second),
+			)
+			screenDecision := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, screen),
+			)
+			screenTimer := screenDecision.Timer()
+
+			hook := hookSignal(t, test.name, test.hookKind, ScopeRoot)
+			hook.VendorEvent = test.hookEvent
+			hook.ReceivedAt = screen.ReceivedAt.Add(200 * time.Millisecond)
+			decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, hook),
+			)
+
+			stale := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				timerObservation(t, screenTimer.Ref, screenTimer.Deadline),
+			)
+			_, outcome, _ := stale.Signal()
+			if outcome != OutcomeStale {
+				t.Fatalf("screen timer outcome = %s, want stale", outcome)
+			}
+		})
+	}
+}
+
 func TestScreenSignalsRespectAwaitingAndProcessAuthority(t *testing.T) {
 	detector := newTestDetector(t)
 	awaitingState := NewState(agent.HooksAuto)

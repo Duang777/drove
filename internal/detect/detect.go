@@ -1012,12 +1012,9 @@ func (d *Detector) decideHook(
 		)
 		return decision, nil
 	}
-	wasActive := decision.next.status == HookActive
-	decision.next.status = HookActive
-	if !wasActive {
+	if decision.next.status != HookActive {
+		decision.next.status = HookActive
 		cancelAllCandidates(&decision)
-	} else {
-		cancelCandidatesByPurpose(&decision, CandidateScreen)
 	}
 
 	switch signal.Kind {
@@ -1037,6 +1034,7 @@ func (d *Detector) decideHook(
 		transition(&decision, current, agent.StateBlocked, "hook "+signal.VendorEvent, "")
 	case KindPermissionRequested:
 		cancelCandidate(&decision, candidateKey{purpose: CandidateHookIdle})
+		cancelCandidatesByPurpose(&decision, CandidateScreen)
 		armCandidate(
 			&decision,
 			candidateKey{purpose: CandidateHookPermission},
@@ -1049,6 +1047,7 @@ func (d *Detector) decideHook(
 	case KindTurnStopped, KindTurnFailed, KindInterrupted, KindIdlePrompt:
 		if signal.Scope == ScopeRoot {
 			cancelCandidate(&decision, candidateKey{purpose: CandidateHookPermission})
+			cancelCandidatesByPurpose(&decision, CandidateScreen)
 			armCandidate(
 				&decision,
 				candidateKey{purpose: CandidateHookIdle},
