@@ -187,7 +187,7 @@ func (a *Archive) renderFrame(
 	if err != nil {
 		return Frame{}, fmt.Errorf("recording: create frame origin: %w", err)
 	}
-	controller, err := term.NewController(size, func([]byte) error { return nil })
+	controller, err := term.NewController(size)
 	if err != nil {
 		return Frame{}, fmt.Errorf("recording: create frame terminal: %w", err)
 	}

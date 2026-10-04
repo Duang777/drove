@@ -1238,14 +1238,14 @@ func hookSignal(
 ) Signal {
 	t.Helper()
 	signal, err := NewHookSignal(Signal{
-		Kind:            kind,
-		Vendor:          "claude",
-		VendorEvent:     "SessionStart",
-		Scope:           scope,
-		VendorSessionID: "vendor-session",
-		Confidence:      1,
-		ReceivedAt:      testTime,
-		DeliveryID:      uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String(),
+		Kind:             kind,
+		Vendor:           "claude",
+		VendorEvent:      "SessionStart",
+		Scope:            scope,
+		VendorSessionRef: "vendor-session",
+		Confidence:       1,
+		ReceivedAt:       testTime,
+		DeliveryID:       uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String(),
 	})
 	if err != nil {
 		t.Fatalf("new hook signal: %v", err)
@@ -1256,16 +1256,15 @@ func hookSignal(
 func notifySignal(t *testing.T, label string, at time.Time) Signal {
 	t.Helper()
 	signal, err := NewNotifySignal(Signal{
-		Kind:            KindTurnStopped,
-		Vendor:          "codex",
-		VendorEvent:     "agent-turn-complete",
-		Scope:           ScopeRoot,
-		VendorSessionID: "thread-1",
-		VendorTurnID:    "turn-1",
-		Evidence:        "turn stopped",
-		Confidence:      1,
-		ReceivedAt:      at,
-		DeliveryID:      uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String(),
+		Kind:             KindTurnStopped,
+		Vendor:           "codex",
+		VendorEvent:      "agent-turn-complete",
+		Scope:            ScopeRoot,
+		VendorSessionRef: "thread-1",
+		Evidence:         "turn stopped",
+		Confidence:       1,
+		ReceivedAt:       at,
+		DeliveryID:       uuid.NewSHA1(uuid.NameSpaceOID, []byte(label)).String(),
 	})
 	if err != nil {
 		t.Fatalf("new notify signal: %v", err)

@@ -6,16 +6,19 @@
 
 ## 关键设计
 
-- `Manager` 持有：`agents`（ID→*agent.Agent）、`sessions`（ID→运行中 PTY）、event Hub、store、adapter Registry。
+- `Manager` 持有：`agents`（ID→session-owned managed Agent）、`sessions`
+  （ID→运行中 PTY）、原生恢复预留、event Hub、store、adapter Registry。
 - 每个运行中会话持有一个 terminal actor、一个 observation actor、一个 recording actor、
   Detector State 和 signal token 的 SHA-256 digest；token 只授权该 Agent 的
   signal endpoint，并在启动失败或退出认领时失效。
 - recording actor 独占源输出偏移、持久化输出偏移、有效终端尺寸和临时 attachment
   状态。容量 64 的 inbox 统一排序 output、resize、attached input、detach 和 close。
 - terminal actor 独占 x/vt controller、adapter classifier、容量 64 的 inbox、
-  固定 100 ms sample timer 和当前不可变 snapshot。query reply 直接调用
-  `pty.Session.Write`，不经过 `SendInput`，不产生 `agent.input`；只有子进程
-  显式回显的 reply 才作为新输出提交。
+  固定 100 ms sample timer 和当前不可变 snapshot。每个 actor 有一个 query reply
+  forwarder 排空 controller 的容量 16 mailbox 并直接调用 `pty.Session.Write`；
+  首次失败、部分写、busy 或 timeout 后记录错误并丢弃后续 reply，controller close
+  后 join。reply 不经过 `SendInput`，不产生 `agent.input`；只有子进程显式回显的
+  reply 才作为新输出提交。
 - observation actor 独占容量 64 的 inbox 和一个真实计时器，一次只提交一个
   Decision；每次提交后按 Detector 返回的最早 timer ref 重置计时器，Detector
   本身不持有 goroutine 或回调。
@@ -24,6 +27,11 @@
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →
   等待 required hook。
+- `Resume(ctx, id)` 在同一 Agent ID 下预留一次恢复，提交私有 `agent.resumed` 与 typed
+  `Stopped -> Starting` 后复用 Start 的 PTY 激活路径；`Status.Resumable` 只由已停止、
+  未连接、未预留、有已提交 ref 且 exact adapter 支持恢复的会话派生。
+- Start 把清理后的绝对工作目录放进创建事件的私有持久载荷；Hub 与公开 replay
+  删除该字段。恢复投影把目录放回 managed record，Resume 用它配置 PTY。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
@@ -39,6 +47,8 @@
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 →
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
+- Manager 把同一 `terminationGrace` 传给新建和恢复的 PTY；关闭顺序仍按 Agent ID
+  串行，不在 session 层复制信号升级逻辑。
 - `Replay(sessionID)`：从 store 读取事件流供回放；仍保留的 `output.chunk` 附件被编码进
   Base64 payload，已过期的附件只返回 offset/len metadata。
 - `Manager` 长期持有一个 recording archive，使 tail、timeline、Blocked lookup 和
@@ -47,23 +57,30 @@
 - `Explain(ctx, id, options)`：读取最多 200 条 `agent.signal` / `state_changed`
   envelope，解码为不透传原始 payload 的类型化摘要；仅同一 attached terminal actor
   可提供带采样时间的临时受限 screen view，退出认领或 detach 后不再返回 screen。
-- `SendInput(id, data)`：校验并完整写入已连接 PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。
+- `SendInput(id, data)`：校验后以 `inputMu.TryLock` fail-fast admission 完整写入已连接
+  PTY，成功后仅持久化字节数，不记录输入正文，也不直接改变 Agent 状态。busy 或
+  timeout 返回 `ErrInputBackpressure`；任何部分送达同时返回 `ErrInputWrite` 和
+  `do not retry`，且不提交成功审计。
 - recording actor 校验 PTY 源偏移，跨回调等长替换 signal token，并把不超过 32 KiB 的
   `output.chunk` 作为一个回调批次提交；Store 成功且 Hub 发布后，才用 receipt 中的
   output offset、最终 sequence 和 commit time 构造 `term.CommittedChunk` 并喂给
   terminal actor。之后才提交无文本 output activity。
 - writable attachment 采用 `latest` 尺寸策略：首个 writer 初始持有尺寸，非 owner
   只更新 proposal，成功输入在写入前应用 proposal 并在写入后晋升，owner detach
-  按 actor activity ticket 选择回退。attachment ID 不进入事件。
+  按 actor activity ticket 选择回退。attached input 在提交 output actor 前获取同一
+  fail-fast input gate，attachment ID 不进入事件。
 - 有效 resize 先由 terminal actor 依次应用到 PTY 与 x/vt，再提交
   `agent.resized`；重复尺寸不写事件。应用后提交失败会触发 fail-stop。
 - live snapshot 仅存在内存中，每个 attachment 最多 2 Hz、channel 容量为 1，
   新值覆盖未读旧值；携带 cursor、尺寸和 `restorable:false`，在 detach 或输出结束时关闭。
 - 进程退出先同步调用 `MarkProcessExited`，再终止 Detector。尾部输出仍持久化并更新
   私有 emulator，但不能产生 screen signal；detach 后 snapshot 不可用。
-- 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
+- 用户输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；用户调用者
+  不在该锁后排队。PTY 输出和 terminal query reply 不参与该锁。
 - 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
   `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。
+- 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
+  只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。
 - 信号与状态证据 reader 同时接受 v1、v2 和 typed screen v3；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。

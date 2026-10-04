@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -136,6 +137,86 @@ func TestAgentResizedPayloadValidationAndCommit(t *testing.T) {
 	}
 	if _, err := DecodeAgentResizedPayload(`{"version":1`); err == nil {
 		t.Fatal("decode accepted malformed resize payload")
+	}
+}
+
+func TestAgentResumedPayloadAndDraft(t *testing.T) {
+	payload := AgentResumedPayloadV1{
+		Version:          1,
+		VendorSessionRef: "vendor-session-1",
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate payload: %v", err)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode payload: %v", err)
+	}
+	at := time.Date(2026, time.October, 4, 14, 0, 0, 0, time.UTC)
+	committed, err := Commit(
+		10,
+		at,
+		NewAgentResumedDraft("agent-1", "agent-1", string(encoded)),
+	)
+	if err != nil {
+		t.Fatalf("commit resumed draft: %v", err)
+	}
+	if committed.Type != TypeAgentResumed ||
+		committed.Reason != "requested" ||
+		committed.Payload != `{"version":1}` ||
+		committed.StoredPayload() != string(encoded) ||
+		strings.Contains(committed.Payload, "vendor-session-1") {
+		t.Fatalf("committed event = %+v", committed)
+	}
+
+	for _, ref := range []string{"", " leading", strings.Repeat("a", 257)} {
+		invalid := AgentResumedPayloadV1{
+			Version:          1,
+			VendorSessionRef: ref,
+		}
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("reference %q passed validation", ref)
+		}
+	}
+}
+
+func TestPrivateSessionLifecycleDraftSeparatesStoredPayload(t *testing.T) {
+	const (
+		publicPayload = `{"version":2,"name":"agent"}`
+		storedPayload = `{"version":2,"name":"agent","working_dir":"/private/project"}`
+	)
+	committed, err := Commit(
+		11,
+		time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC),
+		NewPrivateSessionLifecycleDraft(
+			"agent-1",
+			"agent-1",
+			"created",
+			publicPayload,
+			storedPayload,
+		),
+	)
+	if err != nil {
+		t.Fatalf("commit private lifecycle draft: %v", err)
+	}
+	if committed.Payload != publicPayload ||
+		committed.StoredPayload() != storedPayload {
+		t.Fatalf("committed lifecycle event = %+v", committed)
+	}
+
+	_, err = Commit(
+		12,
+		time.Date(2026, time.October, 4, 15, 0, 1, 0, time.UTC),
+		NewPrivateSessionLifecycleDraft(
+			"agent-1",
+			"agent-1",
+			"deleted",
+			publicPayload,
+			storedPayload,
+		),
+	)
+	if err == nil {
+		t.Fatal("private non-created lifecycle draft committed")
 	}
 }
 
@@ -319,20 +400,75 @@ func TestSignalPayloadV1Validation(t *testing.T) {
 	}
 }
 
+func TestSignalPayloadVendorSessionReferenceCompatibility(t *testing.T) {
+	base := SignalPayloadV1{
+		Version:     1,
+		Source:      "hook",
+		Kind:        "session_started",
+		Vendor:      "claude",
+		VendorEvent: "SessionStart",
+		Scope:       "root",
+		Confidence:  1,
+		ReceivedAt:  time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DeliveryID:  "550e8400-e29b-41d4-a716-446655440000",
+		Outcome:     "observed",
+	}
+
+	current := base
+	current.VendorSessionRef = "session-ref"
+	if err := current.Validate(); err != nil {
+		t.Fatalf("validate current payload: %v", err)
+	}
+	if got := current.VendorSessionReference(); got != "session-ref" {
+		t.Fatalf("current session reference = %q", got)
+	}
+	encoded, err := json.Marshal(current)
+	if err != nil {
+		t.Fatalf("encode current payload: %v", err)
+	}
+	if strings.Contains(string(encoded), "vendor_session_id") ||
+		strings.Contains(string(encoded), "vendor_turn_id") {
+		t.Fatalf("current payload contains legacy identifiers: %s", encoded)
+	}
+
+	legacy := base
+	legacy.VendorSessionID = "legacy-session"
+	legacy.VendorTurnID = "legacy-turn"
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("validate legacy payload: %v", err)
+	}
+	if got := legacy.VendorSessionReference(); got != "legacy-session" {
+		t.Fatalf("legacy session reference = %q", got)
+	}
+
+	for _, ref := range []string{" leading", "trailing ", "line\nbreak", strings.Repeat("x", 257)} {
+		invalid := base
+		invalid.VendorSessionRef = ref
+		if err := invalid.Validate(); err == nil {
+			t.Fatalf("accepted invalid session reference %q", ref)
+		}
+	}
+
+	ambiguous := current
+	ambiguous.VendorSessionID = "other-session"
+	if err := ambiguous.Validate(); err == nil {
+		t.Fatal("accepted conflicting current and legacy session references")
+	}
+}
+
 func TestSignalPayloadV2ValidatesNotifyOnly(t *testing.T) {
 	payload := SignalPayloadV2{
-		Version:         2,
-		Source:          "notify",
-		Kind:            "turn_stopped",
-		Vendor:          "codex",
-		VendorEvent:     "agent-turn-complete",
-		Scope:           "root",
-		VendorSessionID: "thread-1",
-		VendorTurnID:    "turn-1",
-		Confidence:      1,
-		ReceivedAt:      time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
-		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
-		Outcome:         "candidate",
+		Version:          2,
+		Source:           "notify",
+		Kind:             "turn_stopped",
+		Vendor:           "codex",
+		VendorEvent:      "agent-turn-complete",
+		Scope:            "root",
+		VendorSessionRef: "thread-1",
+		Confidence:       1,
+		ReceivedAt:       time.Date(2026, time.October, 3, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		DeliveryID:       "550e8400-e29b-41d4-a716-446655440000",
+		Outcome:          "candidate",
 	}
 	if err := payload.Validate(); err != nil {
 		t.Fatalf("validate notify payload: %v", err)

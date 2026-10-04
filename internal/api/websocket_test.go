@@ -198,6 +198,53 @@ func TestWebSocketInputReturnsStableErrorsAndRejectsDuplicateIDs(t *testing.T) {
 	}
 }
 
+func TestWebSocketInputReturnsBackpressureForBlockedPTY(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "websocket-blocked-input",
+		Command: "/bin/sh",
+		Args: []string{
+			"-c",
+			"stty raw -echo; printf READY; kill -STOP $$",
+		},
+		Mode: agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start agent: %v", err)
+	}
+	waitForOutputText(t, manager, status.AgentID, "READY")
+	t.Cleanup(func() {
+		resumeStoppedAgent(t, manager, status.AgentID)
+	})
+
+	httpServer := httptest.NewServer(server.mux)
+	defer httpServer.Close()
+	conn := dialTestWebSocket(t, httpServer.URL)
+	defer conn.Close()
+
+	request := webSocketInput{
+		Version:   webSocketProtocolVersion,
+		Type:      "input",
+		RequestID: "blocked-1",
+		AgentID:   status.AgentID,
+		Data:      strings.Repeat("x", session.MaxInputBytes),
+	}
+	if err := conn.WriteJSON(request); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	response := readWebSocketType(
+		t,
+		conn,
+		"error",
+		time.Now().Add(2*time.Second),
+	)
+	if response["request_id"] != request.RequestID ||
+		response["code"] != "input_backpressure" ||
+		!strings.Contains(response["message"].(string), "do not retry") {
+		t.Fatalf("response = %#v, want partial input_backpressure", response)
+	}
+}
+
 func TestWebSocketClosesWhenBearerGenerationExpires(t *testing.T) {
 	server, _, _ := newTestServerWithOptions(t, true, auth.Options{
 		RotationGrace: 40 * time.Millisecond,
@@ -296,6 +343,7 @@ func TestWebSocketInputErrorCodes(t *testing.T) {
 		{err: session.ErrUnknownAgent, code: "unknown_agent"},
 		{err: session.ErrNotAttached, code: "not_attached"},
 		{err: session.ErrManagerClosed, code: "manager_closed"},
+		{err: session.ErrInputBackpressure, code: "input_backpressure"},
 		{err: session.ErrInputWrite, code: "write_failed"},
 		{err: session.ErrInputAudit, code: "audit_failed"},
 		{err: errors.New("unexpected"), code: "internal_error"},

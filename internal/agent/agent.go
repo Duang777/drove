@@ -373,6 +373,7 @@ type Change struct {
 	at           time.Time
 	hasState     bool
 	hasError     bool
+	resume       bool
 }
 
 // PreparedChange is bound to one Agent revision and can only be applied once.
@@ -388,6 +389,7 @@ type PreparedChange struct {
 	at           time.Time
 	hasState     bool
 	hasError     bool
+	resume       bool
 }
 
 // MoveTo constructs a state-only change.
@@ -398,6 +400,18 @@ func MoveTo(to State, reason string, evidence Evidence) Change {
 		evidence: evidence,
 		at:       time.Now().UTC(),
 		hasState: true,
+	}
+}
+
+// ResumeToStarting constructs the only change allowed to reopen a stopped Agent.
+func ResumeToStarting(reason string, evidence Evidence) Change {
+	return Change{
+		target:   StateStarting,
+		reason:   reason,
+		evidence: evidence,
+		at:       time.Now().UTC(),
+		hasState: true,
+		resume:   true,
 	}
 }
 
@@ -721,7 +735,7 @@ func (a *Agent) Prepare(change Change) (PreparedChange, error) {
 		if strings.TrimSpace(change.reason) == "" {
 			return PreparedChange{}, errors.New("agent: transition reason is required")
 		}
-		if !CanTransition(a.state, change.target) {
+		if !validPreparedTransition(a.state, change.target, change.resume) {
 			return PreparedChange{}, fmt.Errorf(
 				"%w: %s -> %s",
 				ErrInvalidTransition,
@@ -751,6 +765,7 @@ func (a *Agent) Prepare(change Change) (PreparedChange, error) {
 		at:           change.at,
 		hasState:     change.hasState,
 		hasError:     change.hasError,
+		resume:       change.resume,
 	}, nil
 }
 
@@ -770,7 +785,8 @@ func (a *Agent) ApplyCommitted(prepared PreparedChange) error {
 			a.state,
 		)
 	}
-	if prepared.hasState && !CanTransition(prepared.from, prepared.to) {
+	if prepared.hasState &&
+		!validPreparedTransition(prepared.from, prepared.to, prepared.resume) {
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, prepared.from, prepared.to)
 	}
 	if prepared.hasError {
@@ -783,6 +799,13 @@ func (a *Agent) ApplyCommitted(prepared PreparedChange) error {
 	a.updatedAt = prepared.at
 	a.revision++
 	return nil
+}
+
+func validPreparedTransition(from, to State, resume bool) bool {
+	if resume {
+		return from == StateStopped && to == StateStarting
+	}
+	return CanTransition(from, to)
 }
 
 // Transition exposes the prepared state transition data.

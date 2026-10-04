@@ -303,6 +303,8 @@ func webSocketInputError(requestID string, err error) webSocketError {
 		code = "not_attached"
 	case errors.Is(err, session.ErrManagerClosed):
 		code = "manager_closed"
+	case errors.Is(err, session.ErrInputBackpressure):
+		code = "input_backpressure"
 	case errors.Is(err, session.ErrInputWrite):
 		code = "write_failed"
 	case errors.Is(err, session.ErrInputAudit):

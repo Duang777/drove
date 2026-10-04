@@ -23,8 +23,8 @@ cmd/* ──▶ internal/client ──▶ internal/session
 - `client` 只做 JSON 透传（HTTP 客户端），不解析领域类型。
 - `adapter` 依赖 `detect` 的标准信号类型和 `agent` 的运行模式；`detect` 只依赖
   `agent` 快照与 Change。其余叶子包不得反向依赖 `session`。
-- `term` 只负责无厂商逻辑的流式控制序列清洗，供 `adapter` 和 `session`
-  复用；屏幕仿真、终端查询和应答不属于该包当前职责。
+- `term` 负责无厂商逻辑的流式控制序列清洗、屏幕仿真和有界终端查询应答，
+  供 `adapter`、`recording` 和 `session` 复用。
 
 ## 约束
 

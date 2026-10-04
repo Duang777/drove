@@ -270,6 +270,77 @@ func TestWebSocketV2WritableRawInputResizeAndEvents(t *testing.T) {
 	}
 }
 
+func TestWebSocketV2InputReturnsBackpressureForBlockedPTY(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "websocket-v2-blocked-input",
+		Command: "/bin/sh",
+		Args: []string{
+			"-c",
+			"stty raw -echo; printf READY; kill -STOP $$",
+		},
+		Mode: agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start agent: %v", err)
+	}
+	waitForOutputText(t, manager, status.AgentID, "READY")
+	t.Cleanup(func() {
+		resumeStoppedAgent(t, manager, status.AgentID)
+	})
+
+	httpServer := httptest.NewServer(server.mux)
+	defer httpServer.Close()
+	conn := dialTestWebSocketV2(t, httpServer.URL)
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "subscribe",
+		"request_id": "subscribe-blocked",
+		"agent_id":   status.AgentID,
+		"mode":       "raw",
+		"writable":   true,
+		"rows":       40,
+		"columns":    120,
+	}); err != nil {
+		t.Fatalf("subscribe writable raw: %v", err)
+	}
+	_ = readWebSocketV2TextType(
+		t,
+		conn,
+		"subscribed",
+		time.Now().Add(2*time.Second),
+	)
+	_ = readWebSocketV2TextType(
+		t,
+		conn,
+		"caught_up",
+		time.Now().Add(2*time.Second),
+	)
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "input",
+		"request_id": "blocked-1",
+		"agent_id":   status.AgentID,
+		"data":       strings.Repeat("x", session.MaxInputBytes),
+	}); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	response := readWebSocketV2TextType(
+		t,
+		conn,
+		"error",
+		time.Now().Add(2*time.Second),
+	)
+	if response["request_id"] != "blocked-1" ||
+		response["code"] != "input_backpressure" ||
+		!strings.Contains(response["message"].(string), "do not retry") {
+		t.Fatalf("response = %#v, want partial input_backpressure", response)
+	}
+}
+
 func TestWebSocketV2RejectsUnsupportedNegotiationBeforeUpgrade(t *testing.T) {
 	server, _, _ := newTestServer(t)
 	httpServer := httptest.NewServer(server.mux)
@@ -574,6 +645,19 @@ func TestWebSocketV2OperationErrorIncludesExpiredRanges(t *testing.T) {
 	if response.Code != "output_expired" ||
 		len(response.Missing) != 1 ||
 		response.Missing[0] != source.Missing[0] {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
+func TestWebSocketV2OperationErrorMapsInputBackpressure(t *testing.T) {
+	response := webSocketV2OperationError(
+		"request-1",
+		"agent-1",
+		webSocketV2ModeRaw,
+		session.ErrInputBackpressure,
+	)
+	if response.Code != "input_backpressure" ||
+		response.RequestID != "request-1" {
 		t.Fatalf("response = %+v", response)
 	}
 }

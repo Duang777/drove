@@ -379,6 +379,53 @@ func TestLegalTransitions(t *testing.T) {
 	}
 }
 
+func TestResumeToStartingIsTheOnlyStoppedTransition(t *testing.T) {
+	a := New("a1")
+	stopped, err := a.Prepare(MoveTo(StateStopped, "stopped", Evidence{
+		Source: EvidenceSession, Event: "session_stop", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare stopped: %v", err)
+	}
+	if err := a.ApplyCommitted(stopped); err != nil {
+		t.Fatalf("apply stopped: %v", err)
+	}
+	evidence := Evidence{
+		Source: EvidenceSession, Event: "session_resume", Confidence: 1,
+	}
+	if _, err := a.Prepare(MoveTo(StateStarting, "resume", evidence)); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("ordinary stopped -> starting error = %v, want ErrInvalidTransition", err)
+	}
+
+	resumed, err := a.Prepare(ResumeToStarting("resume", evidence))
+	if err != nil {
+		t.Fatalf("prepare resume: %v", err)
+	}
+	if err := a.ApplyCommitted(resumed); err != nil {
+		t.Fatalf("apply resume: %v", err)
+	}
+	if got := a.State(); got != StateStarting {
+		t.Fatalf("state = %s, want starting", got)
+	}
+	if CanTransition(StateStopped, StateStarting) {
+		t.Fatal("ordinary transition table permits stopped -> starting")
+	}
+}
+
+func TestApplyCommittedRejectsResumeIntentOnAnotherEdge(t *testing.T) {
+	a := New("a1")
+	prepared, err := a.Prepare(MoveTo(StateStarting, "start", Evidence{
+		Source: EvidenceSession, Event: "session_start", Confidence: 1,
+	}))
+	if err != nil {
+		t.Fatalf("prepare start: %v", err)
+	}
+	prepared.resume = true
+	if err := a.ApplyCommitted(prepared); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("apply forged resume error = %v, want ErrInvalidTransition", err)
+	}
+}
+
 func TestTransitionLifecycle(t *testing.T) {
 	a := New("a1", WithRunMode(RunModeOneshot))
 	apply := func(to State, reason string, evidence Evidence) {

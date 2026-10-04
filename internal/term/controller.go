@@ -15,6 +15,7 @@ import (
 const (
 	maxTerminalDimension = 1<<16 - 1
 	replyBufferSize      = 4096
+	replyMailboxSize     = 16
 
 	// MaxViewRows bounds the number of terminal rows in an external view.
 	MaxViewRows = 12
@@ -24,8 +25,12 @@ const (
 	MaxViewBytes = 4 * 1024
 )
 
-// ErrClosed reports an operation on a closed Controller.
-var ErrClosed = errors.New("terminal controller is closed")
+var (
+	// ErrClosed reports an operation on a closed Controller.
+	ErrClosed = errors.New("terminal controller is closed")
+	// ErrReplyBackpressure reports a dropped terminal reply when its mailbox is full.
+	ErrReplyBackpressure = errors.New("terminal reply mailbox is full")
+)
 
 // Size is a validated terminal size.
 type Size struct {
@@ -301,15 +306,22 @@ func rowContentEnd(cells []snapshotCell) int {
 	return min(end, len(cells))
 }
 
-// ReplySink writes one complete terminal reply frame.
-type ReplySink func([]byte) error
+// ReplyFrame is one copied terminal query response.
+type ReplyFrame struct {
+	bytes []byte
+}
+
+// Bytes returns a copy of the terminal reply bytes.
+func (f ReplyFrame) Bytes() []byte {
+	return append([]byte(nil), f.bytes...)
+}
 
 // Controller owns terminal emulation and its reply pump.
 type Controller struct {
 	mu          sync.Mutex
 	emulator    *vt.Emulator
 	replyWriter io.WriteCloser
-	replySink   ReplySink
+	replies     chan ReplyFrame
 	replyErrors chan error
 	pumpDone    chan struct{}
 	closeOnce   sync.Once
@@ -318,12 +330,9 @@ type Controller struct {
 }
 
 // NewController constructs a terminal and starts its reply pump.
-func NewController(size Size, replySink ReplySink) (*Controller, error) {
+func NewController(size Size) (*Controller, error) {
 	if err := size.validate(); err != nil {
 		return nil, fmt.Errorf("create terminal controller: %w", err)
-	}
-	if replySink == nil {
-		return nil, errors.New("create terminal controller: reply sink is required")
 	}
 
 	emulator := vt.NewEmulator(size.Columns(), size.Rows())
@@ -343,7 +352,7 @@ func NewController(size Size, replySink ReplySink) (*Controller, error) {
 	controller := &Controller{
 		emulator:    emulator,
 		replyWriter: replyWriter,
-		replySink:   replySink,
+		replies:     make(chan ReplyFrame, replyMailboxSize),
 		replyErrors: make(chan error, 1),
 		pumpDone:    make(chan struct{}),
 	}
@@ -353,7 +362,12 @@ func NewController(size Size, replySink ReplySink) (*Controller, error) {
 	return controller, nil
 }
 
-// Errors returns bounded asynchronous reply-sink failures.
+// Replies returns the bounded terminal reply mailbox.
+func (c *Controller) Replies() <-chan ReplyFrame {
+	return c.replies
+}
+
+// Errors returns bounded asynchronous reply-mailbox failures.
 func (c *Controller) Errors() <-chan error {
 	return c.replyErrors
 }
@@ -445,6 +459,7 @@ func (c *Controller) Close() error {
 
 func (c *Controller) pumpReplies(ready chan<- struct{}) {
 	defer close(c.pumpDone)
+	defer close(c.replies)
 	defer close(c.replyErrors)
 	close(ready)
 
@@ -452,10 +467,12 @@ func (c *Controller) pumpReplies(ready chan<- struct{}) {
 	for {
 		count, err := c.emulator.Read(buffer)
 		if count > 0 {
-			frame := append([]byte(nil), buffer[:count]...)
-			if sinkErr := c.replySink(frame); sinkErr != nil {
+			frame := ReplyFrame{bytes: append([]byte(nil), buffer[:count]...)}
+			select {
+			case c.replies <- frame:
+			default:
 				select {
-				case c.replyErrors <- fmt.Errorf("write terminal reply: %w", sinkErr):
+				case c.replyErrors <- ErrReplyBackpressure:
 				default:
 				}
 			}

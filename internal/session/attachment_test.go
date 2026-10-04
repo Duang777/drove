@@ -158,6 +158,36 @@ func TestAttachmentFailedInputDoesNotPromoteOwner(t *testing.T) {
 	}
 }
 
+func TestAttachmentInputRejectsConcurrentAdmission(t *testing.T) {
+	manager, id, running, _ := newAttachmentTestRuntime(t)
+	attachment, err := manager.AttachTerminal(
+		context.Background(),
+		id,
+		AttachmentOptions{
+			Mode:    AttachmentWritable,
+			Rows:    24,
+			Columns: 80,
+		},
+	)
+	if err != nil {
+		t.Fatalf("attach writer: %v", err)
+	}
+	defer attachment.Close()
+
+	running.inputMu.Lock()
+	result, err := attachment.SendInput(context.Background(), []byte("input"))
+	running.inputMu.Unlock()
+	if !errors.Is(err, ErrInputBackpressure) {
+		t.Fatalf("send input error = %v, want ErrInputBackpressure", err)
+	}
+	if result.BytesWritten != 0 {
+		t.Fatalf("bytes written = %d, want 0", result.BytesWritten)
+	}
+	if err := running.output.End(0); err != nil {
+		t.Fatalf("end output: %v", err)
+	}
+}
+
 func TestReadOnlyAttachmentCannotWriteOrOwnSize(t *testing.T) {
 	manager, id, running, process := newAttachmentTestRuntime(t)
 	readOnly, err := manager.AttachTerminal(context.Background(), id, AttachmentOptions{
@@ -248,7 +278,7 @@ func newAttachmentTestRuntime(
 		&recordingTerminalObserver{},
 	)
 	manager.mu.Lock()
-	manager.agents[id] = target
+	manager.agents[id] = newManagedAgent(target)
 	manager.sessions[id] = running
 	manager.mu.Unlock()
 	return manager, id, running, process

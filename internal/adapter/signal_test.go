@@ -32,7 +32,7 @@ func TestClaudeHookFixture(t *testing.T) {
 		signal.Vendor != "claude" ||
 		signal.VendorEvent != "SessionStart" ||
 		signal.Scope != detect.ScopeRoot ||
-		signal.VendorSessionID != "claude-session-1" ||
+		signal.VendorSessionRef != "claude-session-1" ||
 		signal.Confidence != 1 ||
 		!signal.ReceivedAt.Equal(receivedAt) {
 		t.Fatalf("signal = %+v", signal)
@@ -54,8 +54,7 @@ func TestCodexHookFixture(t *testing.T) {
 	}
 	if signal.Kind != detect.KindTurnStarted ||
 		signal.Vendor != "codex" ||
-		signal.VendorSessionID != "codex-thread-1" ||
-		signal.VendorTurnID != "codex-turn-1" {
+		signal.VendorSessionRef != "codex-thread-1" {
 		t.Fatalf("signal = %+v", signal)
 	}
 }

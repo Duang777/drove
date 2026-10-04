@@ -178,6 +178,7 @@ func TestTerminalAcceptanceNoGoroutineLeak(t *testing.T) {
 		runtime.GC()
 		afterProfile, after := terminalAcceptanceGoroutines(t)
 		if after.terminalActors <= before.terminalActors &&
+			after.replyForwarders <= before.replyForwarders &&
 			after.replyPumps <= before.replyPumps &&
 			after.observationActors <= before.observationActors &&
 			after.committers <= before.committers {
@@ -309,12 +310,13 @@ func newTerminalAcceptanceHarness(
 		agent.WithRunMode(agent.RunModeInteractive),
 		agent.WithHookPolicy(policy),
 	)
+	managed := newManagedAgent(target)
 	manager.mu.Lock()
-	manager.agents[id] = target
+	manager.agents[id] = managed
 	manager.mu.Unlock()
 	commitTestState(t, manager, target, agent.StateStarting, "acceptance start")
 
-	running, _, _, err := manager.prepareRuntime(target, manager.reg.For(vendor))
+	running, _, _, err := manager.prepareManagedRuntime(managed, manager.reg.For(vendor))
 	if err != nil {
 		t.Fatalf("prepare acceptance runtime: %v", err)
 	}
@@ -446,14 +448,14 @@ func (h *terminalAcceptanceHarness) enterFallback(t *testing.T) {
 func (h *terminalAcceptanceHarness) activateBlockedHook(t *testing.T) {
 	t.Helper()
 	signal, err := detect.NewHookSignal(detect.Signal{
-		Kind:            detect.KindHumanInputRequired,
-		Vendor:          h.target.Vendor(),
-		VendorEvent:     "approval_required",
-		Scope:           detect.ScopeRoot,
-		VendorSessionID: "redacted-session",
-		Confidence:      1,
-		ReceivedAt:      h.detectorClock.Now(),
-		DeliveryID:      uuid.NewString(),
+		Kind:             detect.KindHumanInputRequired,
+		Vendor:           h.target.Vendor(),
+		VendorEvent:      "approval_required",
+		Scope:            detect.ScopeRoot,
+		VendorSessionRef: "redacted-session",
+		Confidence:       1,
+		ReceivedAt:       h.detectorClock.Now(),
+		DeliveryID:       uuid.NewString(),
 	})
 	if err != nil {
 		t.Fatalf("create hook observation: %v", err)
@@ -679,6 +681,7 @@ func countEventType(rows []store.EventRow, eventType event.Type) int {
 
 type terminalAcceptanceGoroutineCount struct {
 	terminalActors    int
+	replyForwarders   int
 	replyPumps        int
 	observationActors int
 	committers        int
@@ -697,6 +700,10 @@ func terminalAcceptanceGoroutines(
 		terminalActors: strings.Count(
 			text,
 			"internal/session.(*terminalActor).run",
+		),
+		replyForwarders: strings.Count(
+			text,
+			"internal/session.(*terminalActor).forwardReplies",
 		),
 		replyPumps: strings.Count(
 			text,

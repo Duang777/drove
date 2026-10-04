@@ -1475,6 +1475,8 @@ func webSocketV2OperationError(
 		code = "input_too_large"
 	case errors.Is(err, session.ErrInputNotUTF8):
 		code = "invalid_utf8"
+	case errors.Is(err, session.ErrInputBackpressure):
+		code = "input_backpressure"
 	case errors.Is(err, session.ErrInputWrite):
 		code = "write_failed"
 	case errors.Is(err, session.ErrInputAudit):

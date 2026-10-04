@@ -8,12 +8,19 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"syscall"
+	"time"
 	"unicode/utf8"
 
 	"github.com/creack/pty"
 )
 
-const maxTerminalDimension = 1<<16 - 1
+const (
+	maxTerminalDimension     = 1<<16 - 1
+	defaultTerminationGrace  = 5 * time.Second
+	processGroupPollInterval = 10 * time.Millisecond
+	writeTimeout             = time.Second
+)
 
 // ExitInfo 描述进程退出信息。
 type ExitInfo struct {
@@ -79,6 +86,8 @@ type Config struct {
 	Dir string
 	// Size 是子进程启动前生效的 PTY 行列尺寸。
 	Size Size
+	// TerminationGrace 是 SIGTERM 到 SIGKILL 之间的宽限期；零值使用 5 秒。
+	TerminationGrace time.Duration
 	// OnOutput 在输出字节可用时被调用。回调不得长期阻塞。
 	OnOutput func(chunk []byte, offset uint64)
 	// OnOutputEnd 在最后一次输出回调后被调用一次。
@@ -90,19 +99,25 @@ type Config struct {
 // Session 是一个运行中的 PTY 会话。
 // 用法：Start -> Write（注入输入）-> Close / Wait。
 type Session struct {
-	mu        sync.Mutex
-	closeOnce sync.Once
-	closeErr  error
+	mu              sync.Mutex
+	writeMu         sync.Mutex
+	closeOnce       sync.Once
+	masterCloseOnce sync.Once
+	groupCloseOnce  sync.Once
+	closeErr        error
 
-	cmd    *exec.Cmd
-	ptmx   *os.File
-	closed bool
+	cmd         *exec.Cmd
+	ptmx        *os.File
+	closed      bool
+	writeActive bool
+	grace       time.Duration
 
-	onOutput    func(chunk []byte, offset uint64)
-	onOutputEnd func(offset uint64)
-	onExit      func(info ExitInfo)
-	readDone    chan struct{}
-	done        chan struct{}
+	onOutput      func(chunk []byte, offset uint64)
+	onOutputEnd   func(offset uint64)
+	onExit        func(info ExitInfo)
+	readDone      chan struct{}
+	processExited chan struct{}
+	done          chan struct{}
 
 	// WaitCh 返回进程退出信息（Close 后仍可读取一次）。
 	WaitCh chan ExitInfo
@@ -113,6 +128,8 @@ var (
 	ErrClosed = errors.New("pty: session closed")
 	// ErrNotStarted 表示会话未启动。
 	ErrNotStarted = errors.New("pty: session not started")
+	// ErrWriteBackpressure 表示写入准入当前不可用，或写入超过了有界期限。
+	ErrWriteBackpressure = errors.New("pty: write backpressure")
 )
 
 // Start 创建 PTY 并启动命令。返回会话，或错误。
@@ -121,6 +138,10 @@ func Start(cfg Config) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pty: invalid initial size: %w", err)
 	}
+	grace, err := normalizeTerminationGrace(cfg.TerminationGrace)
+	if err != nil {
+		return nil, err
+	}
 
 	cmd := exec.Command(cfg.Command, cfg.Args...)
 	cmd.Dir = cfg.Dir
@@ -128,25 +149,45 @@ func Start(cfg Config) (*Session, error) {
 		cmd.Env = append(os.Environ(), cfg.Env...)
 	}
 
-	ptmx, err := pty.StartWithSize(cmd, windowSize)
+	startedMaster, err := pty.StartWithSize(cmd, windowSize)
 	if err != nil {
 		return nil, fmt.Errorf("pty: start %q: %w", cfg.Command, err)
 	}
+	ptmx, err := prepareDeadlineMaster(startedMaster)
+	if err != nil {
+		cleanupErr := cleanupFailedStart(cmd, startedMaster)
+		return nil, errors.Join(
+			fmt.Errorf("pty: prepare master for %q: %w", cfg.Command, err),
+			cleanupErr,
+		)
+	}
 
 	s := &Session{
-		cmd:         cmd,
-		ptmx:        ptmx,
-		onOutput:    cfg.OnOutput,
-		onOutputEnd: cfg.OnOutputEnd,
-		onExit:      cfg.OnExit,
-		readDone:    make(chan struct{}),
-		done:        make(chan struct{}),
-		WaitCh:      make(chan ExitInfo, 1),
+		cmd:           cmd,
+		ptmx:          ptmx,
+		grace:         grace,
+		onOutput:      cfg.OnOutput,
+		onOutputEnd:   cfg.OnOutputEnd,
+		onExit:        cfg.OnExit,
+		readDone:      make(chan struct{}),
+		processExited: make(chan struct{}),
+		done:          make(chan struct{}),
+		WaitCh:        make(chan ExitInfo, 1),
 	}
 
 	go s.readLoop()
 	go s.waitLoop()
 	return s, nil
+}
+
+func normalizeTerminationGrace(grace time.Duration) (time.Duration, error) {
+	if grace < 0 {
+		return 0, fmt.Errorf("pty: termination grace must not be negative")
+	}
+	if grace == 0 {
+		return defaultTerminationGrace, nil
+	}
+	return grace, nil
 }
 
 const outputReadBufferSize = 32 * 1024
@@ -229,6 +270,9 @@ func completeUTF8Prefix(data []byte, limit int) int {
 func (s *Session) waitLoop() {
 	info := ExitInfo{PID: s.cmd.Process.Pid}
 	err := s.cmd.Wait()
+	s.beginClose()
+	close(s.processExited)
+	s.closeProcessGroup()
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -246,31 +290,133 @@ func (s *Session) waitLoop() {
 	default:
 	}
 	<-s.readDone
-	s.closeAfterNaturalExit()
+	s.closeMaster()
+	s.joinWriter()
 	close(s.done)
 }
 
-func (s *Session) closeAfterNaturalExit() {
+func (s *Session) beginClose() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
 	s.closed = true
-	if err := s.ptmx.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
-		s.closeErr = errors.Join(s.closeErr, fmt.Errorf("pty: close master after exit: %w", err))
+	if s.writeActive {
+		if err := s.ptmx.SetWriteDeadline(time.Now()); err != nil {
+			s.closeErr = errors.Join(
+				s.closeErr,
+				fmt.Errorf("pty: interrupt active write: %w", err),
+			)
+		}
 	}
+}
+
+func (s *Session) closeMaster() {
+	s.masterCloseOnce.Do(func() {
+		if err := s.ptmx.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			s.mu.Lock()
+			s.closeErr = errors.Join(
+				s.closeErr,
+				fmt.Errorf("pty: close master: %w", err),
+			)
+			s.mu.Unlock()
+		}
+	})
+}
+
+func (s *Session) joinWriter() {
+	s.writeMu.Lock()
+	s.writeMu.Unlock()
+}
+
+func (s *Session) closeProcessGroup() {
+	s.groupCloseOnce.Do(func() {
+		var closeErrors []error
+		alive, err := processGroupAlive(s.cmd.Process.Pid)
+		if err != nil {
+			closeErrors = append(
+				closeErrors,
+				fmt.Errorf("pty: inspect process group: %w", err),
+			)
+		} else if alive {
+			if err := terminateProcessGroup(s.cmd.Process.Pid); err != nil {
+				closeErrors = append(
+					closeErrors,
+					fmt.Errorf("pty: terminate process group: %w", err),
+				)
+			}
+			exited, err := waitForProcessGroupExit(
+				s.cmd.Process.Pid,
+				s.grace,
+			)
+			if err != nil {
+				closeErrors = append(
+					closeErrors,
+					fmt.Errorf("pty: wait for process group: %w", err),
+				)
+			}
+			if !exited {
+				if err := killProcessGroup(s.cmd.Process.Pid); err != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf("pty: kill process group: %w", err),
+					)
+				}
+			}
+		}
+		s.mu.Lock()
+		s.closeErr = errors.Join(s.closeErr, errors.Join(closeErrors...))
+		s.mu.Unlock()
+	})
 }
 
 // Write 向 agent 注入完整输入，或返回已写入的字节数和错误。
 func (s *Session) Write(data []byte) (int, error) {
+	if !s.writeMu.TryLock() {
+		return 0, ErrWriteBackpressure
+	}
+	defer s.writeMu.Unlock()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return 0, ErrClosed
 	}
+	if err := s.ptmx.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+		s.mu.Unlock()
+		return 0, fmt.Errorf("pty: set write deadline: %w", err)
+	}
+	s.writeActive = true
+	s.mu.Unlock()
+
 	n, err := writeFull(s.ptmx, data)
+	s.mu.Lock()
+	s.writeActive = false
+	closed := s.closed
+	var clearErr error
+	if !closed {
+		clearErr = s.ptmx.SetWriteDeadline(time.Time{})
+	}
+	s.mu.Unlock()
+
+	if closed || errors.Is(err, syscall.EIO) {
+		if err != nil {
+			return n, fmt.Errorf("%w: %v", ErrClosed, err)
+		}
+		return n, ErrClosed
+	}
+	if clearErr != nil {
+		err = errors.Join(err, fmt.Errorf("clear write deadline: %w", clearErr))
+	}
 	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return n, fmt.Errorf(
+				"pty: write timed out after %s: %w",
+				writeTimeout,
+				errors.Join(ErrWriteBackpressure, err),
+			)
+		}
 		return n, fmt.Errorf("pty: write: %w", err)
 	}
 	return n, nil
@@ -293,6 +439,9 @@ func writeFull(w io.Writer, data []byte) (int, error) {
 
 // Resize 调整终端尺寸（rows x cols）。
 func (s *Session) Resize(rows, cols uint16) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -309,30 +458,37 @@ func (s *Session) PID() int {
 	return s.cmd.Process.Pid
 }
 
-// Close 关闭 PTY，中断读取，并终止子进程（若仍存活）。
+// Close 温和终止进程组，关闭 PTY，并等待全部回调完成。
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
-		s.mu.Lock()
-		alreadyClosed := s.closed
-		s.closed = true
-		var closeErr error
-		var killErr error
-		if !alreadyClosed {
-			closeErr = s.ptmx.Close()
-			if s.cmd.Process != nil {
-				killErr = s.cmd.Process.Kill()
-			}
-		}
-		s.mu.Unlock()
-
+		s.beginClose()
+		s.closeProcessGroup()
+		<-s.processExited
+		s.closeMaster()
+		s.joinWriter()
 		<-s.done
-
-		if closeErr != nil && !errors.Is(closeErr, os.ErrClosed) {
-			s.closeErr = errors.Join(s.closeErr, fmt.Errorf("pty: close master: %w", closeErr))
-		}
-		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-			s.closeErr = errors.Join(s.closeErr, fmt.Errorf("pty: kill process: %w", killErr))
-		}
 	})
 	return s.closeErr
+}
+
+func waitForProcessGroupExit(pid int, grace time.Duration) (bool, error) {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	ticker := time.NewTicker(processGroupPollInterval)
+	defer ticker.Stop()
+
+	for {
+		alive, err := processGroupAlive(pid)
+		if err != nil {
+			return false, err
+		}
+		if !alive {
+			return true, nil
+		}
+		select {
+		case <-timer.C:
+			return false, nil
+		case <-ticker.C:
+		}
+	}
 }

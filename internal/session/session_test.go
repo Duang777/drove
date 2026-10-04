@@ -6,9 +6,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -376,7 +378,7 @@ func TestStopRejectsLiveAgentWithoutPTY(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restore test agent: %v", err)
 	}
-	manager.agents[restored.ID()] = restored
+	manager.agents[restored.ID()] = newManagedAgent(restored)
 
 	err = manager.Stop(restored.ID())
 	if err == nil || !strings.Contains(err.Error(), "working without a PTY") {
@@ -521,7 +523,7 @@ func TestTransitionPersistenceFailureLeavesAgentAndHubUnchanged(t *testing.T) {
 		agent.WithRunMode(agent.RunModeInteractive),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	subscription := manager.hub.Subscribe(1)
 	defer manager.hub.Unsubscribe(subscription)
@@ -589,9 +591,23 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	if rows[0].Seq != 1 ||
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
-		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"off","signal_injection":"off","signal_injection_status":"off","signal_injection_reason":"hook_policy_off"}` {
+		rows[0].SessionID != rows[0].AgentID {
 		t.Fatalf("creation event = %+v", rows[0])
+	}
+	var creation createdPayload
+	if err := json.Unmarshal([]byte(rows[0].Payload), &creation); err != nil {
+		t.Fatalf("decode creation event: %v", err)
+	}
+	if creation.Version != 2 ||
+		creation.Name != "broken-agent" ||
+		creation.Vendor != "generic" ||
+		creation.Mode == nil ||
+		*creation.Mode != agent.RunModeInteractive ||
+		creation.HookPolicy == nil ||
+		*creation.HookPolicy != agent.HooksOff ||
+		creation.WorkingDir == "" ||
+		!filepath.IsAbs(creation.WorkingDir) {
+		t.Fatalf("creation metadata = %+v", creation)
 	}
 	if rows[1].Seq != 2 ||
 		rows[1].Type != string(event.TypeStateChanged) ||
@@ -621,6 +637,265 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	}
 	if failedStatus.LastError == "" || failedStatus.LastError != rows[3].Payload {
 		t.Fatalf("failed session error = %q, event payload = %q", failedStatus.LastError, rows[3].Payload)
+	}
+}
+
+func TestStatusDerivesResumableFromCommittedStateAndCapability(t *testing.T) {
+	manager, _ := newTestManager(t)
+	claude := addStoppedAgent(t, manager, "claude-agent", "claude", "vendor-ref")
+	generic := addStoppedAgent(t, manager, "generic-agent", "generic", "vendor-ref")
+	missingRef := addStoppedAgent(t, manager, "missing-ref", "codex", "")
+
+	for _, test := range []struct {
+		id   agent.ID
+		want bool
+	}{
+		{id: claude.agent.ID(), want: true},
+		{id: generic.agent.ID(), want: false},
+		{id: missingRef.agent.ID(), want: false},
+	} {
+		status, err := manager.Status(test.id)
+		if err != nil {
+			t.Fatalf("status %q: %v", test.id, err)
+		}
+		if status.Resumable != test.want {
+			t.Fatalf("status %q resumable = %t, want %t", test.id, status.Resumable, test.want)
+		}
+	}
+
+	manager.mu.Lock()
+	manager.resuming[claude.agent.ID()] = struct{}{}
+	manager.mu.Unlock()
+	status, err := manager.Status(claude.agent.ID())
+	if err != nil {
+		t.Fatalf("status reserved agent: %v", err)
+	}
+	if status.Resumable {
+		t.Fatal("reserved agent is resumable")
+	}
+}
+
+func TestResumeUsesNativeCommandAndKeepsAgentID(t *testing.T) {
+	const terminationGrace = 3 * time.Second
+	manager, st := newTestManager(t, WithTerminationGrace(terminationGrace))
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+
+	status, err := manager.Resume(context.Background(), managed.agent.ID())
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if status.AgentID != string(managed.agent.ID()) ||
+		status.State != agent.StateWorking ||
+		status.Resumable {
+		t.Fatalf("resumed status = %+v", status)
+	}
+	if started.Command != "claude" ||
+		len(started.Args) != 2 ||
+		started.Args[0] != "--resume" ||
+		started.Args[1] != "vendor-ref" {
+		t.Fatalf("resume command = %q %q", started.Command, started.Args)
+	}
+	if started.TerminationGrace != terminationGrace {
+		t.Fatalf(
+			"termination grace = %v, want %v",
+			started.TerminationGrace,
+			terminationGrace,
+		)
+	}
+
+	persisted, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay persisted resume: %v", err)
+	}
+	if len(persisted) == 0 || !strings.Contains(persisted[0].Payload, "vendor-ref") {
+		t.Fatalf("persisted resume payload = %+v, want internal reference", persisted)
+	}
+	rows, err := manager.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("manager replay resume: %v", err)
+	}
+	if len(rows) != 4 ||
+		rows[0].Type != string(event.TypeAgentResumed) ||
+		rows[0].Payload != `{"version":1}` ||
+		strings.Contains(rows[0].Payload, "vendor-ref") ||
+		rows[1].From != string(agent.StateStopped) ||
+		rows[1].To != string(agent.StateStarting) ||
+		rows[2].Type != string(event.TypeAgentSignal) ||
+		rows[3].From != string(agent.StateStarting) ||
+		rows[3].To != string(agent.StateWorking) {
+		t.Fatalf("resume history = %+v", rows)
+	}
+}
+
+func TestBootstrapResumeUsesPersistedWorkingDirectory(t *testing.T) {
+	st := newTestStore(t)
+	base := time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC)
+	workingDir := t.TempDir()
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+				`"mode":"interactive","hook_policy":"auto",` +
+				`"working_dir":` + strconv.Quote(workingDir) + `}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "observed",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_ref":"vendor-ref",` +
+				`"confidence":1,"received_at":"2026-10-04T15:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+			Reason:    "test stopped",
+			Payload: `{"version":1,"source":"session","event":"session_stop",` +
+				`"confidence":1}`,
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+
+	result, err := Bootstrap(context.Background(), adapter.NewRegistry(), st)
+	if err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	if err := result.Manager.ConfigureSignalOrigin(&url.URL{
+		Scheme: "http",
+		Host:   "127.0.0.1:7373",
+	}); err != nil {
+		t.Fatalf("configure signal origin: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := result.Manager.Close(); err != nil {
+			t.Errorf("close restored manager: %v", err)
+		}
+	})
+	var started pty.Config
+	result.Manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+
+	if _, err := result.Manager.Resume(context.Background(), "agent-1"); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if started.Dir != workingDir {
+		t.Fatalf("resumed directory = %q, want %q", started.Dir, workingDir)
+	}
+}
+
+func TestResumeFailureReturnsAgentToResumableStoppedState(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "codex", "thread-ref")
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		return nil, errors.New("exec unavailable")
+	}
+
+	status, err := manager.Resume(context.Background(), managed.agent.ID())
+	if err == nil || !strings.Contains(err.Error(), "start pty") {
+		t.Fatalf("resume error = %v, want PTY startup error", err)
+	}
+	if status != nil {
+		t.Fatalf("resume status = %+v, want nil", status)
+	}
+	current, err := manager.Status(managed.agent.ID())
+	if err != nil {
+		t.Fatalf("status after failure: %v", err)
+	}
+	if current.State != agent.StateStopped || !current.Resumable || current.PID != 0 {
+		t.Fatalf("status after failed resume = %+v", current)
+	}
+
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay failed resume: %v", err)
+	}
+	if len(rows) != 5 ||
+		rows[0].Type != string(event.TypeAgentResumed) ||
+		rows[1].To != string(agent.StateStarting) ||
+		rows[2].Type != string(event.TypeAgentSignal) ||
+		rows[3].Type != string(event.TypeError) ||
+		rows[4].To != string(agent.StateStopped) {
+		t.Fatalf("failed resume history = %+v", rows)
+	}
+}
+
+func TestResumeRejectsUnknownUnsupportedAndReservedAgents(t *testing.T) {
+	manager, _ := newTestManager(t)
+	if _, err := manager.Resume(context.Background(), "missing"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("unknown resume error = %v, want ErrUnknownAgent", err)
+	}
+	generic := addStoppedAgent(t, manager, "generic-agent", "generic", "vendor-ref")
+	if _, err := manager.Resume(context.Background(), generic.agent.ID()); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("unsupported resume error = %v, want ErrResumeConflict", err)
+	}
+	claude := addStoppedAgent(t, manager, "claude-agent", "claude", "vendor-ref")
+	manager.mu.Lock()
+	manager.resuming[claude.agent.ID()] = struct{}{}
+	manager.mu.Unlock()
+	if _, err := manager.Resume(context.Background(), claude.agent.ID()); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("reserved resume error = %v, want ErrResumeConflict", err)
+	}
+}
+
+func TestResumeOnStartRunsEligibleAgentsInCreationOrderOnce(t *testing.T) {
+	manager, _ := newTestManager(t)
+	older := addStoppedAgent(t, manager, "older", "claude", "older-ref")
+	time.Sleep(time.Millisecond)
+	newer := addStoppedAgent(t, manager, "newer", "codex", "newer-ref")
+	manual := addStoppedAgent(t, manager, "manual", "claude", "manual-ref")
+	older.resumeOnStart = true
+	newer.resumeOnStart = true
+	var commands []string
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		commands = append(commands, strings.Join(append([]string{config.Command}, config.Args...), " "))
+		return &fakeProcessSession{}, nil
+	}
+
+	results := manager.ResumeOnStart(context.Background())
+	if len(results) != 2 ||
+		results[0].AgentID != older.agent.ID() ||
+		results[0].Err != nil ||
+		results[1].AgentID != newer.agent.ID() ||
+		results[1].Err != nil {
+		t.Fatalf("startup resume results = %+v", results)
+	}
+	if len(commands) != 2 ||
+		commands[0] != "claude --resume older-ref" ||
+		commands[1] != "codex resume newer-ref" {
+		t.Fatalf("startup resume commands = %#v", commands)
+	}
+	if second := manager.ResumeOnStart(context.Background()); len(second) != 0 {
+		t.Fatalf("second startup resume results = %+v, want none", second)
+	}
+	manualStatus, err := manager.Status(manual.agent.ID())
+	if err != nil {
+		t.Fatalf("manual status: %v", err)
+	}
+	if !manualStatus.Resumable {
+		t.Fatalf("manual status = %+v, want resumable", manualStatus)
 	}
 }
 
@@ -713,6 +988,56 @@ func TestStartPersistsAndReportsRunMode(t *testing.T) {
 	}
 	if metadata.Mode == nil || *metadata.Mode != agent.RunModeOneshot {
 		t.Fatalf("creation mode = %v, want %q", metadata.Mode, agent.RunModeOneshot)
+	}
+}
+
+func TestStartPersistsWorkingDirectoryPrivately(t *testing.T) {
+	manager, st := newTestManager(t)
+	workingDir := t.TempDir()
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	subscription := manager.hub.Subscribe(8)
+	defer manager.hub.Unsubscribe(subscription)
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Name:    "directory-agent",
+		Command: "/bin/cat",
+		Dir:     workingDir,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if started.Dir != workingDir {
+		t.Fatalf("started directory = %q, want %q", started.Dir, workingDir)
+	}
+
+	stored, err := st.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay stored events: %v", err)
+	}
+	if len(stored) == 0 || !strings.Contains(stored[0].Payload, workingDir) {
+		t.Fatalf("stored creation payload = %q, want private working directory", stored[0].Payload)
+	}
+
+	replayed, err := manager.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("manager replay: %v", err)
+	}
+	if len(replayed) == 0 || strings.Contains(replayed[0].Payload, workingDir) {
+		t.Fatalf("public replay exposed working directory: %+v", replayed)
+	}
+
+	select {
+	case published := <-subscription.C():
+		if published.Type != event.TypeSessionLifecycle ||
+			strings.Contains(published.Payload, workingDir) {
+			t.Fatalf("published creation event exposed working directory: %+v", published)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for published creation event")
 	}
 }
 
@@ -1028,6 +1353,68 @@ func TestSendInputValidatesBeforeLookingUpAgent(t *testing.T) {
 	}
 }
 
+func TestSendInputRejectsConcurrentAdmission(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("agent-1")
+	a := agent.New(
+		id,
+		agent.WithName("agent"),
+		agent.WithVendor("generic"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	running := &runningSession{process: &fakeProcessSession{writeN: 5}}
+	manager.mu.Lock()
+	manager.agents[id] = newManagedAgent(a)
+	manager.sessions[id] = running
+	manager.mu.Unlock()
+
+	running.inputMu.Lock()
+	result, err := manager.SendInput(id, []byte("input"))
+	running.inputMu.Unlock()
+	if !errors.Is(err, ErrInputBackpressure) {
+		t.Fatalf("send input error = %v, want ErrInputBackpressure", err)
+	}
+	if result.BytesWritten != 0 {
+		t.Fatalf("bytes written = %d, want 0", result.BytesWritten)
+	}
+}
+
+func TestClassifyInputWriteBackpressure(t *testing.T) {
+	t.Run("no bytes", func(t *testing.T) {
+		err := classifyInputWrite(
+			"agent-1",
+			0,
+			5,
+			pty.ErrWriteBackpressure,
+		)
+		if !errors.Is(err, ErrInputBackpressure) {
+			t.Fatalf("error = %v, want ErrInputBackpressure", err)
+		}
+		if errors.Is(err, ErrInputWrite) {
+			t.Fatalf("zero-byte backpressure also reported ErrInputWrite: %v", err)
+		}
+	})
+
+	t.Run("partial delivery", func(t *testing.T) {
+		err := classifyInputWrite(
+			"agent-1",
+			2,
+			5,
+			pty.ErrWriteBackpressure,
+		)
+		if !errors.Is(err, ErrInputBackpressure) ||
+			!errors.Is(err, ErrInputWrite) {
+			t.Fatalf(
+				"error = %v, want ErrInputBackpressure and ErrInputWrite",
+				err,
+			)
+		}
+		if !strings.Contains(err.Error(), "do not retry") {
+			t.Fatalf("partial-delivery error = %v, want do-not-retry guidance", err)
+		}
+	})
+}
+
 func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
 	manager, _ := newTestManager(t)
 	id := agent.ID("agent-1")
@@ -1039,7 +1426,7 @@ func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
 	)
 	process := &fakeProcessSession{writeN: 2, writeErr: errors.New("broken pipe")}
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.sessions[id] = &runningSession{process: process}
 	manager.mu.Unlock()
 
@@ -1049,6 +1436,9 @@ func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
 	}
 	if result.BytesWritten != 2 {
 		t.Fatalf("bytes written = %d, want 2", result.BytesWritten)
+	}
+	if !strings.Contains(err.Error(), "do not retry") {
+		t.Fatalf("partial write error = %v, want do-not-retry guidance", err)
 	}
 	rows, err := manager.Replay(string(id))
 	if err != nil {
@@ -1123,7 +1513,7 @@ func TestSendInputReportsDeliveredButUnaudited(t *testing.T) {
 	)
 	process := &fakeProcessSession{writeN: 5}
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.sessions[id] = &runningSession{process: process}
 	manager.mu.Unlock()
 	if err := st.Close(); err != nil {
@@ -1365,7 +1755,7 @@ func TestOutputAfterTerminalStateRemainsReplayable(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksOff),
 	)
 	manager.mu.Lock()
-	manager.agents[id] = a
+	manager.agents[id] = newManagedAgent(a)
 	manager.mu.Unlock()
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	commitTestState(t, manager, a, agent.StateWorking, "test working")
@@ -1485,17 +1875,56 @@ func waitForDetachedState(t *testing.T, manager *Manager, id agent.ID, want agen
 	}
 }
 
-func newTestManager(t *testing.T) (*Manager, *store.Store) {
+func newTestManager(
+	t *testing.T,
+	options ...ManagerOption,
+) (*Manager, *store.Store) {
 	t.Helper()
 
 	st := newTestStore(t)
-	manager := NewManager(adapter.NewRegistry(), event.NewHub(0), st, 0)
+	manager := NewManager(adapter.NewRegistry(), event.NewHub(0), st, 0, options...)
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)
 		}
 	})
 	return manager, st
+}
+
+func addStoppedAgent(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+	vendor string,
+	ref string,
+) *managedAgent {
+	t.Helper()
+	target := agent.New(
+		id,
+		agent.WithName(string(id)),
+		agent.WithVendor(vendor),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	prepared, err := target.Prepare(agent.MoveTo(
+		agent.StateStopped,
+		"test stopped",
+		agent.Evidence{
+			Source: agent.EvidenceSession, Event: "session_stop", Confidence: 1,
+		},
+	))
+	if err != nil {
+		t.Fatalf("prepare stopped agent: %v", err)
+	}
+	if err := target.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply stopped agent: %v", err)
+	}
+	managed := newManagedAgent(target)
+	managed.setVendorSessionReference(ref)
+	manager.mu.Lock()
+	manager.agents[id] = managed
+	manager.mu.Unlock()
+	return managed
 }
 
 func attachTestRuntime(
@@ -1506,7 +1935,11 @@ func attachTestRuntime(
 ) *runningSession {
 	t.Helper()
 
-	running, _, _, err := manager.prepareRuntime(a, entry)
+	managed, ok := manager.managed(a.ID())
+	if !ok {
+		t.Fatalf("managed agent %q is not registered", a.ID())
+	}
+	running, _, _, err := manager.prepareManagedRuntime(managed, entry)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}
@@ -1563,6 +1996,10 @@ func (s *fakeProcessSession) Close() error {
 
 func (s *fakeProcessSession) PID() int {
 	return 1
+}
+
+func (s *fakeProcessSession) Resize(uint16, uint16) error {
+	return nil
 }
 
 type cancelAfterAppendStore struct {

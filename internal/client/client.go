@@ -117,6 +117,20 @@ func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.
 	return &out, nil
 }
 
+// Resume starts a vendor-native process under an existing Agent ID.
+func (c *Client) Resume(ctx context.Context, id string) (*session.Status, error) {
+	var out session.Status
+	if err := c.postJSON(
+		ctx,
+		"/api/v1/agents/"+url.PathEscape(id)+"/resume",
+		struct{}{},
+		&out,
+	); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Stop 停止一个会话。
 func (c *Client) Stop(ctx context.Context, id string) error {
 	return c.delete(ctx, "/api/v1/agents/"+id)
