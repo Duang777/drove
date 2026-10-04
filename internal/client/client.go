@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -125,6 +126,75 @@ func (c *Client) Replay(ctx context.Context, id string) ([]store.EventRow, error
 		return nil, err
 	}
 	return out, nil
+}
+
+// Timeline returns the captured state and output-retention projection.
+func (c *Client) Timeline(
+	ctx context.Context,
+	id string,
+) (*recording.Timeline, error) {
+	var out recording.Timeline
+	if err := c.getJSON(
+		ctx,
+		"/api/v1/agents/"+url.PathEscape(id)+"/timeline",
+		&out,
+	); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// BlockedOccurrence returns one one-based Blocked interval and lead-in cursor.
+func (c *Client) BlockedOccurrence(
+	ctx context.Context,
+	id string,
+	number int,
+) (*recording.BlockedOccurrence, error) {
+	if number <= 0 {
+		return nil, fmt.Errorf(
+			"%w: %d",
+			recording.ErrInvalidBlockedOccurrence,
+			number,
+		)
+	}
+	path := fmt.Sprintf(
+		"/api/v1/agents/%s/timeline/blocked/%d",
+		url.PathEscape(id),
+		number,
+	)
+	var out recording.BlockedOccurrence
+	if err := c.getJSON(ctx, path, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Frame returns one exact bounded terminal frame.
+func (c *Client) Frame(
+	ctx context.Context,
+	id string,
+	selector recording.Selector,
+) (*recording.Frame, error) {
+	query := url.Values{}
+	switch selector.Kind() {
+	case recording.SelectorSequence:
+		sequence, _ := selector.Sequence()
+		query.Set("seq", sequence.String())
+	case recording.SelectorTime:
+		at, _ := selector.Time()
+		query.Set("at", at.UTC().Format(time.RFC3339Nano))
+	case recording.SelectorOutputOffset:
+		offset, _ := selector.OutputOffset()
+		query.Set("offset", offset.String())
+	default:
+		return nil, recording.ErrInvalidFrameSelector
+	}
+	path := "/api/v1/agents/" + url.PathEscape(id) + "/frame?" + query.Encode()
+	var out recording.Frame
+	if err := c.getJSON(ctx, path, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // Explain returns the daemon's typed, bounded explanation for one Agent.
@@ -310,6 +380,19 @@ func (c *Client) responseError(resp *http.Response, path string) error {
 	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode == http.StatusUnauthorized {
 		return fmt.Errorf("%w: %s", ErrUnauthorized, strings.TrimSpace(string(msg)))
+	}
+	if resp.StatusCode == http.StatusGone {
+		var payload struct {
+			Code      string                  `json:"code"`
+			SessionID string                  `json:"session_id"`
+			Missing   []recording.OutputRange `json:"missing"`
+		}
+		if json.Unmarshal(msg, &payload) == nil && payload.Code == "output_expired" {
+			return &recording.OutputExpiredError{
+				SessionID: payload.SessionID,
+				Missing:   payload.Missing,
+			}
+		}
 	}
 	return fmt.Errorf("client: %s %s: %s", resp.Status, path, string(msg))
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/Duang777/drove/internal/event"
@@ -33,8 +34,9 @@ type EventRow struct {
 
 // Store 封装 SQLite 存储。
 type Store struct {
-	db      *sql.DB
-	readers *sql.DB
+	db                  *sql.DB
+	readers             *sql.DB
+	retentionGeneration atomic.Uint64
 }
 
 const schemaVersion = 2
@@ -518,6 +520,9 @@ func (s *Store) PruneOutputAttachments(
 	if err != nil {
 		return 0, fmt.Errorf("store: count pruned output attachments: %w", err)
 	}
+	if deleted > 0 {
+		s.retentionGeneration.Add(1)
+	}
 
 	var busy, logFrames, checkpointedFrames int
 	if err := s.db.QueryRowContext(
@@ -533,6 +538,11 @@ func (s *Store) PruneOutputAttachments(
 		)
 	}
 	return deleted, nil
+}
+
+// OutputRetentionGeneration changes after output attachments are deleted.
+func (s *Store) OutputRetentionGeneration() uint64 {
+	return s.retentionGeneration.Load()
 }
 
 // Close 关闭数据库。

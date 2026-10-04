@@ -22,6 +22,7 @@ import (
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 )
 
@@ -77,6 +78,12 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
+	mux.HandleFunc("GET /api/v1/agents/{id}/timeline", s.handleTimeline)
+	mux.HandleFunc(
+		"GET /api/v1/agents/{id}/timeline/blocked/{number}",
+		s.handleBlockedOccurrence,
+	)
+	mux.HandleFunc("GET /api/v1/agents/{id}/frame", s.handleFrame)
 	mux.HandleFunc("GET /ws", s.handleWS)
 }
 
@@ -395,6 +402,142 @@ func (s *Server) handleReplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	timeline, err := s.opts.Manager.Timeline(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeRecordingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, timeline)
+}
+
+func (s *Server) handleBlockedOccurrence(w http.ResponseWriter, r *http.Request) {
+	number, err := strconv.Atoi(r.PathValue("number"))
+	if err != nil || number <= 0 {
+		writeErr(w, http.StatusBadRequest, "blocked occurrence must be one positive integer")
+		return
+	}
+	occurrence, err := s.opts.Manager.BlockedOccurrence(
+		r.Context(),
+		r.PathValue("id"),
+		number,
+	)
+	if err != nil {
+		writeRecordingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, occurrence)
+}
+
+func (s *Server) handleFrame(w http.ResponseWriter, r *http.Request) {
+	selector, err := parseFrameSelector(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	frame, err := s.opts.Manager.Frame(
+		r.Context(),
+		r.PathValue("id"),
+		selector,
+	)
+	if err != nil {
+		writeRecordingError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, frame)
+}
+
+func parseFrameSelector(r *http.Request) (recording.Selector, error) {
+	query := r.URL.Query()
+	for key := range query {
+		switch key {
+		case "seq", "at", "offset":
+		default:
+			return recording.Selector{}, fmt.Errorf(
+				"unsupported query parameter %q",
+				key,
+			)
+		}
+	}
+
+	var input recording.SelectorInput
+	if values, ok := query["seq"]; ok {
+		if len(values) != 1 || values[0] == "" {
+			return recording.Selector{}, errors.New(
+				"seq must be one canonical unsigned decimal",
+			)
+		}
+		sequence, err := recording.ParseSeq(values[0])
+		if err != nil {
+			return recording.Selector{}, err
+		}
+		input.Seq = &sequence
+	}
+	if values, ok := query["at"]; ok {
+		if len(values) != 1 || values[0] == "" {
+			return recording.Selector{}, errors.New(
+				"at must be one RFC3339 timestamp",
+			)
+		}
+		at, err := time.Parse(time.RFC3339Nano, values[0])
+		if err != nil {
+			return recording.Selector{}, fmt.Errorf(
+				"at must be one RFC3339 timestamp: %w",
+				err,
+			)
+		}
+		input.At = &at
+	}
+	if values, ok := query["offset"]; ok {
+		if len(values) != 1 || values[0] == "" {
+			return recording.Selector{}, errors.New(
+				"offset must be one canonical unsigned decimal",
+			)
+		}
+		offset, err := recording.ParseOutputOffset(values[0])
+		if err != nil {
+			return recording.Selector{}, err
+		}
+		input.Offset = &offset
+	}
+	selector, err := recording.NewSelector(input)
+	if err != nil {
+		return recording.Selector{}, fmt.Errorf(
+			"%w: %v",
+			recording.ErrInvalidFrameSelector,
+			err,
+		)
+	}
+	return selector, nil
+}
+
+func writeRecordingError(w http.ResponseWriter, err error) {
+	var expired *recording.OutputExpiredError
+	switch {
+	case errors.As(err, &expired):
+		writeJSON(w, http.StatusGone, struct {
+			Error     string                  `json:"error"`
+			Code      string                  `json:"code"`
+			SessionID string                  `json:"session_id"`
+			Missing   []recording.OutputRange `json:"missing"`
+		}{
+			Error:     err.Error(),
+			Code:      "output_expired",
+			SessionID: expired.SessionID,
+			Missing:   expired.Missing,
+		})
+	case errors.Is(err, recording.ErrUnknownSession),
+		errors.Is(err, recording.ErrBlockedOccurrenceNotFound):
+		writeErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, recording.ErrInvalidCursor),
+		errors.Is(err, recording.ErrInvalidFrameSelector),
+		errors.Is(err, recording.ErrInvalidBlockedOccurrence):
+		writeErr(w, http.StatusBadRequest, err.Error())
+	default:
+		writeErr(w, http.StatusInternalServerError, err.Error())
+	}
 }
 
 func isLoopbackRemote(remoteAddr string) bool {

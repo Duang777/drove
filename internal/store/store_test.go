@@ -1008,12 +1008,20 @@ func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T
 	if err != nil {
 		t.Fatalf("last seq before prune: %v", err)
 	}
+	beforeGeneration := s.OutputRetentionGeneration()
 	deleted, err := s.PruneOutputAttachments(context.Background(), cutoff)
 	if err != nil {
 		t.Fatalf("prune output attachments: %v", err)
 	}
 	if deleted != 1 {
 		t.Fatalf("deleted attachments = %d, want 1", deleted)
+	}
+	if got := s.OutputRetentionGeneration(); got != beforeGeneration+1 {
+		t.Fatalf(
+			"retention generation = %d, want %d",
+			got,
+			beforeGeneration+1,
+		)
 	}
 	afterLastSeq, err := s.LastSeq()
 	if err != nil {
@@ -1091,6 +1099,9 @@ func TestPruneOutputAttachmentsCheckpointsWALWhenNothingExpires(t *testing.T) {
 	}
 	if deleted != 0 {
 		t.Fatalf("deleted attachments = %d, want 0", deleted)
+	}
+	if got := s.OutputRetentionGeneration(); got != 0 {
+		t.Fatalf("retention generation = %d, want 0", got)
 	}
 	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
 		t.Fatalf("WAL size after truncate checkpoint = %d, want 0", info.Size())

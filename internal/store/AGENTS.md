@@ -25,7 +25,8 @@
 - sequence、timestamp 和 output-offset 解析都只读取被 captured sequence
   限定的不可变前缀。
 - `PruneOutputAttachments` 只删除截止时间前的 `output.chunk` 附件，保留所有 event
-  envelope，并在每次清理后执行 `wal_checkpoint(TRUNCATE)`。
+  envelope，并在每次清理后执行 `wal_checkpoint(TRUNCATE)`；实际删除后递增内存
+  retention generation，使精确帧缓存不能跨保留期变化复用。
 
 ## 约束
 

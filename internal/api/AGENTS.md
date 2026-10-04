@@ -15,6 +15,9 @@
   - `POST /api/v1/agents/{id}/signal`：接收 loopback vendor hook relay
   - `GET  /api/v1/agents/{id}/explain`：返回受限决策尾部与可选 attached screen
   - `GET  /api/v1/agents/{id}/events`：回放事件流（REST，JSON 数组）
+  - `GET  /api/v1/agents/{id}/timeline`：状态区间、Blocked 索引与输出保留范围
+  - `GET  /api/v1/agents/{id}/timeline/blocked/{number}`：一基 Blocked 跳转位置
+  - `GET  /api/v1/agents/{id}/frame`：按 seq、at 或 offset 精确重建受限终端帧
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
 - 所有 REST 与 WebSocket 请求必须先通过本地 Bearer 令牌认证；WebSocket 还要求 Origin 缺失或与配置的本地 Origin 精确匹配。
 - signal endpoint 是唯一例外：它只接受 loopback，并使用目标会话的内存 token，
@@ -27,6 +30,8 @@
   通过保留控制槽发送各订阅最后成功写出的 cursor，并以 1013 关闭。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload
   含 Base64 正文，过期回放只含 offset/len 元数据。
+- frame 只接受一个 selector；缺失录制返回 404，selector 错误返回 400，需要的
+  output 已过期时返回带 `output_expired` code 和 missing ranges 的 410。
 - 输入消息必须携带版本、连接内唯一 `request_id` 和 Agent ID；响应以同一 `request_id` 返回稳定 ack/error。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。

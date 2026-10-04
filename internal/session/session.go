@@ -148,6 +148,7 @@ type Manager struct {
 	hub       *event.Hub
 	store     *store.Store
 	committer *committer
+	archive   *recording.Archive
 
 	signalOrigin     string
 	originConfigured bool
@@ -200,6 +201,7 @@ func NewManager(
 	for _, option := range options {
 		option(manager)
 	}
+	manager.archive = recording.NewArchive(st, manager.committer)
 	return manager
 }
 
@@ -714,7 +716,7 @@ func (m *Manager) TailRaw(
 	sessionID string,
 	selector *recording.Selector,
 ) (*recording.RawTail, error) {
-	tail, err := recording.NewArchive(m.store, m.committer).TailRaw(
+	tail, err := m.archive.TailRaw(
 		ctx,
 		sessionID,
 		selector,
@@ -731,7 +733,7 @@ func (m *Manager) TailEvents(
 	sessionID string,
 	selector *recording.Selector,
 ) (*recording.EventTail, error) {
-	tail, err := recording.NewArchive(m.store, m.committer).TailEvents(
+	tail, err := m.archive.TailEvents(
 		ctx,
 		sessionID,
 		selector,
@@ -740,6 +742,53 @@ func (m *Manager) TailEvents(
 		return nil, fmt.Errorf("session: open event recording tail: %w", err)
 	}
 	return tail, nil
+}
+
+// Timeline returns a captured state and output-retention projection.
+func (m *Manager) Timeline(
+	ctx context.Context,
+	sessionID string,
+) (recording.Timeline, error) {
+	timeline, err := m.archive.Timeline(ctx, sessionID)
+	if err != nil {
+		return recording.Timeline{}, fmt.Errorf(
+			"session: read recording timeline: %w",
+			err,
+		)
+	}
+	return timeline, nil
+}
+
+// BlockedOccurrence returns one one-based Blocked interval and lead-in cursor.
+func (m *Manager) BlockedOccurrence(
+	ctx context.Context,
+	sessionID string,
+	number int,
+) (recording.BlockedOccurrence, error) {
+	occurrence, err := m.archive.Blocked(ctx, sessionID, number)
+	if err != nil {
+		return recording.BlockedOccurrence{}, fmt.Errorf(
+			"session: read Blocked occurrence: %w",
+			err,
+		)
+	}
+	return occurrence, nil
+}
+
+// Frame reconstructs one exact bounded terminal frame from recording origin.
+func (m *Manager) Frame(
+	ctx context.Context,
+	sessionID string,
+	selector recording.Selector,
+) (recording.Frame, error) {
+	frame, err := m.archive.Frame(ctx, sessionID, &selector)
+	if err != nil {
+		return recording.Frame{}, fmt.Errorf(
+			"session: replay terminal frame: %w",
+			err,
+		)
+	}
+	return frame, nil
 }
 
 // SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。

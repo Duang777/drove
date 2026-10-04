@@ -82,21 +82,24 @@ type rangeStore interface {
 		uint64,
 		uint64,
 	) (store.OutputOffsetPosition, bool, error)
+	OutputRetentionGeneration() uint64
 }
 
 // Archive reads immutable terminal recordings and follows their durable tail.
 type Archive struct {
-	store rangeStore
-	clock CommitClock
-	limit store.ReadLimit
+	store  rangeStore
+	clock  CommitClock
+	limit  store.ReadLimit
+	frames *frameCache
 }
 
 // NewArchive constructs a recording reader over a Store and commit clock.
 func NewArchive(st *store.Store, clock CommitClock) *Archive {
 	return &Archive{
-		store: st,
-		clock: clock,
-		limit: store.DefaultReadLimit(),
+		store:  st,
+		clock:  clock,
+		limit:  store.DefaultReadLimit(),
+		frames: newFrameCache(defaultFrameCacheEntries),
 	}
 }
 
