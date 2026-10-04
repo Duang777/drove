@@ -20,6 +20,9 @@
 - `Flush` 丢弃未结束的控制序列并重置解析器。
 - 普通 UTF-8 与无效的非控制字节都按原字节保留。
 - `Strip` / `StripString` 是完整输入的一次性接口。
+- `OSC9Scanner` 只在已提交的原始字节上识别 direct OSC 9 和 Codex 单层 tmux
+  passthrough；body 限制为 4 KiB，并携带结束位置的 output offset、提交序号和时间。
+- `OSC9Scanner` 不解释通知正文；厂商文案识别必须留在 `internal/adapter`。
 
 ## 约束
 
@@ -27,3 +30,4 @@
 - 不得向包外暴露 x/vt、x/ansi 或 ultraviolet 类型。
 - 查询应答只进入 controller 自有 mailbox，不得进入快照、输出或输入审计路径。
 - 清洗器只删除控制序列，不解释其语义。
+- OSC scanner 对畸形、超限和未结束帧静默丢弃，不得把正文写入错误。
