@@ -338,6 +338,19 @@ func TestEncodeSignalAuditSelectsVersionBySource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new notify signal: %v", err)
 	}
+	terminalAttribution, err := agent.NewTerminalAttribution("osc9", 4312, 918)
+	if err != nil {
+		t.Fatalf("new terminal attribution: %v", err)
+	}
+	terminalNotify, err := detect.NewTerminalNotifySignal(detect.Signal{
+		Kind: detect.KindPermissionRequested, Vendor: "codex",
+		VendorEvent: "tui_notification", Scope: detect.ScopeRoot,
+		Notification: "approval-requested", Evidence: "approval requested",
+		Confidence: 1, ReceivedAt: now, Terminal: &terminalAttribution,
+	})
+	if err != nil {
+		t.Fatalf("new terminal notify signal: %v", err)
+	}
 
 	for _, test := range []struct {
 		name    string
@@ -348,6 +361,10 @@ func TestEncodeSignalAuditSelectsVersionBySource(t *testing.T) {
 		{name: "heuristic v1", signal: heuristic, outcome: detect.OutcomeObserved, version: 1},
 		{name: "notify v2", signal: notify, outcome: detect.OutcomeCandidate, version: 2},
 		{name: "screen v3", signal: screen, outcome: detect.OutcomeCandidate, version: 3},
+		{
+			name: "terminal notify v4", signal: terminalNotify,
+			outcome: detect.OutcomeCandidate, version: 4,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			encoded, err := encodeSignalAudit(test.signal, test.outcome)
@@ -370,6 +387,15 @@ func TestEncodeSignalAuditSelectsVersionBySource(t *testing.T) {
 				}
 				if err := payload.Validate(); err != nil {
 					t.Fatalf("validate screen payload: %v", err)
+				}
+			}
+			if test.version == 4 {
+				var payload event.SignalPayloadV4
+				if err := json.Unmarshal(encoded, &payload); err != nil {
+					t.Fatalf("decode terminal payload: %v", err)
+				}
+				if err := payload.Validate(); err != nil {
+					t.Fatalf("validate terminal payload: %v", err)
 				}
 			}
 		})

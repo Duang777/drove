@@ -21,6 +21,8 @@
 - timeline 只依赖事件 envelope；输出附件过期后仍可读取。
 - timeline 的状态区间为半开区间，Blocked 使用一基序号并返回进入前 30 秒的跳转
   cursor；输出范围同时报告 retained 区间和合并后的 missing 区间。
+- timeline reader 接受 state evidence v1-v4；v4 terminal attribution 只影响来源
+  识别，不暴露 OSC 通知正文。
 - frame 始终从 40x120 原点精确回放；可见 snapshot 不得充当可恢复 checkpoint。
   只缓存完成的精确响应，key 包含目标 cursor、view bounds 和 Store retention
   generation；回放前后 generation 变化时丢弃结果并重试。

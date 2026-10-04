@@ -599,6 +599,17 @@ func encodeStateEvidence(evidence agent.Evidence) ([]byte, error) {
 		Confidence: evidence.Confidence,
 		DeliveryID: evidence.DeliveryID,
 	}
+	if evidence.Terminal != nil {
+		payload.Version = 4
+		versioned := event.StateEvidencePayloadV4{
+			StateEvidencePayloadV1: payload,
+			Terminal:               terminalAttributionPayload(evidence.Terminal),
+		}
+		if err := versioned.Validate(); err != nil {
+			return nil, err
+		}
+		return json.Marshal(versioned)
+	}
 	if evidence.Source == agent.EvidenceScreen {
 		payload.Version = 3
 		versioned := event.StateEvidencePayloadV3{

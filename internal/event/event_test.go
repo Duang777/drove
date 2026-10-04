@@ -730,6 +730,69 @@ func TestSignalPayloadV3ValidatesScreenOutcomes(t *testing.T) {
 	}
 }
 
+func TestSignalPayloadV4ValidatesTerminalNotify(t *testing.T) {
+	payload := SignalPayloadV4{
+		SignalPayloadV1: SignalPayloadV1{
+			Version:      4,
+			Source:       "notify",
+			Kind:         "permission_requested",
+			Vendor:       "codex",
+			VendorEvent:  "tui_notification",
+			Scope:        "root",
+			Notification: "approval-requested",
+			Evidence:     "approval requested",
+			Confidence:   1,
+			ReceivedAt: time.Date(
+				2026,
+				time.October,
+				5,
+				10,
+				0,
+				0,
+				0,
+				time.UTC,
+			).Format(time.RFC3339Nano),
+			Outcome: "candidate",
+		},
+		Terminal: &TerminalAttributionPayload{
+			Protocol:      "osc9",
+			OutputOffset:  4312,
+			LastOutputSeq: 918,
+		},
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate terminal notify: %v", err)
+	}
+
+	withDelivery := payload
+	withDelivery.DeliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	if err := withDelivery.Validate(); err == nil {
+		t.Fatal("terminal notify accepted delivery ID")
+	}
+	wrongKind := payload
+	wrongKind.Kind = "turn_stopped"
+	if err := wrongKind.Validate(); err == nil {
+		t.Fatal("terminal notify accepted turn_stopped")
+	}
+	missing := payload
+	missing.Terminal = nil
+	if err := missing.Validate(); err == nil {
+		t.Fatal("version 4 terminal notify accepted missing attribution")
+	}
+	foreign := payload
+	foreign.Source = "hook"
+	foreign.DeliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	if err := foreign.Validate(); err == nil {
+		t.Fatal("hook signal accepted terminal attribution")
+	}
+
+	legacyV2 := SignalPayloadV2(payload.SignalPayloadV1)
+	legacyV2.Version = 2
+	if err := legacyV2.Validate(); err == nil {
+		t.Fatal("version 2 accepted terminal notify semantics")
+	}
+}
+
 func TestStateEvidencePayloadV1Validation(t *testing.T) {
 	evidence := StateEvidencePayloadV1{
 		Version:    1,
@@ -784,6 +847,35 @@ func TestStateEvidencePayloadV3ValidatesScreenAttribution(t *testing.T) {
 	payload.Event = "claude.idle_prompt"
 	if err := payload.Validate(); err == nil {
 		t.Fatal("screen evidence accepted a mismatched event")
+	}
+}
+
+func TestStateEvidencePayloadV4ValidatesTerminalAttribution(t *testing.T) {
+	payload := StateEvidencePayloadV4{
+		StateEvidencePayloadV1: StateEvidencePayloadV1{
+			Version:    4,
+			Source:     "notify",
+			Event:      "tui_notification",
+			Confidence: 1,
+		},
+		Terminal: &TerminalAttributionPayload{
+			Protocol:      "osc9",
+			OutputOffset:  4312,
+			LastOutputSeq: 918,
+		},
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate terminal state evidence: %v", err)
+	}
+	withDelivery := payload
+	withDelivery.DeliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	if err := withDelivery.Validate(); err == nil {
+		t.Fatal("terminal state evidence accepted delivery ID")
+	}
+	foreign := payload
+	foreign.Source = "timer"
+	if err := foreign.Validate(); err == nil {
+		t.Fatal("timer state evidence accepted terminal attribution")
 	}
 }
 

@@ -18,6 +18,13 @@ hook JSON）的包。上层只接收规范化 hook signal 和 screen hint。
   prompt、tool input、transcript 和原始 JSON 不得越过本包。
 - Codex legacy notify 只保留 thread/turn ID 和枚举证据；内部任务标题 turn
   返回可忽略结果，不得激活 hook 或写审计事件。
+- Codex session plan 原子注入 legacy notify 与 approval-only OSC 9 配置；四个
+  managed config key 中任一被调用方设置时，整个计划返回冲突。
+- terminal notification normalizer 只接受 Codex 0.160.0 的三个固定 approval
+  前缀，并输出带 committed attribution 的枚举信号；正文不得越过本包。
+- 同一个 Codex normalizer 提供 session-local `term.OSC9Sanitizer` 工厂和安全
+  前缀；adapter 决定可保留语义，streaming framing 与等长替换仍由 `internal/term`
+  实现。
 - `Registry` 按厂商标识注册实现；`For(vendor)` 返回实现，未知厂商回退
   `generic`，即用户命令直接跑在 PTY 里且没有 screen rules。
 - 内置厂商：`claude`（claude CLI）、`codex`（codex CLI）、`generic`。ACP 厂商作为预留条目（`acp` 尚未启用）。
@@ -27,12 +34,14 @@ hook JSON）的包。上层只接收规范化 hook signal 和 screen hint。
 - 禁止在适配器之外引用厂商名做分支判断；新厂商只在本包加文件与注册。
 - `interactive` / `oneshot` 的厂商参数只允许在本包维护；自定义命令覆盖与退出语义由 session 负责。
 - 屏幕规则必须使用真实脱敏终端帧测试，覆盖命中、清除、误报和分块输入。
-- adapter 不清洗或改写持久化及流式输出；分类器只读取 `term.Snapshot`。
+- adapter 不直接清洗或改写持久化及流式输出；只向 session 提供厂商专属的
+  sanitizer policy。分类器只读取 `term.Snapshot`。
 - 状态判断只输出提示，最终迁移决定权在 `detect.Detector`。
 - `generic` 的屏幕分类器为空；Claude/Codex 的稳定规则名和静态证据必须保持可审计，
   不得把匹配文本、正则捕获或屏幕内容放进提示。
 - hook 查找必须使用 `Registry.Lookup` 精确匹配，禁止回退到 generic。
 - signal injection 同样只允许精确 adapter；参数冲突必须返回显式错误，禁止覆盖
-  调用方提供的 `--settings`、`--bare` 或 Codex `notify`。
+  调用方提供的 `--settings`、`--bare` 或 Codex managed notification key。
 - 导出类型以 `Registry`、`Entry`、`Runner`、`ScreenClassifier`、
-  `ScreenHint`、`HookInput`、`HookNormalizer` 和 `SignalInjector` 为核心。
+  `ScreenHint`、`HookInput`、`HookNormalizer`、`SignalInjector` 和
+  `TerminalNotificationNormalizer` 为核心。

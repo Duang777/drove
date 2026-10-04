@@ -49,9 +49,10 @@ type SignalInjectionFile struct {
 
 // SignalInjectionPlan is a complete vendor argument and file plan.
 type SignalInjectionPlan struct {
-	Args    []string
-	Files   []SignalInjectionFile
-	Channel SignalChannel
+	Args                  []string
+	Files                 []SignalInjectionFile
+	Channel               SignalChannel
+	TerminalNotifications bool
 }
 
 // SignalInjector plans process-local vendor signal configuration.
@@ -89,6 +90,11 @@ func injectSignals(
 		return SignalInjectionPlan{}, fmt.Errorf(
 			"adapter: invalid signal channel %q",
 			plan.Channel,
+		)
+	}
+	if plan.TerminalNotifications && plan.Channel != SignalChannelNotify {
+		return SignalInjectionPlan{}, errors.New(
+			"adapter: terminal notifications require the notify channel",
 		)
 	}
 	seen := make(map[string]struct{}, len(plan.Files))

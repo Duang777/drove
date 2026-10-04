@@ -8,12 +8,20 @@ import (
 
 type codexSignalInjector struct{}
 
+var codexManagedConfigKeys = map[string]struct{}{
+	"notify":                     {},
+	"tui.notifications":          {},
+	"tui.notification_method":    {},
+	"tui.notification_condition": {},
+}
+
 func (codexSignalInjector) InjectSignals(
 	request SignalInjectionRequest,
 ) (SignalInjectionPlan, error) {
-	if codexNotifyConflict(request.RequestArgs) {
+	if codexSignalInjectionConflict(request.BaseArgs) ||
+		codexSignalInjectionConflict(request.RequestArgs) {
 		return SignalInjectionPlan{}, fmt.Errorf(
-			"%w: notify is already set",
+			"%w: a managed Codex notification key is already set",
 			ErrSignalInjectionConflict,
 		)
 	}
@@ -26,29 +34,35 @@ func (codexSignalInjector) InjectSignals(
 	if err != nil {
 		return SignalInjectionPlan{}, err
 	}
-	args := make([]string, 0, len(request.BaseArgs)+len(request.RequestArgs)+2)
+	args := make([]string, 0, len(request.BaseArgs)+len(request.RequestArgs)+8)
 	args = append(args, "-c", "notify="+notify)
+	args = append(args, "-c", `tui.notifications=["approval-requested"]`)
+	args = append(args, "-c", `tui.notification_method="osc9"`)
+	args = append(args, "-c", `tui.notification_condition="always"`)
 	args = append(args, request.BaseArgs...)
 	args = append(args, request.RequestArgs...)
 	return SignalInjectionPlan{
-		Args:    args,
-		Channel: SignalChannelNotify,
+		Args:                  args,
+		Channel:               SignalChannelNotify,
+		TerminalNotifications: true,
 	}, nil
 }
 
-func codexNotifyConflict(args []string) bool {
+func codexSignalInjectionConflict(args []string) bool {
 	for index, arg := range args {
 		switch {
 		case arg == "-c" || arg == "--config":
-			if index+1 < len(args) && codexConfigKey(args[index+1]) == "notify" {
-				return true
+			if index+1 < len(args) {
+				if _, managed := codexManagedConfigKeys[codexConfigKey(args[index+1])]; managed {
+					return true
+				}
 			}
 		case strings.HasPrefix(arg, "-c="):
-			if codexConfigKey(strings.TrimPrefix(arg, "-c=")) == "notify" {
+			if _, managed := codexManagedConfigKeys[codexConfigKey(strings.TrimPrefix(arg, "-c="))]; managed {
 				return true
 			}
 		case strings.HasPrefix(arg, "--config="):
-			if codexConfigKey(strings.TrimPrefix(arg, "--config=")) == "notify" {
+			if _, managed := codexManagedConfigKeys[codexConfigKey(strings.TrimPrefix(arg, "--config="))]; managed {
 				return true
 			}
 		}

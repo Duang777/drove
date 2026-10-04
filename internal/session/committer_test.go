@@ -78,6 +78,10 @@ func TestEncodeStateEvidenceSelectsVersionBySource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new screen attribution: %v", err)
 	}
+	terminal, err := agent.NewTerminalAttribution("osc9", 5312, 1018)
+	if err != nil {
+		t.Fatalf("new terminal attribution: %v", err)
+	}
 	tests := []struct {
 		name     string
 		evidence agent.Evidence
@@ -106,6 +110,14 @@ func TestEncodeStateEvidenceSelectsVersionBySource(t *testing.T) {
 			},
 			version: 3,
 		},
+		{
+			name: "terminal notify v4",
+			evidence: agent.Evidence{
+				Source: agent.EvidenceNotify, Event: "tui_notification", Confidence: 1,
+				Terminal: &terminal,
+			},
+			version: 4,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -129,6 +141,15 @@ func TestEncodeStateEvidenceSelectsVersionBySource(t *testing.T) {
 				}
 				if err := payload.Validate(); err != nil {
 					t.Fatalf("validate screen evidence: %v", err)
+				}
+			}
+			if test.version == 4 {
+				var payload event.StateEvidencePayloadV4
+				if err := json.Unmarshal(encoded, &payload); err != nil {
+					t.Fatalf("decode terminal evidence: %v", err)
+				}
+				if err := payload.Validate(); err != nil {
+					t.Fatalf("validate terminal evidence: %v", err)
 				}
 			}
 		})

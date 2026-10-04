@@ -59,6 +59,7 @@ type outputProcessor struct {
 	running *runningSession
 
 	redactor            streamingRedactor
+	sanitizer           *term.OSC9Sanitizer
 	initialOutputOffset uint64
 	requests            chan outputRequest
 	done                chan struct{}
@@ -70,7 +71,8 @@ type outputProcessor struct {
 }
 
 type outputProcessorState struct {
-	redactor streamingRedactor
+	redactor  streamingRedactor
+	sanitizer *term.OSC9Sanitizer
 
 	nextSourceOffset uint64
 	nextOutputOffset uint64
@@ -104,11 +106,30 @@ func newOutputProcessorAtOffset(
 	signalToken string,
 	initialOutputOffset uint64,
 ) *outputProcessor {
+	return newOutputProcessorAtOffsetWithSanitizer(
+		manager,
+		id,
+		running,
+		signalToken,
+		initialOutputOffset,
+		nil,
+	)
+}
+
+func newOutputProcessorAtOffsetWithSanitizer(
+	manager *Manager,
+	id agent.ID,
+	running *runningSession,
+	signalToken string,
+	initialOutputOffset uint64,
+	sanitizer *term.OSC9Sanitizer,
+) *outputProcessor {
 	processor := &outputProcessor{
 		manager:             manager,
 		id:                  id,
 		running:             running,
 		redactor:            newStreamingRedactor([]byte(signalToken)),
+		sanitizer:           sanitizer,
 		initialOutputOffset: initialOutputOffset,
 		requests:            make(chan outputRequest, outputInboxSize),
 		done:                make(chan struct{}),
@@ -295,6 +316,7 @@ func (p *outputProcessor) run() {
 	}
 	state := outputProcessorState{
 		redactor:             p.redactor,
+		sanitizer:            p.sanitizer,
 		nextOutputOffset:     p.initialOutputOffset,
 		effectiveSize:        initialSize,
 		attachments:          make(map[AttachmentID]*attachmentState),
@@ -383,6 +405,9 @@ func (p *outputProcessor) feed(
 	state.nextSourceOffset += uint64(len(chunk))
 	state.pendingActivity++
 	output := state.redactor.Feed(chunk)
+	if state.sanitizer != nil {
+		output = state.sanitizer.Feed(output)
+	}
 	if len(output) == 0 {
 		return nil
 	}
@@ -406,6 +431,10 @@ func (p *outputProcessor) end(
 	}()
 
 	output := state.redactor.Flush()
+	if state.sanitizer != nil {
+		sanitized := state.sanitizer.Feed(output)
+		output = append(sanitized, state.sanitizer.Flush()...)
+	}
 	if len(output) > 0 {
 		if err := p.commitAndObserve(state, output); err != nil {
 			return err
@@ -479,6 +508,7 @@ func (p *outputProcessor) commitAndObserve(
 		)
 	}
 
+	var terminalObservations []detect.Observation
 	if p.running.terminal != nil {
 		chunk, err := term.NewCommittedChunk(
 			output,
@@ -489,10 +519,11 @@ func (p *outputProcessor) commitAndObserve(
 		if err != nil {
 			return p.failTerminal(state, "create committed chunk", err, true)
 		}
-		if err := p.running.terminal.FeedCommitted(
+		terminalObservations, err = p.running.terminal.FeedCommitted(
 			context.Background(),
 			chunk,
-		); err != nil {
+		)
+		if err != nil {
 			return p.failTerminal(state, "feed committed output", err, true)
 		}
 	}
@@ -511,6 +542,17 @@ func (p *outputProcessor) commitAndObserve(
 		}
 	}
 	state.pendingActivity = 0
+	for _, observation := range terminalObservations {
+		if !p.canObserve() {
+			break
+		}
+		if err := p.running.observer.Deliver(
+			context.Background(),
+			observation,
+		); err != nil {
+			break
+		}
+	}
 	return nil
 }
 

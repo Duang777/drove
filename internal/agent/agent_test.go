@@ -247,6 +247,53 @@ func TestScreenAttributionAndEvidenceValidation(t *testing.T) {
 	}
 }
 
+func TestTerminalAttributionAndNotifyEvidenceValidation(t *testing.T) {
+	attribution, err := NewTerminalAttribution("osc9", 4312, 918)
+	if err != nil {
+		t.Fatalf("new terminal attribution: %v", err)
+	}
+	evidence := Evidence{
+		Source:     EvidenceNotify,
+		Event:      "tui_notification",
+		Confidence: 1,
+		Terminal:   &attribution,
+	}
+	if err := evidence.Validate(); err != nil {
+		t.Fatalf("validate terminal evidence: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		change func(*TerminalAttribution)
+	}{
+		{name: "unknown protocol", change: func(a *TerminalAttribution) { a.Protocol = "osc777" }},
+		{name: "zero offset", change: func(a *TerminalAttribution) { a.OutputOffset = 0 }},
+		{name: "zero sequence", change: func(a *TerminalAttribution) { a.LastOutputSeq = 0 }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := attribution
+			test.change(&invalid)
+			candidate := evidence
+			candidate.Terminal = &invalid
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("invalid terminal attribution was accepted")
+			}
+		})
+	}
+
+	withDelivery := evidence
+	withDelivery.DeliveryID = "550e8400-e29b-41d4-a716-446655440000"
+	if err := withDelivery.Validate(); err == nil {
+		t.Fatal("terminal evidence accepted a delivery ID")
+	}
+	foreign := evidence
+	foreign.Source = EvidenceHook
+	if err := foreign.Validate(); err == nil {
+		t.Fatal("hook evidence accepted terminal attribution")
+	}
+}
+
 func TestLastTransitionCopiesScreenAttribution(t *testing.T) {
 	attribution, err := NewScreenAttribution(
 		"claude.idle_prompt",
@@ -300,6 +347,33 @@ func TestLastTransitionCopiesScreenAttribution(t *testing.T) {
 	second := target.LastTransition()
 	if second.Screen.Rule != "claude.idle_prompt" {
 		t.Fatalf("stored screen rule = %q, want copied attribution", second.Screen.Rule)
+	}
+}
+
+func TestLastTransitionCopiesTerminalAttribution(t *testing.T) {
+	attribution, err := NewTerminalAttribution("osc9", 12, 4)
+	if err != nil {
+		t.Fatalf("new terminal attribution: %v", err)
+	}
+	target := New("terminal-copy")
+	change := MoveTo(StateStarting, "start", Evidence{
+		Source:     EvidenceNotify,
+		Event:      "tui_notification",
+		Confidence: 1,
+		Terminal:   &attribution,
+	})
+	prepared, err := target.Prepare(change)
+	if err != nil {
+		t.Fatalf("prepare transition: %v", err)
+	}
+	if err := target.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply transition: %v", err)
+	}
+
+	exposed := target.LastTransition()
+	exposed.Terminal.OutputOffset = 99
+	if got := target.LastTransition().Terminal.OutputOffset; got != 12 {
+		t.Fatalf("stored output offset = %d, want 12", got)
 	}
 }
 

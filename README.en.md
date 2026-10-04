@@ -18,7 +18,7 @@
   <a href="LICENSE"><img alt="Apache-2.0" src="https://img.shields.io/github/license/Duang777/drove"></a>
 </p>
 
-Drove is a local daemon and CLI. It starts Claude Code, Codex, or any executable in a real PTY, appends the raw terminal bytes to SQLite, and reports one shared set of states.
+Drove is a local daemon and CLI. It starts Claude Code, Codex, or any executable in a real PTY, appends terminal bytes to SQLite, and reports one shared set of states.
 
 The recorder and single-session controls work today. `drove attach` connects to
 the live terminal. The Web detail page shows a live xterm.js terminal and exact
@@ -39,12 +39,13 @@ release binaries or multi-session TUI.
 | One PTY per agent, owned by `droved` | Shipped | `internal/pty` |
 | `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
 | Per-session Claude / Codex signal injection | Shipped | [#15](https://github.com/Duang777/drove/issues/15) |
-| Raw terminal bytes, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
+| Terminal byte recording, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` byte replay, `--plain` strips control sequences | Shipped | |
 | Unix local control, Host / Origin checks, cookie login, and token rotation | Shipped | [#21](https://github.com/Duang777/drove/issues/21) |
 | WebSocket v1 events and v2 per-session terminal streams, input, and resize | Shipped | [#19](https://github.com/Duang777/drove/issues/19) |
 | Web console: list, start, stop, live events, live terminal, exact playback | Shipped | `web/` |
 | Terminal emulation, query replies, screen rules, and `drove explain` | Shipped | [#14](https://github.com/Duang777/drove/issues/14), [spec 010](specs/010-terminal-screen-detection/spec.md) |
+| Codex approval-only OSC 9 Blocked candidate | Shipped | [#40](https://github.com/Duang777/drove/issues/40), [spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | State timeline, Blocked jumps, and exact terminal frames | Shipped | [#25](https://github.com/Duang777/drove/issues/25) |
 | `drove attach` and the Web xterm.js single-session terminal | Shipped | [#20](https://github.com/Duang777/drove/issues/20), [spec 012](specs/012-terminal-attach-web-playback/spec.md) |
 | Bubble Tea multi-session overview | Planned | [#41](https://github.com/Duang777/drove/issues/41) |
@@ -138,7 +139,7 @@ A per-session detector computes one decision. That decision is stored in SQLite,
 
 1. **Process.** Startup failure and exit override other signals. An interactive session ends as `stopped`. A successful `--oneshot` exit is `done`.
 2. **Claude command hooks.** After the first valid hook signal is committed, that session is hook-authoritative. The event kind selects Working, Blocked, or an Idle candidate. Idle has a 1 second confirmation window that later activity can cancel.
-3. **Codex notify.** This does not become hook authority and does not satisfy `--hooks required`. In fallback it is only a cancellable Idle candidate.
+3. **Codex notify and OSC 9.** Legacy notify is only a cancellable Idle candidate in fallback. Approval-only OSC 9 is a Blocked candidate, confirmed after 750 ms, only in fallback. Neither becomes hook authority or satisfies `--hooks required`.
 4. **Screen rules.** Before hooks activate, fallback uses stable Claude and Codex screen rules. After hooks are active, only two screen signals can change state: an approval prompt disappearing (Blocked to Working), and a Claude interrupt (Working to Idle). Other screen edges are stored with a `suppressed` outcome.
 
 `--hooks auto` is the default for Claude and Codex. It waits 5 seconds, then enters fallback if no valid native hook arrived. In fallback, 60 seconds of output silence can become an Idle candidate. `--hooks off` does not inject a reporter. `--hooks required` stops the session as `stopped` if no valid native hook arrives within 5 seconds. generic cannot select `required`.
@@ -182,15 +183,15 @@ multi-session overview is tracked by
 By default Drove only changes the process it starts. It does not edit `~/.claude`, `~/.codex`, or project config, and it does not accept workspace trust or hook trust for you.
 
 - Claude Code: a hooks-only file is written to `<data_dir>/sessions/<agent-id>/claude-settings.json` with mode `0600`, in a `0700` directory, and loaded with `--settings`. The directory is removed after the process exits.
-- Codex: `-c notify=[...]` is appended. No config file is written. notify only means a turn finished.
+- Codex: four `-c` settings atomically add legacy `notify` and approval-only OSC 9. No config file is written. notify means a turn finished; OSC 9 only provides a Blocked candidate for an approval wait.
 
 Both inherit `DROVE_AGENT_ID`, `DROVE_SIGNAL_URL`, and `DROVE_SIGNAL_TOKEN`. The signal endpoint accepts only loopback plus that session token. The event log does not store the raw payload, prompt, tool input, transcript, or token.
 
-If the caller already passed Claude `--bare` or `--settings`, or a Codex `notify` setting, Drove leaves it alone and records the injection as skipped. If the `drove` relay cannot be found, `auto` still starts the session. Manual setup is in the [hook guide](docs/hooks.md). A persistent installer is [#24](https://github.com/Duang777/drove/issues/24) and is not implemented. Codex OSC 9 notifications are not injected either.
+If the caller already passed Claude `--bare` or `--settings`, or any Codex `notify`, `tui.notifications`, `tui.notification_method`, or `tui.notification_condition` setting, Drove leaves it alone and skips the whole Codex injection plan. If the `drove` relay cannot be found, `auto` still starts the session. Manual setup is in the [hook guide](docs/hooks.md). A persistent installer is [#24](https://github.com/Duang777/drove/issues/24) and is not implemented.
 
 ### Recording
 
-New sessions store PTY output as `output.chunk` events with a byte offset. Older `output` line events remain readable; replay adds a newline to each of them. `drove log` keeps ANSI sequences and invalid bytes. Expired attachments produce no placeholder text.
+New sessions store PTY output as `output.chunk` events with a byte offset. Older `output` line events remain readable; replay adds a newline to each of them. `drove log` keeps ANSI sequences and invalid bytes. The only protocol-level exception is Drove-injected Codex OSC 9: the classification prefix remains, while free-form command, path, and server text is replaced byte-for-byte with `*` before persistence. Expired attachments produce no placeholder text.
 
 `GET /api/v1/agents/{id}/timeline` projects half-open state spans, output
 retention ranges, and Blocked occurrences from event envelopes.
@@ -249,7 +250,7 @@ and [#18](https://github.com/Duang777/drove/issues/18).
 | Launch | Interactive | `--oneshot` | State signal |
 | --- | --- | --- | --- |
 | `drove up claude` | `claude` | `claude --print` | Per-session command hooks |
-| `drove up codex` | `codex` | `codex exec` | Process-level notify; Idle only while in fallback |
+| `drove up codex` | `codex` | `codex exec` | Legacy notify provides Idle candidates; approval-only OSC 9 provides Blocked candidates |
 | `drove up <executable>` | Runs that file with no extra arguments | Successful exit is `done` | No hooks, empty screen classifier, `--hooks required` is rejected |
 
 ACP is not registered. `drove up acp` tries to execute a program named `acp`. It does not start an ACP adapter.
@@ -351,7 +352,7 @@ After the MVP: the shim in [#17](https://github.com/Duang777/drove/issues/17) / 
 
 Drove runs the vendor's own CLI and does not link a vendor SDK. What it offers today is a local event log, byte replay, and one set of state commands for Claude and Codex. It does not offer git worktrees, diff review, or a PR workflow.
 
-[herdr](https://herdr.dev/) is a TUI-centered tool whose public positioning keeps terminals in a background server after the client closes. Drove stores raw bytes and state events in local SQLite. Keeping the process alive after the daemon exits is not what Drove does today. Single-vendor background sessions, phone approval, and the official apps each cover that vendor's own agent.
+[herdr](https://herdr.dev/) is a TUI-centered tool whose public positioning keeps terminals in a background server after the client closes. Drove stores terminal bytes and state events in local SQLite. Keeping the process alive after the daemon exits is not what Drove does today. Single-vendor background sessions, phone approval, and the official apps each cover that vendor's own agent.
 
 ## Security
 
@@ -368,6 +369,7 @@ This is a single-user control plane on the local machine.
 - `agent.attachment` stores only the attached or detached action and the
   writable or read-only access. It stores no attachment ID or client identity.
 - Signal tokens in the output stream are redacted with an equal-length replacement.
+- Fully injected Codex OSC 9 retains only fixed approval classification prefixes. Free-form text is redacted before Store, Hub, replay, and raw tail.
 - There is no auto-approve. Phone approval is [#28](https://github.com/Duang777/drove/issues/28), and the default there is still not automatic approval.
 
 The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-state-and-control.md). The repository does not have a separate threat-model document.
@@ -383,7 +385,8 @@ The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-st
 | [spec 009](specs/009-raw-output-chunks/spec.md) | Raw bytes and retention |
 | [spec 010](specs/010-terminal-screen-detection/spec.md) | Screen detection, query replies, and explain |
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | Terminal streams, cursors, timeline, and exact frames |
-| [spec 012](specs/012-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
+| [spec 012, terminal attach](specs/012-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
+| [spec 012, Codex OSC 9](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 detection and body redaction |
 | [Technical notes](docs/technical-notes.md) | A point-in-time reading. Its opening says the first six sections are not current `main` |
 | [AGENTS.md](AGENTS.md) | Directory responsibilities and engineering constraints |
 

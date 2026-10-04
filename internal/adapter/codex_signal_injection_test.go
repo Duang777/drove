@@ -22,13 +22,21 @@ func TestCodexSignalInjectionPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("inject signals: %v", err)
 	}
-	if plan.Channel != SignalChannelNotify || len(plan.Files) != 0 {
+	if plan.Channel != SignalChannelNotify ||
+		!plan.TerminalNotifications ||
+		len(plan.Files) != 0 {
 		t.Fatalf("plan = %+v", plan)
 	}
-	if len(plan.Args) != 5 ||
+	if len(plan.Args) != 11 ||
 		plan.Args[0] != "-c" ||
-		plan.Args[2] != "exec" ||
-		!slices.Equal(plan.Args[3:], []string{"--model", "gpt-5"}) {
+		plan.Args[2] != "-c" ||
+		plan.Args[3] != `tui.notifications=["approval-requested"]` ||
+		plan.Args[4] != "-c" ||
+		plan.Args[5] != `tui.notification_method="osc9"` ||
+		plan.Args[6] != "-c" ||
+		plan.Args[7] != `tui.notification_condition="always"` ||
+		plan.Args[8] != "exec" ||
+		!slices.Equal(plan.Args[9:], []string{"--model", "gpt-5"}) {
 		t.Fatalf("args = %#v", plan.Args)
 	}
 	override := plan.Args[1]
@@ -48,24 +56,39 @@ func TestCodexSignalInjectionPlan(t *testing.T) {
 	}
 }
 
-func TestCodexSignalInjectionRejectsExistingNotify(t *testing.T) {
-	tests := [][]string{
-		{"-c", `notify=["other"]`},
-		{"--config", `notify = ["other"]`},
-		{`-c=notify=["other"]`},
-		{`--config=notify=["other"]`},
+func TestCodexSignalInjectionRejectsManagedKeys(t *testing.T) {
+	keys := []string{
+		"notify",
+		"tui.notifications",
+		"tui.notification_method",
+		"tui.notification_condition",
 	}
-	for _, args := range tests {
-		_, err := NewRegistry().For("codex").InjectSignals(
-			SignalInjectionRequest{
-				Mode:        agent.RunModeInteractive,
-				RequestArgs: args,
-				RelayPath:   "/tmp/drove",
-				SessionDir:  "/tmp/session",
-			},
-		)
-		if !errors.Is(err, ErrSignalInjectionConflict) {
-			t.Fatalf("args %v error = %v", args, err)
+	for _, key := range keys {
+		forms := [][]string{
+			{"-c", key + `="other"`},
+			{"--config", key + ` = "other"`},
+			{"-c=" + key + `="other"`},
+			{"--config=" + key + `="other"`},
+		}
+		for _, args := range forms {
+			for _, field := range []string{"base", "request"} {
+				t.Run(key+"/"+field+"/"+args[0], func(t *testing.T) {
+					request := SignalInjectionRequest{
+						Mode:       agent.RunModeInteractive,
+						RelayPath:  "/tmp/drove",
+						SessionDir: "/tmp/session",
+					}
+					if field == "base" {
+						request.BaseArgs = args
+					} else {
+						request.RequestArgs = args
+					}
+					_, err := NewRegistry().For("codex").InjectSignals(request)
+					if !errors.Is(err, ErrSignalInjectionConflict) {
+						t.Fatalf("args %v error = %v", args, err)
+					}
+				})
+			}
 		}
 	}
 }

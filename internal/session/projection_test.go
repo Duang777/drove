@@ -558,6 +558,87 @@ func TestRecoveryProjectorReadsScreenV3WithoutOutputAttachments(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorReadsTerminalV4(t *testing.T) {
+	base := time.Date(2026, time.October, 5, 10, 0, 0, 0, time.UTC)
+	terminal := &event.TerminalAttributionPayload{
+		Protocol:      "osc9",
+		OutputOffset:  4312,
+		LastOutputSeq: 918,
+	}
+	signalPayload, err := json.Marshal(event.SignalPayloadV4{
+		SignalPayloadV1: event.SignalPayloadV1{
+			Version: 4, Source: "notify", Kind: "permission_requested",
+			Vendor: "codex", VendorEvent: "tui_notification", Scope: "root",
+			Notification: "approval-requested", Evidence: "approval requested",
+			Confidence: 1, ReceivedAt: base.Format(time.RFC3339Nano),
+			Outcome: "candidate",
+		},
+		Terminal: terminal,
+	})
+	if err != nil {
+		t.Fatalf("encode terminal signal: %v", err)
+	}
+	statePayload, err := json.Marshal(event.StateEvidencePayloadV4{
+		StateEvidencePayloadV1: event.StateEvidencePayloadV1{
+			Version: 4, Source: "notify", Event: "tui_notification", Confidence: 1,
+		},
+		Terminal: terminal,
+	})
+	if err != nil {
+		t.Fatalf("encode terminal state evidence: %v", err)
+	}
+
+	projector := newRecoveryProjector()
+	rows := []store.EventRow{
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "created",
+			Payload: `{"version":1,"name":"agent","vendor":"codex"}`,
+		},
+		{
+			Seq: 2, Timestamp: base.Add(time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "pending", To: "starting",
+			Payload: `{"version":1,"source":"session","event":"session_start","confidence":1}`,
+		},
+		{
+			Seq: 3, Timestamp: base.Add(2 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "starting", To: "working",
+			Payload: `{"version":1,"source":"process","event":"process_started","confidence":1}`,
+		},
+		{
+			Seq: 4, Timestamp: base.Add(3 * time.Second), Type: string(event.TypeAgentSignal),
+			SessionID: "agent-1", AgentID: "agent-1", Payload: string(signalPayload),
+		},
+		{
+			Seq: 5, Timestamp: base.Add(4 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "working", To: "blocked",
+			Reason: "notify permission request confirmed", Payload: string(statePayload),
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	evidence := projector.sessions["agent-1"].lastTransition
+	if evidence == nil ||
+		evidence.Source != agent.EvidenceNotify ||
+		evidence.Event != "tui_notification" ||
+		evidence.DeliveryID != "" ||
+		evidence.Terminal == nil ||
+		evidence.Terminal.OutputOffset != terminal.OutputOffset {
+		t.Fatalf("terminal transition = %+v", evidence)
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if plan.Report.UnknownSignalPayloadVersions != 0 ||
+		plan.Report.UnknownStateEvidenceVersions != 0 {
+		t.Fatalf("report = %+v", plan.Report)
+	}
+}
+
 func TestRecoveryProjectorRejectsMalformedKnownScreenV3(t *testing.T) {
 	base := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
 	tests := []store.EventRow{

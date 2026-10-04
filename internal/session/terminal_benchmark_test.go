@@ -55,6 +55,7 @@ func BenchmarkTerminalActor32(b *testing.B) {
 				&terminalBenchmarkProcess{},
 				classifier,
 				nil,
+				nil,
 				"generic",
 				systemObservationClock{},
 				nil,
@@ -96,7 +97,7 @@ func BenchmarkTerminalActor32(b *testing.B) {
 						errors <- fmt.Errorf("actor %d create chunk: %w", index, err)
 						return
 					}
-					if err := actor.FeedCommitted(context.Background(), chunk); err != nil {
+					if _, err := actor.FeedCommitted(context.Background(), chunk); err != nil {
 						errors <- fmt.Errorf("actor %d feed chunk: %w", index, err)
 						return
 					}

@@ -789,7 +789,10 @@ func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 	)
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	managed := newManagedAgent(a)
-	running, _, _, err := manager.prepareManagedRuntime(managed, manager.reg.For("claude"))
+	running, _, _, err := manager.prepareManagedRuntime(
+		managed,
+		manager.reg.For("claude"),
+	)
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}
