@@ -2,14 +2,12 @@ package session
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
-	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/workspace"
 	"github.com/google/uuid"
 )
@@ -55,7 +53,9 @@ type workspaceLifecycle interface {
 		string,
 	) (workspace.Workspace, error)
 	Discard(context.Context, workspace.Workspace) error
-	Cleanup(context.Context, string, bool) (workspace.Workspace, error)
+	Remove(context.Context, string, bool) (workspace.RemovalResult, error)
+	ReconcileRemovals(context.Context) ([]workspace.Removal, error)
+	AcknowledgeRemoval(workspace.Removal) error
 }
 
 // WithWorkspaces enables managed Git worktrees below dataDir.
@@ -137,63 +137,110 @@ func (m *Manager) CleanupWorkspace(
 		return workspace.Workspace{}, ErrWorkspaceUnavailable
 	}
 	agentID := agent.ID(id)
-	if err := m.reserveWorkspaceCleanup(agentID); err != nil {
+	completion, err := m.reserveWorkspaceCleanup(agentID)
+	if err != nil {
 		return workspace.Workspace{}, err
 	}
-	defer m.releaseWorkspaceCleanup(agentID)
+	defer m.releaseWorkspaceCleanup(agentID, completion)
 
-	removed, err := m.workspaces.Cleanup(ctx, id, force)
-	switch {
-	case errors.Is(err, workspace.ErrDirty):
-		return workspace.Workspace{}, errors.Join(ErrWorkspaceDirty, err)
-	case errors.Is(err, workspace.ErrNotFound):
-		return workspace.Workspace{}, errors.Join(ErrWorkspaceNotFound, err)
-	case err != nil:
-		return workspace.Workspace{}, fmt.Errorf(
-			"session: cleanup workspace: %w",
-			err,
-		)
-	default:
-		known := m.markWorkspaceRemoved(agentID)
-		if !known {
-			return removed, nil
-		}
-		payload, encodeErr := json.Marshal(workspaceRemovedPayload{Version: 1})
-		if encodeErr != nil {
-			return workspace.Workspace{}, fmt.Errorf(
-				"session: encode workspace removal: %w",
-				encodeErr,
+	result, removalErr := m.workspaces.Remove(ctx, id, force)
+	removed := result.Removal.Workspace
+	switch result.State {
+	case workspace.RemovalUnchanged:
+		if removalErr == nil {
+			removalErr = errors.New(
+				"workspace removal stopped without changing physical state",
 			)
 		}
-		if _, commitErr := m.committer.CommitEvents(
-			context.Background(),
-			[]event.Draft{event.NewSessionLifecycleDraft(
-				id,
-				id,
-				workspaceRemovedReason,
-				string(payload),
-			)},
-		); commitErr != nil {
+		return workspace.Workspace{}, mapWorkspaceRemovalError(removalErr)
+	case workspace.RemovalPending:
+		if managed, known := m.managed(agentID); known {
+			managed.setWorkspaceRemovalPending()
+		}
+		if removalErr == nil {
+			removalErr = errors.New(
+				"workspace removal requires restart reconciliation",
+			)
+		}
+		return workspace.Workspace{}, fmt.Errorf(
+			"session: cleanup workspace pending: %w",
+			removalErr,
+		)
+	case workspace.RemovalComplete:
+	default:
+		return workspace.Workspace{}, fmt.Errorf(
+			"session: cleanup workspace returned invalid removal state %d",
+			result.State,
+		)
+	}
+
+	managed, known := m.managed(agentID)
+	if !known {
+		ackErr := m.workspaces.AcknowledgeRemoval(result.Removal)
+		if err := errors.Join(removalErr, ackErr); err != nil {
 			return workspace.Workspace{}, fmt.Errorf(
-				"session: persist workspace removal: %w",
-				commitErr,
+				"session: finalize orphan workspace removal: %w",
+				err,
 			)
 		}
 		return removed, nil
 	}
+	if managed.workspaceState().removed {
+		ackErr := m.workspaces.AcknowledgeRemoval(result.Removal)
+		if err := errors.Join(removalErr, ackErr); err != nil {
+			return workspace.Workspace{}, fmt.Errorf(
+				"session: acknowledge durable workspace removal: %w",
+				err,
+			)
+		}
+		return removed, nil
+	}
+	managed.setWorkspaceRemovalPending()
+	receipt, commitErr := m.committer.CommitWorkspaceRemoved(
+		context.Background(),
+		managed,
+	)
+	var acknowledgeErr error
+	if receipt.Durable {
+		acknowledgeErr = m.workspaces.AcknowledgeRemoval(result.Removal)
+	}
+	if err := errors.Join(removalErr, commitErr, acknowledgeErr); err != nil {
+		return workspace.Workspace{}, fmt.Errorf(
+			"session: persist workspace removal: %w",
+			err,
+		)
+	}
+	return removed, nil
 }
 
-func (m *Manager) reserveWorkspaceCleanup(id agent.ID) error {
+func mapWorkspaceRemovalError(err error) error {
+	switch {
+	case errors.Is(err, workspace.ErrDirty):
+		return errors.Join(ErrWorkspaceDirty, err)
+	case errors.Is(err, workspace.ErrNotFound):
+		return errors.Join(ErrWorkspaceNotFound, err)
+	default:
+		return fmt.Errorf("session: cleanup workspace: %w", err)
+	}
+}
+
+func (m *Manager) reserveWorkspaceCleanup(
+	id agent.ID,
+) (chan struct{}, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
-		return ErrManagerClosed
+		return nil, ErrManagerClosed
 	}
 	if _, cleaning := m.cleaning[id]; cleaning {
-		return fmt.Errorf("%w: agent %q cleanup is already running", ErrWorkspaceInUse, id)
+		return nil, fmt.Errorf(
+			"%w: agent %q cleanup is already running",
+			ErrWorkspaceInUse,
+			id,
+		)
 	}
 	if _, creating := m.creating[id]; creating {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"%w: agent %q is being created",
 			ErrWorkspaceInUse,
 			id,
@@ -205,7 +252,7 @@ func (m *Manager) reserveWorkspaceCleanup(id agent.ID) error {
 		state := managed.agent.State()
 		if attached || resuming ||
 			(state != agent.StateDone && state != agent.StateStopped) {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"%w: agent %q is %s",
 				ErrWorkspaceInUse,
 				id,
@@ -213,14 +260,23 @@ func (m *Manager) reserveWorkspaceCleanup(id agent.ID) error {
 			)
 		}
 	}
-	m.cleaning[id] = struct{}{}
-	return nil
+	completion := make(chan struct{})
+	m.cleanups.Add(1)
+	m.cleaning[id] = completion
+	return completion, nil
 }
 
-func (m *Manager) releaseWorkspaceCleanup(id agent.ID) {
+func (m *Manager) releaseWorkspaceCleanup(
+	id agent.ID,
+	completion chan struct{},
+) {
 	m.mu.Lock()
-	delete(m.cleaning, id)
+	if current, ok := m.cleaning[id]; ok && current == completion {
+		delete(m.cleaning, id)
+		close(completion)
+	}
 	m.mu.Unlock()
+	m.cleanups.Done()
 }
 
 func (m *Manager) reserveWorkspaceCreation(id agent.ID) {
@@ -235,16 +291,65 @@ func (m *Manager) releaseWorkspaceCreation(id agent.ID) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) markWorkspaceRemoved(id agent.ID) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	managed, ok := m.agents[id]
-	if !ok {
-		return false
+func (m *Manager) reconcileWorkspaceRemovals(
+	ctx context.Context,
+	metadata map[string]workspaceMetadata,
+) error {
+	if m.workspaces == nil {
+		return nil
 	}
-	managed.workspaceRemoved = true
-	managed.resumeOnStart = false
-	return true
+	removals, err := m.workspaces.ReconcileRemovals(ctx)
+	if err != nil {
+		return fmt.Errorf("session: reconcile physical workspace removals: %w", err)
+	}
+	for _, removal := range removals {
+		id := agent.ID(removal.Workspace.AgentID)
+		managed, known := m.managed(id)
+		if !known {
+			if err := m.workspaces.AcknowledgeRemoval(removal); err != nil {
+				return fmt.Errorf(
+					"session: acknowledge orphan workspace removal %q: %w",
+					id,
+					err,
+				)
+			}
+			continue
+		}
+		expected, ok := metadata[string(id)]
+		if !ok ||
+			expected.Repository != removal.Workspace.Repository ||
+			expected.Path != removal.Workspace.Path ||
+			expected.Branch != removal.Workspace.Branch {
+			return fmt.Errorf(
+				"session: workspace removal %q does not match session metadata",
+				id,
+			)
+		}
+		if managed.workspaceState().removed {
+			if err := m.workspaces.AcknowledgeRemoval(removal); err != nil {
+				return fmt.Errorf(
+					"session: acknowledge projected workspace removal %q: %w",
+					id,
+					err,
+				)
+			}
+			continue
+		}
+		managed.setWorkspaceRemovalPending()
+		receipt, commitErr := m.committer.CommitWorkspaceRemoved(ctx, managed)
+		var acknowledgeErr error
+		if receipt.Durable {
+			acknowledgeErr = m.workspaces.AcknowledgeRemoval(removal)
+		}
+		if err := errors.Join(commitErr, acknowledgeErr); err != nil {
+			return fmt.Errorf(
+				"session: reconcile workspace removal %q: %w",
+				id,
+				err,
+			)
+		}
+	}
+	return nil
 }
 
 func metadataForWorkspace(target *workspace.Workspace) *workspaceMetadata {

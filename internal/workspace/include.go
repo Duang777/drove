@@ -7,19 +7,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
 const worktreeIncludeFile = ".worktreeinclude"
 
-func (m *Manager) copyIncludedFiles(ctx context.Context, target Workspace) error {
+func (m *Manager) copyIncludedFiles(
+	target Workspace,
+	paths []string,
+) error {
 	sourceRoot := target.sourcePath
 	if sourceRoot == "" {
 		sourceRoot = target.Repository
-	}
-	paths, err := m.includedPaths(ctx, sourceRoot)
-	if err != nil {
-		return err
 	}
 	for _, relative := range paths {
 		if err := copyIncludedPath(
@@ -85,7 +85,14 @@ func (m *Manager) includedPaths(
 		}
 		paths = append(paths, relative)
 	}
-	return paths, nil
+	sort.Strings(paths)
+	unique := paths[:0]
+	for _, path := range paths {
+		if len(unique) == 0 || path != unique[len(unique)-1] {
+			unique = append(unique, path)
+		}
+	}
+	return unique, nil
 }
 
 func validateIncludedPath(path string) (string, error) {

@@ -9,20 +9,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const (
-	workspaceRecordSuffix  = ".workspace.json"
-	workspaceRecordVersion = 1
-	maxWorkspaceRecordSize = 64 * 1024
+	workspaceRecordSuffix        = ".workspace.json"
+	legacyWorkspaceRecordVersion = 1
+	workspaceRecordVersion       = 2
+	maxWorkspaceRecordSize       = 64 * 1024
 )
 
 type workspaceRecord struct {
-	Version    int    `json:"version"`
-	AgentID    string `json:"agent_id"`
-	Repository string `json:"repository"`
-	Path       string `json:"path"`
-	Branch     string `json:"branch"`
+	Version         int                     `json:"version"`
+	AgentID         string                  `json:"agent_id"`
+	Repository      string                  `json:"repository"`
+	Path            string                  `json:"path"`
+	Branch          string                  `json:"branch"`
+	ProtectionKnown bool                    `json:"protection_known"`
+	IncludedPaths   []string                `json:"included_paths"`
+	Removal         *workspaceRemovalRecord `json:"removal,omitempty"`
+}
+
+type workspaceRemovalRecord struct {
+	OperationID string `json:"operation_id"`
+	Force       bool   `json:"force"`
 }
 
 func workspaceRecordPath(worktreePath string) string {
@@ -40,18 +51,55 @@ func workspaceRecordAgentID(name string) (string, bool) {
 	return agentID, true
 }
 
-func (m *Manager) writeWorkspaceRecord(target Workspace) error {
-	recordPath := workspaceRecordPath(target.Path)
-	if err := ensureAbsent(recordPath); err != nil {
+func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecord {
+	return workspaceRecord{
+		Version:         workspaceRecordVersion,
+		AgentID:         target.AgentID,
+		Repository:      target.Repository,
+		Path:            target.Path,
+		Branch:          target.Branch,
+		ProtectionKnown: true,
+		IncludedPaths:   append([]string{}, includedPaths...),
+	}
+}
+
+func (r workspaceRecord) workspace() Workspace {
+	return Workspace{
+		AgentID:    r.AgentID,
+		Repository: r.Repository,
+		Path:       r.Path,
+		Branch:     r.Branch,
+	}
+}
+
+func (m *Manager) writeWorkspaceRecord(
+	target Workspace,
+	includedPaths []string,
+) error {
+	record := newWorkspaceRecord(target, includedPaths)
+	return m.installWorkspaceRecord(record, true)
+}
+
+func (m *Manager) replaceWorkspaceRecord(record workspaceRecord) error {
+	return m.installWorkspaceRecord(record, false)
+}
+
+func (m *Manager) installWorkspaceRecord(
+	record workspaceRecord,
+	requireAbsent bool,
+) error {
+	if err := m.validateWorkspaceRecord(record); err != nil {
 		return err
 	}
-	raw, err := json.Marshal(workspaceRecord{
-		Version:    workspaceRecordVersion,
-		AgentID:    target.AgentID,
-		Repository: target.Repository,
-		Path:       target.Path,
-		Branch:     target.Branch,
-	})
+	recordPath := workspaceRecordPath(record.Path)
+	if requireAbsent {
+		if err := ensureAbsent(recordPath); err != nil {
+			return err
+		}
+	} else if err := ensureRegularRecord(recordPath); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("workspace: encode record: %w", err)
 	}
@@ -94,7 +142,11 @@ func (m *Manager) writeWorkspaceRecord(target Workspace) error {
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("workspace: close temporary record %q: %w", recordPath, err)
 	}
-	if err := ensureAbsent(recordPath); err != nil {
+	if requireAbsent {
+		if err := ensureAbsent(recordPath); err != nil {
+			return err
+		}
+	} else if err := ensureRegularRecord(recordPath); err != nil {
 		return err
 	}
 	if err := os.Rename(temporaryPath, recordPath); err != nil {
@@ -103,6 +155,17 @@ func (m *Manager) writeWorkspaceRecord(target Workspace) error {
 	temporaryPath = ""
 	if err := syncDirectory(directory); err != nil {
 		return fmt.Errorf("workspace: sync record directory %q: %w", directory, err)
+	}
+	return nil
+}
+
+func ensureRegularRecord(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("workspace: inspect record %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("workspace: record %q is not a regular file", path)
 	}
 	return nil
 }
@@ -120,27 +183,27 @@ func syncDirectory(path string) (result error) {
 
 func (m *Manager) readWorkspaceRecord(
 	worktreePath string,
-) (Workspace, bool, error) {
+) (workspaceRecord, bool, error) {
 	recordPath := workspaceRecordPath(worktreePath)
 	info, err := os.Lstat(recordPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return Workspace{}, false, nil
+		return workspaceRecord{}, false, nil
 	}
 	if err != nil {
-		return Workspace{}, false, fmt.Errorf(
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: inspect record %q: %w",
 			recordPath,
 			err,
 		)
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return Workspace{}, false, fmt.Errorf(
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: record %q is not a regular file",
 			recordPath,
 		)
 	}
 	if info.Size() > maxWorkspaceRecordSize {
-		return Workspace{}, false, fmt.Errorf(
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: record %q exceeds %d bytes",
 			recordPath,
 			maxWorkspaceRecordSize,
@@ -148,7 +211,7 @@ func (m *Manager) readWorkspaceRecord(
 	}
 	raw, err := os.ReadFile(recordPath)
 	if err != nil {
-		return Workspace{}, false, fmt.Errorf(
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: read record %q: %w",
 			recordPath,
 			err,
@@ -158,57 +221,113 @@ func (m *Manager) readWorkspaceRecord(
 	decoder.DisallowUnknownFields()
 	var record workspaceRecord
 	if err := decoder.Decode(&record); err != nil {
-		return Workspace{}, false, fmt.Errorf(
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: decode record %q: %w",
 			recordPath,
 			err,
 		)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return Workspace{}, false, fmt.Errorf(
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: record %q has trailing data",
 			recordPath,
 		)
 	}
-	if record.Version != workspaceRecordVersion {
-		return Workspace{}, false, fmt.Errorf(
+	switch record.Version {
+	case legacyWorkspaceRecordVersion:
+		if record.ProtectionKnown ||
+			len(record.IncludedPaths) != 0 ||
+			record.Removal != nil {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: legacy record %q contains version 2 fields",
+				recordPath,
+			)
+		}
+	case workspaceRecordVersion:
+		if record.IncludedPaths == nil {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: version 2 record %q has no included paths",
+				recordPath,
+			)
+		}
+	default:
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: record %q has unsupported version %d",
 			recordPath,
 			record.Version,
 		)
 	}
-	target := Workspace{
-		AgentID:    record.AgentID,
-		Repository: record.Repository,
-		Path:       record.Path,
-		Branch:     record.Branch,
-	}
-	if filepath.Clean(worktreePath) != target.Path {
-		return Workspace{}, false, fmt.Errorf(
+	if filepath.Clean(worktreePath) != record.Path {
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: record %q path mismatch",
 			recordPath,
 		)
 	}
-	if target.Branch == "" {
-		return Workspace{}, false, fmt.Errorf(
-			"workspace: record %q has an empty branch",
-			recordPath,
-		)
-	}
-	if err := m.validateManagedPath(target); err != nil {
-		return Workspace{}, false, fmt.Errorf(
+	if err := m.validateWorkspaceRecord(record); err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: validate record %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	return target, true, nil
+	return record, true, nil
+}
+
+func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
+	if record.Version != legacyWorkspaceRecordVersion &&
+		record.Version != workspaceRecordVersion {
+		return fmt.Errorf("workspace: unsupported record version %d", record.Version)
+	}
+	target := record.workspace()
+	if err := m.validateManagedPath(target); err != nil {
+		return err
+	}
+	if target.Branch == "" {
+		return errors.New("workspace: record has an empty branch")
+	}
+	previous := ""
+	for index, rawPath := range record.IncludedPaths {
+		path, err := validateIncludedPath(rawPath)
+		if err != nil {
+			return err
+		}
+		if path != rawPath {
+			return fmt.Errorf(
+				"workspace: included path %q is not canonical",
+				rawPath,
+			)
+		}
+		if index > 0 && path <= previous {
+			return errors.New(
+				"workspace: included paths are not sorted and unique",
+			)
+		}
+		previous = path
+	}
+	if record.Removal != nil {
+		operationID, err := uuid.Parse(record.Removal.OperationID)
+		if err != nil || operationID.String() != record.Removal.OperationID {
+			return errors.New(
+				"workspace: removal operation ID is not a canonical UUID",
+			)
+		}
+	}
+	return nil
 }
 
 func removeWorkspaceRecord(worktreePath string) error {
 	recordPath := workspaceRecordPath(worktreePath)
-	if err := os.Remove(recordPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(recordPath); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
 		return fmt.Errorf("workspace: remove record %q: %w", recordPath, err)
+	}
+	if err := syncDirectory(filepath.Dir(recordPath)); err != nil {
+		return fmt.Errorf(
+			"workspace: sync record directory %q: %w",
+			filepath.Dir(recordPath),
+			err,
+		)
 	}
 	return nil
 }

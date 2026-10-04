@@ -247,6 +247,50 @@ func TestTypedCommitterStoreFailureLeavesAgentUnchanged(t *testing.T) {
 	}
 }
 
+func TestWorkspaceRemovalCommitAppliesManagedProjectionAfterStore(t *testing.T) {
+	managed := newManagedAgent(agent.New("agent-1"))
+	managed.setWorkspaceState(workspaceRuntimeState{
+		workingDir:     "/tmp/worktree",
+		resumeOnStart:  true,
+		removalPending: true,
+	})
+	st := &memoryCommitStore{}
+	st.onAppend = func() {
+		state := managed.workspaceState()
+		if state.removed || state.workingDir == "" {
+			t.Errorf("workspace projection changed before append: %+v", state)
+		}
+	}
+	hub := event.NewHub(0)
+	committer := newCommitter(0, st, hub)
+	defer committer.Close()
+
+	receipt, err := committer.CommitWorkspaceRemoved(
+		context.Background(),
+		managed,
+	)
+	if err != nil {
+		t.Fatalf("commit workspace removal: %v", err)
+	}
+	if !receipt.Durable || receipt.FirstSeq != 1 || receipt.LastSeq != 1 {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	state := managed.workspaceState()
+	if !state.removed ||
+		state.removalPending ||
+		state.resumeOnStart ||
+		state.workingDir != "" {
+		t.Fatalf("workspace projection = %+v", state)
+	}
+	rows := st.Rows()
+	if len(rows) != 1 ||
+		rows[0].Type != string(event.TypeSessionLifecycle) ||
+		rows[0].Reason != workspaceRemovedReason ||
+		rows[0].Payload != `{"version":1}` {
+		t.Fatalf("stored rows = %+v", rows)
+	}
+}
+
 func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 	a, err := agent.Restore(agent.RestoreSnapshot{
 		ID:         "agent-1",

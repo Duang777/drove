@@ -57,6 +57,7 @@ type sessionDraft struct {
 	lastStateGapGeneration uint64
 	vendorSessionRef       string
 	workingDir             string
+	workspace              *workspaceMetadata
 	workspaceRemoved       bool
 	hasCreated             bool
 	hasState               bool
@@ -66,6 +67,7 @@ type recoveryPlan struct {
 	Snapshots         []agent.RestoreSnapshot
 	VendorSessionRefs map[string]string
 	WorkingDirs       map[string]string
+	Workspaces        map[string]workspaceMetadata
 	ResumeOnStart     map[string]bool
 	WorkspaceRemoved  map[string]bool
 	Reconciliation    []store.EventRow
@@ -264,6 +266,10 @@ func (p *recoveryProjector) applyCreated(row store.EventRow) error {
 		metadata.WorkingDir,
 	); err != nil {
 		return projectionWrapError(row, "validate workspace metadata", err)
+	}
+	if metadata.Workspace != nil {
+		workspace := *metadata.Workspace
+		draft.workspace = &workspace
 	}
 
 	draft.name = metadata.Name
@@ -650,6 +656,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		Snapshots:         make([]agent.RestoreSnapshot, 0, len(drafts)),
 		VendorSessionRefs: make(map[string]string),
 		WorkingDirs:       make(map[string]string),
+		Workspaces:        make(map[string]workspaceMetadata),
 		ResumeOnStart:     make(map[string]bool),
 		WorkspaceRemoved:  make(map[string]bool),
 		Report:            p.report,
@@ -682,6 +689,9 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		}
 		if workingDir != "" {
 			plan.WorkingDirs[draft.id] = workingDir
+		}
+		if draft.workspace != nil {
+			plan.Workspaces[draft.id] = *draft.workspace
 		}
 		lastError := draft.lastError
 		updatedAt := draft.updatedAt

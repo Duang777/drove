@@ -374,7 +374,9 @@ func TestCleanupWorkspacePersistsRemovalAndDisablesResumeAfterRecovery(t *testin
 		t.Fatalf("persist resumable session history: %v", err)
 	}
 	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
-	managed.workingDir = "/tmp/drove-workspace"
+	managed.setWorkspaceState(workspaceRuntimeState{
+		workingDir: "/tmp/drove-workspace",
+	})
 	manager.workspaces = &fakeWorkspaceLifecycle{
 		cleanupResult: workspace.Workspace{
 			AgentID: string(id),
@@ -446,24 +448,508 @@ func TestCleanupWorkspacePersistsRemovalAndDisablesResumeAfterRecovery(t *testin
 	}
 }
 
+func TestCleanupWorkspaceStoreFailureReconcilesOnceAfterRestart(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	target := workspace.Workspace{
+		AgentID:    string(id),
+		Repository: "/tmp/repository",
+		Path:       "/tmp/drove-workspace",
+		Branch:     "feature/workspace",
+	}
+	persistStoppedWorkspaceHistory(t, manager, id, target)
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	managed.setWorkspaceState(workspaceRuntimeState{workingDir: target.Path})
+	workspaces := &fakeWorkspaceLifecycle{cleanupResult: target}
+	manager.workspaces = workspaces
+
+	lastSeq := manager.committer.HighWatermark()
+	manager.committer.Close()
+	appendErr := errors.New("workspace tombstone unavailable")
+	manager.committer = newCommitter(
+		lastSeq,
+		&failingCommitStore{commitStore: st, err: appendErr},
+		manager.hub,
+	)
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); !errors.Is(err, appendErr) {
+		t.Fatalf("cleanup error = %v, want append failure", err)
+	}
+	state := managed.workspaceState()
+	if !state.removalPending || state.removed || state.resumeOnStart {
+		t.Fatalf("workspace state after append failure = %+v", state)
+	}
+	if workspaces.acknowledgeCount != 0 {
+		t.Fatalf("append failure acknowledged removal %d times", workspaces.acknowledgeCount)
+	}
+
+	registry := manager.reg
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close failed manager: %v", err)
+	}
+	recoveryWorkspace := &fakeWorkspaceLifecycle{
+		reconcileResult: []workspace.Removal{{Workspace: target}},
+	}
+	recovered, err := Bootstrap(
+		context.Background(),
+		registry,
+		st,
+		withWorkspaceLifecycle(recoveryWorkspace),
+	)
+	if err != nil {
+		t.Fatalf("bootstrap pending removal: %v", err)
+	}
+	if recoveryWorkspace.acknowledgeCount != 1 {
+		t.Fatalf(
+			"recovery acknowledgement count = %d, want 1",
+			recoveryWorkspace.acknowledgeCount,
+		)
+	}
+	recoveredStatus, err := recovered.Manager.Status(id)
+	if err != nil {
+		t.Fatalf("recovered status: %v", err)
+	}
+	if recoveredStatus.Resumable || recoveredStatus.Dir != "" {
+		t.Fatalf("recovered status = %+v", recoveredStatus)
+	}
+	if err := recovered.Manager.Close(); err != nil {
+		t.Fatalf("close recovered manager: %v", err)
+	}
+
+	secondWorkspace := &fakeWorkspaceLifecycle{
+		reconcileResult: []workspace.Removal{{Workspace: target}},
+	}
+	second, err := Bootstrap(
+		context.Background(),
+		registry,
+		st,
+		withWorkspaceLifecycle(secondWorkspace),
+	)
+	if err != nil {
+		t.Fatalf("second bootstrap: %v", err)
+	}
+	defer second.Manager.Close()
+	rows, err := st.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay reconciled history: %v", err)
+	}
+	removedEvents := 0
+	for _, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) &&
+			row.Reason == workspaceRemovedReason {
+			removedEvents++
+		}
+	}
+	if removedEvents != 1 || secondWorkspace.acknowledgeCount != 1 {
+		t.Fatalf(
+			"removed events = %d, second acknowledgements = %d",
+			removedEvents,
+			secondWorkspace.acknowledgeCount,
+		)
+	}
+}
+
+func TestCleanupWorkspaceAcknowledgesAfterDurablePublishFailure(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	target := workspace.Workspace{
+		AgentID:    string(id),
+		Repository: "/tmp/repository",
+		Path:       "/tmp/drove-workspace",
+		Branch:     "feature/workspace",
+	}
+	persistStoppedWorkspaceHistory(t, manager, id, target)
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	managed.setWorkspaceState(workspaceRuntimeState{workingDir: target.Path})
+	workspaces := &fakeWorkspaceLifecycle{cleanupResult: target}
+	manager.workspaces = workspaces
+	manager.hub.Close()
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); !errors.Is(err, event.ErrHubClosed) {
+		t.Fatalf("cleanup error = %v, want closed Hub", err)
+	}
+	if workspaces.acknowledgeCount != 1 {
+		t.Fatalf("durable removal acknowledgement count = %d", workspaces.acknowledgeCount)
+	}
+	state := managed.workspaceState()
+	if !state.removed || state.removalPending || state.workingDir != "" {
+		t.Fatalf("workspace state after publish failure = %+v", state)
+	}
+	rows, err := st.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay durable removal: %v", err)
+	}
+	if rows[len(rows)-1].Reason != workspaceRemovedReason {
+		t.Fatalf("durable history = %+v", rows)
+	}
+}
+
+func TestCleanupWorkspaceRetriesAcknowledgementWithoutDuplicateEvent(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	target := workspace.Workspace{
+		AgentID:    string(id),
+		Repository: "/tmp/repository",
+		Path:       "/tmp/drove-workspace",
+		Branch:     "feature/workspace",
+	}
+	persistStoppedWorkspaceHistory(t, manager, id, target)
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	managed.setWorkspaceState(workspaceRuntimeState{workingDir: target.Path})
+	ackErr := errors.New("sidecar unlink unavailable")
+	workspaces := &fakeWorkspaceLifecycle{
+		cleanupResult:  target,
+		acknowledgeErr: ackErr,
+	}
+	manager.workspaces = workspaces
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); !errors.Is(err, ackErr) {
+		t.Fatalf("first cleanup error = %v, want acknowledgement failure", err)
+	}
+	workspaces.acknowledgeErr = nil
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); err != nil {
+		t.Fatalf("retry cleanup: %v", err)
+	}
+	rows, err := st.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay cleanup history: %v", err)
+	}
+	removedEvents := 0
+	for _, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) &&
+			row.Reason == workspaceRemovedReason {
+			removedEvents++
+		}
+	}
+	if removedEvents != 1 || workspaces.acknowledgeCount != 2 {
+		t.Fatalf(
+			"removed events = %d, acknowledgement count = %d",
+			removedEvents,
+			workspaces.acknowledgeCount,
+		)
+	}
+}
+
+func TestManagerCloseWaitsForWorkspaceCleanupCommit(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupStarted: cleanupStarted,
+		releaseCleanup: releaseCleanup,
+		cleanupResult: workspace.Workspace{
+			AgentID: string(id),
+			Branch:  "feature/cleanup",
+		},
+	}
+
+	cleanupResult := make(chan error, 1)
+	go func() {
+		_, err := manager.CleanupWorkspace(context.Background(), string(id), false)
+		cleanupResult <- err
+	}()
+	<-cleanupStarted
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- manager.Close()
+	}()
+	select {
+	case err := <-closeResult:
+		t.Fatalf("manager closed before cleanup completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCleanup)
+	if err := <-cleanupResult; err != nil {
+		t.Fatalf("cleanup workspace: %v", err)
+	}
+	if err := <-closeResult; err != nil {
+		t.Fatalf("close manager: %v", err)
+	}
+}
+
+func TestPendingWorkspaceRemovalBlocksManualAndStartupResume(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupState: workspace.RemovalPending,
+		cleanupErr:   errors.New("partial physical removal"),
+		cleanupResult: workspace.Workspace{
+			AgentID: string(id),
+			Branch:  "feature/cleanup",
+		},
+	}
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		true,
+	); err == nil {
+		t.Fatal("pending cleanup returned success")
+	}
+	if _, err := manager.Resume(context.Background(), id); !errors.Is(
+		err,
+		ErrResumeConflict,
+	) {
+		t.Fatalf("manual resume error = %v, want conflict", err)
+	}
+	if results := manager.ResumeOnStart(context.Background()); len(results) != 0 {
+		t.Fatalf("startup resume results = %+v, want none", results)
+	}
+}
+
+func TestStartupResumeWaitsForFailedWorkspaceCleanup(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupStarted: cleanupStarted,
+		releaseCleanup: releaseCleanup,
+		cleanupState:   workspace.RemovalUnchanged,
+		cleanupErr:     workspace.ErrDirty,
+	}
+	startedPTY := make(chan struct{}, 1)
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		startedPTY <- struct{}{}
+		return &fakeProcessSession{}, nil
+	}
+
+	cleanupResult := make(chan error, 1)
+	go func() {
+		_, err := manager.CleanupWorkspace(context.Background(), string(id), false)
+		cleanupResult <- err
+	}()
+	<-cleanupStarted
+	resumeResult := make(chan []StartupResumeResult, 1)
+	go func() {
+		resumeResult <- manager.ResumeOnStart(context.Background())
+	}()
+	close(releaseCleanup)
+	if err := <-cleanupResult; !errors.Is(err, ErrWorkspaceDirty) {
+		t.Fatalf("cleanup error = %v, want dirty workspace", err)
+	}
+	results := <-resumeResult
+	if len(results) != 1 || results[0].AgentID != id || results[0].Err != nil {
+		t.Fatalf("startup resume results = %+v", results)
+	}
+	select {
+	case <-startedPTY:
+	default:
+		t.Fatal("startup resume did not start the PTY")
+	}
+}
+
+func TestSuccessfulWorkspaceCleanupPreventsWaitingStartupResume(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupStarted: cleanupStarted,
+		releaseCleanup: releaseCleanup,
+		cleanupResult: workspace.Workspace{
+			AgentID: string(id),
+			Branch:  "feature/cleanup",
+		},
+	}
+	startedPTY := make(chan struct{}, 1)
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		startedPTY <- struct{}{}
+		return &fakeProcessSession{}, nil
+	}
+
+	cleanupResult := make(chan error, 1)
+	go func() {
+		_, err := manager.CleanupWorkspace(context.Background(), string(id), false)
+		cleanupResult <- err
+	}()
+	<-cleanupStarted
+	resumeResult := make(chan []StartupResumeResult, 1)
+	go func() {
+		resumeResult <- manager.ResumeOnStart(context.Background())
+	}()
+	close(releaseCleanup)
+	if err := <-cleanupResult; err != nil {
+		t.Fatalf("cleanup workspace: %v", err)
+	}
+	if results := <-resumeResult; len(results) != 0 {
+		t.Fatalf("startup resume results = %+v, want none", results)
+	}
+	select {
+	case <-startedPTY:
+		t.Fatal("startup resume started after successful cleanup")
+	default:
+	}
+}
+
+func TestCanceledStartupResumeDoesNotConsumeCandidate(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupStarted: cleanupStarted,
+		releaseCleanup: releaseCleanup,
+		cleanupState:   workspace.RemovalUnchanged,
+		cleanupErr:     workspace.ErrDirty,
+	}
+
+	cleanupResult := make(chan error, 1)
+	go func() {
+		_, err := manager.CleanupWorkspace(context.Background(), string(id), false)
+		cleanupResult <- err
+	}()
+	<-cleanupStarted
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	results := manager.ResumeOnStart(ctx)
+	if len(results) != 1 || !errors.Is(results[0].Err, context.DeadlineExceeded) {
+		t.Fatalf("canceled startup resume results = %+v", results)
+	}
+	if !managed.shouldResumeOnStart() {
+		t.Fatal("canceled startup resume consumed its candidate")
+	}
+	close(releaseCleanup)
+	if err := <-cleanupResult; !errors.Is(err, ErrWorkspaceDirty) {
+		t.Fatalf("cleanup error = %v, want dirty workspace", err)
+	}
+}
+
+func persistStoppedWorkspaceHistory(
+	t *testing.T,
+	manager *Manager,
+	id agent.ID,
+	target workspace.Workspace,
+) {
+	t.Helper()
+	mode := agent.RunModeInteractive
+	policy := agent.HooksOff
+	created, err := json.Marshal(createdPayload{
+		Version:    2,
+		Name:       "workspace-agent",
+		Vendor:     "claude",
+		Mode:       &mode,
+		HookPolicy: &policy,
+		WorkingDir: target.Path,
+		Workspace: &workspaceMetadata{
+			Repository: target.Repository,
+			Path:       target.Path,
+			Branch:     target.Branch,
+		},
+	})
+	if err != nil {
+		t.Fatalf("encode creation metadata: %v", err)
+	}
+	resumed, err := json.Marshal(event.AgentResumedPayloadV1{
+		Version:          1,
+		VendorSessionRef: "vendor-session",
+	})
+	if err != nil {
+		t.Fatalf("encode resume metadata: %v", err)
+	}
+	if _, err := manager.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{
+			event.NewSessionLifecycleDraft(
+				string(id),
+				string(id),
+				"created",
+				string(created),
+			),
+			event.NewStateChangedDraft(
+				string(id),
+				string(id),
+				string(agent.StatePending),
+				string(agent.StateStopped),
+				"test stopped",
+				"",
+			),
+			event.NewAgentResumedDraft(
+				string(id),
+				string(id),
+				string(resumed),
+			),
+		},
+	); err != nil {
+		t.Fatalf("persist workspace history: %v", err)
+	}
+}
+
+func withWorkspaceLifecycle(lifecycle workspaceLifecycle) ManagerOption {
+	return func(manager *Manager) {
+		manager.workspaces = lifecycle
+	}
+}
+
+type failingCommitStore struct {
+	commitStore
+	err error
+}
+
+func (s *failingCommitStore) AppendEvents(
+	context.Context,
+	uint64,
+	[]store.EventRow,
+) (uint64, error) {
+	return 0, s.err
+}
+
 type fakeWorkspaceLifecycle struct {
 	prepared workspace.Workspace
 
-	prepareSource  string
-	prepareBranch  string
-	prepareAgentID string
-	prepareErr     error
-	prepareStarted chan struct{}
-	releasePrepare chan struct{}
-	discardCount   int
-	discarded      workspace.Workspace
-	cleanupCount   int
-	cleanupAgentID string
-	cleanupForce   bool
-	cleanupStarted chan struct{}
-	releaseCleanup chan struct{}
-	cleanupResult  workspace.Workspace
-	cleanupErr     error
+	prepareSource    string
+	prepareBranch    string
+	prepareAgentID   string
+	prepareErr       error
+	prepareStarted   chan struct{}
+	releasePrepare   chan struct{}
+	discardCount     int
+	discarded        workspace.Workspace
+	cleanupCount     int
+	cleanupAgentID   string
+	cleanupForce     bool
+	cleanupStarted   chan struct{}
+	releaseCleanup   chan struct{}
+	cleanupResult    workspace.Workspace
+	cleanupState     workspace.RemovalState
+	cleanupErr       error
+	acknowledgeErr   error
+	acknowledgeCount int
+	reconcileResult  []workspace.Removal
+	reconcileErr     error
 }
 
 func (f *fakeWorkspaceLifecycle) Prepare(
@@ -502,11 +988,11 @@ func (f *fakeWorkspaceLifecycle) Discard(
 	return nil
 }
 
-func (f *fakeWorkspaceLifecycle) Cleanup(
+func (f *fakeWorkspaceLifecycle) Remove(
 	ctx context.Context,
 	agentID string,
 	force bool,
-) (workspace.Workspace, error) {
+) (workspace.RemovalResult, error) {
 	f.cleanupCount++
 	f.cleanupAgentID = agentID
 	f.cleanupForce = force
@@ -516,9 +1002,27 @@ func (f *fakeWorkspaceLifecycle) Cleanup(
 	if f.releaseCleanup != nil {
 		select {
 		case <-ctx.Done():
-			return workspace.Workspace{}, ctx.Err()
+			return workspace.RemovalResult{}, ctx.Err()
 		case <-f.releaseCleanup:
 		}
 	}
-	return f.cleanupResult, f.cleanupErr
+	state := f.cleanupState
+	if state == workspace.RemovalUnchanged && f.cleanupErr == nil {
+		state = workspace.RemovalComplete
+	}
+	return workspace.RemovalResult{
+		Removal: workspace.Removal{Workspace: f.cleanupResult},
+		State:   state,
+	}, f.cleanupErr
+}
+
+func (f *fakeWorkspaceLifecycle) ReconcileRemovals(
+	context.Context,
+) ([]workspace.Removal, error) {
+	return append([]workspace.Removal(nil), f.reconcileResult...), f.reconcileErr
+}
+
+func (f *fakeWorkspaceLifecycle) AcknowledgeRemoval(workspace.Removal) error {
+	f.acknowledgeCount++
+	return f.acknowledgeErr
 }

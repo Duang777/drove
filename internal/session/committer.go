@@ -125,6 +125,12 @@ type decisionOperation struct {
 
 func (decisionOperation) isCommitOperation() {}
 
+type workspaceRemovedOperation struct {
+	managed *managedAgent
+}
+
+func (workspaceRemovedOperation) isCommitOperation() {}
+
 type commitRequest struct {
 	operation commitOperation
 	result    chan commitResult
@@ -247,6 +253,19 @@ func (c *committer) CommitDecision(
 		ctx,
 		newDecisionOperation(target, state, decision, drafts),
 	)
+	return result.receipt, err
+}
+
+func (c *committer) CommitWorkspaceRemoved(
+	ctx context.Context,
+	target *managedAgent,
+) (commitReceipt, error) {
+	if target == nil || target.agent == nil {
+		return commitReceipt{}, errors.New(
+			"session: workspace removal commit requires a managed Agent",
+		)
+	}
+	result, err := c.submit(ctx, workspaceRemovedOperation{managed: target})
 	return result.receipt, err
 }
 
@@ -587,6 +606,30 @@ func prepareCommitOperation(
 			typed.managed.setVendorSessionReference(signal.VendorSessionRef)
 			return nil
 		}, signal.ReceivedAt, nil
+	case workspaceRemovedOperation:
+		if typed.managed == nil || typed.managed.agent == nil {
+			return nil, nil, time.Time{}, errors.New(
+				"session: workspace removal operation requires a managed Agent",
+			)
+		}
+		payload, encodeErr := json.Marshal(workspaceRemovedPayload{Version: 1})
+		if encodeErr != nil {
+			return nil, nil, time.Time{}, fmt.Errorf(
+				"session: encode workspace removal: %w",
+				encodeErr,
+			)
+		}
+		id := string(typed.managed.agent.ID())
+		draft := event.NewSessionLifecycleDraft(
+			id,
+			id,
+			workspaceRemovedReason,
+			string(payload),
+		)
+		return []event.Draft{draft}, func([]event.Event) error {
+			typed.managed.applyWorkspaceRemoved()
+			return nil
+		}, time.Now().UTC(), nil
 	default:
 		return nil, nil, time.Time{}, fmt.Errorf(
 			"session: unknown commit operation %T",

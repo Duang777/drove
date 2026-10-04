@@ -124,7 +124,7 @@ drove up claude --worktree --branch feature/api
 | `drove stop <agent-id>` | 停止该会话 |
 | `drove hook --vendor claude\|codex` | 给被注入的 agent 子进程用。从 stdin 读一份 JSON，失败也返回 0 |
 | `drove worktree ls` | 列出 Drove 创建的 worktree、分支和 dirty 状态 |
-| `drove worktree rm <agent-id>` | 删除 clean worktree，保留分支。`--force` 允许丢弃未提交更改 |
+| `drove worktree rm <agent-id>` | 删除受保护的 clean worktree，保留分支。`--force` 允许丢弃未提交更改、detached HEAD 或旧版未知保护信息 |
 | `drove web` | 经 Unix socket 签发一次性登录码并打开内嵌 Web 控制台 |
 | `drove token rotate` | 原子轮换控制令牌，不打印令牌值 |
 | `drove version` | 打印版本。`make build` 用 `git describe` 填版本号；commit 和构建时间未注入时是 `unknown` |
@@ -153,8 +153,9 @@ WebSocket 和公开回放会删除这些字段。
 
 会话退出后 worktree 不会自动删除。`drove worktree rm` 由 daemon 原子确认对应会话
 已经停止并执行清理，避免与恢复操作并发；它默认拒绝 dirty worktree，`--force`
-只放宽 dirty 检查。两种方式都保留分支，Drove 不自动 merge、rebase、push 或删除
-分支。
+还用于显式确认 detached HEAD 或旧版未知保护信息。删除意图先写入 sidecar，物理删除
+完成并持久化 `workspace_removed` 事件后才清除 sidecar；daemon 重启会先收敛未完成
+删除，再开放 Resume。两种方式都保留分支，Drove 不自动 merge、rebase、push 或删除分支。
 
 ### 状态
 

@@ -193,11 +193,12 @@ type Manager struct {
 	agents   map[agent.ID]*managedAgent
 	sessions map[agent.ID]*runningSession
 	resuming map[agent.ID]struct{}
-	cleaning map[agent.ID]struct{}
+	cleaning map[agent.ID]chan struct{}
 	creating map[agent.ID]struct{}
 	closed   bool
 
 	starts    sync.WaitGroup
+	cleanups  sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -238,7 +239,7 @@ func NewManager(
 		agents:        make(map[agent.ID]*managedAgent),
 		sessions:      make(map[agent.ID]*runningSession),
 		resuming:      make(map[agent.ID]struct{}),
-		cleaning:      make(map[agent.ID]struct{}),
+		cleaning:      make(map[agent.ID]chan struct{}),
 		creating:      make(map[agent.ID]struct{}),
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
@@ -280,9 +281,11 @@ func Bootstrap(
 		}
 		managed := newManagedAgent(restored)
 		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
-		managed.workingDir = plan.WorkingDirs[string(snapshot.ID)]
-		managed.resumeOnStart = plan.ResumeOnStart[string(snapshot.ID)]
-		managed.workspaceRemoved = plan.WorkspaceRemoved[string(snapshot.ID)]
+		managed.setWorkspaceState(workspaceRuntimeState{
+			workingDir:    plan.WorkingDirs[string(snapshot.ID)],
+			resumeOnStart: plan.ResumeOnStart[string(snapshot.ID)],
+			removed:       plan.WorkspaceRemoved[string(snapshot.ID)],
+		})
 		restoredAgents[snapshot.ID] = managed
 	}
 
@@ -293,6 +296,11 @@ func Bootstrap(
 	hub := event.NewHub(committedLastSeq)
 	manager := NewManager(reg, hub, st, committedLastSeq, options...)
 	manager.agents = restoredAgents
+	if err := manager.reconcileWorkspaceRemovals(ctx, plan.Workspaces); err != nil {
+		_ = manager.Close()
+		return nil, err
+	}
+	committedLastSeq = manager.committer.HighWatermark()
 	plan.Report.LastSeq = committedLastSeq
 	return &BootstrapResult{
 		Manager:  manager,
@@ -405,7 +413,7 @@ func (m *Manager) Start(
 		),
 	)
 	managed := newManagedAgent(a)
-	managed.workingDir = req.Dir
+	managed.setWorkspaceState(workspaceRuntimeState{workingDir: req.Dir})
 	persistedMode := req.Mode
 	persistedPolicy := req.Hooks
 	persistedInjection := injection.mode
@@ -658,6 +666,16 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
+	return m.resumeReserved(ctx, id, managed, entry, ref)
+}
+
+func (m *Manager) resumeReserved(
+	ctx context.Context,
+	id agent.ID,
+	managed *managedAgent,
+	entry adapter.Entry,
+	ref string,
+) (*Status, error) {
 	reserved := true
 	defer func() {
 		if reserved {
@@ -763,7 +781,7 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 		command:      command.Name,
 		args:         injection.args,
 		env:          processEnv,
-		dir:          managed.workingDir,
+		dir:          managed.workspaceState().workingDir,
 		terminalSize: terminalSize,
 		ptySize:      initialPTYSize,
 		outputOffset: initialOutputOffset,
@@ -792,6 +810,12 @@ func (m *Manager) reserveResume(
 ) (*managedAgent, adapter.Entry, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.reserveResumeLocked(id)
+}
+
+func (m *Manager) reserveResumeLocked(
+	id agent.ID,
+) (*managedAgent, adapter.Entry, string, error) {
 	managed, ok := m.agents[id]
 	if !ok {
 		return nil, adapter.Entry{}, "", fmt.Errorf("%w: %q", ErrUnknownAgent, id)
@@ -817,7 +841,15 @@ func (m *Manager) reserveResume(
 			id,
 		)
 	}
-	if managed.workspaceRemoved {
+	workspaceState := managed.workspaceState()
+	if workspaceState.removalPending {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q workspace removal is pending",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if workspaceState.removed {
 		return nil, adapter.Entry{}, "", fmt.Errorf(
 			"%w: agent %q workspace was removed",
 			ErrResumeConflict,
@@ -873,6 +905,7 @@ func (m *Manager) Close() error {
 		m.mu.Unlock()
 
 		m.starts.Wait()
+		m.cleanups.Wait()
 
 		type attachedSession struct {
 			id      agent.ID
@@ -992,20 +1025,18 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	state := a.State()
 	ref := managed.vendorSessionReference()
 	entry, exactVendor := m.reg.Lookup(a.Vendor())
-	workspaceRemoved := managed.workspaceRemoved
+	workspaceState := managed.workspaceState()
 	resumable := state == agent.StateStopped &&
 		sess == nil &&
 		!reserved &&
-		!workspaceRemoved &&
+		!workspaceState.removalPending &&
+		!workspaceState.removed &&
 		ref != "" &&
 		exactVendor &&
 		entry.SupportsResume()
 	m.mu.RUnlock()
 
-	workingDir := a.WorkingDir()
-	if workspaceRemoved {
-		workingDir = ""
-	}
+	workingDir := workspaceState.workingDir
 	st := &Status{
 		AgentID:        string(a.ID()),
 		Name:           a.Name(),
@@ -1056,23 +1087,25 @@ func (m *Manager) List() []*Status {
 
 // ResumeOnStart attempts each recovery-marked Agent once in creation order.
 func (m *Manager) ResumeOnStart(ctx context.Context) []StartupResumeResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	type candidate struct {
 		id        agent.ID
 		createdAt time.Time
 	}
-	m.mu.Lock()
+	m.mu.RLock()
 	candidates := make([]candidate, 0)
 	for id, managed := range m.agents {
-		if !managed.resumeOnStart {
+		if !managed.shouldResumeOnStart() {
 			continue
 		}
-		managed.resumeOnStart = false
 		candidates = append(candidates, candidate{
 			id:        id,
 			createdAt: managed.agent.CreatedAt(),
 		})
 	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].createdAt.Equal(candidates[j].createdAt) {
 			return candidates[i].id < candidates[j].id
@@ -1082,13 +1115,69 @@ func (m *Manager) ResumeOnStart(ctx context.Context) []StartupResumeResult {
 
 	results := make([]StartupResumeResult, 0, len(candidates))
 	for _, candidate := range candidates {
-		_, err := m.Resume(ctx, candidate.id)
+		attempted, err := m.resumeOnStart(ctx, candidate.id)
+		if !attempted && err == nil {
+			continue
+		}
 		results = append(results, StartupResumeResult{
 			AgentID: candidate.id,
 			Err:     err,
 		})
 	}
 	return results
+}
+
+func (m *Manager) resumeOnStart(
+	ctx context.Context,
+	id agent.ID,
+) (bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf(
+				"session: wait to resume agent %q at startup: %w",
+				id,
+				err,
+			)
+		}
+		if err := m.beginStart(); err != nil {
+			return false, fmt.Errorf("session: resume at startup: %w", err)
+		}
+
+		m.mu.Lock()
+		managed, exists := m.agents[id]
+		if !exists || !managed.shouldResumeOnStart() {
+			m.mu.Unlock()
+			m.endStart()
+			return false, nil
+		}
+		if completion, cleaning := m.cleaning[id]; cleaning {
+			m.mu.Unlock()
+			m.endStart()
+			select {
+			case <-completion:
+				continue
+			case <-ctx.Done():
+				return false, fmt.Errorf(
+					"session: wait for workspace cleanup before resuming agent %q: %w",
+					id,
+					ctx.Err(),
+				)
+			}
+		}
+		managed, entry, ref, err := m.reserveResumeLocked(id)
+		if err == nil {
+			managed.consumeResumeOnStart()
+		}
+		m.mu.Unlock()
+		if err != nil {
+			m.endStart()
+			return false, err
+		}
+
+		_, err = m.resumeReserved(ctx, id, managed, entry, ref)
+		m.endStart()
+		return true, err
+	}
 }
 
 // Replay 返回某会话的事件流（来自 store，按 seq 升序）。

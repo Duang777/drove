@@ -44,8 +44,10 @@ type Workspace struct {
 	Detached   bool   `json:"detached,omitempty"`
 	Missing    bool   `json:"missing,omitempty"`
 
-	createdBranch bool
-	sourcePath    string
+	createdBranch   bool
+	sourcePath      string
+	protectionKnown bool
+	includedPaths   []string
 }
 
 // Manager owns worktrees below one Drove data directory.
@@ -175,16 +177,24 @@ func (m *Manager) prepare(
 		createdBranch: createdBranch,
 		sourcePath:    sourcePath,
 	}
-	if err := m.writeWorkspaceRecord(result); err != nil {
+	includedPaths, err := m.includedPaths(ctx, sourcePath)
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
-	if err := m.copyIncludedFiles(ctx, result); err != nil {
+	if err := m.writeWorkspaceRecord(result, includedPaths); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
+	if err := m.copyIncludedFiles(result, includedPaths); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
+	}
+	result.protectionKnown = true
+	result.includedPaths = append([]string(nil), includedPaths...)
 	return result, nil
 }
 
@@ -250,8 +260,14 @@ func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
 				if !hasRecord {
 					continue
 				}
-				record.Missing = true
-				result = append(result, record)
+				missing := record.workspace()
+				missing.Missing = true
+				missing.protectionKnown = record.ProtectionKnown
+				missing.includedPaths = append(
+					[]string(nil),
+					record.IncludedPaths...,
+				)
+				result = append(result, missing)
 				continue
 			}
 			if pathErr != nil {
@@ -267,7 +283,7 @@ func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
 					path,
 				)
 			}
-			var recorded *Workspace
+			var recorded *workspaceRecord
 			if hasRecord {
 				recorded = &record
 			}
@@ -291,103 +307,6 @@ func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
 		return result[i].Repository < result[j].Repository
 	})
 	return result, nil
-}
-
-// Cleanup removes one managed worktree and preserves its branch.
-func (m *Manager) Cleanup(
-	ctx context.Context,
-	agentID string,
-	force bool,
-) (Workspace, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.cleanup(ctx, agentID, force)
-}
-
-func (m *Manager) cleanup(
-	ctx context.Context,
-	agentID string,
-	force bool,
-) (Workspace, error) {
-	if err := validateAgentID(agentID); err != nil {
-		return Workspace{}, err
-	}
-	all, err := m.list(ctx)
-	if err != nil {
-		return Workspace{}, err
-	}
-	var matches []Workspace
-	for _, current := range all {
-		if current.AgentID == agentID {
-			matches = append(matches, current)
-		}
-	}
-	if len(matches) == 0 {
-		return Workspace{}, fmt.Errorf("%w: agent %q", ErrNotFound, agentID)
-	}
-	if len(matches) > 1 {
-		return Workspace{}, fmt.Errorf(
-			"workspace: agent %q has %d managed worktrees",
-			agentID,
-			len(matches),
-		)
-	}
-	target := matches[0]
-	if target.Dirty && !force {
-		return Workspace{}, fmt.Errorf("%w: %s", ErrDirty, target.Path)
-	}
-	if !target.Missing && !force {
-		current, err := m.inspect(ctx, target.Path, &target)
-		if err != nil {
-			return Workspace{}, err
-		}
-		if current.Dirty {
-			return Workspace{}, fmt.Errorf("%w: %s", ErrDirty, target.Path)
-		}
-		target = current
-	}
-	if target.Missing {
-		registered, err := m.worktreeRegistered(
-			ctx,
-			target.Repository,
-			target.Path,
-		)
-		if err != nil {
-			return Workspace{}, err
-		}
-		if registered {
-			if _, err := m.run(
-				ctx,
-				"-C",
-				target.Repository,
-				"worktree",
-				"remove",
-				"--force",
-				target.Path,
-			); err != nil {
-				return Workspace{}, fmt.Errorf(
-					"workspace: remove missing worktree registration: %w",
-					err,
-				)
-			}
-		}
-	} else {
-		arguments := []string{"-C", target.Repository, "worktree", "remove"}
-		if force {
-			arguments = append(arguments, "--force")
-		}
-		arguments = append(arguments, target.Path)
-		if _, err := m.run(ctx, arguments...); err != nil {
-			return Workspace{}, fmt.Errorf("workspace: remove worktree: %w", err)
-		}
-	}
-	if err := removeWorkspaceRecord(target.Path); err != nil {
-		return Workspace{}, err
-	}
-	if err := removeEmptyDirectory(filepath.Dir(target.Path)); err != nil {
-		return Workspace{}, err
-	}
-	return target, nil
 }
 
 // Discard rolls back a prepared worktree before its session metadata commits.
@@ -489,7 +408,7 @@ func (m *Manager) rollbackFailedAdd(
 func (m *Manager) inspect(
 	ctx context.Context,
 	path string,
-	recorded *Workspace,
+	recorded *workspaceRecord,
 ) (Workspace, error) {
 	agentID := filepath.Base(path)
 	repository, err := m.repositoryRoot(ctx, path)
@@ -535,17 +454,35 @@ func (m *Manager) inspect(
 	if err != nil {
 		return Workspace{}, fmt.Errorf("workspace: inspect status for %q: %w", path, err)
 	}
-	included, err := m.includedPaths(ctx, path)
-	if err != nil {
-		return Workspace{}, err
+	protectionKnown := recorded != nil && recorded.ProtectionKnown
+	var includedPaths []string
+	includedDirty := !protectionKnown
+	if recorded != nil {
+		includedPaths = append([]string(nil), recorded.IncludedPaths...)
+		for _, relative := range includedPaths {
+			_, pathErr := os.Lstat(filepath.Join(path, relative))
+			switch {
+			case pathErr == nil:
+				includedDirty = true
+			case errors.Is(pathErr, os.ErrNotExist):
+			case pathErr != nil:
+				return Workspace{}, fmt.Errorf(
+					"workspace: inspect included path %q: %w",
+					relative,
+					pathErr,
+				)
+			}
+		}
 	}
 	return Workspace{
-		AgentID:    agentID,
-		Repository: repository,
-		Path:       path,
-		Branch:     branch,
-		Dirty:      len(status) != 0 || len(included) != 0,
-		Detached:   detached,
+		AgentID:         agentID,
+		Repository:      repository,
+		Path:            path,
+		Branch:          branch,
+		Dirty:           len(status) != 0 || includedDirty,
+		Detached:        detached,
+		protectionKnown: protectionKnown,
+		includedPaths:   includedPaths,
 	}, nil
 }
 

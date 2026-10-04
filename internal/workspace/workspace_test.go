@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -82,10 +83,16 @@ func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	); err != nil {
 		t.Fatalf("dirty tracked file: %v", err)
 	}
-	if _, err := manager.Cleanup(context.Background(), testAgentID, false); !errors.Is(err, ErrDirty) {
+	if _, err := removeWorkspace(
+		t,
+		manager,
+		context.Background(),
+		testAgentID,
+		false,
+	); !errors.Is(err, ErrDirty) {
 		t.Fatalf("cleanup dirty worktree error = %v, want ErrDirty", err)
 	}
-	removed, err := manager.Cleanup(context.Background(), testAgentID, true)
+	removed, err := removeWorkspace(t, manager, context.Background(), testAgentID, true)
 	if err != nil {
 		t.Fatalf("force cleanup worktree: %v", err)
 	}
@@ -209,14 +216,18 @@ func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
 	assertFileContents(t, filepath.Join(repository, "tracked.txt"), "tracked\n")
 	assertFileContents(t, filepath.Join(first.Path, "tracked.txt"), "first agent\n")
 	assertFileContents(t, filepath.Join(second.Path, "tracked.txt"), "second agent\n")
-	if _, err := manager.Cleanup(
+	if _, err := removeWorkspace(
+		t,
+		manager,
 		context.Background(),
 		first.AgentID,
 		true,
 	); err != nil {
 		t.Fatalf("cleanup first worktree: %v", err)
 	}
-	if _, err := manager.Cleanup(
+	if _, err := removeWorkspace(
+		t,
+		manager,
 		context.Background(),
 		second.AgentID,
 		true,
@@ -241,6 +252,15 @@ func TestListAndCleanupDetachedWorktree(t *testing.T) {
 		t.Fatalf("prepare worktree: %v", err)
 	}
 	runGit(t, prepared.Path, "checkout", "--detach")
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "detached.txt"),
+		[]byte("unreferenced commit\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write detached commit: %v", err)
+	}
+	runGit(t, prepared.Path, "add", "detached.txt")
+	runGit(t, prepared.Path, "commit", "-m", "detached work")
 
 	listed, err := manager.List(context.Background())
 	if err != nil {
@@ -251,12 +271,23 @@ func TestListAndCleanupDetachedWorktree(t *testing.T) {
 		listed[0].Branch != prepared.Branch {
 		t.Fatalf("detached worktrees = %+v", listed)
 	}
-	if _, err := manager.Cleanup(
+	if _, err := removeWorkspace(
+		t,
+		manager,
 		context.Background(),
 		testAgentID,
 		false,
+	); !errors.Is(err, ErrDirty) {
+		t.Fatalf("cleanup detached worktree error = %v, want ErrDirty", err)
+	}
+	if _, err := removeWorkspace(
+		t,
+		manager,
+		context.Background(),
+		testAgentID,
+		true,
 	); err != nil {
-		t.Fatalf("cleanup detached worktree: %v", err)
+		t.Fatalf("force cleanup detached worktree: %v", err)
 	}
 	runGit(t, repository, "show-ref", "--verify", "refs/heads/"+prepared.Branch)
 }
@@ -287,7 +318,9 @@ func TestCleanupRepairsMissingWorktreeRegistration(t *testing.T) {
 	if len(listed) != 1 || !listed[0].Missing {
 		t.Fatalf("missing worktrees = %+v", listed)
 	}
-	if _, err := manager.Cleanup(
+	if _, err := removeWorkspace(
+		t,
+		manager,
 		context.Background(),
 		testAgentID,
 		false,
@@ -465,6 +498,15 @@ func TestCleanupRechecksIncludedFilesBeforeRemoval(t *testing.T) {
 		t.Skip("test requires a POSIX shell")
 	}
 	repository := newTestRepository(t)
+	runGit(t, repository, "rm", "--cached", ".worktreeinclude")
+	runGit(t, repository, "commit", "-m", "leave include manifest local")
+	if err := os.WriteFile(
+		filepath.Join(repository, ".env"),
+		[]byte("initial local value\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source included file: %v", err)
+	}
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -477,6 +519,23 @@ func TestCleanupRechecksIncludedFilesBeforeRemoval(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if _, err := os.Lstat(
+		filepath.Join(prepared.Path, worktreeIncludeFile),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target include manifest exists or inspect failed: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	if !record.ProtectionKnown ||
+		len(record.IncludedPaths) != 1 ||
+		record.IncludedPaths[0] != ".env" {
+		t.Fatalf("workspace record protection = %+v", record)
+	}
+	if err := os.Remove(filepath.Join(prepared.Path, ".env")); err != nil {
+		t.Fatalf("remove copied include before cleanup: %v", err)
 	}
 	listed, err := manager.List(context.Background())
 	if err != nil {
@@ -493,13 +552,15 @@ func TestCleanupRechecksIncludedFilesBeforeRemoval(t *testing.T) {
 	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
 	script := `#!/bin/sh
 case " $* " in
-  *" ls-files --others --ignored "*)
-    if [ ! -e "$DROVE_TEST_INJECT_MARKER" ]; then
-      "$DROVE_TEST_REAL_GIT" "$@"
-      status=$?
-      : > "$DROVE_TEST_INJECT_MARKER"
+  *" status --porcelain=v1 "*)
+    count=0
+    if [ -e "$DROVE_TEST_INJECT_MARKER" ]; then
+      count=$(cat "$DROVE_TEST_INJECT_MARKER")
+    fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$DROVE_TEST_INJECT_MARKER"
+    if [ "$count" -eq 2 ]; then
       printf 'late local value\n' > "$DROVE_TEST_INJECT_FILE"
-      exit "$status"
     fi
     ;;
 esac
@@ -514,7 +575,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	t.Setenv("DROVE_TEST_INJECT_FILE", injected)
 	manager.git = wrapper
 
-	if _, err := manager.Cleanup(
+	if _, err := removeWorkspace(
+		t,
+		manager,
 		context.Background(),
 		prepared.AgentID,
 		false,
@@ -524,12 +587,309 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	assertFileContents(t, injected, "late local value\n")
 
 	manager.git = realGit
-	if _, err := manager.Cleanup(
+	if _, err := removeWorkspace(
+		t,
+		manager,
 		context.Background(),
 		prepared.AgentID,
 		true,
 	); err != nil {
 		t.Fatalf("force cleanup retained worktree: %v", err)
+	}
+}
+
+func TestVersionOneRecordRequiresForceEvenWhenPathIsMissing(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	legacy, err := json.Marshal(struct {
+		Version    int    `json:"version"`
+		AgentID    string `json:"agent_id"`
+		Repository string `json:"repository"`
+		Path       string `json:"path"`
+		Branch     string `json:"branch"`
+	}{
+		Version:    legacyWorkspaceRecordVersion,
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	})
+	if err != nil {
+		t.Fatalf("encode legacy record: %v", err)
+	}
+	if err := os.WriteFile(workspaceRecordPath(prepared.Path), legacy, 0o600); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+	if err := os.RemoveAll(prepared.Path); err != nil {
+		t.Fatalf("remove worktree path: %v", err)
+	}
+
+	result, err := manager.Remove(context.Background(), prepared.AgentID, false)
+	if !errors.Is(err, ErrDirty) || result.State != RemovalUnchanged {
+		t.Fatalf("non-force legacy removal = %+v, %v", result, err)
+	}
+	result, err = manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("force legacy removal = %+v, %v", result, err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read migrated record: exists=%v err=%v", exists, err)
+	}
+	if record.Version != workspaceRecordVersion ||
+		record.ProtectionKnown ||
+		record.Removal == nil ||
+		!record.Removal.Force {
+		t.Fatalf("migrated record = %+v", record)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge migrated removal: %v", err)
+	}
+}
+
+func TestRemoveReturnsPendingAfterPartialGitMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	realGit := manager.git
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" worktree remove "*)
+    rm -rf "$DROVE_TEST_WORKTREE"
+    exit 1
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_WORKTREE", prepared.Path)
+	manager.git = wrapper
+
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err == nil || result.State != RemovalPending {
+		t.Fatalf("partial removal = %+v, %v, want pending error", result, err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("partial removal lost sidecar: %v", err)
+	}
+	if !strings.Contains(
+		runGit(t, repository, "worktree", "list", "--porcelain"),
+		prepared.Path,
+	) {
+		t.Fatal("partial removal unexpectedly removed Git registration")
+	}
+
+	manager.git = realGit
+	removals, err := manager.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile partial removal: %v", err)
+	}
+	if len(removals) != 1 || removals[0].Workspace.Path != prepared.Path {
+		t.Fatalf("reconciled removals = %+v", removals)
+	}
+	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
+		t.Fatalf("acknowledge reconciled removal: %v", err)
+	}
+}
+
+func TestReconcileRemovalDeletesPresentUnregisteredPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "33333333-3333-4333-8333-333333333333",
+		Force:       true,
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+	saved := filepath.Join(t.TempDir(), "saved-worktree")
+	if err := os.Rename(prepared.Path, saved); err != nil {
+		t.Fatalf("move worktree path: %v", err)
+	}
+	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
+	if err := os.Rename(saved, prepared.Path); err != nil {
+		t.Fatalf("restore unregistered worktree path: %v", err)
+	}
+
+	removals, err := manager.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile unregistered path: %v", err)
+	}
+	if len(removals) != 1 {
+		t.Fatalf("reconciled removals = %+v", removals)
+	}
+	if _, err := os.Lstat(prepared.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unregistered path remains or inspect failed: %v", err)
+	}
+	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
+func TestReconcileRemovalReturnsAlreadyAbsentWorkspace(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "55555555-5555-4555-8555-555555555555",
+		Force:       true,
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
+
+	removals, err := manager.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile absent workspace: %v", err)
+	}
+	if len(removals) != 1 || removals[0].Workspace.Path != prepared.Path {
+		t.Fatalf("reconciled removals = %+v", removals)
+	}
+	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
+		t.Fatalf("acknowledge absent workspace: %v", err)
+	}
+}
+
+func TestReconcileClearsUnsafeNonForceIntent(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "66666666-6666-4666-8666-666666666666",
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write removal intent: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "tracked.txt"),
+		[]byte("changed after intent\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("dirty worktree: %v", err)
+	}
+
+	removals, err := manager.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile unsafe intent: %v", err)
+	}
+	if len(removals) != 0 {
+		t.Fatalf("unsafe intent produced removals = %+v", removals)
+	}
+	record, exists, err = manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal != nil {
+		t.Fatalf("record after safe rollback = %+v, exists=%v err=%v", record, exists, err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("unsafe reconciliation removed workspace: %v", err)
+	}
+}
+
+func TestAcknowledgeRemovalValidatesTokenAndIsIdempotent(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	wrong := result.Removal
+	wrong.operationID = "44444444-4444-4444-8444-444444444444"
+	if err := manager.AcknowledgeRemoval(wrong); err == nil {
+		t.Fatal("acknowledgement accepted the wrong operation token")
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("repeat acknowledgement: %v", err)
 	}
 }
 
@@ -657,10 +1017,22 @@ func TestCleanupRejectsInvalidAndUnknownAgentIDs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if _, err := manager.Cleanup(context.Background(), "not-an-id", false); err == nil {
+	if _, err := removeWorkspace(
+		t,
+		manager,
+		context.Background(),
+		"not-an-id",
+		false,
+	); err == nil {
 		t.Fatal("cleanup accepted an invalid Agent ID")
 	}
-	if _, err := manager.Cleanup(context.Background(), testAgentID, false); !errors.Is(err, ErrNotFound) {
+	if _, err := removeWorkspace(
+		t,
+		manager,
+		context.Background(),
+		testAgentID,
+		false,
+	); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cleanup unknown Agent ID error = %v, want ErrNotFound", err)
 	}
 }
@@ -740,4 +1112,27 @@ func assertFileContents(t *testing.T, path string, want string) {
 	if string(contents) != want {
 		t.Fatalf("%s contents = %q, want %q", path, contents, want)
 	}
+}
+
+func removeWorkspace(
+	t *testing.T,
+	manager *Manager,
+	ctx context.Context,
+	agentID string,
+	force bool,
+) (Workspace, error) {
+	t.Helper()
+	result, err := manager.Remove(ctx, agentID, force)
+	if err != nil {
+		return result.Removal.Workspace, err
+	}
+	if result.State != RemovalComplete {
+		return result.Removal.Workspace, errors.New(
+			"workspace removal did not complete",
+		)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		return result.Removal.Workspace, err
+	}
+	return result.Removal.Workspace, nil
 }
