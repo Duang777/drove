@@ -8,7 +8,9 @@
 ## 关键设计
 
 - `Controller` 是 x/vt、x/ansi 与 ultraviolet 类型的唯一边界。
-- reply pump 必须在首次 `Write` 前就绪；sink 失败后继续排空，直至 `Close`。
+- reply pump 必须在首次 `Write` 前就绪；查询应答以复制后的 `ReplyFrame` 非阻塞写入
+  容量 16 的 `Replies()` mailbox。mailbox 满时丢弃新帧并通过容量 1 的 `Errors()`
+  报告 `ErrReplyBackpressure`，不得阻塞 emulator、snapshot 或 `Close`。
 - `Snapshot` 只复制可见 cell 的内容与宽度，不包含样式、链接、标题或 scrollback。
 - 对外快照视图最多返回底部 12 行、每行 160 cells 和 4 KiB UTF-8 数据。
 - 快照调用方只能依赖上游的 signal token 打码；本包不做通用密钥扫描。
@@ -23,5 +25,5 @@
 
 - 本包不得依赖 adapter、session、PTY、event 或 store。
 - 不得向包外暴露 x/vt、x/ansi 或 ultraviolet 类型。
-- 查询应答只进入注入的完整帧 sink，不得进入快照、输出或输入审计路径。
+- 查询应答只进入 controller 自有 mailbox，不得进入快照、输出或输入审计路径。
 - 清洗器只删除控制序列，不解释其语义。

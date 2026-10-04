@@ -533,6 +533,19 @@ func (t *EventTail) Next() (EventItem, error) {
 			return nil, fmt.Errorf("recording: read event tail: %w", err)
 		}
 		for _, row := range page.Rows {
+			payload, redactErr := event.PublicPayload(
+				event.Type(row.Type),
+				row.Reason,
+				row.Payload,
+			)
+			if redactErr != nil {
+				t.state.failed = fmt.Errorf(
+					"recording: redact public payload at seq %d: %w",
+					row.Seq,
+					redactErr,
+				)
+				break
+			}
 			if err := t.state.advanceRow(row); err != nil {
 				t.state.failed = err
 				break
@@ -547,7 +560,7 @@ func (t *EventTail) Next() (EventItem, error) {
 					From:      row.From,
 					To:        row.To,
 					Reason:    row.Reason,
-					Payload:   row.Payload,
+					Payload:   payload,
 				},
 				Cursor:     t.state.cursor,
 				Historical: row.Seq <= t.state.initialHead,

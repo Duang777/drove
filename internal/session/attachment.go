@@ -10,7 +10,6 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
-	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/term"
 )
 
@@ -148,7 +147,9 @@ func (a *TerminalAttachment) Mode() AttachmentMode {
 	return a.mode
 }
 
-// SendInput writes one complete UTF-8 input through a writable attachment.
+// SendInput attempts one complete UTF-8 input through a writable attachment.
+// A partial write returns its exact byte count, records no successful audit,
+// and must not be retried as a whole.
 func (a *TerminalAttachment) SendInput(
 	ctx context.Context,
 	data []byte,
@@ -333,8 +334,6 @@ func (p *outputProcessor) sendAttachedInput(
 		return InputResult{}, ErrAttachmentClosed
 	}
 
-	p.running.inputMu.Lock()
-	defer p.running.inputMu.Unlock()
 	if err := p.attachedInputAvailable(); err != nil {
 		return InputResult{}, err
 	}
@@ -346,27 +345,13 @@ func (p *outputProcessor) sendAttachedInput(
 
 	written, err := p.running.process.Write(data)
 	result := InputResult{BytesWritten: written}
-	if err != nil {
-		if errors.Is(err, pty.ErrClosed) {
-			return result, fmt.Errorf("%w: %q", ErrNotAttached, p.id)
-		}
-		return result, fmt.Errorf(
-			"%w: agent %q wrote %d/%d bytes: %w",
-			ErrInputWrite,
-			p.id,
-			written,
-			len(data),
-			err,
-		)
-	}
-	if written != len(data) {
-		return result, fmt.Errorf(
-			"%w: agent %q wrote %d/%d bytes",
-			ErrInputWrite,
-			p.id,
-			written,
-			len(data),
-		)
+	if writeErr := classifyInputWrite(
+		p.id,
+		written,
+		len(data),
+		err,
+	); writeErr != nil {
+		return result, writeErr
 	}
 
 	attachment.ticket = p.nextTicket(state)

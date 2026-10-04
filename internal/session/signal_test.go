@@ -184,7 +184,9 @@ func TestStartRejectsInvalidHookPolicyBeforePersistence(t *testing.T) {
 }
 
 func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
-	manager, _ := newSignalTestManager(t, "http://127.0.0.1:7373")
+	manager, st := newSignalTestManager(t, "http://127.0.0.1:7373")
+	subscription := manager.hub.Subscribe(64)
+	defer manager.hub.Unsubscribe(subscription)
 	status, err := manager.Start(context.Background(), StartRequest{
 		Vendor:  "claude",
 		Hooks:   agent.HooksAuto,
@@ -246,6 +248,13 @@ func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 	}
 	if got, err := manager.Status(id); err != nil || got.State != agent.StateBlocked {
 		t.Fatalf("blocked status = %+v, error = %v", got, err)
+	}
+	managed, ok := manager.managed(id)
+	if !ok {
+		t.Fatal("managed agent is missing")
+	}
+	if got := managed.vendorSessionReference(); got != "vendor-session" {
+		t.Fatalf("committed vendor session reference = %q", got)
 	}
 	blockedStatus, err := manager.Status(id)
 	if err != nil {
@@ -309,7 +318,9 @@ func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 			continue
 		}
 		if strings.Contains(row.Payload, "never persist") ||
-			strings.Contains(row.Payload, "tool_input") {
+			strings.Contains(row.Payload, "tool_input") ||
+			strings.Contains(row.Payload, "vendor_session_id") ||
+			strings.Contains(row.Payload, "vendor_turn_id") {
 			t.Fatalf("signal row retained raw payload: %+v", row)
 		}
 		if i+1 < len(rows) && rows[i+1].Type == string(event.TypeStateChanged) {
@@ -323,6 +334,39 @@ func TestDeliverHookAuthenticatesDeduplicatesAndTransitions(t *testing.T) {
 		}
 		if audit.Version != 1 || audit.Source == "" || audit.VendorEvent == "" {
 			t.Fatalf("audit = %+v", audit)
+		}
+		if audit.VendorSessionReference() != "" {
+			t.Fatalf("public hook audit exposed session reference = %q", audit.VendorSessionReference())
+		}
+	}
+
+	persisted, err := st.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay persisted events: %v", err)
+	}
+	storedReference := false
+	for _, row := range persisted {
+		if row.Type == string(event.TypeAgentSignal) &&
+			strings.Contains(row.Payload, `"vendor_session_ref":"vendor-session"`) {
+			storedReference = true
+			break
+		}
+	}
+	if !storedReference {
+		t.Fatal("persisted signal history lost the vendor session reference")
+	}
+
+	for range rows {
+		select {
+		case published := <-subscription.C():
+			if published.Type == event.TypeAgentSignal &&
+				(strings.Contains(published.Payload, "vendor_session_ref") ||
+					strings.Contains(published.Payload, "vendor_session_id") ||
+					strings.Contains(published.Payload, "vendor-session")) {
+				t.Fatalf("Hub signal exposed private session reference: %+v", published)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for published event")
 		}
 	}
 }
@@ -744,13 +788,14 @@ func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 		agent.WithHookPolicy(agent.HooksRequired),
 	)
 	commitTestState(t, manager, a, agent.StateStarting, "test start")
-	running, _, _, err := manager.prepareRuntime(a, manager.reg.For("claude"))
+	managed := newManagedAgent(a)
+	running, _, _, err := manager.prepareManagedRuntime(managed, manager.reg.For("claude"))
 	if err != nil {
 		t.Fatalf("prepare runtime: %v", err)
 	}
 	running.process = &fakeProcessSession{}
 	manager.mu.Lock()
-	manager.agents[a.ID()] = a
+	manager.agents[a.ID()] = managed
 	manager.sessions[a.ID()] = running
 	manager.mu.Unlock()
 	t.Cleanup(func() {

@@ -6,7 +6,7 @@
 
 ## 关键设计
 
-- `Client` 封装 REST 调用（List / Start / Status / Stop / SendInput / Replay /
+- `Client` 封装 REST 调用（List / Start / Resume / Status / Stop / SendInput / Replay /
   Explain / Timeline / BlockedOccurrence / Frame / RotateToken / IssueLoginCode）；
   CLI 使用 `NewLocal` 经
   `$DataDir/run/droved.sock` 调用，

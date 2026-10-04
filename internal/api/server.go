@@ -98,6 +98,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDelete)
+	mux.HandleFunc("POST /api/v1/agents/{id}/resume", s.handleResume)
 	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
@@ -373,6 +374,34 @@ func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	status, err := s.opts.Manager.Resume(
+		r.Context(),
+		agent.ID(r.PathValue("id")),
+	)
+	if err != nil {
+		writeResumeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func writeResumeError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, session.ErrUnknownAgent):
+		writeErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, session.ErrResumeConflict):
+		writeErr(w, http.StatusConflict, err.Error())
+	case errors.Is(err, session.ErrHookRequired),
+		errors.Is(err, session.ErrSignalOriginUnavailable),
+		errors.Is(err, session.ErrManagerClosed),
+		errors.Is(err, session.ErrEventCommitterUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+	default:
+		writeErr(w, http.StatusInternalServerError, err.Error())
+	}
+}
+
 const maxInputRequestBytes = 6*session.MaxInputBytes + 1024
 const maxSignalRequestBytes = session.MaxSignalPayloadBytes + 4096
 const maxLoginRequestBytes = 4096
@@ -441,6 +470,8 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, err.Error())
 		case errors.Is(err, session.ErrNotAttached):
 			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, session.ErrInputBackpressure):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
 		case errors.Is(err, session.ErrManagerClosed):
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
 		default:

@@ -354,12 +354,12 @@ func TestManagerExplainEmptyHistoryAndUnknownAgent(t *testing.T) {
 func addExplainTestAgent(manager *Manager, rawID string) agent.ID {
 	id := agent.ID(rawID)
 	manager.mu.Lock()
-	manager.agents[id] = agent.New(
+	manager.agents[id] = newManagedAgent(agent.New(
 		id,
 		agent.WithName(rawID),
 		agent.WithVendor("generic"),
 		agent.WithHookPolicy(agent.HooksOff),
-	)
+	))
 	manager.mu.Unlock()
 	return id
 }

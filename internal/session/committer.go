@@ -117,7 +117,7 @@ type agentOperation struct {
 func (agentOperation) isCommitOperation() {}
 
 type decisionOperation struct {
-	agent    *agent.Agent
+	managed  *managedAgent
 	state    *detect.State
 	decision detect.Decision
 	drafts   []event.Draft
@@ -158,13 +158,13 @@ func newAgentOperation(
 }
 
 func newDecisionOperation(
-	target *agent.Agent,
+	target *managedAgent,
 	state *detect.State,
 	decision detect.Decision,
 	drafts []event.Draft,
 ) decisionOperation {
 	return decisionOperation{
-		agent:    target,
+		managed:  target,
 		state:    state,
 		decision: decision,
 		drafts:   append([]event.Draft(nil), drafts...),
@@ -229,12 +229,12 @@ func (c *committer) CommitAgent(
 
 func (c *committer) CommitDecision(
 	ctx context.Context,
-	target *agent.Agent,
+	target *managedAgent,
 	state *detect.State,
 	decision detect.Decision,
 	drafts []event.Draft,
 ) (commitReceipt, error) {
-	if target == nil || state == nil {
+	if target == nil || target.agent == nil || state == nil {
 		return commitReceipt{}, errors.New(
 			"session: decision commit requires Agent and Detector state",
 		)
@@ -528,6 +528,7 @@ func prepareCommitOperation(
 			return typed.agent.ApplyCommitted(prepared)
 		}, prepared.Timestamp(), nil
 	case decisionOperation:
+		target := typed.managed.agent
 		signal, _, ok := typed.decision.Signal()
 		if !ok {
 			return nil, nil, time.Time{}, errors.New(
@@ -538,14 +539,14 @@ func prepareCommitOperation(
 		var prepared agent.PreparedChange
 		change, hasChange := typed.decision.Change()
 		if hasChange {
-			prepared, err = typed.agent.Prepare(change)
+			prepared, err = target.Prepare(change)
 			if err != nil {
 				return nil, nil, time.Time{}, err
 			}
 			if message, hasError := prepared.ErrorMessage(); hasError {
 				drafts = append(drafts, event.NewErrorDraft(
-					string(typed.agent.ID()),
-					string(typed.agent.ID()),
+					string(target.ID()),
+					string(target.ID()),
 					message,
 				))
 			}
@@ -558,8 +559,8 @@ func prepareCommitOperation(
 					)
 				}
 				drafts = append(drafts, event.NewStateChangedDraft(
-					string(typed.agent.ID()),
-					string(typed.agent.ID()),
+					string(target.ID()),
+					string(target.ID()),
 					string(from),
 					string(to),
 					reason,
@@ -572,11 +573,15 @@ func prepareCommitOperation(
 		}
 		return drafts, func([]event.Event) error {
 			if hasChange {
-				if applyErr := typed.agent.ApplyCommitted(prepared); applyErr != nil {
+				if applyErr := target.ApplyCommitted(prepared); applyErr != nil {
 					return applyErr
 				}
 			}
-			return typed.state.ApplyCommitted(typed.decision)
+			if applyErr := typed.state.ApplyCommitted(typed.decision); applyErr != nil {
+				return applyErr
+			}
+			typed.managed.setVendorSessionReference(signal.VendorSessionRef)
+			return nil
 		}, signal.ReceivedAt, nil
 	default:
 		return nil, nil, time.Time{}, fmt.Errorf(

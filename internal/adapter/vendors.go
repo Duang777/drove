@@ -15,6 +15,10 @@ func (claudeRunner) Command(mode agent.RunMode) (string, []string) {
 	return "claude", nil
 }
 
+func (claudeRunner) ResumeCommand(_ CreationMeta, ref string) (Command, error) {
+	return Command{Name: "claude", Args: []string{"--resume", ref}}, nil
+}
+
 // codexRunner 适配 OpenAI Codex CLI。
 type codexRunner struct{}
 
@@ -24,6 +28,10 @@ func (codexRunner) Command(mode agent.RunMode) (string, []string) {
 		return "codex", []string{"exec"}
 	}
 	return "codex", nil
+}
+
+func (codexRunner) ResumeCommand(_ CreationMeta, ref string) (Command, error) {
+	return Command{Name: "codex", Args: []string{"resume", ref}}, nil
 }
 
 // genericRunner 兜底：直接运行用户命令。

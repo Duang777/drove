@@ -21,8 +21,8 @@ func TestObservationActorCommitsDecisionAndDeduplicatesDelivery(t *testing.T) {
 	hub := event.NewHub(0)
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
-	actor, err := newObservationActor(
-		target,
+	actor, err := newManagedObservationActor(
+		newManagedAgent(target),
 		committer,
 		agent.HooksAuto,
 		detect.Config{},
@@ -70,8 +70,8 @@ func TestObservationActorRunsCommittedTimerPlan(t *testing.T) {
 	committer := newCommitter(0, st, event.NewHub(0))
 	defer committer.Close()
 	clock := newActorFakeClock(time.Date(2026, time.October, 3, 12, 0, 0, 0, time.UTC))
-	actor, err := newObservationActor(
-		target,
+	actor, err := newManagedObservationActor(
+		newManagedAgent(target),
 		committer,
 		agent.HooksAuto,
 		detect.Config{},
@@ -123,8 +123,8 @@ func TestObservationActorRearmsTheEarliestCandidate(t *testing.T) {
 	committer := newCommitter(0, st, event.NewHub(0))
 	defer committer.Close()
 	clock := newActorFakeClock(time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC))
-	actor, err := newObservationActor(
-		target,
+	actor, err := newManagedObservationActor(
+		newManagedAgent(target),
 		committer,
 		agent.HooksOff,
 		detect.Config{},
@@ -247,8 +247,8 @@ func TestObservationActorRejectsAfterTerminalAdmissionClose(t *testing.T) {
 	target := actorTestAgent(t, agent.StateWorking, agent.HooksOff)
 	committer := newCommitter(0, &memoryCommitStore{}, event.NewHub(0))
 	defer committer.Close()
-	actor, err := newObservationActor(
-		target,
+	actor, err := newManagedObservationActor(
+		newManagedAgent(target),
 		committer,
 		agent.HooksOff,
 		detect.Config{},
@@ -287,8 +287,8 @@ func TestObservationActorInboxHasFixedCapacity(t *testing.T) {
 	target := actorTestAgent(t, agent.StateWorking, agent.HooksOff)
 	committer := newCommitter(0, &memoryCommitStore{}, event.NewHub(0))
 	defer committer.Close()
-	actor, err := newObservationActor(
-		target,
+	actor, err := newManagedObservationActor(
+		newManagedAgent(target),
 		committer,
 		agent.HooksOff,
 		detect.Config{},
@@ -407,13 +407,13 @@ func actorHookObservation(
 ) detect.Observation {
 	t.Helper()
 	signal, err := detect.NewHookSignal(detect.Signal{
-		Kind:            kind,
-		Vendor:          "claude",
-		VendorEvent:     vendorEvent,
-		Scope:           detect.ScopeRoot,
-		VendorSessionID: "vendor-session",
-		Confidence:      1,
-		ReceivedAt:      time.Now().UTC(),
+		Kind:             kind,
+		Vendor:           "claude",
+		VendorEvent:      vendorEvent,
+		Scope:            detect.ScopeRoot,
+		VendorSessionRef: "vendor-session",
+		Confidence:       1,
+		ReceivedAt:       time.Now().UTC(),
 		DeliveryID: uuid.NewSHA1(
 			uuid.NameSpaceOID,
 			[]byte(label),

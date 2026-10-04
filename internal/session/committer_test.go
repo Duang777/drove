@@ -240,20 +240,21 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restore Agent: %v", err)
 	}
+	managed := newManagedAgent(a)
 	detector, err := detect.New(detect.Config{})
 	if err != nil {
 		t.Fatalf("new Detector: %v", err)
 	}
 	detectorState := detect.NewState(agent.HooksAuto)
 	signal, err := detect.NewHookSignal(detect.Signal{
-		Kind:            detect.KindHumanInputRequired,
-		Vendor:          "claude",
-		VendorEvent:     "Elicitation",
-		Scope:           detect.ScopeRoot,
-		VendorSessionID: "vendor-session",
-		Confidence:      1,
-		ReceivedAt:      time.Now().UTC(),
-		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
+		Kind:             detect.KindHumanInputRequired,
+		Vendor:           "claude",
+		VendorEvent:      "Elicitation",
+		Scope:            detect.ScopeRoot,
+		VendorSessionRef: "vendor-session",
+		Confidence:       1,
+		ReceivedAt:       time.Now().UTC(),
+		DeliveryID:       "550e8400-e29b-41d4-a716-446655440000",
 	})
 	if err != nil {
 		t.Fatalf("new signal: %v", err)
@@ -274,11 +275,13 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 	st := &memoryCommitStore{}
 	st.onAppend = func() {
 		if a.State() != agent.StateWorking ||
-			detectorState.Snapshot().HookStatus() != detect.HookAwaiting {
+			detectorState.Snapshot().HookStatus() != detect.HookAwaiting ||
+			managed.vendorSessionReference() != "" {
 			t.Errorf(
-				"projections changed before append: Agent=%s Detector=%s",
+				"projections changed before append: Agent=%s Detector=%s ref=%q",
 				a.State(),
 				detectorState.Snapshot().HookStatus(),
+				managed.vendorSessionReference(),
 			)
 		}
 	}
@@ -290,7 +293,7 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 
 	receipt, err := committer.CommitDecision(
 		context.Background(),
-		a,
+		managed,
 		&detectorState,
 		decision,
 		[]event.Draft{
@@ -304,11 +307,13 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 		t.Fatalf("receipt = %+v", receipt)
 	}
 	if a.State() != agent.StateBlocked ||
-		detectorState.Snapshot().HookStatus() != detect.HookActive {
+		detectorState.Snapshot().HookStatus() != detect.HookActive ||
+		managed.vendorSessionReference() != "vendor-session" {
 		t.Fatalf(
-			"projections after commit: Agent=%s Detector=%s",
+			"projections after commit: Agent=%s Detector=%s ref=%q",
 			a.State(),
 			detectorState.Snapshot().HookStatus(),
+			managed.vendorSessionReference(),
 		)
 	}
 	for want := uint64(1); want <= 2; want++ {
@@ -316,12 +321,14 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 		case published := <-subscription.C():
 			if published.Seq != want ||
 				a.State() != agent.StateBlocked ||
-				detectorState.Snapshot().HookStatus() != detect.HookActive {
+				detectorState.Snapshot().HookStatus() != detect.HookActive ||
+				managed.vendorSessionReference() != "vendor-session" {
 				t.Fatalf(
-					"published=%+v Agent=%s Detector=%s",
+					"published=%+v Agent=%s Detector=%s ref=%q",
 					published,
 					a.State(),
 					detectorState.Snapshot().HookStatus(),
+					managed.vendorSessionReference(),
 				)
 			}
 		case <-time.After(time.Second):
@@ -344,20 +351,21 @@ func TestDecisionCommitStoreFailureLeavesBothProjectionsUnchanged(t *testing.T) 
 	if err != nil {
 		t.Fatalf("restore Agent: %v", err)
 	}
+	managed := newManagedAgent(a)
 	detector, err := detect.New(detect.Config{})
 	if err != nil {
 		t.Fatalf("new Detector: %v", err)
 	}
 	detectorState := detect.NewState(agent.HooksAuto)
 	signal, err := detect.NewHookSignal(detect.Signal{
-		Kind:            detect.KindHumanInputRequired,
-		Vendor:          "claude",
-		VendorEvent:     "Elicitation",
-		Scope:           detect.ScopeRoot,
-		VendorSessionID: "vendor-session",
-		Confidence:      1,
-		ReceivedAt:      time.Now().UTC(),
-		DeliveryID:      "550e8400-e29b-41d4-a716-446655440000",
+		Kind:             detect.KindHumanInputRequired,
+		Vendor:           "claude",
+		VendorEvent:      "Elicitation",
+		Scope:            detect.ScopeRoot,
+		VendorSessionRef: "vendor-session",
+		Confidence:       1,
+		ReceivedAt:       time.Now().UTC(),
+		DeliveryID:       "550e8400-e29b-41d4-a716-446655440000",
 	})
 	if err != nil {
 		t.Fatalf("new signal: %v", err)
@@ -384,7 +392,7 @@ func TestDecisionCommitStoreFailureLeavesBothProjectionsUnchanged(t *testing.T) 
 	defer committer.Close()
 	_, err = committer.CommitDecision(
 		context.Background(),
-		a,
+		managed,
 		&detectorState,
 		decision,
 		[]event.Draft{
@@ -395,11 +403,13 @@ func TestDecisionCommitStoreFailureLeavesBothProjectionsUnchanged(t *testing.T) 
 		t.Fatalf("commit error = %v, want storage error", err)
 	}
 	if a.State() != agent.StateWorking ||
-		detectorState.Snapshot().HookStatus() != detect.HookAwaiting {
+		detectorState.Snapshot().HookStatus() != detect.HookAwaiting ||
+		managed.vendorSessionReference() != "" {
 		t.Fatalf(
-			"projections changed after append failure: Agent=%s Detector=%s",
+			"projections changed after append failure: Agent=%s Detector=%s ref=%q",
 			a.State(),
 			detectorState.Snapshot().HookStatus(),
+			managed.vendorSessionReference(),
 		)
 	}
 }

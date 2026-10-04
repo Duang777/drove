@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/Duang777/drove/internal/agent"
@@ -57,5 +59,75 @@ func TestRunnerCommands(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResumeCommands(t *testing.T) {
+	registry := NewRegistry()
+	tests := []struct {
+		vendor string
+		want   Command
+	}{
+		{
+			vendor: "claude",
+			want:   Command{Name: "claude", Args: []string{"--resume", "session-ref"}},
+		},
+		{
+			vendor: "codex",
+			want:   Command{Name: "codex", Args: []string{"resume", "session-ref"}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.vendor, func(t *testing.T) {
+			entry, ok := registry.Lookup(test.vendor)
+			if !ok || !entry.SupportsResume() {
+				t.Fatalf("adapter %q does not advertise resume", test.vendor)
+			}
+			command, err := entry.ResumeCommand(
+				CreationMeta{Mode: agent.RunModeInteractive},
+				"session-ref",
+			)
+			if err != nil {
+				t.Fatalf("resume command: %v", err)
+			}
+			if !reflect.DeepEqual(command, test.want) {
+				t.Fatalf("resume command = %+v, want %+v", command, test.want)
+			}
+		})
+	}
+}
+
+func TestGenericAndUnknownVendorsDoNotResume(t *testing.T) {
+	registry := NewRegistry()
+	for _, vendor := range []string{"generic", "unknown"} {
+		entry := registry.For(vendor)
+		if entry.SupportsResume() {
+			t.Fatalf("adapter %q advertises resume", vendor)
+		}
+		if _, err := entry.ResumeCommand(
+			CreationMeta{Mode: agent.RunModeInteractive},
+			"session-ref",
+		); !errors.Is(err, ErrUnsupportedResume) {
+			t.Fatalf("adapter %q resume error = %v", vendor, err)
+		}
+	}
+}
+
+func TestResumeCommandRejectsInvalidReferences(t *testing.T) {
+	entry := NewRegistry().For("claude")
+	for _, ref := range []string{
+		"",
+		" leading",
+		"trailing ",
+		"line\nbreak",
+		"non-ascii-\u4f1a\u8bdd",
+		string(make([]byte, 257)),
+	} {
+		if _, err := entry.ResumeCommand(
+			CreationMeta{Mode: agent.RunModeInteractive},
+			ref,
+		); err == nil {
+			t.Fatalf("accepted invalid session reference %q", ref)
+		}
 	}
 }

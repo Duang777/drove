@@ -169,9 +169,16 @@ func TestTerminalActorReportsShortQueryReplyAtOutputEnd(t *testing.T) {
 
 	query := []byte("\x1b[6n")
 	feedTerminalTestChunk(t, actor, query, uint64(len(query)), 1, clock.Now())
-	err := actor.EndOutput(context.Background(), uint64(len(query)))
+	process.WaitForWrites(t, 1)
+	feedTerminalTestChunk(t, actor, query, uint64(2*len(query)), 2, clock.Now())
+	feedTerminalTestChunk(t, actor, query, uint64(3*len(query)), 3, clock.Now())
+
+	err := actor.EndOutput(context.Background(), uint64(3*len(query)))
 	if !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("end output error = %v, want short write", err)
+	}
+	if got := process.Writes(); len(got) != 1 {
+		t.Fatalf("query reply writes = %q, want only the first failed write", got)
 	}
 }
 

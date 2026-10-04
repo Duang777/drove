@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +33,19 @@ type Daemon struct {
 	now            func() time.Time
 	retentionTicks <-chan time.Time
 	pruneOutput    outputRetentionPruner
+}
+
+type acceptingListener struct {
+	net.Listener
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (l *acceptingListener) Accept() (net.Conn, error) {
+	l.once.Do(func() {
+		close(l.entered)
+	})
+	return l.Listener.Accept()
 }
 
 // New 创建 Daemon。
@@ -80,6 +94,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		ctx,
 		st,
 		signalInjectionOption(d.cfg, socketPath),
+		session.WithTerminationGrace(
+			time.Duration(d.cfg.Session.TerminationGraceSeconds)*time.Second,
+		),
 	)
 	if err != nil {
 		return err
@@ -197,6 +214,16 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		})
 	}
 
+	accepting := make([]<-chan struct{}, len(endpoints))
+	for index := range endpoints {
+		entered := make(chan struct{})
+		endpoints[index].listener = &acceptingListener{
+			Listener: endpoints[index].listener,
+			entered:  entered,
+		}
+		accepting[index] = entered
+	}
+
 	errCh := make(chan error, len(endpoints))
 	for _, endpoint := range endpoints {
 		endpoint := endpoint
@@ -214,13 +241,48 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		}()
 	}
 
-	select {
-	case <-ctx.Done():
-		log.Info("shutdown signal received")
-	case err := <-errCh:
-		runErr = fmt.Errorf("daemon: serve: %w", err)
-	case err := <-mgr.Fatal():
-		runErr = fmt.Errorf("daemon: session event commit: %w", err)
+	serving := true
+	for _, entered := range accepting {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			log.Info("shutdown signal received")
+			serving = false
+		case err := <-errCh:
+			runErr = fmt.Errorf("daemon: serve: %w", err)
+			serving = false
+		case err := <-mgr.Fatal():
+			runErr = fmt.Errorf("daemon: session event commit: %w", err)
+			serving = false
+		}
+		if !serving {
+			break
+		}
+	}
+	if serving {
+		if d.cfg.Session.AutoResumeOnStart {
+			for _, result := range mgr.ResumeOnStart(ctx) {
+				if result.Err != nil {
+					log.Warn(
+						"automatic session resume failed",
+						"agent_id",
+						result.AgentID,
+						"err",
+						result.Err,
+					)
+					continue
+				}
+				log.Info("automatic session resume completed", "agent_id", result.AgentID)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			log.Info("shutdown signal received")
+		case err := <-errCh:
+			runErr = fmt.Errorf("daemon: serve: %w", err)
+		case err := <-mgr.Fatal():
+			runErr = fmt.Errorf("daemon: session event commit: %w", err)
+		}
 	}
 
 	stopRetention()

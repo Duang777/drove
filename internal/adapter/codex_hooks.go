@@ -16,9 +16,7 @@ type codexHookPayload struct {
 	EventName     string   `json:"event_name"`
 	SessionID     string   `json:"session_id"`
 	ThreadID      string   `json:"thread_id"`
-	TurnID        string   `json:"turn_id"`
 	NotifyThread  string   `json:"thread-id"`
-	NotifyTurn    string   `json:"turn-id"`
 	AgentID       string   `json:"agent_id"`
 	Scope         string   `json:"scope"`
 	Timestamp     string   `json:"timestamp"`
@@ -71,17 +69,16 @@ func (codexHookDecoder) NormalizeHook(input HookInput) (detect.Signal, error) {
 		return detect.Signal{}, err
 	}
 	signal, err := detect.NewHookSignal(detect.Signal{
-		Kind:            kind,
-		Vendor:          "codex",
-		VendorEvent:     eventName,
-		Scope:           scope,
-		VendorSessionID: sessionID,
-		VendorTurnID:    payload.TurnID,
-		Evidence:        evidence,
-		Confidence:      1,
-		OccurredAt:      occurredAt,
-		ReceivedAt:      input.ReceivedAt,
-		DeliveryID:      input.DeliveryID,
+		Kind:             kind,
+		Vendor:           "codex",
+		VendorEvent:      eventName,
+		Scope:            scope,
+		VendorSessionRef: sessionID,
+		Evidence:         evidence,
+		Confidence:       1,
+		OccurredAt:       occurredAt,
+		ReceivedAt:       input.ReceivedAt,
+		DeliveryID:       input.DeliveryID,
 	})
 	if err != nil {
 		return detect.Signal{}, fmt.Errorf("%w: %v", ErrInvalidHookPayload, err)
@@ -116,16 +113,15 @@ func normalizeCodexNotify(
 		return detect.Signal{}, err
 	}
 	signal, err := detect.NewNotifySignal(detect.Signal{
-		Kind:            detect.KindTurnStopped,
-		Vendor:          "codex",
-		VendorEvent:     payload.Type,
-		Scope:           detect.ScopeRoot,
-		VendorSessionID: payload.NotifyThread,
-		VendorTurnID:    payload.NotifyTurn,
-		Evidence:        "turn stopped",
-		Confidence:      1,
-		ReceivedAt:      input.ReceivedAt,
-		DeliveryID:      input.DeliveryID,
+		Kind:             detect.KindTurnStopped,
+		Vendor:           "codex",
+		VendorEvent:      payload.Type,
+		Scope:            detect.ScopeRoot,
+		VendorSessionRef: payload.NotifyThread,
+		Evidence:         "turn stopped",
+		Confidence:       1,
+		ReceivedAt:       input.ReceivedAt,
+		DeliveryID:       input.DeliveryID,
 	})
 	if err != nil {
 		return detect.Signal{}, fmt.Errorf("%w: %v", ErrInvalidHookPayload, err)

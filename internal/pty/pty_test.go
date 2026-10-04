@@ -6,10 +6,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -140,6 +143,35 @@ func TestStartRejectsInvalidSizeBeforeProcessStart(t *testing.T) {
 			}
 			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
 				t.Fatalf("process marker error = %v, want not exist", statErr)
+			}
+		})
+	}
+}
+
+func TestNormalizeTerminationGrace(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		input   time.Duration
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "default", want: 5 * time.Second},
+		{name: "configured", input: 250 * time.Millisecond, want: 250 * time.Millisecond},
+		{name: "negative", input: -time.Second, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := normalizeTerminationGrace(test.input)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("normalize %v succeeded", test.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalize %v: %v", test.input, err)
+			}
+			if got != test.want {
+				t.Fatalf("normalized grace = %v, want %v", got, test.want)
 			}
 		})
 	}
@@ -373,6 +405,457 @@ func TestCloseWaitsForOutputCallbackAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestCloseAllowsProcessGroupToExitOnTerm(t *testing.T) {
+	outputs := make(chan []byte, 128)
+	outputEnds := make(chan struct{}, 1)
+	exits := make(chan ExitInfo, 1)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("cooperative"),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: 2 * time.Second,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+		OnOutputEnd: func(uint64) {
+			outputEnds <- struct{}{}
+		},
+		OnExit: func(info ExitInfo) {
+			exits <- info
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	waitForOutput(t, outputs, "ready")
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	info := waitExit(t, exits)
+	if info.Code != 0 || info.Err != nil {
+		t.Fatalf("exit info = %+v, want cooperative exit", info)
+	}
+	select {
+	case <-outputEnds:
+	case <-time.After(2 * time.Second):
+		t.Fatal("output end callback did not finish")
+	}
+	waitForOutput(t, outputs, "terminated")
+}
+
+func TestCloseKillsProcessGroupAfterGrace(t *testing.T) {
+	const grace = 75 * time.Millisecond
+	outputs := make(chan []byte, 128)
+	exits := make(chan ExitInfo, 1)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("ignore"),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: grace,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+		OnExit: func(info ExitInfo) {
+			exits <- info
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	waitForOutput(t, outputs, "ready")
+	started := time.Now()
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < grace {
+		t.Fatalf("close elapsed = %v, want at least %v", elapsed, grace)
+	}
+	info := waitExit(t, exits)
+	if info.Err == nil || info.Code != -1 {
+		t.Fatalf("exit info = %+v, want forced signal exit", info)
+	}
+}
+
+func TestCloseKillsRemainingProcessGroupChildren(t *testing.T) {
+	const grace = 75 * time.Millisecond
+	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
+	childReadyPath := filepath.Join(t.TempDir(), "child.ready")
+	outputs := make(chan []byte, 128)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("group-leader", childPIDPath, childReadyPath),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: grace,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	waitForOutput(t, outputs, "ready")
+	rawPID, err := os.ReadFile(childPIDPath)
+	if err != nil {
+		t.Fatalf("read child pid: %v", err)
+	}
+	childPID, err := strconv.Atoi(string(rawPID))
+	if err != nil {
+		t.Fatalf("parse child pid %q: %v", rawPID, err)
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("surviving child is not alive before Close: %v", err)
+	}
+	childNeedsCleanup := true
+	t.Cleanup(func() {
+		if childNeedsCleanup {
+			_ = syscall.Kill(childPID, syscall.SIGKILL)
+		}
+	})
+
+	started := time.Now()
+	if err := sess.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < grace {
+		t.Fatalf("close elapsed = %v, want at least %v", elapsed, grace)
+	}
+	waitForProcessExit(t, childPID)
+	childNeedsCleanup = false
+}
+
+func TestCloseCleansProcessGroupAfterLeaderNaturalExit(t *testing.T) {
+	const grace = 75 * time.Millisecond
+	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
+	childReadyPath := filepath.Join(t.TempDir(), "child.ready")
+	outputs := make(chan []byte, 128)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("natural-group-leader", childPIDPath, childReadyPath),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: grace,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	waitForOutput(t, outputs, "ready")
+	select {
+	case <-sess.processExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("direct child did not exit")
+	}
+	rawPID, err := os.ReadFile(childPIDPath)
+	if err != nil {
+		t.Fatalf("read child pid: %v", err)
+	}
+	childPID, err := strconv.Atoi(string(rawPID))
+	if err != nil {
+		t.Fatalf("parse child pid %q: %v", rawPID, err)
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("surviving child is not alive before Close: %v", err)
+	}
+	childNeedsCleanup := true
+	t.Cleanup(func() {
+		if childNeedsCleanup {
+			_ = syscall.Kill(childPID, syscall.SIGKILL)
+			_ = syscall.Kill(-sess.PID(), syscall.SIGKILL)
+		}
+	})
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- sess.Close()
+	}()
+	select {
+	case closeErr := <-closeDone:
+		if closeErr != nil {
+			t.Fatalf("close: %v", closeErr)
+		}
+	case <-time.After(grace + time.Second):
+		_ = syscall.Kill(-sess.PID(), syscall.SIGKILL)
+		<-closeDone
+		t.Fatal("close did not clean the surviving process group")
+	}
+	waitForProcessNotRunning(t, childPID)
+	childNeedsCleanup = false
+}
+
+func TestCloseInterruptsWriteBlockedByStoppedRawProcess(t *testing.T) {
+	const grace = 75 * time.Millisecond
+	outputs := make(chan []byte, 16)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("stopped-raw"),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: grace,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	waitForOutput(t, outputs, "ready")
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := sess.Write(bytes.Repeat([]byte{'x'}, 256*1024))
+		writeDone <- writeErr
+	}()
+	select {
+	case writeErr := <-writeDone:
+		t.Fatalf("write returned before close: %v", writeErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if written, err := sess.Write([]byte("second")); written != 0 ||
+		!errors.Is(err, ErrWriteBackpressure) {
+		t.Fatalf(
+			"concurrent write = (%d, %v), want (0, ErrWriteBackpressure)",
+			written,
+			err,
+		)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- sess.Close()
+	}()
+	select {
+	case closeErr := <-closeDone:
+		if closeErr != nil {
+			t.Fatalf("close: %v", closeErr)
+		}
+	case <-time.After(grace + time.Second):
+		_ = syscall.Kill(-sess.PID(), syscall.SIGKILL)
+		<-closeDone
+		<-writeDone
+		t.Fatal("close remained blocked behind the PTY write")
+	}
+	if writeErr := <-writeDone; writeErr == nil {
+		t.Fatal("blocked write succeeded after close")
+	}
+}
+
+func TestWriteTimesOutWithPartialCount(t *testing.T) {
+	const grace = 25 * time.Millisecond
+	outputs := make(chan []byte, 16)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("stopped-raw"),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: grace,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	waitForOutput(t, outputs, "ready")
+	data := bytes.Repeat([]byte{'x'}, 256*1024)
+	started := time.Now()
+	written, err := sess.Write(data)
+	if !errors.Is(err, ErrWriteBackpressure) {
+		t.Fatalf("write error = %v, want ErrWriteBackpressure", err)
+	}
+	if written <= 0 || written >= len(data) {
+		t.Fatalf("written bytes = %d, want a partial count below %d", written, len(data))
+	}
+	if elapsed := time.Since(started); elapsed < writeTimeout/2 ||
+		elapsed > writeTimeout+time.Second {
+		t.Fatalf("write elapsed = %v, want a bounded timeout near %v", elapsed, writeTimeout)
+	}
+}
+
+func TestNaturalExitInterruptsBlockedWrite(t *testing.T) {
+	outputs := make(chan []byte, 16)
+	sess, err := Start(Config{
+		Command: os.Args[0],
+		Args:    ptyHelperArgs("raw-exit"),
+		Env:     []string{"DROVE_PTY_HELPER=1"},
+		Size:    testSize(t),
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sess.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	waitForOutput(t, outputs, "ready")
+	data := bytes.Repeat([]byte{'x'}, 256*1024)
+	written, err := sess.Write(data)
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("write error = %v, want ErrClosed", err)
+	}
+	if written <= 0 || written >= len(data) {
+		t.Fatalf("written bytes = %d, want a partial count below %d", written, len(data))
+	}
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after natural exit")
+	}
+}
+
+func TestPTYProcessHelper(t *testing.T) {
+	if os.Getenv("DROVE_PTY_HELPER") != "1" {
+		return
+	}
+	args := helperArguments()
+	if len(args) == 0 {
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "cooperative":
+		terms := make(chan os.Signal, 1)
+		signal.Notify(terms, syscall.SIGTERM)
+		_, _ = os.Stdout.WriteString("ready")
+		<-terms
+		_, _ = os.Stdout.WriteString("terminated")
+		os.Exit(0)
+	case "ignore":
+		signal.Ignore(syscall.SIGTERM)
+		_, _ = os.Stdout.WriteString("ready")
+		for {
+			time.Sleep(time.Hour)
+		}
+	case "stopped-raw":
+		stty := exec.Command("stty", "raw", "-echo")
+		stty.Stdin = os.Stdin
+		stty.Stdout = os.Stdout
+		stty.Stderr = os.Stderr
+		if err := stty.Run(); err != nil {
+			os.Exit(6)
+		}
+		_, _ = os.Stdout.WriteString("ready")
+		if err := syscall.Kill(os.Getpid(), syscall.SIGSTOP); err != nil {
+			os.Exit(7)
+		}
+		os.Exit(0)
+	case "raw-exit":
+		stty := exec.Command("stty", "raw", "-echo")
+		stty.Stdin = os.Stdin
+		stty.Stdout = os.Stdout
+		stty.Stderr = os.Stderr
+		if err := stty.Run(); err != nil {
+			os.Exit(6)
+		}
+		exitTimer := exec.Command(
+			"/bin/sh",
+			"-c",
+			`sleep 0.1; kill -KILL "$1"`,
+			"pty-exit-timer",
+			strconv.Itoa(os.Getpid()),
+		)
+		exitTimer.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+		if err := exitTimer.Start(); err != nil {
+			os.Exit(8)
+		}
+		_, _ = os.Stdout.WriteString("ready")
+		for {
+			time.Sleep(time.Hour)
+		}
+	case "group-leader":
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		child := exec.Command(
+			os.Args[0],
+			ptyHelperArgs("group-child", args[2])...,
+		)
+		child.Env = os.Environ()
+		if err := child.Start(); err != nil {
+			os.Exit(3)
+		}
+		if err := os.WriteFile(
+			args[1],
+			[]byte(strconv.Itoa(child.Process.Pid)),
+			0o600,
+		); err != nil {
+			os.Exit(4)
+		}
+		for {
+			if _, err := os.Stat(args[2]); err == nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		terms := make(chan os.Signal, 1)
+		signal.Notify(terms, syscall.SIGTERM)
+		_, _ = os.Stdout.WriteString("ready")
+		<-terms
+		os.Exit(0)
+	case "natural-group-leader":
+		if len(args) != 3 {
+			os.Exit(2)
+		}
+		child := exec.Command(
+			os.Args[0],
+			ptyHelperArgs("group-child", args[2])...,
+		)
+		child.Env = os.Environ()
+		child.Stdin = os.Stdin
+		child.Stdout = os.Stdout
+		child.Stderr = os.Stderr
+		if err := child.Start(); err != nil {
+			os.Exit(3)
+		}
+		if err := os.WriteFile(
+			args[1],
+			[]byte(strconv.Itoa(child.Process.Pid)),
+			0o600,
+		); err != nil {
+			os.Exit(4)
+		}
+		for {
+			if _, err := os.Stat(args[2]); err == nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		_, _ = os.Stdout.WriteString("ready")
+		os.Exit(0)
+	case "group-child":
+		if len(args) != 2 {
+			os.Exit(2)
+		}
+		signal.Ignore(syscall.SIGTERM, syscall.SIGHUP)
+		if err := os.WriteFile(args[1], nil, 0o600); err != nil {
+			os.Exit(5)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
+	default:
+		os.Exit(2)
+	}
+}
+
 func TestStartFailureInvokesNoCallback(t *testing.T) {
 	var outputCalls atomic.Int32
 	var exitCalls atomic.Int32
@@ -519,6 +1002,86 @@ func waitExit(t *testing.T, ch <-chan ExitInfo) ExitInfo {
 		t.Fatal("exit callback timed out")
 		return ExitInfo{}
 	}
+}
+
+func waitForOutput(t *testing.T, outputs <-chan []byte, want string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	var observed []byte
+	for {
+		select {
+		case chunk := <-outputs:
+			observed = append(observed, chunk...)
+			if strings.Contains(string(observed), want) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("output = %q, want substring %q", observed, want)
+		}
+	}
+}
+
+func waitForProcessExit(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if err != nil && !errors.Is(err, syscall.EPERM) {
+			t.Fatalf("inspect child process %d: %v", pid, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child process %d is still alive", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForProcessNotRunning(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if err != nil && !errors.Is(err, syscall.EPERM) {
+			t.Fatalf("inspect child process %d: %v", pid, err)
+		}
+		status, statusErr := exec.Command(
+			"ps",
+			"-o",
+			"stat=",
+			"-p",
+			strconv.Itoa(pid),
+		).Output()
+		if statusErr != nil || strings.HasPrefix(
+			strings.TrimSpace(string(status)),
+			"Z",
+		) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("child process %d is still running", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func ptyHelperArgs(mode string, args ...string) []string {
+	result := []string{"-test.run=^TestPTYProcessHelper$", "--", mode}
+	return append(result, args...)
+}
+
+func helperArguments() []string {
+	for index, arg := range os.Args {
+		if arg == "--" {
+			return os.Args[index+1:]
+		}
+	}
+	return nil
 }
 
 func testSize(t *testing.T) Size {
