@@ -19,6 +19,7 @@ import (
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
+	"github.com/Duang777/drove/internal/store"
 )
 
 func TestWebSocketV2ClosesWhenAuthorizationExpires(t *testing.T) {
@@ -254,6 +255,105 @@ func TestWebSocketV2ExplicitReadOnlyRawAuditsLifecycle(t *testing.T) {
 	}
 }
 
+func TestWebSocketV2EventHistoryRedactsPrivateSessionMetadata(t *testing.T) {
+	server, _, st := newTestServer(t)
+	base := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+				`"working_dir":"/private/project"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "observed",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_ref":"vendor-ref",` +
+				`"confidence":1,"received_at":"2026-10-04T12:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeAgentResumed),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "requested",
+			Payload:   `{"version":1,"vendor_session_ref":"vendor-ref"}`,
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("seed private event history: %v", err)
+	}
+
+	httpServer := httptest.NewServer(server.mux)
+	defer httpServer.Close()
+	conn := dialTestWebSocketV2(t, httpServer.URL)
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "subscribe",
+		"request_id": "subscribe-private-events",
+		"agent_id":   "agent-1",
+		"mode":       "events",
+	}); err != nil {
+		t.Fatalf("subscribe events: %v", err)
+	}
+	_ = readWebSocketV2TextType(
+		t,
+		conn,
+		"subscribed",
+		time.Now().Add(3*time.Second),
+	)
+
+	eventCount := 0
+	for {
+		messageType, payload := readWebSocketV2Message(
+			t,
+			conn,
+			time.Now().Add(3*time.Second),
+		)
+		if messageType != websocket.TextMessage {
+			continue
+		}
+		message := decodeTestJSONObject(t, payload)
+		if message["type"] == "caught_up" {
+			break
+		}
+		if message["type"] != "event" {
+			t.Fatalf("unexpected events message = %#v", message)
+		}
+		eventCount++
+		encoded, err := json.Marshal(message)
+		if err != nil {
+			t.Fatalf("encode event message: %v", err)
+		}
+		for _, private := range []string{
+			"/private/project",
+			"vendor-ref",
+			"working_dir",
+			"vendor_session_ref",
+			"vendor_session_id",
+		} {
+			if bytes.Contains(encoded, []byte(private)) {
+				t.Fatalf("WebSocket event exposed %q: %s", private, encoded)
+			}
+		}
+	}
+	if eventCount != len(rows) {
+		t.Fatalf("event count = %d, want %d", eventCount, len(rows))
+	}
+}
+
 func TestWebSocketV2WritableRawInputResizeAndEvents(t *testing.T) {
 	server, manager, _ := newTestServer(t)
 	status, err := manager.Start(context.Background(), session.StartRequest{
@@ -362,6 +462,77 @@ func TestWebSocketV2WritableRawInputResizeAndEvents(t *testing.T) {
 	cursor := eventMessage["cursor"].(map[string]any)
 	if _, ok := cursor["seq"].(string); !ok {
 		t.Fatalf("event cursor sequence is not a decimal string: %#v", cursor)
+	}
+}
+
+func TestWebSocketV2InputReturnsBackpressureForBlockedPTY(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "websocket-v2-blocked-input",
+		Command: "/bin/sh",
+		Args: []string{
+			"-c",
+			"stty raw -echo; printf READY; kill -STOP $$",
+		},
+		Mode: agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start agent: %v", err)
+	}
+	waitForOutputText(t, manager, status.AgentID, "READY")
+	t.Cleanup(func() {
+		resumeStoppedAgent(t, manager, status.AgentID)
+	})
+
+	httpServer := httptest.NewServer(server.mux)
+	defer httpServer.Close()
+	conn := dialTestWebSocketV2(t, httpServer.URL)
+	defer conn.Close()
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "subscribe",
+		"request_id": "subscribe-blocked",
+		"agent_id":   status.AgentID,
+		"mode":       "raw",
+		"writable":   true,
+		"rows":       40,
+		"columns":    120,
+	}); err != nil {
+		t.Fatalf("subscribe writable raw: %v", err)
+	}
+	_ = readWebSocketV2TextType(
+		t,
+		conn,
+		"subscribed",
+		time.Now().Add(2*time.Second),
+	)
+	_ = readWebSocketV2TextType(
+		t,
+		conn,
+		"caught_up",
+		time.Now().Add(2*time.Second),
+	)
+
+	if err := conn.WriteJSON(map[string]any{
+		"version":    2,
+		"type":       "input",
+		"request_id": "blocked-1",
+		"agent_id":   status.AgentID,
+		"data":       strings.Repeat("x", session.MaxInputBytes),
+	}); err != nil {
+		t.Fatalf("write input: %v", err)
+	}
+	response := readWebSocketV2TextType(
+		t,
+		conn,
+		"error",
+		time.Now().Add(2*time.Second),
+	)
+	if response["request_id"] != "blocked-1" ||
+		response["code"] != "input_backpressure" ||
+		!strings.Contains(response["message"].(string), "do not retry") {
+		t.Fatalf("response = %#v, want partial input_backpressure", response)
 	}
 }
 
@@ -669,6 +840,19 @@ func TestWebSocketV2OperationErrorIncludesExpiredRanges(t *testing.T) {
 	if response.Code != "output_expired" ||
 		len(response.Missing) != 1 ||
 		response.Missing[0] != source.Missing[0] {
+		t.Fatalf("response = %+v", response)
+	}
+}
+
+func TestWebSocketV2OperationErrorMapsInputBackpressure(t *testing.T) {
+	response := webSocketV2OperationError(
+		"request-1",
+		"agent-1",
+		webSocketV2ModeRaw,
+		session.ErrInputBackpressure,
+	)
+	if response.Code != "input_backpressure" ||
+		response.RequestID != "request-1" {
 		t.Fatalf("response = %+v", response)
 	}
 }

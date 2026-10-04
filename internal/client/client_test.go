@@ -163,6 +163,43 @@ func TestSendInputReturnsServerError(t *testing.T) {
 	}
 }
 
+func TestResumePostsEscapedAgentPathAndDecodesStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if got := r.URL.EscapedPath(); got != "/api/v1/agents/agent%2Fone/resume" {
+			t.Errorf("path = %q, want escaped resume path", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"agent_id":"agent/one",
+			"name":"agent",
+			"vendor":"claude",
+			"mode":"interactive",
+			"state":"working",
+			"created_at":"2026-10-04T15:00:00Z",
+			"updated_at":"2026-10-04T15:00:01Z",
+			"hook_policy":"off",
+			"hook_status":"off",
+			"signal_injection":"off",
+			"signal_injection_status":"off",
+			"signal_injection_reason":"hook_policy_off",
+			"resumable":false
+		}`)
+	}))
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	status, err := c.Resume(context.Background(), "agent/one")
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if status.AgentID != "agent/one" || status.State != "working" || status.Resumable {
+		t.Fatalf("resume status = %+v", status)
+	}
+}
+
 func TestExplainEncodesPathAndOptionalLimit(t *testing.T) {
 	tests := []struct {
 		name      string

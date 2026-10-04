@@ -108,23 +108,22 @@ type ProcessFact struct {
 
 // Signal is a bounded, redacted observation suitable for durable audit.
 type Signal struct {
-	Version         int
-	Source          Source
-	Kind            Kind
-	Vendor          string
-	VendorEvent     string
-	Scope           Scope
-	VendorSessionID string
-	VendorTurnID    string
-	Notification    string
-	Evidence        string
-	Confidence      float64
-	OccurredAt      time.Time
-	ReceivedAt      time.Time
-	DeliveryID      string
-	Timer           TimerRef
-	Process         *ProcessFact
-	Screen          *agent.ScreenAttribution
+	Version          int
+	Source           Source
+	Kind             Kind
+	Vendor           string
+	VendorEvent      string
+	Scope            Scope
+	VendorSessionRef string
+	Notification     string
+	Evidence         string
+	Confidence       float64
+	OccurredAt       time.Time
+	ReceivedAt       time.Time
+	DeliveryID       string
+	Timer            TimerRef
+	Process          *ProcessFact
+	Screen           *agent.ScreenAttribution
 }
 
 // NewHookSignal validates and copies a normalized vendor hook signal.
@@ -224,11 +223,15 @@ func (s Signal) validate() error {
 		return errors.New("detect: vendor event must contain 1 to 64 ASCII bytes")
 	}
 	if len(s.Vendor) > maxVendorBytes ||
-		len(s.VendorSessionID) > maxVendorIDBytes ||
-		len(s.VendorTurnID) > maxVendorIDBytes ||
+		len(s.VendorSessionRef) > maxVendorIDBytes ||
 		len(s.Notification) > maxNotificationBytes ||
 		len(s.Evidence) > maxEvidenceBytes {
 		return errors.New("detect: signal metadata exceeds its size limit")
+	}
+	if s.VendorSessionRef != "" && !asciiToken(s.VendorSessionRef) {
+		return errors.New(
+			"detect: vendor session reference must contain printable ASCII without surrounding whitespace",
+		)
 	}
 	if math.IsNaN(s.Confidence) || math.IsInf(s.Confidence, 0) ||
 		s.Confidence < 0 || s.Confidence > 1 {
@@ -489,7 +492,7 @@ func asciiToken(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if r < 0x20 || r > 0x7f {
+		if r < 0x20 || r > 0x7e {
 			return false
 		}
 	}

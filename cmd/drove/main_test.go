@@ -120,6 +120,10 @@ func TestInitCreatesPrivateDataDirectoryWithRetentionDefault(t *testing.T) {
 			cfg.Storage.OutputRetentionDays,
 		)
 	}
+	if cfg.Session.AutoResumeOnStart ||
+		cfg.Session.TerminationGraceSeconds != 5 {
+		t.Fatalf("session defaults = %+v", cfg.Session)
+	}
 }
 
 func TestUpCommandExposesRunnerAndHookFlags(t *testing.T) {
@@ -215,6 +219,99 @@ func TestAttachCommandMapsAgentAndAccessToRunner(t *testing.T) {
 			runAgentID,
 			runOptions,
 		)
+	}
+}
+
+func TestResumeCommandUsesEscapedAgentIDAndPrintsStatus(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "drove-resume-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".drove")
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch r.URL.EscapedPath() {
+		case "/api/v1/agents":
+			_, _ = io.WriteString(w, "[]")
+		case "/api/v1/agents/agent%2Fone/resume":
+			if r.Method != http.MethodPost {
+				t.Errorf("method = %s, want POST", r.Method)
+			}
+			_ = json.NewEncoder(w).Encode(session.Status{
+				AgentID: "agent/one",
+				Vendor:  "claude",
+				Mode:    agent.RunModeInteractive,
+				State:   agent.StateWorking,
+				PID:     42,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	cfg := config.Defaults()
+	cfg.DataDir = dataDir
+	cfg.DBPath = ""
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	command := newResumeCmd()
+	command.SetArgs([]string{"agent/one"})
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute resume: %v", err)
+	}
+	if got := stdout.String(); got != "resumed agent agent/one (vendor=claude, mode=interactive, state=working, pid=42)\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+}
+
+func TestWriteStatusesIncludesResumableColumn(t *testing.T) {
+	var output bytes.Buffer
+	err := writeStatuses(&output, []*session.Status{
+		{
+			AgentID:   "agent-1",
+			Name:      "first",
+			Vendor:    "claude",
+			Mode:      agent.RunModeInteractive,
+			State:     agent.StateStopped,
+			Resumable: true,
+		},
+	})
+	if err != nil {
+		t.Fatalf("write statuses: %v", err)
+	}
+	if !strings.Contains(output.String(), "RESUMABLE") ||
+		!strings.Contains(output.String(), "true") {
+		t.Fatalf("status output = %q", output.String())
 	}
 }
 

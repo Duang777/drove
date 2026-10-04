@@ -141,6 +141,7 @@ describe('terminal REST parsing', () => {
             signal_injection: 'off',
             signal_injection_status: 'off',
             signal_injection_reason: 'unsupported',
+            resumable: true,
             last_transition: {
               source: 'screen',
               event: 'blocked_prompt',
@@ -165,6 +166,7 @@ describe('terminal REST parsing', () => {
         dir: '/workspace/drove',
         hook_policy: 'auto',
         signal_injection_reason: 'unsupported',
+        resumable: true,
         last_transition: {
           source: 'screen',
           screen: { edge: 'present', output_offset: 5 },

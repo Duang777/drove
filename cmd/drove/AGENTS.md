@@ -2,8 +2,8 @@
 
 ## 职责
 
-**CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / ps / log /
-timeline / explain / attach / stop / token rotate / web / version），所有会话操作都经
+**CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / resume / ps /
+log / timeline / explain / attach / stop / token rotate / web / version），所有会话操作都经
 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
 
@@ -23,6 +23,8 @@ timeline / explain / attach / stop / token rotate / web / version），所有会
 - `drove ps` 列出全部会话；`drove log <id>` 默认只向 stdout 回放终端字节，
   `--plain` 使用流式清洗器移除跨事件控制序列；旧 `output` 事件补一个换行，
   已过期的 `output.chunk` 不输出占位文本；`drove stop <id>` 停止（幂等）。
+- `drove resume <id>` 调用厂商原生恢复并保持同一 Agent ID；`drove ps` 的
+  `RESUMABLE` 列来自 daemon 派生状态。
 - `drove explain <id>` 按时间顺序打印类型化决策；`--limit` 限制最近事件数，
   `--json` 保持 stdout 仅含响应 JSON。只有 attached snapshot 存在时才打印
   `ephemeral redacted current screen` 标签和受限行视图。

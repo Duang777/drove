@@ -12,7 +12,6 @@ type claudeHookDecoder struct{}
 type claudeHookPayload struct {
 	HookEventName    string `json:"hook_event_name"`
 	SessionID        string `json:"session_id"`
-	PromptID         string `json:"prompt_id"`
 	AgentID          string `json:"agent_id"`
 	Scope            string `json:"scope"`
 	NotificationType string `json:"notification_type"`
@@ -56,18 +55,17 @@ func (claudeHookDecoder) NormalizeHook(input HookInput) (detect.Signal, error) {
 		return detect.Signal{}, err
 	}
 	signal, err := detect.NewHookSignal(detect.Signal{
-		Kind:            kind,
-		Vendor:          "claude",
-		VendorEvent:     payload.HookEventName,
-		Scope:           scope,
-		VendorSessionID: payload.SessionID,
-		VendorTurnID:    payload.PromptID,
-		Notification:    notification,
-		Evidence:        evidence,
-		Confidence:      1,
-		OccurredAt:      occurredAt,
-		ReceivedAt:      input.ReceivedAt,
-		DeliveryID:      input.DeliveryID,
+		Kind:             kind,
+		Vendor:           "claude",
+		VendorEvent:      payload.HookEventName,
+		Scope:            scope,
+		VendorSessionRef: payload.SessionID,
+		Notification:     notification,
+		Evidence:         evidence,
+		Confidence:       1,
+		OccurredAt:       occurredAt,
+		ReceivedAt:       input.ReceivedAt,
+		DeliveryID:       input.DeliveryID,
 	})
 	if err != nil {
 		return detect.Signal{}, fmt.Errorf("%w: %v", ErrInvalidHookPayload, err)

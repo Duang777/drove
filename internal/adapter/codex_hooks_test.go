@@ -22,8 +22,7 @@ func TestCodexHookAcceptsEventAndThreadAliases(t *testing.T) {
 		t.Fatalf("normalize aliases: %v", err)
 	}
 	if signal.Kind != detect.KindTurnStarted ||
-		signal.VendorSessionID != "thread-1" ||
-		signal.VendorTurnID != "turn-1" {
+		signal.VendorSessionRef != "thread-1" {
 		t.Fatalf("signal = %+v", signal)
 	}
 }
@@ -62,15 +61,13 @@ func TestCodexNotifyNormalizesOnlyBoundedIdentifiers(t *testing.T) {
 	if signal.Source != detect.SourceNotify ||
 		signal.Kind != detect.KindTurnStopped ||
 		signal.VendorEvent != "agent-turn-complete" ||
-		signal.VendorSessionID != "thread-1" ||
-		signal.VendorTurnID != "turn-1" ||
+		signal.VendorSessionRef != "thread-1" ||
 		signal.Evidence != "turn stopped" {
 		t.Fatalf("signal = %+v", signal)
 	}
 	for _, sensitive := range []string{"/secret/project", "private prompt", "private response"} {
 		if signal.Evidence == sensitive ||
-			signal.VendorSessionID == sensitive ||
-			signal.VendorTurnID == sensitive {
+			signal.VendorSessionRef == sensitive {
 			t.Fatalf("signal retained sensitive value %q: %+v", sensitive, signal)
 		}
 	}

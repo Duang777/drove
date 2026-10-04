@@ -37,7 +37,7 @@ release binaries or multi-session TUI.
 | Capability | Status | Where |
 | --- | --- | --- |
 | One PTY per agent, owned by `droved` | Shipped | `internal/pty` |
-| `init` `up` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
+| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
 | Per-session Claude / Codex signal injection | Shipped | [#15](https://github.com/Duang777/drove/issues/15) |
 | Raw terminal bytes, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` byte replay, `--plain` strips control sequences | Shipped | |
@@ -51,7 +51,7 @@ release binaries or multi-session TUI.
 | Control-tower grid | Planned | [#26](https://github.com/Duang777/drove/issues/26) |
 | Push notifications | Planned | [#27](https://github.com/Duang777/drove/issues/27) |
 | Approve, deny, or reply from a phone | Planned | [#28](https://github.com/Duang777/drove/issues/28) |
-| Native resume, and SIGTERM with a grace period before SIGKILL | Planned | [#16](https://github.com/Duang777/drove/issues/16) |
+| Native resume, and process-group SIGTERM with a grace period before SIGKILL | Shipped | [#16](https://github.com/Duang777/drove/issues/16) |
 | Agent processes that survive daemon exit | Planned | [#17](https://github.com/Duang777/drove/issues/17), [#18](https://github.com/Duang777/drove/issues/18) |
 | Away brief, cross-session search, git worktree | Planned | [#29](https://github.com/Duang777/drove/issues/29), [#30](https://github.com/Duang777/drove/issues/30), [#23](https://github.com/Duang777/drove/issues/23) |
 
@@ -106,7 +106,8 @@ drove up claude --hooks required
 | --- | --- |
 | `drove init` | Write the default `config.json`. Overwrites an existing file |
 | `drove up <vendor\|command>` | Start a session. Vendor names are `claude` and `codex`. Any other string is an executable name, with no extra arguments |
-| `drove ps` | Print AGENT ID, NAME, VENDOR, MODE, STATE, PID. Prints `no agents running` when empty |
+| `drove resume <agent-id>` | Run the vendor-native resume for an eligible Claude or Codex session while preserving its Agent ID |
+| `drove ps` | Print AGENT ID, NAME, VENDOR, MODE, STATE, PID, RESUMABLE. Prints `no agents running` when empty |
 | `drove log <agent-id>` | Write terminal bytes to stdout. Does not print state events |
 | `drove log <agent-id> --plain` | Strip control sequences with a streaming filter |
 | `drove timeline <agent-id>` | Print state spans, output retention, and one-based Blocked jump points. `--json` prints the full response |
@@ -216,13 +217,32 @@ Once a database contains `output.chunk`, the oldest safe reader is [`d11f6c3`](h
 
 ### Stop and restart
 
-`drove stop`, and daemon shutdown on SIGINT or SIGTERM, both call `Process.Kill` (SIGKILL) on the PTY child. There is no SIGTERM grace period.
+`drove stop` and daemon shutdown on SIGINT or SIGTERM first send SIGTERM to
+the PTY's entire process group. The default grace period is 5 seconds. If the
+group remains, Drove sends SIGKILL. It closes the PTY master only after reaping
+the direct child, then waits for trailing output and exit callbacks.
 
 After `drove up` returns, the foreground command is gone and the session lives in `droved`. That daemon is not detached from the controlling terminal and does not handle SIGHUP. When the daemon exits, its agent processes do not remain.
 
-On the next start the daemon rebuilds projections from the event log. Sessions whose PTY cannot be reattached are closed as `stopped` with `session interrupted by daemon restart; previous PTY is not reconnectable`. Bytes already stored can still be read with `drove log`. The live process does not come back.
+On the next start the daemon rebuilds projections from the event log. Sessions
+whose PTY cannot be reattached are first closed as `stopped` with
+`session interrupted by daemon restart; previous PTY is not reconnectable`.
+Bytes already stored can still be read with `drove log`.
 
-Native `claude --resume` / `codex resume`, and a SIGTERM-then-grace-then-SIGKILL stop, are [#16](https://github.com/Duang777/drove/issues/16). A per-session shim that keeps the process across a daemon restart is [#17](https://github.com/Duang777/drove/issues/17) and [#18](https://github.com/Duang777/drove/issues/18).
+A valid native Claude or Codex signal stores one private resume reference. When
+`drove ps` shows `RESUMABLE=true` after a stop, `drove resume <agent-id>` runs
+`claude --resume` or `codex resume` under the same Agent ID and append-only
+event stream. The reference is absent from Status, public API events, CLI
+output, logs, and public replay. The absolute working directory from creation
+is also stored only in the private event payload. Native resume starts there
+so a changed daemon working directory cannot hide the vendor session.
+
+`session.auto_resume_on_start` is off by default. When enabled, the daemon
+waits until the API is accepting connections, then resumes sessions that were
+nonterminal before restart and have a reference, in creation order. A session
+stopped by the user is not resumed automatically. Keeping the original process
+alive across daemon restart remains [#17](https://github.com/Duang777/drove/issues/17)
+and [#18](https://github.com/Duang777/drove/issues/18).
 
 ## Supported agents
 
@@ -250,6 +270,10 @@ The config file is `~/.drove/config.json`. `DROVE_DATA_DIR` overrides `data_dir`
   ],
   "storage": {
     "output_retention_days": 30
+  },
+  "session": {
+    "auto_resume_on_start": false,
+    "termination_grace_seconds": 5
   }
 }
 ```
@@ -319,8 +343,7 @@ The next items are:
 1. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
 2. [#41](https://github.com/Duang777/drove/issues/41) Bubble Tea multi-session overview
 3. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
-4. [#16](https://github.com/Duang777/drove/issues/16) native resume and a gentler stop
-5. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
+4. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
 
 After the MVP: the shim in [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18), then the away brief [#29](https://github.com/Duang777/drove/issues/29), full-text search [#30](https://github.com/Duang777/drove/issues/30), and worktrees [#23](https://github.com/Duang777/drove/issues/23). Structured state sources [#22](https://github.com/Duang777/drove/issues/22) and the persistent hook installer [#24](https://github.com/Duang777/drove/issues/24) are deferred.
 

@@ -231,7 +231,7 @@ func newScreenTestController(t *testing.T) *term.Controller {
 	if err != nil {
 		t.Fatalf("NewSize: %v", err)
 	}
-	controller, err := term.NewController(size, func([]byte) error { return nil })
+	controller, err := term.NewController(size)
 	if err != nil {
 		t.Fatalf("NewController: %v", err)
 	}

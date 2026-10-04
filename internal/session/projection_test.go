@@ -266,6 +266,62 @@ func TestRecoveryProjectorIgnoresSignalOnlySessions(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorRestoresLatestVendorSessionReference(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "hook",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_id":"legacy-ref",` +
+				`"confidence":1,"received_at":"2026-10-03T05:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "hook",
+			Payload: `{"version":1,"source":"hook","kind":"observed","vendor":"claude",` +
+				`"vendor_event":"Notification","scope":"root","vendor_session_ref":"current-ref",` +
+				`"confidence":1,"received_at":"2026-10-03T05:00:02Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440001","outcome":"observed"}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if got := plan.VendorSessionRefs["agent-1"]; got != "current-ref" {
+		t.Fatalf("vendor session reference = %q, want current-ref", got)
+	}
+	if !plan.ResumeOnStart["agent-1"] {
+		t.Fatal("nonterminal recovered session is not eligible for automatic resume")
+	}
+}
+
 func TestRecoveryProjectorReadsVersionTwoMetadataAndEvidence(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	projector := newRecoveryProjector()
@@ -679,6 +735,126 @@ func TestRecoveryProjectorStateChainCompatibility(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorRequiresAdjacentResumeEvent(t *testing.T) {
+	base := time.Date(2026, time.October, 4, 14, 0, 0, 0, time.UTC)
+	prefix := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "s1",
+			AgentID:   "s1",
+			From:      "pending",
+			To:        "stopped",
+		},
+	}
+	resumed := store.EventRow{
+		Seq:       3,
+		Timestamp: base.Add(2 * time.Second),
+		Type:      string(event.TypeAgentResumed),
+		SessionID: "s1",
+		AgentID:   "s1",
+		Reason:    "requested",
+		Payload:   `{"version":1,"vendor_session_ref":"vendor-session-1"}`,
+	}
+	starting := store.EventRow{
+		Seq:       4,
+		Timestamp: base.Add(3 * time.Second),
+		Type:      string(event.TypeStateChanged),
+		SessionID: "s1",
+		AgentID:   "s1",
+		From:      "stopped",
+		To:        "starting",
+	}
+	tests := []struct {
+		name    string
+		middle  []store.EventRow
+		wantErr bool
+	}{
+		{name: "adjacent same agent", middle: []store.EventRow{resumed}},
+		{name: "missing resume", wantErr: true},
+		{
+			name: "different agent",
+			middle: []store.EventRow{{
+				Seq:       3,
+				Timestamp: base.Add(2 * time.Second),
+				Type:      string(event.TypeAgentResumed),
+				SessionID: "s2",
+				AgentID:   "s2",
+				Reason:    "requested",
+				Payload:   resumed.Payload,
+			}},
+			wantErr: true,
+		},
+		{
+			name: "intervening event",
+			middle: []store.EventRow{
+				resumed,
+				{
+					Seq:       4,
+					Timestamp: base.Add(3 * time.Second),
+					Type:      string(event.TypeOutput),
+					SessionID: "s1",
+					AgentID:   "s1",
+				},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projector := newRecoveryProjector()
+			rows := append([]store.EventRow(nil), prefix...)
+			rows = append(rows, test.middle...)
+			final := starting
+			final.Seq = uint64(len(rows) + 1)
+			final.Timestamp = base.Add(time.Duration(len(rows)) * time.Second)
+			rows = append(rows, final)
+			var applyErr error
+			for _, row := range rows {
+				if applyErr = projector.Apply(row); applyErr != nil {
+					break
+				}
+			}
+			if test.wantErr {
+				if applyErr == nil || !strings.Contains(applyErr.Error(), "agent.resumed") {
+					t.Fatalf("apply error = %v, want agent.resumed rejection", applyErr)
+				}
+				return
+			}
+			if applyErr != nil {
+				t.Fatalf("apply: %v", applyErr)
+			}
+		})
+	}
+}
+
+func TestRecoveryProjectorRejectsMalformedResumePayload(t *testing.T) {
+	projector := newRecoveryProjector()
+	err := projector.Apply(store.EventRow{
+		Seq:       1,
+		Timestamp: time.Date(2026, time.October, 4, 14, 0, 0, 0, time.UTC),
+		Type:      string(event.TypeAgentResumed),
+		SessionID: "s1",
+		AgentID:   "s1",
+		Reason:    "requested",
+		Payload:   `{"version":1,"vendor_session_ref":""}`,
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate agent.resumed payload") {
+		t.Fatalf("apply error = %v, want malformed resume payload", err)
+	}
+}
+
 func TestRecoveryProjectorOrdersReconciliationByFirstEvent(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	projector := newRecoveryProjector()
@@ -973,6 +1149,20 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "signal injection",
 		},
 		{
+			name: "relative working directory",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeSessionLifecycle),
+				SessionID: "s1",
+				Reason:    "created",
+				Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+					`"mode":"interactive","hook_policy":"auto",` +
+					`"working_dir":"relative/project"}`,
+			}},
+			wantErr: "working directory",
+		},
+		{
 			name: "empty metadata name",
 			rows: []store.EventRow{
 				{Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle), SessionID: "s1", Reason: "created", Payload: `{"version":1,"name":"","vendor":"generic"}`},
@@ -1224,6 +1414,7 @@ func TestCreationMetadataRemainsReadableByOldVersionTwoDecoder(t *testing.T) {
 		SignalInjection:       &injection,
 		SignalInjectionStatus: &injectionStatus,
 		SignalInjectionReason: &injectionReason,
+		WorkingDir:            "/private/project",
 	})
 	if err != nil {
 		t.Fatalf("marshal creation metadata: %v", err)

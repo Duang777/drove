@@ -778,9 +778,9 @@ macOS 真实控制终端的 `stty` 对比只有内核维护的 `PENDIN` 位不�
 
 ### Web 与工作目录验收
 
-新会话在启动边界把 `--dir` 解析为绝对路径，并把它写入 version 2 creation
-metadata。恢复投影和 REST status 保留该路径。旧 creation 事件没有 `dir` 时，
-详情页明确显示工作目录不可用。
+新会话在启动边界把 `--dir` 解析为绝对路径，并把它写入 version 2 creation 的私有
+`working_dir` metadata。恢复投影和 REST status 保留该路径。旧 creation 事件没有
+工作目录时，详情页明确显示工作目录不可用。
 
 浏览器使用真实 daemon 和 PTY 验证了 live output、输入、durable resize、断线重连、
 seek、播放和返回 live。桌面、375 px 和 320 px 视口都没有页面级横向溢出。长工作
@@ -798,3 +798,47 @@ viewport 内滚动。
 
 大型录制仍需要从 origin 在服务端重建 exact frame。50 MiB 冷回放的 checkpoint
 优化继续由 [Issue #35](https://github.com/Duang777/drove/issues/35) 跟踪。
+
+## 13. 原生恢复与进程组停止
+
+Claude `session_id` 与 Codex `session_id` / `thread_id` 被归一为一个最多 256
+字节的私有 vendor reference。它只在 `agent.signal` 已写入 SQLite 后更新
+session 私有投影。失败的持久化不会让会话变成可恢复。
+
+`drove resume <agent-id>` 对 `stopped`、未连接、已有已提交 reference 且 adapter
+支持恢复的会话生效：
+
+| Vendor | 原生命令 |
+| --- | --- |
+| Claude | `claude --resume <ref>` |
+| Codex | `codex resume <ref>` |
+
+恢复先追加私有 `agent.resumed`，再执行 typed `Stopped -> Starting`，最后复用
+普通 Start 的 PTY 激活、terminal actor、Detector 和退出仲裁。恢复投影只接受紧邻
+同 Agent `agent.resumed` 的这条迁移。公开 Status 只返回派生的 `resumable`；
+Hub、WebSocket、REST replay、CLI、错误和日志都不返回 reference。
+
+创建事件的持久载荷还保存清理后的绝对工作目录，Hub 和公开 replay 使用不含目录的
+独立载荷。恢复投影把目录放回 session 私有 managed record，PTY 启动原生命令时复用
+该目录。这样 daemon 从不同目录重启时，Claude 仍能按 session ID 找到原会话；旧
+version 1/2 历史没有目录时继续继承 daemon 当前目录。
+
+`session.auto_resume_on_start=true` 只消费重启前非终态且已有 reference 的一次性
+候选。daemon 先绑定 listener 并进入 `Accept`，再按创建时间顺序恢复。用户主动
+停止的会话仍只支持手工恢复。
+
+PTY 启动的直接子进程是独立 session 和进程组 leader。主动关闭按以下顺序执行：
+
+```text
+拒绝新写入
+-> SIGTERM(-PID)
+-> 等待 session.termination_grace_seconds
+-> 进程组仍存在时 SIGKILL(-PID)
+-> 回收直接子进程
+-> 关闭 PTY master
+-> 等待输出、output-end 和 exit 回调排空
+```
+
+默认宽限是 5 秒。Manager 保留按 Agent ID 串行关闭，避免改变既有持久化顺序。
+`scripts/verify-issue16.sh` 重复运行聚焦 race 测试，并执行全量 race、vet、Go
+构建、Web 类型检查、Web 构建和 diff whitespace 检查。

@@ -91,5 +91,6 @@ function agentFixture(): AgentStatus {
     signal_injection: 'off',
     signal_injection_status: 'off',
     signal_injection_reason: 'configured_off',
+    resumable: false,
   }
 }

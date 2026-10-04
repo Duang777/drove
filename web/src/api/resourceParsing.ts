@@ -1,5 +1,6 @@
 import {
   requireArray,
+  requireBoolean,
   requireKeys,
   requirePositiveInteger,
   requireRecord,
@@ -47,6 +48,7 @@ export function parseAgentStatus(
       'signal_injection',
       'signal_injection_status',
       'signal_injection_reason',
+      'resumable',
     ],
     [
       'dir',
@@ -89,6 +91,7 @@ export function parseAgentStatus(
       object.signal_injection_reason,
       `${name}.signal_injection_reason`,
     ),
+    resumable: requireBoolean(object.resumable, `${name}.resumable`),
     ...(dir === undefined ? {} : { dir }),
     ...(pid === undefined ? {} : { pid }),
     ...(object.last_error === undefined

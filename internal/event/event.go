@@ -42,6 +42,8 @@ const (
 	TypeAgentResized Type = "agent.resized"
 	// TypeAgentAttachment 表示用户终端 attachment 的脱敏生命周期审计。
 	TypeAgentAttachment Type = "agent.attachment"
+	// TypeAgentResumed marks an explicit native resume attempt.
+	TypeAgentResumed Type = "agent.resumed"
 )
 
 // Event 是不可变事件。公开字段供序列化，私有字段保存持久化附件。
@@ -104,7 +106,8 @@ const (
 	// OutputChunkPayloadVersion 是当前 output.chunk payload 版本。
 	OutputChunkPayloadVersion = 1
 	// MaxOutputChunkBytes 是单个 output.chunk 可携带的最大解码字节数。
-	MaxOutputChunkBytes = 32 * 1024
+	MaxOutputChunkBytes       = 32 * 1024
+	agentResumedPublicPayload = `{"version":1}`
 )
 
 // OutputChunkPayloadV1 是 output.chunk 的版本 1 传输载荷。
@@ -256,6 +259,25 @@ func NewSessionLifecycleDraft(sessionID, agentID, reason, payload string) Draft 
 	}
 }
 
+// NewPrivateSessionLifecycleDraft stores private lifecycle metadata separately
+// from the payload published to subscribers.
+func NewPrivateSessionLifecycleDraft(
+	sessionID,
+	agentID,
+	reason,
+	publicPayload,
+	storedPayload string,
+) Draft {
+	return Draft{
+		typ:           TypeSessionLifecycle,
+		sessionID:     sessionID,
+		agentID:       agentID,
+		reason:        reason,
+		payload:       publicPayload,
+		storedPayload: storedPayload,
+	}
+}
+
 // NewAgentInputDraft constructs an uncommitted input audit event.
 func NewAgentInputDraft(sessionID, agentID, payload string) Draft {
 	return Draft{
@@ -269,12 +291,14 @@ func NewAgentInputDraft(sessionID, agentID, payload string) Draft {
 
 // NewAgentSignalDraft constructs an uncommitted signal audit event.
 func NewAgentSignalDraft(sessionID, agentID, payload string) Draft {
+	publicPayload, _ := PublicPayload(TypeAgentSignal, "observed", payload)
 	return Draft{
-		typ:       TypeAgentSignal,
-		sessionID: sessionID,
-		agentID:   agentID,
-		reason:    "observed",
-		payload:   payload,
+		typ:           TypeAgentSignal,
+		sessionID:     sessionID,
+		agentID:       agentID,
+		reason:        "observed",
+		payload:       publicPayload,
+		storedPayload: payload,
 	}
 }
 
@@ -454,6 +478,18 @@ func NewAgentAttachmentDraft(
 	}, nil
 }
 
+// NewAgentResumedDraft stores the full payload but exposes only its version.
+func NewAgentResumedDraft(sessionID, agentID, payload string) Draft {
+	return Draft{
+		typ:           TypeAgentResumed,
+		sessionID:     sessionID,
+		agentID:       agentID,
+		reason:        "requested",
+		payload:       agentResumedPublicPayload,
+		storedPayload: payload,
+	}
+}
+
 // Commit seals a copied draft with its durable sequence and timestamp.
 func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	if seq == 0 {
@@ -471,7 +507,8 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		TypeAgentInput,
 		TypeAgentSignal,
 		TypeAgentResized,
-		TypeAgentAttachment:
+		TypeAgentAttachment,
+		TypeAgentResumed:
 	default:
 		return Event{}, fmt.Errorf("event: invalid draft type %q", draft.typ)
 	}
@@ -509,6 +546,39 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		}
 		storedPayload = draft.storedPayload
 		outputAttachment = append([]byte(nil), draft.outputAttachment...)
+	} else if draft.typ == TypeAgentSignal {
+		publicPayload, err := PublicPayload(
+			TypeAgentSignal,
+			draft.reason,
+			draft.storedPayload,
+		)
+		if err != nil {
+			return Event{}, err
+		}
+		if draft.payload != publicPayload {
+			return Event{}, errors.New("event: invalid public agent.signal payload")
+		}
+		storedPayload = draft.storedPayload
+	} else if draft.typ == TypeAgentResumed {
+		if _, err := DecodeAgentResumedPayload(draft.storedPayload); err != nil {
+			return Event{}, err
+		}
+		if draft.payload != agentResumedPublicPayload {
+			return Event{}, errors.New("event: invalid public agent.resumed payload")
+		}
+		storedPayload = draft.storedPayload
+	} else if draft.typ == TypeSessionLifecycle && draft.storedPayload != "" {
+		if draft.reason != "created" {
+			return Event{}, errors.New(
+				"event: private lifecycle payload requires the created reason",
+			)
+		}
+		if draft.payload == "" {
+			return Event{}, errors.New(
+				"event: private lifecycle payload requires a public payload",
+			)
+		}
+		storedPayload = draft.storedPayload
 	} else if len(draft.outputAttachment) != 0 || draft.storedPayload != "" {
 		return Event{}, errors.New("event: non-output chunk draft contains private output data")
 	}
@@ -550,25 +620,124 @@ func (e Event) OutputAttachment() []byte {
 	return append([]byte(nil), e.outputAttachment...)
 }
 
+// AgentResumedPayloadV1 identifies the opaque vendor session selected for resume.
+type AgentResumedPayloadV1 struct {
+	Version          int    `json:"version"`
+	VendorSessionRef string `json:"vendor_session_ref"`
+}
+
+// Validate requires version 1 and a bounded printable ASCII reference.
+func (p AgentResumedPayloadV1) Validate() error {
+	if p.Version != 1 {
+		return fmt.Errorf("event: unsupported agent.resumed payload version %d", p.Version)
+	}
+	if p.VendorSessionRef == "" ||
+		len(p.VendorSessionRef) > 256 ||
+		!ascii(p.VendorSessionRef) {
+		return errors.New(
+			"event: vendor_session_ref must contain 1 to 256 printable ASCII bytes without surrounding whitespace",
+		)
+	}
+	return nil
+}
+
+// DecodeAgentResumedPayload validates a persisted native resume payload.
+func DecodeAgentResumedPayload(raw string) (AgentResumedPayloadV1, error) {
+	var payload AgentResumedPayloadV1
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return AgentResumedPayloadV1{}, fmt.Errorf(
+			"event: decode agent.resumed payload: %w",
+			err,
+		)
+	}
+	if err := payload.Validate(); err != nil {
+		return AgentResumedPayloadV1{}, err
+	}
+	return payload, nil
+}
+
+// RedactAgentResumedPayload validates a persisted payload and removes its reference.
+func RedactAgentResumedPayload(raw string) (string, error) {
+	if _, err := DecodeAgentResumedPayload(raw); err != nil {
+		return "", err
+	}
+	return agentResumedPublicPayload, nil
+}
+
+// PublicPayload removes private fields from a stored event payload.
+func PublicPayload(typ Type, reason, raw string) (string, error) {
+	switch {
+	case typ == TypeAgentSignal:
+		return removePayloadFields(
+			raw,
+			"vendor_session_ref",
+			"vendor_session_id",
+		)
+	case typ == TypeAgentResumed:
+		return RedactAgentResumedPayload(raw)
+	case typ == TypeSessionLifecycle && reason == "created":
+		if raw == "" {
+			return "", nil
+		}
+		return removePayloadFields(raw, "working_dir")
+	default:
+		return raw, nil
+	}
+}
+
+func removePayloadFields(raw string, fields ...string) (string, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", fmt.Errorf("event: decode private payload: %w", err)
+	}
+	if payload == nil {
+		return "", errors.New("event: private payload must be one JSON object")
+	}
+	changed := false
+	for _, field := range fields {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("event: encode public payload: %w", err)
+	}
+	return string(encoded), nil
+}
+
 // SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.
 type SignalPayloadV1 struct {
-	Version         int     `json:"version"`
-	Source          string  `json:"source"`
-	Kind            string  `json:"kind"`
-	Vendor          string  `json:"vendor,omitempty"`
-	VendorEvent     string  `json:"vendor_event"`
-	Scope           string  `json:"scope"`
-	VendorSessionID string  `json:"vendor_session_id,omitempty"`
-	VendorTurnID    string  `json:"vendor_turn_id,omitempty"`
-	Notification    string  `json:"notification,omitempty"`
-	Evidence        string  `json:"evidence,omitempty"`
-	Confidence      float64 `json:"confidence"`
-	OccurredAt      string  `json:"occurred_at,omitempty"`
-	ReceivedAt      string  `json:"received_at"`
-	DeliveryID      string  `json:"delivery_id,omitempty"`
-	Outcome         string  `json:"outcome"`
-	ExitCode        *int    `json:"exit_code,omitempty"`
-	ExitKind        string  `json:"exit_kind,omitempty"`
+	Version          int     `json:"version"`
+	Source           string  `json:"source"`
+	Kind             string  `json:"kind"`
+	Vendor           string  `json:"vendor,omitempty"`
+	VendorEvent      string  `json:"vendor_event"`
+	Scope            string  `json:"scope"`
+	VendorSessionRef string  `json:"vendor_session_ref,omitempty"`
+	VendorSessionID  string  `json:"vendor_session_id,omitempty"`
+	VendorTurnID     string  `json:"vendor_turn_id,omitempty"`
+	Notification     string  `json:"notification,omitempty"`
+	Evidence         string  `json:"evidence,omitempty"`
+	Confidence       float64 `json:"confidence"`
+	OccurredAt       string  `json:"occurred_at,omitempty"`
+	ReceivedAt       string  `json:"received_at"`
+	DeliveryID       string  `json:"delivery_id,omitempty"`
+	Outcome          string  `json:"outcome"`
+	ExitCode         *int    `json:"exit_code,omitempty"`
+	ExitKind         string  `json:"exit_kind,omitempty"`
+}
+
+// VendorSessionReference returns the current reference or its legacy alias.
+func (p SignalPayloadV1) VendorSessionReference() string {
+	if p.VendorSessionRef != "" {
+		return p.VendorSessionRef
+	}
+	return p.VendorSessionID
 }
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
@@ -716,11 +885,20 @@ func validateSignalPayload(
 		return fmt.Errorf("event: invalid signal scope %q", p.Scope)
 	}
 	if len(p.Vendor) > 64 ||
+		len(p.VendorSessionRef) > 256 ||
 		len(p.VendorSessionID) > 256 ||
 		len(p.VendorTurnID) > 256 ||
 		len(p.Notification) > 64 ||
 		len(p.Evidence) > 128 {
 		return errors.New("event: signal metadata exceeds its size limit")
+	}
+	if p.VendorSessionRef != "" && !ascii(p.VendorSessionRef) {
+		return errors.New(
+			"event: vendor_session_ref must contain printable ASCII without surrounding whitespace",
+		)
+	}
+	if p.VendorSessionRef != "" && p.VendorSessionID != "" {
+		return errors.New("event: signal contains current and legacy vendor session references")
 	}
 	if math.IsNaN(p.Confidence) || math.IsInf(p.Confidence, 0) ||
 		p.Confidence < 0 || p.Confidence > 1 {
@@ -916,7 +1094,7 @@ func ascii(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if r > 0x7f || r < 0x20 {
+		if r > 0x7e || r < 0x20 {
 			return false
 		}
 	}

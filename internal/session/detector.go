@@ -64,6 +64,7 @@ type observationRequest struct {
 
 type observationActor struct {
 	target    *agent.Agent
+	managed   *managedAgent
 	detector  *detect.Detector
 	state     *detect.State
 	committer *committer
@@ -83,14 +84,14 @@ type observationActor struct {
 	requiredOnce   sync.Once
 }
 
-func newObservationActor(
-	target *agent.Agent,
+func newManagedObservationActor(
+	managed *managedAgent,
 	committer *committer,
 	policy agent.HookPolicy,
 	config detect.Config,
 	clock observationClock,
 ) (*observationActor, error) {
-	if target == nil || committer == nil {
+	if managed == nil || managed.agent == nil || committer == nil {
 		return nil, errors.New("session: observation actor requires Agent and committer")
 	}
 	detector, err := detect.New(config)
@@ -102,7 +103,8 @@ func newObservationActor(
 	}
 	state := detect.NewState(policy)
 	actor := &observationActor{
-		target:         target,
+		target:         managed.agent,
+		managed:        managed,
 		detector:       detector,
 		state:          &state,
 		committer:      committer,
@@ -253,7 +255,7 @@ func (a *observationActor) handle(
 	}
 	_, err = a.committer.CommitDecision(
 		context.Background(),
-		a.target,
+		a.managed,
 		a.state,
 		decision,
 		[]event.Draft{
@@ -335,21 +337,20 @@ func encodeSignalAudit(
 		occurredAt = signal.OccurredAt.UTC().Format(time.RFC3339Nano)
 	}
 	payload := event.SignalPayloadV1{
-		Version:         1,
-		Source:          string(signal.Source),
-		Kind:            string(signal.Kind),
-		Vendor:          signal.Vendor,
-		VendorEvent:     signal.VendorEvent,
-		Scope:           string(signal.Scope),
-		VendorSessionID: signal.VendorSessionID,
-		VendorTurnID:    signal.VendorTurnID,
-		Notification:    signal.Notification,
-		Evidence:        signal.Evidence,
-		Confidence:      signal.Confidence,
-		OccurredAt:      occurredAt,
-		ReceivedAt:      signal.ReceivedAt.UTC().Format(time.RFC3339Nano),
-		DeliveryID:      signal.DeliveryID,
-		Outcome:         string(outcome),
+		Version:          1,
+		Source:           string(signal.Source),
+		Kind:             string(signal.Kind),
+		Vendor:           signal.Vendor,
+		VendorEvent:      signal.VendorEvent,
+		Scope:            string(signal.Scope),
+		VendorSessionRef: signal.VendorSessionRef,
+		Notification:     signal.Notification,
+		Evidence:         signal.Evidence,
+		Confidence:       signal.Confidence,
+		OccurredAt:       occurredAt,
+		ReceivedAt:       signal.ReceivedAt.UTC().Format(time.RFC3339Nano),
+		DeliveryID:       signal.DeliveryID,
+		Outcome:          string(outcome),
 	}
 	if signal.Process != nil {
 		payload.ExitCode = signal.Process.ExitCode

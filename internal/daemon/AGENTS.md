@@ -16,6 +16,10 @@
   `127.0.0.1`、`localhost` 和 `[::1]` Host 与同源 Origin 白名单。
 - 浏览器 listener 同源提供 `internal/webui` 的嵌入式生产构建；运行时不依赖源码目录
   或 Node。
+- 自动恢复开启时，API server 必须先进入 listener `Accept`，再按创建时间顺序调用
+  Manager 的同 ID 原生恢复；单个失败只记录 Agent ID 与脱敏错误并继续。
+- daemon 把 `session.termination_grace_seconds` 转为 duration 注入 Manager；PTY
+  负责进程组信号与升级。
 - 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
 - Store 打开后、投影恢复前执行一次严格的输出附件保留清理；首次失败中止启动。

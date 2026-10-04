@@ -63,6 +63,7 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(
 		newInitCmd(),
 		newUpCmd(),
+		newResumeCmd(),
 		newPSCmd(),
 		newLogCmd(),
 		newTimelineCmd(),
@@ -157,7 +158,7 @@ func newPSCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ps",
 		Short: "列出全部 Agent 会话",
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := context.Background()
 			c, err := newClient(ctx)
 			if err != nil {
@@ -167,16 +168,72 @@ func newPSCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if len(list) == 0 {
-				fmt.Println("no agents running")
-				return nil
+			return writeStatuses(cmd.OutOrStdout(), list)
+		},
+	}
+}
+
+func writeStatuses(w io.Writer, list []*session.Status) error {
+	if len(list) == 0 {
+		_, err := fmt.Fprintln(w, "no agents running")
+		return err
+	}
+	if _, err := fmt.Fprintf(
+		w,
+		"%-38s %-16s %-10s %-12s %-10s %-6s %-9s\n",
+		"AGENT ID",
+		"NAME",
+		"VENDOR",
+		"MODE",
+		"STATE",
+		"PID",
+		"RESUMABLE",
+	); err != nil {
+		return fmt.Errorf("write status header: %w", err)
+	}
+	for _, status := range list {
+		if _, err := fmt.Fprintf(
+			w,
+			"%-38s %-16s %-10s %-12s %-10s %-6d %-9t\n",
+			status.AgentID,
+			truncate(status.Name, 16),
+			status.Vendor,
+			status.Mode,
+			status.State,
+			status.PID,
+			status.Resumable,
+		); err != nil {
+			return fmt.Errorf("write status for agent %q: %w", status.AgentID, err)
+		}
+	}
+	return nil
+}
+
+func newResumeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "resume <agent-id>",
+		Short: "原生恢复一个已停止的 Agent 会话",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			client, err := newClient(ctx)
+			if err != nil {
+				return err
 			}
-			fmt.Printf("%-38s %-16s %-10s %-12s %-10s %-6s\n", "AGENT ID", "NAME", "VENDOR", "MODE", "STATE", "PID")
-			for _, st := range list {
-				fmt.Printf("%-38s %-16s %-10s %-12s %-10s %-6d\n",
-					st.AgentID, truncate(st.Name, 16), st.Vendor, st.Mode, st.State, st.PID)
+			status, err := client.Resume(ctx, args[0])
+			if err != nil {
+				return err
 			}
-			return nil
+			_, err = fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"resumed agent %s (vendor=%s, mode=%s, state=%s, pid=%d)\n",
+				status.AgentID,
+				status.Vendor,
+				status.Mode,
+				status.State,
+				status.PID,
+			)
+			return err
 		},
 	}
 }

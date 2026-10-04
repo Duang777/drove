@@ -36,7 +36,7 @@ xterm.js 终端并按时间精确回放。塔台网格、推送和手机审批�
 | 能力 | 状态 | 在哪里 |
 | --- | --- | --- |
 | 每个 agent 一个 PTY，由 `droved` 持有 | 已落地 | `internal/pty` |
-| `init` `up` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
+| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
 | Claude / Codex 按会话注入状态上报 | 已落地 | [#15](https://github.com/Duang777/drove/issues/15) |
 | 原始终端字节，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` 回放字节，`--plain` 去掉控制序列 | 已落地 | |
@@ -50,7 +50,7 @@ xterm.js 终端并按时间精确回放。塔台网格、推送和手机审批�
 | 塔台网格 | 规划中 | [#26](https://github.com/Duang777/drove/issues/26) |
 | 推送通知 | 规划中 | [#27](https://github.com/Duang777/drove/issues/27) |
 | 手机上批准、拒绝或回一句 | 规划中 | [#28](https://github.com/Duang777/drove/issues/28) |
-| 原生 resume，停止改为 SIGTERM 后宽限再 SIGKILL | 规划中 | [#16](https://github.com/Duang777/drove/issues/16) |
+| 原生 resume，停止按进程组 SIGTERM 后宽限再 SIGKILL | 已落地 | [#16](https://github.com/Duang777/drove/issues/16) |
 | daemon 退出后 agent 进程仍在 | 规划中 | [#17](https://github.com/Duang777/drove/issues/17)、[#18](https://github.com/Duang777/drove/issues/18) |
 | 离开简报、跨会话搜索、git worktree | 规划中 | [#29](https://github.com/Duang777/drove/issues/29)、[#30](https://github.com/Duang777/drove/issues/30)、[#23](https://github.com/Duang777/drove/issues/23) |
 
@@ -109,7 +109,8 @@ drove up claude --hooks required
 | --- | --- |
 | `drove init` | 写入默认 `config.json`。已存在则覆盖 |
 | `drove up <vendor\|command>` | 启动一个会话。厂商名是 `claude`、`codex`；其他字符串当作可执行文件名，不能再跟参数 |
-| `drove ps` | 打印 AGENT ID、NAME、VENDOR、MODE、STATE、PID。没有会话时打印 `no agents running` |
+| `drove resume <agent-id>` | 对可恢复的 Claude / Codex 会话执行厂商原生 resume，保留 Agent ID |
+| `drove ps` | 打印 AGENT ID、NAME、VENDOR、MODE、STATE、PID、RESUMABLE。没有会话时打印 `no agents running` |
 | `drove log <agent-id>` | 只把终端字节写到 stdout。不打印状态事件 |
 | `drove log <agent-id> --plain` | 用流式清洗器去掉控制序列 |
 | `drove timeline <agent-id>` | 打印状态区间、输出保留范围和一基 Blocked 跳转点。`--json` 输出完整响应 |
@@ -232,13 +233,27 @@ frame 做拖动预览，并从浏览器保存的 origin 前缀构建精确播放
 
 ### 停止和重启
 
-`drove stop` 以及 daemon 收到 SIGINT / SIGTERM 后的关闭，都对 PTY 子进程调用 `Process.Kill`（SIGKILL）。没有 SIGTERM 宽限。
+`drove stop` 以及 daemon 收到 SIGINT / SIGTERM 后的关闭，都先向 PTY 的整个
+进程组发送 SIGTERM。默认等待 5 秒；进程组仍存在时发送 SIGKILL。直接子进程被
+回收后才关闭 PTY master，并等待尾部输出和退出回调完成。
 
 `drove up` 返回之后，前台命令已经结束，会话挂在 `droved` 上。这个 daemon 没有脱离控制终端，也不处理 SIGHUP。daemon 退出后不会留下 agent 进程。
 
-daemon 再次启动时从事件日志恢复投影。无法重连的旧会话被收口为 `stopped`，原因是 `session interrupted by daemon restart; previous PTY is not reconnectable`。已经写下的字节还在，可以用 `drove log` 看。活着的进程不会回来。
+daemon 再次启动时从事件日志恢复投影。无法重连的旧会话先被收口为 `stopped`，
+原因是 `session interrupted by daemon restart; previous PTY is not
+reconnectable`。已经写下的字节还在，可以用 `drove log` 看。
 
-原生 `claude --resume` / `codex resume`，以及先 SIGTERM 再宽限、最后 SIGKILL，在 [#16](https://github.com/Duang777/drove/issues/16)。每会话 shim、daemon 重启后进程仍在，在 [#17](https://github.com/Duang777/drove/issues/17) 和 [#18](https://github.com/Duang777/drove/issues/18)。
+Claude / Codex 的合法原生信号会保存一个私有恢复引用。停止后 `drove ps` 的
+`RESUMABLE` 为 `true` 时，`drove resume <agent-id>` 分别执行
+`claude --resume` 或 `codex resume`，继续使用原 Agent ID 和追加式事件流。引用
+不会出现在 Status、公开 API 事件、CLI、日志或公开回放中。创建会话时的绝对工作
+目录同样只写入私有事件载荷；原生恢复从该目录启动，避免厂商 CLI 在 daemon
+工作目录变化后找不到原会话。
+
+`session.auto_resume_on_start` 默认关闭。开启后，daemon 会在 API 已开始接受连接后，
+按创建时间恢复重启前处于非终态且已有引用的会话；用户主动停止的会话不会自动恢复。
+原进程跨 daemon 重启继续存活仍属于 [#17](https://github.com/Duang777/drove/issues/17)
+和 [#18](https://github.com/Duang777/drove/issues/18)。
 
 ## 支持的 agent
 
@@ -266,6 +281,10 @@ ACP 没有注册。`drove up acp` 会去执行一个名叫 `acp` 的程序，而
   ],
   "storage": {
     "output_retention_days": 30
+  },
+  "session": {
+    "auto_resume_on_start": false,
+    "termination_grace_seconds": 5
   }
 }
 ```
@@ -324,8 +343,7 @@ Blocked 跳转和返回 live。录制过期或达到浏览器本地上限时，�
 1. [#26](https://github.com/Duang777/drove/issues/26) 塔台网格
 2. [#41](https://github.com/Duang777/drove/issues/41) Bubble Tea 多会话总览
 3. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准、拒绝或回复
-4. [#16](https://github.com/Duang777/drove/issues/16) 原生 resume 与更温和的停止
-5. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
+4. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
 
 MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18) 的 shim，然后是 [#29](https://github.com/Duang777/drove/issues/29) 离开简报、[#30](https://github.com/Duang777/drove/issues/30) 全文搜索、[#23](https://github.com/Duang777/drove/issues/23) worktree。[#22](https://github.com/Duang777/drove/issues/22) 结构化状态源和 [#24](https://github.com/Duang777/drove/issues/24) 持久 hook 安装器推迟。
 

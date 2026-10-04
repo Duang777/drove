@@ -98,6 +98,7 @@ export interface AgentStatus {
   signal_injection_status: SignalInjectionStatus
   signal_injection_reason: SignalInjectionReason
   last_transition?: StateEvidence
+  resumable: boolean
 }
 
 /** 启动会话请求（Go: session.StartRequest）。 */
@@ -122,6 +123,7 @@ export type EventType =
   | 'agent.signal'
   | 'agent.resized'
   | 'agent.attachment'
+  | 'agent.resumed'
 
 /** 实时事件（Go: event.Event）。 */
 export interface Event {
