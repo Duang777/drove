@@ -16,17 +16,28 @@ const worktreeIncludeFile = ".worktreeinclude"
 func (m *Manager) copyIncludedFiles(
 	target Workspace,
 	paths []string,
-) error {
+) (result error) {
 	sourceRoot := target.sourcePath
 	if sourceRoot == "" {
 		sourceRoot = target.Repository
 	}
+	source, err := openRealPathRoot(sourceRoot)
+	if err != nil {
+		return fmt.Errorf("workspace: open include source root: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, source.Close())
+	}()
+	destination, err := m.openManagedWorkspaceRoot(target)
+	if err != nil {
+		return fmt.Errorf("workspace: open include destination root: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, destination.Close())
+	}()
+
 	for _, relative := range paths {
-		if err := copyIncludedPath(
-			filepath.Join(sourceRoot, relative),
-			filepath.Join(target.Path, relative),
-			target.Path,
-		); err != nil {
+		if err := copyIncludedPath(source, destination, relative); err != nil {
 			return fmt.Errorf("workspace: copy included path %q: %w", relative, err)
 		}
 	}
@@ -107,89 +118,157 @@ func validateIncludedPath(path string) (string, error) {
 	return clean, nil
 }
 
-func copyIncludedPath(source string, destination string, root string) error {
-	info, err := os.Lstat(source)
+func copyIncludedPath(
+	sourceRoot *os.Root,
+	destinationRoot *os.Root,
+	relative string,
+) (result error) {
+	relative, err := validateIncludedPath(relative)
 	if err != nil {
 		return err
 	}
-	if err := ensureSafeDestinationParent(root, destination); err != nil {
-		return err
-	}
+	directory := filepath.Dir(relative)
+	name := filepath.Base(relative)
 
-	switch {
-	case info.Mode().IsRegular():
-		return copyIncludedFile(source, destination, info.Mode().Perm())
-	case info.Mode()&os.ModeSymlink != 0:
-		return errors.New("symbolic links are unsupported")
-	default:
-		return fmt.Errorf("source mode %s is unsupported", info.Mode())
-	}
-}
-
-func ensureSafeDestinationParent(root string, destination string) error {
-	relative, err := filepath.Rel(root, destination)
-	if err != nil {
-		return fmt.Errorf("resolve destination path: %w", err)
-	}
-	relative, err = validateIncludedPath(relative)
+	sourceParent, sourceOwned, err := openIncludedParent(
+		sourceRoot,
+		directory,
+		false,
+	)
 	if err != nil {
 		return err
 	}
-
-	current := root
-	for _, component := range strings.Split(
-		filepath.Dir(relative),
-		string(filepath.Separator),
-	) {
-		if component == "." || component == "" {
-			continue
+	if sourceOwned {
+		defer func() {
+			result = errors.Join(result, sourceParent.Close())
+		}()
+	}
+	sourceInfo, err := sourceParent.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("inspect source: %w", err)
+	}
+	if !sourceInfo.Mode().IsRegular() ||
+		sourceInfo.Mode()&os.ModeSymlink != 0 {
+		if sourceInfo.Mode()&os.ModeSymlink != 0 {
+			return errors.New("symbolic links are unsupported")
 		}
-		current = filepath.Join(current, component)
-		info, err := os.Lstat(current)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			if err := os.Mkdir(current, 0o700); err != nil {
-				return fmt.Errorf(
-					"create destination directory %q: %w",
-					current,
-					err,
-				)
-			}
-		case err != nil:
-			return fmt.Errorf(
-				"inspect destination directory %q: %w",
-				current,
-				err,
-			)
-		case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
-			return fmt.Errorf(
-				"destination parent %q is not a real directory",
-				current,
-			)
-		}
+		return fmt.Errorf("source mode %s is unsupported", sourceInfo.Mode())
 	}
-	return nil
-}
-
-func copyIncludedFile(source string, destination string, mode os.FileMode) (result error) {
-	input, err := os.Open(source)
+	input, err := sourceParent.Open(name)
 	if err != nil {
 		return fmt.Errorf("open source: %w", err)
 	}
 	defer func() {
 		result = errors.Join(result, input.Close())
 	}()
+	openedInfo, err := input.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect opened source: %w", err)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(sourceInfo, openedInfo) {
+		return errors.New("source changed while opening")
+	}
 
-	output, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	destinationParent, destinationOwned, err := openIncludedParent(
+		destinationRoot,
+		directory,
+		true,
+	)
+	if err != nil {
+		return err
+	}
+	if destinationOwned {
+		defer func() {
+			result = errors.Join(result, destinationParent.Close())
+		}()
+	}
+	output, err := destinationParent.OpenFile(
+		name,
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		sourceInfo.Mode().Perm(),
+	)
 	if err != nil {
 		return fmt.Errorf("create destination: %w", err)
 	}
 	defer func() {
 		result = errors.Join(result, output.Close())
 	}()
-
 	if _, err := io.Copy(output, input); err != nil {
 		return fmt.Errorf("copy contents: %w", err)
 	}
 	return nil
+}
+
+func openIncludedParent(
+	root *os.Root,
+	directory string,
+	create bool,
+) (_ *os.Root, _ bool, result error) {
+	current := root
+	currentOwned := false
+	defer func() {
+		if result != nil && currentOwned {
+			result = errors.Join(result, current.Close())
+		}
+	}()
+	for _, component := range strings.Split(
+		directory,
+		string(filepath.Separator),
+	) {
+		if component == "." || component == "" {
+			continue
+		}
+		info, err := current.Lstat(component)
+		switch {
+		case errors.Is(err, os.ErrNotExist) && create:
+			if err := current.Mkdir(component, 0o700); err != nil &&
+				!errors.Is(err, os.ErrExist) {
+				return nil, false, fmt.Errorf(
+					"create destination directory %q: %w",
+					component,
+					err,
+				)
+			}
+			info, err = current.Lstat(component)
+			if err != nil {
+				return nil, false, fmt.Errorf(
+					"inspect created destination directory %q: %w",
+					component,
+					err,
+				)
+			}
+		case err != nil:
+			return nil, false, fmt.Errorf(
+				"inspect included directory %q: %w",
+				component,
+				err,
+			)
+		case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
+			return nil, false, fmt.Errorf(
+				"included parent %q is not a real directory",
+				component,
+			)
+		}
+		next, err := openRealRootFromRoot(current, component)
+		if err != nil {
+			return nil, false, fmt.Errorf(
+				"open included directory %q: %w",
+				component,
+				err,
+			)
+		}
+		if currentOwned {
+			if err := current.Close(); err != nil {
+				_ = next.Close()
+				return nil, false, fmt.Errorf(
+					"close included directory %q: %w",
+					component,
+					err,
+				)
+			}
+		}
+		current = next
+		currentOwned = true
+	}
+	return current, currentOwned, nil
 }

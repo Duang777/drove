@@ -43,7 +43,9 @@
 - `StartRequest.Worktree` 存在时，Manager 在生成 Agent ID 后调用
   `internal/workspace` 创建独立 worktree，并把 Agent 工作目录切到该路径。创建事件
   持久化前的失败会回滚 worktree 和本次新建的分支；SQLite append 成功后，即使投影
-  或 Hub 发布失败也不得回滚，后续由用户显式清理。
+  或 Hub 发布失败也不得回滚。创建事件 durable 后必须确认 preparation sidecar；确认
+  失败时保留 creation reservation 并 fail-stop，由 Bootstrap 按私有 workspace metadata
+  采纳。
 - `Start` 从生成 Agent ID 起登记 workspace creation reservation；创建事件 durable
   后将 reservation 与 Agent/PTY 登记原子交接。durable 后的发布失败保留 reservation
   直到 daemon fail-stop，防止清理已由事件拥有的目录。
@@ -54,8 +56,9 @@
 - workspace 先持久化 removal intent，再执行物理删除。已登记 Agent 通过 typed
   Committer 提交 `session_lifecycle(workspace_removed)`。Store durable 后，
   `AcknowledgeRemoval` 才删除 sidecar。物理删除 pending 时，运行时立即关闭 Resume。
-- Bootstrap 在返回 Manager 前调用 `ReconcileRemovals`。该方法按私有 workspace
-  metadata 匹配 session。它补写缺失 tombstone；如果事件已存在，则只删除 sidecar。
+- Bootstrap 在返回 Manager 前先调用 `ReconcilePreparations`，按私有 workspace
+  metadata 采纳 durable 创建并回滚无对应事件的 orphan，再调用 `ReconcileRemovals`。
+  removal reconciliation 补写缺失 tombstone；如果事件已存在，则只删除 sidecar。
 - 创建事件的私有 `workspace` 元数据记录仓库、路径和分支；Hub 与公开 replay 删除
   整个对象，恢复投影仍校验其中的绝对路径、分支及其路径与 working directory 一致。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；

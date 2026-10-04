@@ -296,6 +296,10 @@ func Bootstrap(
 	hub := event.NewHub(committedLastSeq)
 	manager := NewManager(reg, hub, st, committedLastSeq, options...)
 	manager.agents = restoredAgents
+	if err := manager.reconcileWorkspacePreparations(ctx, plan.Workspaces); err != nil {
+		_ = manager.Close()
+		return nil, err
+	}
 	if err := manager.reconcileWorkspaceRemovals(ctx, plan.Workspaces); err != nil {
 		_ = manager.Close()
 		return nil, err
@@ -477,6 +481,12 @@ func (m *Manager) Start(
 	)
 	if receipt.Durable {
 		workspaceCommitted = true
+		if preparedWorkspace != nil {
+			err = errors.Join(
+				err,
+				m.workspaces.AcknowledgePreparation(*preparedWorkspace),
+			)
+		}
 	}
 	if err != nil {
 		outputErr := running.output.Close()

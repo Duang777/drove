@@ -257,6 +257,8 @@ func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
 	tests := [][]string{
 		{"unknown"},
 		{"worktree", "unknown"},
+		{"--", "unknown"},
+		{"worktree", "--", "unknown"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, "/"), func(t *testing.T) {

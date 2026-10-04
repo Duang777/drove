@@ -8,45 +8,38 @@ import (
 	"strings"
 )
 
-func (m *Manager) validateManagedPathLocation(target Workspace) (result error) {
+func (m *Manager) openManagedWorkspaceRoot(
+	target Workspace,
+) (*os.Root, error) {
 	if err := m.validateManagedPath(target); err != nil {
-		return err
+		return nil, err
 	}
 	root, err := openRealRoot(filepath.Dir(m.root), filepath.Base(m.root))
 	if err != nil {
-		return fmt.Errorf("open managed root: %w", err)
+		return nil, fmt.Errorf("open managed root: %w", err)
 	}
-	defer func() {
-		result = errors.Join(result, root.Close())
-	}()
 
 	bucketName := repositoryHash(target.Repository)
 	bucket, err := openRealRootFromRoot(root, bucketName)
 	if err != nil {
-		return fmt.Errorf("open repository bucket: %w", err)
+		_ = root.Close()
+		return nil, fmt.Errorf("open repository bucket: %w", err)
 	}
-	defer func() {
-		result = errors.Join(result, bucket.Close())
-	}()
+	if err := root.Close(); err != nil {
+		_ = bucket.Close()
+		return nil, fmt.Errorf("close managed root: %w", err)
+	}
 
-	info, err := bucket.Lstat(target.AgentID)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect managed entry: %w", err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("%q is not a real directory", target.AgentID)
-	}
 	entry, err := openRealRootFromRoot(bucket, target.AgentID)
 	if err != nil {
-		return fmt.Errorf("open managed entry: %w", err)
+		_ = bucket.Close()
+		return nil, fmt.Errorf("open managed entry: %w", err)
 	}
-	if err := entry.Close(); err != nil {
-		return fmt.Errorf("close managed entry: %w", err)
+	if err := bucket.Close(); err != nil {
+		_ = entry.Close()
+		return nil, fmt.Errorf("close repository bucket: %w", err)
 	}
-	return nil
+	return entry, nil
 }
 
 func (m *Manager) removeManagedPath(target Workspace) (result error) {
@@ -98,6 +91,30 @@ func openRealRoot(parentPath string, name string) (*os.Root, error) {
 	if err := parent.Close(); err != nil {
 		_ = root.Close()
 		return nil, err
+	}
+	return root, nil
+}
+
+func openRealPathRoot(path string) (*os.Root, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("%q is not a real directory", path)
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	if !os.SameFile(info, opened) {
+		_ = root.Close()
+		return nil, fmt.Errorf("%q changed while opening", path)
 	}
 	return root, nil
 }

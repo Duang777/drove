@@ -69,6 +69,9 @@ func executeRoot(root *cobra.Command, args []string) error {
 	if err != nil {
 		return markUsageError(err)
 	}
+	if len(remaining) > 0 && remaining[0] == "--" {
+		remaining = remaining[1:]
+	}
 	if command.HasSubCommands() &&
 		!command.Runnable() &&
 		len(remaining) > 0 &&

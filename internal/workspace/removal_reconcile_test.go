@@ -42,7 +42,7 @@ func TestReconcileAcceptsCompletedRemovalAfterGitError(t *testing.T) {
 	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
 	script := `#!/bin/sh
 case " $* " in
-  *" worktree remove "*)
+  *" worktree prune "*)
     "$DROVE_TEST_REAL_GIT" "$@"
     exit 1
     ;;

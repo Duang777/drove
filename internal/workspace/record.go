@@ -14,26 +14,30 @@ import (
 )
 
 const (
-	workspaceRecordSuffix        = ".workspace.json"
-	legacyWorkspaceRecordVersion = 1
-	workspaceRecordVersion       = 2
-	maxWorkspaceRecordSize       = 64 * 1024
+	workspaceRecordSuffix           = ".workspace.json"
+	legacyWorkspaceRecordVersion    = 1
+	protectedWorkspaceRecordVersion = 2
+	workspaceRecordVersion          = 3
+	maxWorkspaceRecordSize          = 64 * 1024
 )
 
 type workspaceRecord struct {
-	Version         int                     `json:"version"`
-	AgentID         string                  `json:"agent_id"`
-	Repository      string                  `json:"repository"`
-	Path            string                  `json:"path"`
-	Branch          string                  `json:"branch"`
-	ProtectionKnown bool                    `json:"protection_known"`
-	IncludedPaths   []string                `json:"included_paths"`
-	Removal         *workspaceRemovalRecord `json:"removal,omitempty"`
+	Version              int                     `json:"version"`
+	AgentID              string                  `json:"agent_id"`
+	Repository           string                  `json:"repository"`
+	Path                 string                  `json:"path"`
+	Branch               string                  `json:"branch"`
+	ProtectionKnown      bool                    `json:"protection_known"`
+	IncludedPaths        []string                `json:"included_paths"`
+	PreparationCommitted bool                    `json:"preparation_committed"`
+	CreatedBranch        bool                    `json:"created_branch"`
+	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
 }
 
 type workspaceRemovalRecord struct {
 	OperationID string `json:"operation_id"`
 	Force       bool   `json:"force"`
+	Started     bool   `json:"started"`
 }
 
 func workspaceRecordPath(worktreePath string) string {
@@ -60,15 +64,17 @@ func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecor
 		Branch:          target.Branch,
 		ProtectionKnown: true,
 		IncludedPaths:   append([]string{}, includedPaths...),
+		CreatedBranch:   target.createdBranch,
 	}
 }
 
 func (r workspaceRecord) workspace() Workspace {
 	return Workspace{
-		AgentID:    r.AgentID,
-		Repository: r.Repository,
-		Path:       r.Path,
-		Branch:     r.Branch,
+		AgentID:       r.AgentID,
+		Repository:    r.Repository,
+		Path:          r.Path,
+		Branch:        r.Branch,
+		createdBranch: r.CreatedBranch,
 	}
 }
 
@@ -244,16 +250,36 @@ func (m *Manager) readWorkspaceRecord(
 	case legacyWorkspaceRecordVersion:
 		if record.ProtectionKnown ||
 			len(record.IncludedPaths) != 0 ||
+			record.PreparationCommitted ||
+			record.CreatedBranch ||
 			record.Removal != nil {
 			return workspaceRecord{}, false, fmt.Errorf(
-				"workspace: legacy record %q contains version 2 fields",
+				"workspace: legacy record %q contains newer fields",
 				recordPath,
 			)
+		}
+		record.PreparationCommitted = true
+	case protectedWorkspaceRecordVersion:
+		if record.IncludedPaths == nil {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: version 2 record %q has no included paths",
+				recordPath,
+			)
+		}
+		if record.PreparationCommitted || record.CreatedBranch {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: version 2 record %q contains version 3 fields",
+				recordPath,
+			)
+		}
+		record.PreparationCommitted = true
+		if record.Removal != nil {
+			record.Removal.Started = true
 		}
 	case workspaceRecordVersion:
 		if record.IncludedPaths == nil {
 			return workspaceRecord{}, false, fmt.Errorf(
-				"workspace: version 2 record %q has no included paths",
+				"workspace: version 3 record %q has no included paths",
 				recordPath,
 			)
 		}
@@ -282,6 +308,7 @@ func (m *Manager) readWorkspaceRecord(
 
 func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 	if record.Version != legacyWorkspaceRecordVersion &&
+		record.Version != protectedWorkspaceRecordVersion &&
 		record.Version != workspaceRecordVersion {
 		return fmt.Errorf("workspace: unsupported record version %d", record.Version)
 	}

@@ -84,15 +84,17 @@ func (m *Manager) remove(
 		if force && !record.Removal.Force {
 			upgraded := *record.Removal
 			upgraded.Force = true
+			record.Version = workspaceRecordVersion
 			record.Removal = &upgraded
 			if err := m.replaceWorkspaceRecord(record); err != nil {
-				return RemovalResult{
-						Removal: removal,
-						State:   RemovalPending,
-					}, fmt.Errorf(
-						"workspace: upgrade removal intent to force: %w",
-						err,
-					)
+				pending := RemovalResult{
+					Removal: removal,
+					State:   RemovalPending,
+				}
+				return pending, fmt.Errorf(
+					"workspace: upgrade removal intent to force: %w",
+					err,
+				)
 			}
 		}
 		state, removalErr := m.resumePendingRemoval(ctx, record)
@@ -136,6 +138,13 @@ func (m *Manager) remove(
 		}
 	}
 
+	record, err = m.startRemoval(record)
+	if err != nil {
+		return RemovalResult{
+			Removal: removal,
+			State:   RemovalPending,
+		}, err
+	}
 	state, removalErr := m.completeRemoval(ctx, record)
 	return RemovalResult{Removal: removal, State: state}, removalErr
 }
@@ -307,66 +316,40 @@ func (m *Manager) completeRemoval(
 	ctx context.Context,
 	record workspaceRecord,
 ) (RemovalState, error) {
+	if record.Removal == nil || !record.Removal.Started {
+		return RemovalPending, errors.New(
+			"workspace: physical removal has not been started",
+		)
+	}
 	facts, err := m.removalFacts(ctx, record)
 	if err != nil {
 		return RemovalPending, err
 	}
-	if !record.Removal.Force {
-		if err := m.validateRemovalSafety(ctx, record, facts); err != nil {
-			return RemovalPending, fmt.Errorf(
-				"workspace: revalidate pending removal for agent %q: %w",
-				record.AgentID,
-				err,
+	if !facts.pathExists && !facts.registered {
+		return RemovalComplete, nil
+	}
+	if facts.pathExists {
+		if err := m.removeManagedPath(record.workspace()); err != nil {
+			return m.classifyRemovalFailure(
+				record,
+				fmt.Errorf("workspace: remove managed worktree: %w", err),
 			)
 		}
 	}
 	if facts.registered {
-		if err := m.validateManagedPathLocation(record.workspace()); err != nil {
-			return RemovalPending, fmt.Errorf(
-				"workspace: validate registered worktree path: %w",
-				err,
-			)
-		}
-	}
-	switch {
-	case !facts.pathExists && !facts.registered:
-		return RemovalComplete, nil
-	case facts.pathExists && facts.registered:
-		arguments := []string{"-C", record.Repository, "worktree", "remove"}
-		if record.Removal.Force {
-			arguments = append(arguments, "--force")
-		}
-		arguments = append(arguments, record.Path)
-		if _, err := m.run(ctx, arguments...); err != nil {
-			return m.classifyRemovalFailure(
-				record,
-				fmt.Errorf("workspace: remove worktree: %w", err),
-			)
-		}
-	case !facts.pathExists && facts.registered:
 		if _, err := m.run(
 			ctx,
 			"-C",
 			record.Repository,
 			"worktree",
-			"remove",
-			"--force",
-			record.Path,
+			"prune",
+			"--expire",
+			"now",
 		); err != nil {
 			return m.classifyRemovalFailure(
 				record,
 				fmt.Errorf(
-					"workspace: remove missing worktree registration: %w",
-					err,
-				),
-			)
-		}
-	case facts.pathExists && !facts.registered:
-		if err := m.removeManagedPath(record.workspace()); err != nil {
-			return m.classifyRemovalFailure(
-				record,
-				fmt.Errorf(
-					"workspace: remove unregistered managed path: %w",
+					"workspace: prune worktree registration: %w",
 					err,
 				),
 			)
@@ -392,10 +375,14 @@ func (m *Manager) resumePendingRemoval(
 	if err != nil {
 		return RemovalPending, err
 	}
-	if !record.Removal.Force {
+	if !record.Removal.Force && !record.Removal.Started {
 		if safetyErr := m.validateRemovalSafety(ctx, record, facts); safetyErr != nil {
 			return m.rejectPendingRemoval(record, facts, safetyErr)
 		}
+	}
+	record, err = m.startRemoval(record)
+	if err != nil {
+		return RemovalPending, err
 	}
 	state, removalErr := m.completeRemoval(ctx, record)
 	if state != RemovalPending || !errors.Is(removalErr, ErrDirty) {
@@ -409,6 +396,30 @@ func (m *Manager) resumePendingRemoval(
 	return state, safetyErr
 }
 
+func (m *Manager) startRemoval(
+	record workspaceRecord,
+) (workspaceRecord, error) {
+	if record.Removal == nil {
+		return workspaceRecord{}, errors.New(
+			"workspace: removal intent is missing",
+		)
+	}
+	if record.Removal.Started {
+		return record, nil
+	}
+	started := *record.Removal
+	started.Started = true
+	record.Version = workspaceRecordVersion
+	record.Removal = &started
+	if err := m.replaceWorkspaceRecord(record); err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: mark physical removal started: %w",
+			err,
+		)
+	}
+	return record, nil
+}
+
 func (m *Manager) rejectPendingRemoval(
 	record workspaceRecord,
 	facts removalFacts,
@@ -419,6 +430,9 @@ func (m *Manager) rejectPendingRemoval(
 		record.AgentID,
 		safetyErr,
 	)
+	if record.Removal != nil && record.Removal.Started {
+		return RemovalPending, wrapped
+	}
 	if !errors.Is(safetyErr, ErrDirty) ||
 		!facts.pathExists ||
 		!facts.registered {
@@ -452,6 +466,9 @@ func (m *Manager) rollbackRemovalIntent(
 	record workspaceRecord,
 	before removalFacts,
 ) (RemovalState, error) {
+	if record.Removal != nil && record.Removal.Started {
+		return RemovalPending, nil
+	}
 	after, err := m.removalFacts(ctx, record)
 	if err != nil {
 		return RemovalPending, err
@@ -510,10 +527,24 @@ func (m *Manager) workspaceRecords() ([]workspaceRecord, error) {
 	}
 	var records []workspaceRecord
 	for _, bucket := range buckets {
-		if !bucket.IsDir() || !validRepositoryHash(bucket.Name()) {
+		if !validRepositoryHash(bucket.Name()) {
 			continue
 		}
 		bucketPath := filepath.Join(m.root, bucket.Name())
+		bucketInfo, err := os.Lstat(bucketPath)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"workspace: inspect repository bucket %q: %w",
+				bucket.Name(),
+				err,
+			)
+		}
+		if !bucketInfo.IsDir() || bucketInfo.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf(
+				"workspace: repository bucket %q is not a real directory",
+				bucket.Name(),
+			)
+		}
 		entries, err := os.ReadDir(bucketPath)
 		if err != nil {
 			return nil, fmt.Errorf(

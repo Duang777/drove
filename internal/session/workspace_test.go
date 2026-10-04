@@ -89,6 +89,13 @@ func TestStartPreparesWorkspaceAndPersistsPrivateMetadata(t *testing.T) {
 	if workspaces.discardCount != 0 {
 		t.Fatalf("successful workspace was discarded %d times", workspaces.discardCount)
 	}
+	if len(workspaces.preparationAcks) != 1 ||
+		workspaces.preparationAcks[0].AgentID != status.AgentID {
+		t.Fatalf(
+			"preparation acknowledgements = %+v",
+			workspaces.preparationAcks,
+		)
+	}
 	if _, err := manager.CleanupWorkspace(
 		context.Background(),
 		status.AgentID,
@@ -133,6 +140,12 @@ func TestStartDiscardsWorkspaceWhenCreationCannotPersist(t *testing.T) {
 		workspaces.discarded.Path != workspaces.prepared.Path {
 		t.Fatalf("discard calls = %+v", workspaces)
 	}
+	if len(workspaces.preparationAcks) != 0 {
+		t.Fatalf(
+			"failed creation acknowledgements = %+v",
+			workspaces.preparationAcks,
+		)
+	}
 }
 
 func TestStartPreservesWorkspaceAfterDurableCreationPublishFails(t *testing.T) {
@@ -167,6 +180,12 @@ func TestStartPreservesWorkspaceAfterDurableCreationPublishFails(t *testing.T) {
 			workspaces.discardCount,
 		)
 	}
+	if len(workspaces.preparationAcks) != 1 {
+		t.Fatalf(
+			"durable preparation acknowledgements = %+v",
+			workspaces.preparationAcks,
+		)
+	}
 	stored, replayErr := st.Replay(workspaces.prepareAgentID)
 	if replayErr != nil {
 		t.Fatalf("replay durable creation: %v", replayErr)
@@ -186,6 +205,58 @@ func TestStartPreservesWorkspaceAfterDurableCreationPublishFails(t *testing.T) {
 	}
 	if workspaces.cleanupCount != 0 {
 		t.Fatalf("durable workspace cleanup reached lifecycle %d times", workspaces.cleanupCount)
+	}
+}
+
+func TestStartPreservesDurableWorkspaceWhenPreparationAckFails(t *testing.T) {
+	manager, st := newTestManager(t)
+	source := t.TempDir()
+	ackErr := errors.New("preparation acknowledgement failed")
+	workspaces := &fakeWorkspaceLifecycle{
+		prepared: workspace.Workspace{
+			Repository: source,
+			Path:       filepath.Join(t.TempDir(), "worktree"),
+			Branch:     "feature/ack-failure",
+		},
+		preparationAckErr: ackErr,
+	}
+	manager.workspaces = workspaces
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Command: "/bin/cat",
+		Dir:     source,
+		Worktree: &WorktreeRequest{
+			Branch: "feature/ack-failure",
+		},
+	})
+	if !errors.Is(err, ackErr) {
+		t.Fatalf("start error = %v, want acknowledgement failure", err)
+	}
+	if status != nil {
+		t.Fatalf("status = %+v, want nil", status)
+	}
+	if workspaces.discardCount != 0 {
+		t.Fatalf(
+			"durable workspace was discarded %d times",
+			workspaces.discardCount,
+		)
+	}
+	stored, replayErr := st.Replay(workspaces.prepareAgentID)
+	if replayErr != nil {
+		t.Fatalf("replay durable creation: %v", replayErr)
+	}
+	if len(stored) != 2 || stored[0].Reason != "created" {
+		t.Fatalf("stored creation events = %+v", stored)
+	}
+	if _, cleanupErr := manager.CleanupWorkspace(
+		context.Background(),
+		workspaces.prepareAgentID,
+		false,
+	); !errors.Is(cleanupErr, ErrWorkspaceInUse) {
+		t.Fatalf(
+			"cleanup after acknowledgement failure error = %v, want ErrWorkspaceInUse",
+			cleanupErr,
+		)
 	}
 }
 
@@ -273,6 +344,47 @@ func TestBootstrapWithoutManagedWorkspacesDoesNotRequireGit(t *testing.T) {
 	}
 	if err := recovered.Manager.Close(); err != nil {
 		t.Fatalf("close recovered manager: %v", err)
+	}
+}
+
+func TestBootstrapReconcilesPreparationsAgainstDurableMetadata(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	target := workspace.Workspace{
+		AgentID:    string(id),
+		Repository: filepath.Join(t.TempDir(), "repository"),
+		Path:       filepath.Join(t.TempDir(), "worktree"),
+		Branch:     "feature/recovered",
+	}
+	persistStoppedWorkspaceHistory(t, manager, id, target)
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close initial manager: %v", err)
+	}
+	workspaces := &fakeWorkspaceLifecycle{}
+
+	recovered, err := Bootstrap(
+		context.Background(),
+		adapter.NewRegistry(),
+		st,
+		withWorkspaceLifecycle(workspaces),
+	)
+	if err != nil {
+		t.Fatalf("bootstrap workspace metadata: %v", err)
+	}
+	defer recovered.Manager.Close()
+	if len(workspaces.reconcileExpected) != 1 {
+		t.Fatalf(
+			"expected preparations = %+v, want %+v",
+			workspaces.reconcileExpected,
+			target,
+		)
+	}
+	reconciled := workspaces.reconcileExpected[0]
+	if reconciled.AgentID != target.AgentID ||
+		reconciled.Repository != target.Repository ||
+		reconciled.Path != target.Path ||
+		reconciled.Branch != target.Branch {
+		t.Fatalf("expected preparation = %+v, want %+v", reconciled, target)
 	}
 }
 
@@ -828,6 +940,35 @@ func TestPendingWorkspaceRemovalBlocksManualAndStartupResume(t *testing.T) {
 	}
 }
 
+func TestUnchangedWorkspaceRemovalRestoresStartupResumeCandidate(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	managed.setWorkspaceRemovalPending()
+	if managed.shouldResumeOnStart() {
+		t.Fatal("pending workspace removal did not block startup resume")
+	}
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupState: workspace.RemovalUnchanged,
+		cleanupErr:   workspace.ErrDirty,
+	}
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); !errors.Is(err, ErrWorkspaceDirty) {
+		t.Fatalf("unchanged cleanup error = %v, want ErrWorkspaceDirty", err)
+	}
+	state = managed.workspaceState()
+	if state.removalPending || !state.resumeOnStart {
+		t.Fatalf("workspace state after unchanged cleanup = %+v", state)
+	}
+}
+
 func TestStartupResumeWaitsForFailedWorkspaceCleanup(t *testing.T) {
 	manager, _ := newTestManager(t)
 	id := agent.ID("11111111-1111-4111-8111-111111111111")
@@ -1040,26 +1181,30 @@ func (s *failingCommitStore) AppendEvents(
 type fakeWorkspaceLifecycle struct {
 	prepared workspace.Workspace
 
-	prepareSource    string
-	prepareBranch    string
-	prepareAgentID   string
-	prepareErr       error
-	prepareStarted   chan struct{}
-	releasePrepare   chan struct{}
-	discardCount     int
-	discarded        workspace.Workspace
-	cleanupCount     int
-	cleanupAgentID   string
-	cleanupForce     bool
-	cleanupStarted   chan struct{}
-	releaseCleanup   chan struct{}
-	cleanupResult    workspace.Workspace
-	cleanupState     workspace.RemovalState
-	cleanupErr       error
-	acknowledgeErr   error
-	acknowledgeCount int
-	reconcileResult  []workspace.Removal
-	reconcileErr     error
+	prepareSource     string
+	prepareBranch     string
+	prepareAgentID    string
+	prepareErr        error
+	prepareStarted    chan struct{}
+	releasePrepare    chan struct{}
+	preparationAckErr error
+	preparationAcks   []workspace.Workspace
+	reconcileExpected []workspace.Workspace
+	reconcilePrepErr  error
+	discardCount      int
+	discarded         workspace.Workspace
+	cleanupCount      int
+	cleanupAgentID    string
+	cleanupForce      bool
+	cleanupStarted    chan struct{}
+	releaseCleanup    chan struct{}
+	cleanupResult     workspace.Workspace
+	cleanupState      workspace.RemovalState
+	cleanupErr        error
+	acknowledgeErr    error
+	acknowledgeCount  int
+	reconcileResult   []workspace.Removal
+	reconcileErr      error
 }
 
 func (f *fakeWorkspaceLifecycle) Prepare(
@@ -1087,6 +1232,24 @@ func (f *fakeWorkspaceLifecycle) Prepare(
 	prepared := f.prepared
 	prepared.AgentID = agentID
 	return prepared, nil
+}
+
+func (f *fakeWorkspaceLifecycle) AcknowledgePreparation(
+	target workspace.Workspace,
+) error {
+	f.preparationAcks = append(f.preparationAcks, target)
+	return f.preparationAckErr
+}
+
+func (f *fakeWorkspaceLifecycle) ReconcilePreparations(
+	_ context.Context,
+	expected []workspace.Workspace,
+) error {
+	f.reconcileExpected = append(
+		[]workspace.Workspace(nil),
+		expected...,
+	)
+	return f.reconcilePrepErr
 }
 
 func (f *fakeWorkspaceLifecycle) Discard(

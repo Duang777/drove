@@ -765,8 +765,7 @@ func TestRemoveReturnsPendingAfterPartialGitMutation(t *testing.T) {
 	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
 	script := `#!/bin/sh
 case " $* " in
-  *" worktree remove "*)
-    rm -f "$DROVE_TEST_WORKTREE/tracked.txt"
+  *" worktree prune "*)
     exit 1
     ;;
 esac
@@ -776,7 +775,6 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 		t.Fatalf("write git wrapper: %v", err)
 	}
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
-	t.Setenv("DROVE_TEST_WORKTREE", prepared.Path)
 	manager.git = wrapper
 
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
@@ -1419,6 +1417,177 @@ func TestListRejectsSymlinkedWorktreeRoot(t *testing.T) {
 	}
 	if _, err := manager.List(context.Background()); err == nil {
 		t.Fatal("list accepted a symlinked worktree root")
+	}
+}
+
+func TestListAndReconciliationRejectSymlinkedRepositoryBucket(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := os.MkdirAll(manager.root, 0o700); err != nil {
+		t.Fatalf("create worktree root: %v", err)
+	}
+	bucket := filepath.Join(manager.root, "0123456789abcdef")
+	if err := os.Symlink(t.TempDir(), bucket); err != nil {
+		t.Skipf("create repository bucket symlink: %v", err)
+	}
+	if _, err := manager.List(context.Background()); err == nil {
+		t.Fatal("list silently skipped a symlinked repository bucket")
+	}
+	if _, err := manager.ReconcileRemovals(context.Background()); err == nil {
+		t.Fatal("reconciliation silently skipped a symlinked repository bucket")
+	}
+}
+
+func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "12121212-1212-4212-8212-121212121212",
+		Started:     true,
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write started removal: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "tracked.txt"),
+		[]byte("changed after physical removal started\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("dirty started removal: %v", err)
+	}
+
+	removals, err := manager.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile started removal: %v", err)
+	}
+	if len(removals) != 1 ||
+		removals[0].Workspace.Path != prepared.Path {
+		t.Fatalf("reconciled removals = %+v", removals)
+	}
+	if _, err := os.Lstat(prepared.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("started removal retained path or inspect failed: %v", err)
+	}
+	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
+		t.Fatalf("acknowledge started removal: %v", err)
+	}
+}
+
+func TestRemoveUsesPruneWithoutPassingManagedPathToGit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	realGit := manager.git
+	logPath := filepath.Join(t.TempDir(), "git-arguments")
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$DROVE_TEST_GIT_LOG"
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_GIT_LOG", logPath)
+	manager.git = wrapper
+
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read Git arguments: %v", err)
+	}
+	for _, arguments := range strings.Split(string(raw), "\n") {
+		if strings.Contains(arguments, "worktree remove") {
+			t.Fatalf("Git received path deletion command: %q", arguments)
+		}
+		if strings.Contains(arguments, "worktree prune") &&
+			strings.Contains(arguments, prepared.Path) {
+			t.Fatalf("Git prune received managed path: %q", arguments)
+		}
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
+func TestPrepareRejectsMissingRepositoryWithoutRunningGit(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = filepath.Join(t.TempDir(), "git-must-not-run")
+	missing := filepath.Join(t.TempDir(), "missing")
+	_, err = manager.Prepare(
+		context.Background(),
+		missing,
+		"",
+		testAgentID,
+	)
+	if !errors.Is(err, ErrNotRepository) {
+		t.Fatalf("prepare missing repository error = %v, want ErrNotRepository", err)
+	}
+}
+
+func TestValidateBranchPreservesRuntimeGitFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	if err := os.WriteFile(wrapper, []byte("#!/bin/sh\nexit 2\n"), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	manager.git = wrapper
+
+	err = manager.validateBranch(context.Background(), "valid-name")
+	if err == nil {
+		t.Fatal("branch validation ignored Git runtime failure")
+	}
+	if errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf("runtime branch validation error = %v, want non-request error", err)
 	}
 }
 

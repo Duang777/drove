@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
@@ -52,6 +53,8 @@ type workspaceLifecycle interface {
 		string,
 		string,
 	) (workspace.Workspace, error)
+	AcknowledgePreparation(workspace.Workspace) error
+	ReconcilePreparations(context.Context, []workspace.Workspace) error
 	Discard(context.Context, workspace.Workspace) error
 	Remove(context.Context, string, bool) (workspace.RemovalResult, error)
 	ReconcileRemovals(context.Context) ([]workspace.Removal, error)
@@ -147,6 +150,9 @@ func (m *Manager) CleanupWorkspace(
 	removed := result.Removal.Workspace
 	switch result.State {
 	case workspace.RemovalUnchanged:
+		if managed, known := m.managed(agentID); known {
+			managed.clearWorkspaceRemovalPending()
+		}
 		if removalErr == nil {
 			removalErr = errors.New(
 				"workspace removal stopped without changing physical state",
@@ -355,6 +361,40 @@ func (m *Manager) reconcileWorkspaceRemovals(
 				err,
 			)
 		}
+	}
+	return nil
+}
+
+func (m *Manager) reconcileWorkspacePreparations(
+	ctx context.Context,
+	metadata map[string]workspaceMetadata,
+) error {
+	if m.workspaceErr != nil {
+		return errors.Join(
+			ErrWorkspaceUnavailable,
+			fmt.Errorf("session: initialize workspace manager: %w", m.workspaceErr),
+		)
+	}
+	if m.workspaces == nil {
+		return nil
+	}
+	agentIDs := make([]string, 0, len(metadata))
+	for id := range metadata {
+		agentIDs = append(agentIDs, id)
+	}
+	sort.Strings(agentIDs)
+	expected := make([]workspace.Workspace, 0, len(agentIDs))
+	for _, id := range agentIDs {
+		current := metadata[id]
+		expected = append(expected, workspace.Workspace{
+			AgentID:    id,
+			Repository: current.Repository,
+			Path:       current.Path,
+			Branch:     current.Branch,
+		})
+	}
+	if err := m.workspaces.ReconcilePreparations(ctx, expected); err != nil {
+		return fmt.Errorf("session: reconcile workspace preparations: %w", err)
 	}
 	return nil
 }

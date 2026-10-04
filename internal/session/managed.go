@@ -59,7 +59,12 @@ func (m *managedAgent) setWorkspaceRemovalPending() {
 	if !m.workspace.removed {
 		m.workspace.removalPending = true
 	}
-	m.workspace.resumeOnStart = false
+	m.workspaceMu.Unlock()
+}
+
+func (m *managedAgent) clearWorkspaceRemovalPending() {
+	m.workspaceMu.Lock()
+	m.workspace.removalPending = false
 	m.workspaceMu.Unlock()
 }
 
