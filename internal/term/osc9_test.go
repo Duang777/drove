@@ -2,7 +2,10 @@ package term
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -11,14 +14,20 @@ func TestOSC9ScannerAcceptsDirectTerminators(t *testing.T) {
 	tests := []struct {
 		name  string
 		input []byte
+		body  string
 	}{
 		{
-			name:  "bell",
-			input: []byte("\x1b]9;Approval requested: command\x07"),
+			name: "bell",
+			input: loadOSC9Fixture(
+				t,
+				"testdata/codex-0.160.0-osc9-direct.hex",
+			),
+			body: "Approval requested: redacted-command",
 		},
 		{
 			name:  "string terminator",
 			input: []byte("\x1b]9;Approval requested: command\x1b\\"),
+			body:  "Approval requested: command",
 		},
 	}
 	for _, test := range tests {
@@ -31,7 +40,7 @@ func TestOSC9ScannerAcceptsDirectTerminators(t *testing.T) {
 			assertOSC9Frame(
 				t,
 				frames[0],
-				"Approval requested: command",
+				test.body,
 				uint64(len(test.input)),
 				1,
 				at,
@@ -41,8 +50,9 @@ func TestOSC9ScannerAcceptsDirectTerminators(t *testing.T) {
 }
 
 func TestOSC9ScannerAcceptsCodexTmuxPassthrough(t *testing.T) {
-	input := []byte(
-		"\x1bPtmux;\x1b\x1b]9;Codex wants to edit /private/path\x07\x1b\\",
+	input := loadOSC9Fixture(
+		t,
+		"testdata/codex-0.160.0-osc9-tmux.hex",
 	)
 	at := time.Date(2026, time.October, 5, 2, 0, 0, 0, time.UTC)
 	frames := feedOSC9Chunks(t, NewOSC9Scanner(), input, nil, at)
@@ -53,7 +63,7 @@ func TestOSC9ScannerAcceptsCodexTmuxPassthrough(t *testing.T) {
 	assertOSC9Frame(
 		t,
 		frames[0],
-		"Codex wants to edit /private/path",
+		"Codex wants to edit redacted/path",
 		wantOffset,
 		1,
 		at,
@@ -207,6 +217,20 @@ func TestOSC9FrameReturnsPayloadCopies(t *testing.T) {
 	if got := string(frames[0].Payload()); got != "Approval requested: copy" {
 		t.Fatalf("payload after caller mutation = %q", got)
 	}
+}
+
+func loadOSC9Fixture(t *testing.T, path string) []byte {
+	t.Helper()
+
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read OSC 9 fixture: %v", err)
+	}
+	data, err := hex.DecodeString(strings.Join(strings.Fields(string(encoded)), ""))
+	if err != nil {
+		t.Fatalf("decode OSC 9 fixture: %v", err)
+	}
+	return data
 }
 
 func feedOSC9Chunks(

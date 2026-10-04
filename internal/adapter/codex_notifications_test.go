@@ -1,6 +1,9 @@
 package adapter
 
 import (
+	"bytes"
+	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -83,6 +86,63 @@ func TestCodexOSC9NormalizerIgnoresOtherMessages(t *testing.T) {
 	}
 }
 
+func TestCodexOSC9SanitizerRetainsOnlyApprovalPrefix(t *testing.T) {
+	entry := NewRegistry().For("codex")
+	tests := []struct {
+		name   string
+		path   string
+		secret string
+	}{
+		{
+			name:   "direct",
+			path:   "../term/testdata/codex-0.160.0-osc9-direct.hex",
+			secret: "redacted-command",
+		},
+		{
+			name:   "tmux",
+			path:   "../term/testdata/codex-0.160.0-osc9-tmux.hex",
+			secret: "redacted/path",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			sanitizer, err := entry.NewOSC9Sanitizer()
+			if err != nil {
+				t.Fatalf("new OSC 9 sanitizer: %v", err)
+			}
+			input := loadAdapterOSC9Fixture(t, test.path)
+			output := append(sanitizer.Feed(input), sanitizer.Flush()...)
+			if len(output) != len(input) {
+				t.Fatalf("sanitized length = %d, want %d", len(output), len(input))
+			}
+			if bytes.Contains(output, []byte(test.secret)) {
+				t.Fatalf("sanitized output retained body: %q", output)
+			}
+
+			chunk, err := term.NewCommittedChunk(
+				output,
+				uint64(len(output)),
+				17,
+				time.Date(2026, time.October, 5, 10, 30, 0, 0, time.UTC),
+			)
+			if err != nil {
+				t.Fatalf("new committed chunk: %v", err)
+			}
+			frames := term.NewOSC9Scanner().Feed(chunk)
+			if len(frames) != 1 {
+				t.Fatalf("frames = %d, want 1", len(frames))
+			}
+			signal, matched, err := entry.NormalizeOSC9(frames[0])
+			if err != nil {
+				t.Fatalf("normalize sanitized frame: %v", err)
+			}
+			if !matched || signal.Kind != detect.KindPermissionRequested {
+				t.Fatalf("sanitized frame normalization = (%+v, %t)", signal, matched)
+			}
+		})
+	}
+}
+
 func TestOnlyCodexSupportsTerminalNotifications(t *testing.T) {
 	registry := NewRegistry()
 	if !registry.For("codex").SupportsTerminalNotifications() {
@@ -136,4 +196,18 @@ func scanCodexOSC9Bytes(
 		t.Fatalf("frames = %d, want 1", len(frames))
 	}
 	return frames[0]
+}
+
+func loadAdapterOSC9Fixture(t *testing.T, path string) []byte {
+	t.Helper()
+
+	encoded, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read OSC 9 fixture: %v", err)
+	}
+	data, err := hex.DecodeString(strings.Join(strings.Fields(string(encoded)), ""))
+	if err != nil {
+		t.Fatalf("decode OSC 9 fixture: %v", err)
+	}
+	return data
 }
