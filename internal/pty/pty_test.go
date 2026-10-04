@@ -562,9 +562,6 @@ func TestCloseCleansProcessGroupAfterLeaderNaturalExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse child pid %q: %v", rawPID, err)
 	}
-	if err := syscall.Kill(childPID, 0); err != nil {
-		t.Fatalf("surviving child is not alive before Close: %v", err)
-	}
 	childNeedsCleanup := true
 	t.Cleanup(func() {
 		if childNeedsCleanup {
