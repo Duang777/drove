@@ -104,16 +104,86 @@ const (
 	EvidenceHook      EvidenceSource = "hook"
 	EvidenceNotify    EvidenceSource = "notify"
 	EvidenceHeuristic EvidenceSource = "heuristic"
+	EvidenceScreen    EvidenceSource = "screen"
 	EvidenceTimer     EvidenceSource = "timer"
 	EvidenceRecovery  EvidenceSource = "recovery"
 )
 
+// ScreenEdge describes whether a stable screen rule appeared or cleared.
+type ScreenEdge string
+
+const (
+	// ScreenEdgePresent means a stable rule currently matches the screen.
+	ScreenEdgePresent ScreenEdge = "present"
+	// ScreenEdgeCleared means a previously matching rule no longer matches.
+	ScreenEdgeCleared ScreenEdge = "cleared"
+)
+
+// ScreenAttribution is bounded adapter-authored evidence for a screen edge.
+type ScreenAttribution struct {
+	Rule          string     `json:"rule"`
+	Edge          ScreenEdge `json:"edge"`
+	Region        string     `json:"region"`
+	OutputOffset  uint64     `json:"output_offset"`
+	LastOutputSeq uint64     `json:"last_output_seq"`
+	Evidence      string     `json:"evidence"`
+}
+
+// NewScreenAttribution validates and copies one screen attribution value.
+func NewScreenAttribution(
+	rule string,
+	edge ScreenEdge,
+	region string,
+	outputOffset uint64,
+	lastOutputSeq uint64,
+	evidence string,
+) (ScreenAttribution, error) {
+	attribution := ScreenAttribution{
+		Rule:          rule,
+		Edge:          edge,
+		Region:        region,
+		OutputOffset:  outputOffset,
+		LastOutputSeq: lastOutputSeq,
+		Evidence:      evidence,
+	}
+	if err := attribution.Validate(); err != nil {
+		return ScreenAttribution{}, err
+	}
+	return attribution, nil
+}
+
+// Validate rejects unbounded or non-static screen attribution.
+func (a ScreenAttribution) Validate() error {
+	if a.Rule == "" || len(a.Rule) > 64 || !asciiToken(a.Rule) {
+		return errors.New("agent: screen rule must contain 1 to 64 ASCII bytes")
+	}
+	switch a.Edge {
+	case ScreenEdgePresent, ScreenEdgeCleared:
+	default:
+		return fmt.Errorf("agent: invalid screen edge %q", a.Edge)
+	}
+	if a.Region == "" || len(a.Region) > 64 || !asciiToken(a.Region) {
+		return errors.New("agent: screen region must contain 1 to 64 ASCII bytes")
+	}
+	if a.OutputOffset == 0 {
+		return errors.New("agent: screen output offset must be positive")
+	}
+	if a.LastOutputSeq == 0 {
+		return errors.New("agent: screen last output sequence must be positive")
+	}
+	if a.Evidence == "" || len(a.Evidence) > 128 || !asciiText(a.Evidence) {
+		return errors.New("agent: screen evidence must contain 1 to 128 printable ASCII bytes")
+	}
+	return nil
+}
+
 // Evidence is the bounded, redacted explanation for one state transition.
 type Evidence struct {
-	Source     EvidenceSource `json:"source"`
-	Event      string         `json:"event"`
-	Confidence float64        `json:"confidence"`
-	DeliveryID string         `json:"delivery_id,omitempty"`
+	Source     EvidenceSource     `json:"source"`
+	Event      string             `json:"event"`
+	Confidence float64            `json:"confidence"`
+	DeliveryID string             `json:"delivery_id,omitempty"`
+	Screen     *ScreenAttribution `json:"screen,omitempty"`
 }
 
 // Validate checks that evidence can be stored in a versioned state payload.
@@ -124,6 +194,7 @@ func (e Evidence) Validate() error {
 		EvidenceHook,
 		EvidenceNotify,
 		EvidenceHeuristic,
+		EvidenceScreen,
 		EvidenceTimer,
 		EvidenceRecovery:
 	default:
@@ -146,6 +217,19 @@ func (e Evidence) Validate() error {
 	} else if e.DeliveryID != "" {
 		return errors.New("agent: only delivered evidence may contain a delivery ID")
 	}
+	if e.Source == EvidenceScreen {
+		if e.Screen == nil {
+			return errors.New("agent: screen evidence requires screen attribution")
+		}
+		if err := e.Screen.Validate(); err != nil {
+			return fmt.Errorf("agent: screen evidence attribution: %w", err)
+		}
+		if e.Event != e.Screen.Rule {
+			return errors.New("agent: screen evidence event must match its rule")
+		}
+	} else if e.Screen != nil {
+		return errors.New("agent: only screen evidence may contain screen attribution")
+	}
 	return nil
 }
 
@@ -155,6 +239,18 @@ func asciiToken(value string) bool {
 	}
 	for _, r := range value {
 		if r < 0x20 || r > 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiText(value string) bool {
+	if !utf8.ValidString(value) || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r > 0x7e {
 			return false
 		}
 	}
@@ -516,6 +612,10 @@ func cloneEvidence(evidence *Evidence) *Evidence {
 		return nil
 	}
 	copy := *evidence
+	if evidence.Screen != nil {
+		screen := *evidence.Screen
+		copy.Screen = &screen
+	}
 	return &copy
 }
 
@@ -638,6 +738,7 @@ func (a *Agent) Prepare(change Change) (PreparedChange, error) {
 			)
 		}
 	}
+	copiedEvidence := *cloneEvidence(&change.evidence)
 	return PreparedChange{
 		owner:        a,
 		agentID:      a.id,
@@ -646,7 +747,7 @@ func (a *Agent) Prepare(change Change) (PreparedChange, error) {
 		to:           change.target,
 		reason:       change.reason,
 		errorMessage: change.errorMessage,
-		evidence:     change.evidence,
+		evidence:     copiedEvidence,
 		at:           change.at,
 		hasState:     change.hasState,
 		hasError:     change.hasError,
@@ -677,8 +778,7 @@ func (a *Agent) ApplyCommitted(prepared PreparedChange) error {
 	}
 	if prepared.hasState {
 		a.state = prepared.to
-		evidence := prepared.evidence
-		a.lastTransition = &evidence
+		a.lastTransition = cloneEvidence(&prepared.evidence)
 	}
 	a.updatedAt = prepared.at
 	a.revision++
@@ -693,7 +793,8 @@ func (p PreparedChange) Transition() (
 	evidence Evidence,
 	ok bool,
 ) {
-	return p.from, p.to, p.reason, p.evidence, p.hasState
+	evidence = *cloneEvidence(&p.evidence)
+	return p.from, p.to, p.reason, evidence, p.hasState
 }
 
 // ErrorMessage returns the prepared error update when present.

@@ -186,6 +186,121 @@ func TestHookPolicyAndEvidenceValidation(t *testing.T) {
 	}
 }
 
+func TestScreenAttributionAndEvidenceValidation(t *testing.T) {
+	valid, err := NewScreenAttribution(
+		"claude.approval_prompt",
+		ScreenEdgeCleared,
+		"viewport.bottom",
+		4312,
+		918,
+		"approval prompt",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	evidence := Evidence{
+		Source:     EvidenceScreen,
+		Event:      valid.Rule,
+		Confidence: 1,
+		Screen:     &valid,
+	}
+	if err := evidence.Validate(); err != nil {
+		t.Fatalf("validate screen evidence: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		change func(*ScreenAttribution)
+	}{
+		{name: "empty rule", change: func(a *ScreenAttribution) { a.Rule = "" }},
+		{name: "invalid edge", change: func(a *ScreenAttribution) { a.Edge = "changed" }},
+		{name: "empty region", change: func(a *ScreenAttribution) { a.Region = "" }},
+		{name: "zero offset", change: func(a *ScreenAttribution) { a.OutputOffset = 0 }},
+		{name: "zero sequence", change: func(a *ScreenAttribution) { a.LastOutputSeq = 0 }},
+		{name: "dynamic evidence", change: func(a *ScreenAttribution) { a.Evidence = "line\ntext" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			attribution := valid
+			test.change(&attribution)
+			if err := attribution.Validate(); err == nil {
+				t.Fatal("invalid screen attribution was accepted")
+			}
+		})
+	}
+
+	mismatched := evidence
+	mismatched.Event = "claude.idle_prompt"
+	if err := mismatched.Validate(); err == nil {
+		t.Fatal("screen evidence accepted a mismatched event")
+	}
+	foreign := Evidence{
+		Source:     EvidenceHeuristic,
+		Event:      "heuristic_blocked",
+		Confidence: 1,
+		Screen:     &valid,
+	}
+	if err := foreign.Validate(); err == nil {
+		t.Fatal("non-screen evidence accepted screen attribution")
+	}
+}
+
+func TestLastTransitionCopiesScreenAttribution(t *testing.T) {
+	attribution, err := NewScreenAttribution(
+		"claude.idle_prompt",
+		ScreenEdgePresent,
+		"viewport.bottom",
+		12,
+		4,
+		"idle prompt",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	target := New("screen-copy")
+	apply := func(change Change) {
+		t.Helper()
+		prepared, prepareErr := target.Prepare(change)
+		if prepareErr != nil {
+			t.Fatalf("prepare transition: %v", prepareErr)
+		}
+		if applyErr := target.ApplyCommitted(prepared); applyErr != nil {
+			t.Fatalf("apply transition: %v", applyErr)
+		}
+	}
+	apply(MoveTo(StateStarting, "start", Evidence{
+		Source: EvidenceSession, Event: "session_start", Confidence: 1,
+	}))
+	apply(MoveTo(StateWorking, "working", Evidence{
+		Source: EvidenceProcess, Event: "process_started", Confidence: 1,
+	}))
+	prepared, err := target.Prepare(MoveTo(StateIdle, "screen idle", Evidence{
+		Source:     EvidenceScreen,
+		Event:      attribution.Rule,
+		Confidence: 1,
+		Screen:     &attribution,
+	}))
+	if err != nil {
+		t.Fatalf("prepare screen transition: %v", err)
+	}
+	attribution.Rule = "mutated-before-apply"
+	_, _, _, exposed, ok := prepared.Transition()
+	if !ok {
+		t.Fatal("prepared transition is missing")
+	}
+	exposed.Screen.Rule = "mutated-return-value"
+	if err := target.ApplyCommitted(prepared); err != nil {
+		t.Fatalf("apply screen transition: %v", err)
+	}
+
+	first := target.LastTransition()
+	first.Screen.Rule = "mutated"
+	second := target.LastTransition()
+	if second.Screen.Rule != "claude.idle_prompt" {
+		t.Fatalf("stored screen rule = %q, want copied attribution", second.Screen.Rule)
+	}
+}
+
 func TestSignalInjectionMetadataValidation(t *testing.T) {
 	if !ValidSignalInjectionMode(SignalInjectionAuto) ||
 		!ValidSignalInjectionMode(SignalInjectionOff) ||

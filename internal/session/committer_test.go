@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -62,6 +63,75 @@ func TestCommitterStoresOutputMetadataAndPublishesHydratedChunk(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for output chunk")
+	}
+}
+
+func TestEncodeStateEvidenceSelectsVersionBySource(t *testing.T) {
+	screen, err := agent.NewScreenAttribution(
+		"claude.approval_prompt",
+		agent.ScreenEdgeCleared,
+		"viewport.bottom",
+		4312,
+		918,
+		"approval prompt",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	tests := []struct {
+		name     string
+		evidence agent.Evidence
+		version  int
+	}{
+		{
+			name: "process v1",
+			evidence: agent.Evidence{
+				Source: agent.EvidenceProcess, Event: "process_started", Confidence: 1,
+			},
+			version: 1,
+		},
+		{
+			name: "notify v2",
+			evidence: agent.Evidence{
+				Source: agent.EvidenceNotify, Event: "agent-turn-complete", Confidence: 1,
+				DeliveryID: "550e8400-e29b-41d4-a716-446655440000",
+			},
+			version: 2,
+		},
+		{
+			name: "screen v3",
+			evidence: agent.Evidence{
+				Source: agent.EvidenceScreen, Event: screen.Rule, Confidence: 1,
+				Screen: &screen,
+			},
+			version: 3,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := encodeStateEvidence(test.evidence)
+			if err != nil {
+				t.Fatalf("encode state evidence: %v", err)
+			}
+			var version struct {
+				Version int `json:"version"`
+			}
+			if err := json.Unmarshal(encoded, &version); err != nil {
+				t.Fatalf("decode evidence version: %v", err)
+			}
+			if version.Version != test.version {
+				t.Fatalf("version = %d, want %d", version.Version, test.version)
+			}
+			if test.version == 3 {
+				var payload event.StateEvidencePayloadV3
+				if err := json.Unmarshal(encoded, &payload); err != nil {
+					t.Fatalf("decode screen evidence: %v", err)
+				}
+				if err := payload.Validate(); err != nil {
+					t.Fatalf("validate screen evidence: %v", err)
+				}
+			}
+		})
 	}
 }
 

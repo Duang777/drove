@@ -380,7 +380,7 @@ func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
 			Type:      string(event.TypeAgentSignal),
 			SessionID: "agent-1",
 			AgentID:   "agent-1",
-			Payload:   `{"version":3}`,
+			Payload:   `{"version":99}`,
 		},
 		{
 			Seq:       3,
@@ -390,7 +390,7 @@ func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
 			AgentID:   "agent-1",
 			From:      "pending",
 			To:        "stopped",
-			Payload:   `{"version":3}`,
+			Payload:   `{"version":99}`,
 		},
 	} {
 		if err := projector.Apply(row); err != nil {
@@ -404,6 +404,146 @@ func TestRecoveryProjectorCountsUnknownAuditPayloadVersions(t *testing.T) {
 	if plan.Report.UnknownSignalPayloadVersions != 1 ||
 		plan.Report.UnknownStateEvidenceVersions != 1 {
 		t.Fatalf("report = %+v", plan.Report)
+	}
+}
+
+func TestRecoveryProjectorReadsScreenV3WithoutOutputAttachments(t *testing.T) {
+	base := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	screen := &event.ScreenAttributionPayload{
+		Rule:          "claude.approval_prompt",
+		Edge:          "present",
+		Region:        "viewport.bottom",
+		OutputOffset:  4312,
+		LastOutputSeq: 918,
+		Evidence:      "approval prompt",
+	}
+	projector := newRecoveryProjector()
+	rows := []store.EventRow{
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "created",
+			Payload: `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq: 2, Timestamp: base.Add(time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "pending", To: "starting",
+			Payload: `{"version":1,"source":"session","event":"session_start","confidence":1}`,
+		},
+		{
+			Seq: 3, Timestamp: base.Add(2 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "starting", To: "working",
+			Payload: `{"version":1,"source":"process","event":"process_started","confidence":1}`,
+		},
+	}
+	for _, outcome := range []string{
+		"candidate",
+		"suppressed",
+		"transitioned",
+		"stale",
+		"terminal",
+	} {
+		payload := event.SignalPayloadV3{
+			SignalPayloadV1: event.SignalPayloadV1{
+				Version: 3, Source: "screen", Kind: "human_input_required",
+				Vendor: "claude", VendorEvent: "screen_rule", Scope: "root",
+				Confidence: 1, ReceivedAt: base.Format(time.RFC3339Nano),
+				Outcome: outcome,
+			},
+			Screen: screen,
+		}
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("encode %s signal: %v", outcome, err)
+		}
+		rows = append(rows, store.EventRow{
+			Seq: uint64(len(rows) + 1), Timestamp: base.Add(time.Duration(len(rows)) * time.Second),
+			Type: string(event.TypeAgentSignal), SessionID: "agent-1", AgentID: "agent-1",
+			Payload: string(encoded),
+		})
+	}
+	statePayload, err := json.Marshal(event.StateEvidencePayloadV3{
+		StateEvidencePayloadV1: event.StateEvidencePayloadV1{
+			Version: 3, Source: "screen", Event: screen.Rule, Confidence: 1,
+		},
+		Screen: screen,
+	})
+	if err != nil {
+		t.Fatalf("encode screen state evidence: %v", err)
+	}
+	rows = append(rows, store.EventRow{
+		Seq: uint64(len(rows) + 1), Timestamp: base.Add(time.Duration(len(rows)) * time.Second),
+		Type: string(event.TypeStateChanged), SessionID: "agent-1", AgentID: "agent-1",
+		From: "working", To: "blocked", Reason: "screen approval confirmed",
+		Payload: string(statePayload),
+	})
+
+	for _, row := range rows {
+		if len(row.OutputAttachment) != 0 {
+			t.Fatalf("seed row %d unexpectedly has output attachment", row.Seq)
+		}
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	draft := projector.sessions["agent-1"]
+	if draft.lastTransition == nil ||
+		draft.lastTransition.Source != agent.EvidenceScreen ||
+		draft.lastTransition.Screen == nil ||
+		draft.lastTransition.Screen.Rule != screen.Rule {
+		t.Fatalf("screen transition = %+v", draft.lastTransition)
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if plan.Report.UnknownSignalPayloadVersions != 0 ||
+		plan.Report.UnknownStateEvidenceVersions != 0 {
+		t.Fatalf("recovery report = %+v", plan.Report)
+	}
+}
+
+func TestRecoveryProjectorRejectsMalformedKnownScreenV3(t *testing.T) {
+	base := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	tests := []store.EventRow{
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeAgentSignal),
+			SessionID: "agent-1", AgentID: "agent-1",
+			Payload: `{"version":3,"source":"screen","kind":"idle_prompt",` +
+				`"vendor":"claude","vendor_event":"screen_rule","scope":"root",` +
+				`"confidence":1,"received_at":"2026-10-04T10:00:00Z","outcome":"candidate"}`,
+		},
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "pending", To: "starting",
+			Payload: `{"version":3,"source":"screen",` +
+				`"event":"claude.approval_prompt","confidence":1}`,
+		},
+	}
+	for _, row := range tests {
+		projector := newRecoveryProjector()
+		if err := projector.Apply(row); err == nil {
+			t.Fatalf("malformed %s v3 payload was accepted", row.Type)
+		}
+	}
+}
+
+func TestRecoveryProjectorAcceptsV3WithoutScreenForOtherSource(t *testing.T) {
+	projector := newRecoveryProjector()
+	row := store.EventRow{
+		Seq: 1, Timestamp: time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC),
+		Type: string(event.TypeStateChanged), SessionID: "agent-1", AgentID: "agent-1",
+		From: "pending", To: "starting",
+		Payload: `{"version":3,"source":"session",` +
+			`"event":"session_start","confidence":1}`,
+	}
+	if err := projector.Apply(row); err != nil {
+		t.Fatalf("apply non-screen v3 evidence: %v", err)
+	}
+	evidence := projector.sessions["agent-1"].lastTransition
+	if evidence == nil ||
+		evidence.Source != agent.EvidenceSession ||
+		evidence.Screen != nil {
+		t.Fatalf("projected evidence = %+v", evidence)
 	}
 }
 

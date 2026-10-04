@@ -53,6 +53,63 @@ func TestSignalConstructorsRejectInvalidSourceMetadata(t *testing.T) {
 	}
 }
 
+func TestScreenSignalConstructorValidatesAndCopiesAttribution(t *testing.T) {
+	attribution, err := agent.NewScreenAttribution(
+		"claude.approval_prompt",
+		agent.ScreenEdgeCleared,
+		"viewport.bottom",
+		4312,
+		918,
+		"approval prompt",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	signal, err := NewScreenSignal(Signal{
+		Kind:       KindHumanInputResolved,
+		Vendor:     "claude",
+		Confidence: 1,
+		ReceivedAt: testTime,
+		Screen:     &attribution,
+	})
+	if err != nil {
+		t.Fatalf("new screen signal: %v", err)
+	}
+	if signal.Source != SourceScreen ||
+		signal.Scope != ScopeRoot ||
+		signal.VendorEvent != "screen_rule" {
+		t.Fatalf("normalized screen signal = %+v", signal)
+	}
+	attribution.Rule = "mutated"
+	if signal.Screen.Rule != "claude.approval_prompt" {
+		t.Fatalf("screen rule = %q, want copied attribution", signal.Screen.Rule)
+	}
+
+	wrongEdge := *signal.Screen
+	wrongEdge.Edge = agent.ScreenEdgePresent
+	if _, err := NewScreenSignal(Signal{
+		Kind:       KindHumanInputResolved,
+		Vendor:     "claude",
+		Confidence: 1,
+		ReceivedAt: testTime,
+		Screen:     &wrongEdge,
+	}); err == nil {
+		t.Fatal("screen signal accepted a kind and edge mismatch")
+	}
+	if _, err := NewHookSignal(Signal{
+		Kind:        KindSessionStarted,
+		Vendor:      "claude",
+		VendorEvent: "SessionStart",
+		Scope:       ScopeRoot,
+		Confidence:  1,
+		ReceivedAt:  testTime,
+		DeliveryID:  uuid.NewString(),
+		Screen:      signal.Screen,
+	}); err == nil {
+		t.Fatal("hook signal accepted screen attribution")
+	}
+}
+
 func TestHookActivationPermanentlySuppressesHeuristics(t *testing.T) {
 	detector := newTestDetector(t)
 	state := NewState(agent.HooksAuto)
@@ -107,7 +164,7 @@ func TestNotifyIsNonAuthoritativeAndConfirmsFallbackIdle(t *testing.T) {
 	)
 	_, outcome, ok := awaiting.Signal()
 	if !ok || outcome != OutcomeSuppressed ||
-		awaiting.Timer().Generation != activationTimer.Generation ||
+		awaiting.Timer().Ref != activationTimer.Ref ||
 		state.Snapshot().HookStatus() != HookAwaiting {
 		t.Fatalf(
 			"awaiting notify outcome=%s timer=%+v hook=%s",
@@ -122,7 +179,7 @@ func TestNotifyIsNonAuthoritativeAndConfirmsFallbackIdle(t *testing.T) {
 		detector,
 		&state,
 		target,
-		timerObservation(t, activationTimer.Generation, activationTimer.Deadline),
+		timerObservation(t, activationTimer.Ref, activationTimer.Deadline),
 	)
 	if state.Snapshot().HookStatus() != HookFallback {
 		t.Fatalf("hook status = %s, want fallback", state.Snapshot().HookStatus())
@@ -154,7 +211,7 @@ func TestNotifyIsNonAuthoritativeAndConfirmsFallbackIdle(t *testing.T) {
 		detector,
 		&state,
 		target,
-		timerObservation(t, notifyTimer.Generation, notifyTimer.Deadline),
+		timerObservation(t, notifyTimer.Ref, notifyTimer.Deadline),
 	)
 	evidence := target.LastTransition()
 	if target.State() != agent.StateIdle ||
@@ -184,7 +241,7 @@ func TestActiveHookAndRequiredPolicySuppressNotify(t *testing.T) {
 			)
 			_, outcome, _ := decision.Signal()
 			if outcome != OutcomeSuppressed ||
-				decision.Timer().Action != TimerKeep ||
+				decision.Timer().Action != TimerCancel ||
 				target.State() != agent.StateWorking {
 				t.Fatalf(
 					"notify outcome=%s timer=%+v state=%s",
@@ -231,7 +288,7 @@ func TestHookPermissionAndIdleTimersAreCancelable(t *testing.T) {
 		t.Fatalf("activity timer plan = %+v, want cancel", decision.Timer())
 	}
 
-	stale := timerObservation(t, permissionTimer.Generation, permissionTimer.Deadline)
+	stale := timerObservation(t, permissionTimer.Ref, permissionTimer.Deadline)
 	decision = decideAndApply(t, detector, &state, target, stale)
 	_, outcome, _ := decision.Signal()
 	if outcome != OutcomeStale || target.State() != agent.StateWorking {
@@ -257,7 +314,7 @@ func TestHookPermissionAndIdleTimersAreCancelable(t *testing.T) {
 		detector,
 		&state,
 		target,
-		timerObservation(t, idleTimer.Generation, idleTimer.Deadline),
+		timerObservation(t, idleTimer.Ref, idleTimer.Deadline),
 	)
 	if target.State() != agent.StateIdle {
 		t.Fatalf("state = %s, want idle", target.State())
@@ -279,7 +336,7 @@ func TestSubagentStopNeverChangesRootState(t *testing.T) {
 		target,
 		signalObservation(t, signal),
 	)
-	if _, ok := decision.Change(); ok || decision.Timer().Action != TimerKeep {
+	if _, ok := decision.Change(); ok || decision.Timer().Action != TimerCancel {
 		t.Fatalf("subagent stop decision changed root state: %+v", decision)
 	}
 	if target.State() != agent.StateWorking {
@@ -320,7 +377,7 @@ func TestFallbackBlockedRecoveryAndSilence(t *testing.T) {
 		detector,
 		&state,
 		target,
-		timerObservation(t, blockedTimer.Generation, blockedTimer.Deadline),
+		timerObservation(t, blockedTimer.Ref, blockedTimer.Deadline),
 	)
 	if target.State() != agent.StateBlocked {
 		t.Fatalf("state = %s, want blocked", target.State())
@@ -351,7 +408,7 @@ func TestFallbackBlockedRecoveryAndSilence(t *testing.T) {
 		detector,
 		&state,
 		target,
-		timerObservation(t, silenceTimer.Generation, silenceTimer.Deadline),
+		timerObservation(t, silenceTimer.Ref, silenceTimer.Deadline),
 	)
 	if target.State() != agent.StateIdle {
 		t.Fatalf("state after silence = %s, want idle", target.State())
@@ -509,7 +566,7 @@ func TestRequiredActivationTimerFailsSession(t *testing.T) {
 		detector,
 		&state,
 		target,
-		timerObservation(t, timer.Generation, timer.Deadline),
+		timerObservation(t, timer.Ref, timer.Deadline),
 	)
 	if target.State() != agent.StateStopped ||
 		target.LastError() != "required hook not observed" ||
@@ -536,6 +593,382 @@ func TestRequiredActivationTimerFailsSession(t *testing.T) {
 			outcome,
 			state.Snapshot().HookStatus(),
 		)
+	}
+}
+
+func TestActiveHookScreenAuthority(t *testing.T) {
+	t.Run("approval clearance", func(t *testing.T) {
+		detector := newTestDetector(t)
+		state := NewState(agent.HooksAuto)
+		target := newTestAgent(t, agent.StateBlocked, agent.RunModeInteractive)
+		activateHook(t, detector, &state, target)
+
+		signal := screenSignal(
+			t,
+			KindHumanInputResolved,
+			"claude.approval_prompt",
+			agent.ScreenEdgeCleared,
+			testTime.Add(time.Second),
+		)
+		decision := decideAndApply(
+			t,
+			detector,
+			&state,
+			target,
+			signalObservation(t, signal),
+		)
+		timer := decision.Timer()
+		if timer.Ref.Purpose != CandidateScreen ||
+			timer.Ref.Rule != "claude.approval_prompt" ||
+			timer.Deadline.Sub(signal.ReceivedAt) != 500*time.Millisecond {
+			t.Fatalf("approval timer = %+v", timer)
+		}
+		decideAndApply(
+			t,
+			detector,
+			&state,
+			target,
+			timerObservation(t, timer.Ref, timer.Deadline),
+		)
+		evidence := target.LastTransition()
+		if target.State() != agent.StateWorking ||
+			evidence.Source != agent.EvidenceScreen ||
+			evidence.Screen == nil ||
+			evidence.Screen.Rule != "claude.approval_prompt" {
+			t.Fatalf("state=%s evidence=%+v", target.State(), evidence)
+		}
+	})
+
+	t.Run("Claude interrupt", func(t *testing.T) {
+		detector := newTestDetector(t)
+		state := NewState(agent.HooksAuto)
+		target := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+		activateHook(t, detector, &state, target)
+
+		signal := screenSignal(
+			t,
+			KindInterrupted,
+			"claude.interrupted",
+			agent.ScreenEdgePresent,
+			testTime.Add(time.Second),
+		)
+		decision := decideAndApply(
+			t,
+			detector,
+			&state,
+			target,
+			signalObservation(t, signal),
+		)
+		timer := decision.Timer()
+		if timer.Deadline.Sub(signal.ReceivedAt) != time.Second {
+			t.Fatalf("interrupt timer = %+v", timer)
+		}
+		decideAndApply(
+			t,
+			detector,
+			&state,
+			target,
+			timerObservation(t, timer.Ref, timer.Deadline),
+		)
+		if target.State() != agent.StateIdle {
+			t.Fatalf("state = %s, want idle", target.State())
+		}
+	})
+
+	t.Run("other edge suppressed", func(t *testing.T) {
+		detector := newTestDetector(t)
+		state := NewState(agent.HooksAuto)
+		target := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+		activateHook(t, detector, &state, target)
+
+		decision := decideAndApply(
+			t,
+			detector,
+			&state,
+			target,
+			signalObservation(t, screenSignal(
+				t,
+				KindIdlePrompt,
+				"claude.idle_prompt",
+				agent.ScreenEdgePresent,
+				testTime.Add(time.Second),
+			)),
+		)
+		_, outcome, _ := decision.Signal()
+		if outcome != OutcomeSuppressed ||
+			decision.Timer().Action != TimerCancel ||
+			target.State() != agent.StateWorking {
+			t.Fatalf(
+				"outcome=%s timer=%+v state=%s",
+				outcome,
+				decision.Timer(),
+				target.State(),
+			)
+		}
+	})
+}
+
+func TestScreenSignalsRespectAwaitingAndProcessAuthority(t *testing.T) {
+	detector := newTestDetector(t)
+	awaitingState := NewState(agent.HooksAuto)
+	awaitingTarget := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+	awaiting := decideAndApply(
+		t,
+		detector,
+		&awaitingState,
+		awaitingTarget,
+		signalObservation(t, screenSignal(
+			t,
+			KindHumanInputRequired,
+			"claude.approval_prompt",
+			agent.ScreenEdgePresent,
+			testTime,
+		)),
+	)
+	_, outcome, _ := awaiting.Signal()
+	if outcome != OutcomeSuppressed || awaitingTarget.State() != agent.StateWorking {
+		t.Fatalf("awaiting outcome=%s state=%s", outcome, awaitingTarget.State())
+	}
+
+	terminalState := NewState(agent.HooksOff)
+	terminalTarget := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+	exitCode := 0
+	decideAndApply(
+		t,
+		detector,
+		&terminalState,
+		terminalTarget,
+		processObservation(t, KindProcessExited, &ProcessFact{
+			ExitCode: &exitCode,
+			ExitKind: ExitSuccess,
+		}),
+	)
+	terminal := decideAndApply(
+		t,
+		detector,
+		&terminalState,
+		terminalTarget,
+		signalObservation(t, screenSignal(
+			t,
+			KindIdlePrompt,
+			"claude.idle_prompt",
+			agent.ScreenEdgePresent,
+			testTime.Add(time.Second),
+		)),
+	)
+	_, outcome, _ = terminal.Signal()
+	if outcome != OutcomeTerminal ||
+		terminalTarget.State() != agent.StateStopped ||
+		!terminalState.Snapshot().Terminal() {
+		t.Fatalf(
+			"terminal outcome=%s state=%s detector_terminal=%t",
+			outcome,
+			terminalTarget.State(),
+			terminalState.Snapshot().Terminal(),
+		)
+	}
+}
+
+func TestFallbackScreenAuthorityNeverProducesDone(t *testing.T) {
+	tests := []struct {
+		name     string
+		start    agent.State
+		kind     Kind
+		rule     string
+		edge     agent.ScreenEdge
+		delay    time.Duration
+		expected agent.State
+	}{
+		{
+			name: "approval present", start: agent.StateWorking,
+			kind: KindHumanInputRequired, rule: "claude.approval_prompt",
+			edge: agent.ScreenEdgePresent, delay: 750 * time.Millisecond,
+			expected: agent.StateBlocked,
+		},
+		{
+			name: "approval cleared", start: agent.StateBlocked,
+			kind: KindHumanInputResolved, rule: "codex.approval_prompt",
+			edge: agent.ScreenEdgeCleared, delay: 500 * time.Millisecond,
+			expected: agent.StateWorking,
+		},
+		{
+			name: "idle present", start: agent.StateWorking,
+			kind: KindIdlePrompt, rule: "codex.idle_prompt",
+			edge: agent.ScreenEdgePresent, delay: time.Second,
+			expected: agent.StateIdle,
+		},
+		{
+			name: "interrupt present", start: agent.StateWorking,
+			kind: KindInterrupted, rule: "claude.interrupted",
+			edge: agent.ScreenEdgePresent, delay: time.Second,
+			expected: agent.StateIdle,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			detector := newTestDetector(t)
+			state := NewState(agent.HooksOff)
+			target := newTestAgent(t, test.start, agent.RunModeOneshot)
+			signal := screenSignal(t, test.kind, test.rule, test.edge, testTime)
+			decision := decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				signalObservation(t, signal),
+			)
+			timer := decision.Timer()
+			if timer.Deadline.Sub(signal.ReceivedAt) != test.delay {
+				t.Fatalf("screen timer = %+v", timer)
+			}
+			decideAndApply(
+				t,
+				detector,
+				&state,
+				target,
+				timerObservation(t, timer.Ref, timer.Deadline),
+			)
+			if target.State() != test.expected || target.State() == agent.StateDone {
+				t.Fatalf("state = %s, want %s", target.State(), test.expected)
+			}
+		})
+	}
+}
+
+func TestScreenCandidatesUseIndependentKeysAndStaleRefs(t *testing.T) {
+	detector := newTestDetector(t)
+	state := NewState(agent.HooksOff)
+	target := newTestAgent(t, agent.StateStarting, agent.RunModeInteractive)
+	decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		processObservation(t, KindProcessStarted, &ProcessFact{}),
+	)
+
+	approval := screenSignal(
+		t,
+		KindHumanInputRequired,
+		"claude.approval_prompt",
+		agent.ScreenEdgePresent,
+		testTime.Add(time.Second),
+	)
+	approvalDecision := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, approval),
+	)
+	approvalTimer := approvalDecision.Timer()
+	idle := screenSignal(
+		t,
+		KindIdlePrompt,
+		"claude.idle_prompt",
+		agent.ScreenEdgePresent,
+		testTime.Add(1100*time.Millisecond),
+	)
+	idleDecision := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, idle),
+	)
+	if len(state.Snapshot().data.candidates) != 3 ||
+		idleDecision.Timer().Ref != approvalTimer.Ref {
+		t.Fatalf(
+			"candidate count=%d earliest=%+v want=%+v",
+			len(state.Snapshot().data.candidates),
+			idleDecision.Timer(),
+			approvalTimer,
+		)
+	}
+
+	approvalConfirmed := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, approvalTimer.Ref, approvalTimer.Deadline),
+	)
+	nextTimer := approvalConfirmed.Timer()
+	if target.State() != agent.StateBlocked ||
+		nextTimer.Ref.Rule != "claude.idle_prompt" {
+		t.Fatalf("state=%s next timer=%+v", target.State(), nextTimer)
+	}
+
+	stale := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(t, approvalTimer.Ref, approvalTimer.Deadline),
+	)
+	_, outcome, _ := stale.Signal()
+	if outcome != OutcomeStale || stale.Timer().Ref != nextTimer.Ref {
+		t.Fatalf("stale outcome=%s timer=%+v want=%+v", outcome, stale.Timer(), nextTimer)
+	}
+}
+
+func TestScreenClearedEdgeCancelsOnlyItsRule(t *testing.T) {
+	detector := newTestDetector(t)
+	state := NewState(agent.HooksOff)
+	target := newTestAgent(t, agent.StateWorking, agent.RunModeInteractive)
+	present := screenSignal(
+		t,
+		KindIdlePrompt,
+		"claude.idle_prompt",
+		agent.ScreenEdgePresent,
+		testTime,
+	)
+	presentDecision := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, present),
+	)
+	cleared := screenSignal(
+		t,
+		KindIdlePrompt,
+		"claude.idle_prompt",
+		agent.ScreenEdgeCleared,
+		testTime.Add(100*time.Millisecond),
+	)
+	clearedDecision := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		signalObservation(t, cleared),
+	)
+	_, outcome, _ := clearedDecision.Signal()
+	if outcome != OutcomeSuppressed ||
+		clearedDecision.Timer().Action != TimerCancel ||
+		len(state.Snapshot().data.candidates) != 0 {
+		t.Fatalf(
+			"cleared outcome=%s timer=%+v candidates=%d",
+			outcome,
+			clearedDecision.Timer(),
+			len(state.Snapshot().data.candidates),
+		)
+	}
+	stale := decideAndApply(
+		t,
+		detector,
+		&state,
+		target,
+		timerObservation(
+			t,
+			presentDecision.Timer().Ref,
+			presentDecision.Timer().Deadline,
+		),
+	)
+	_, outcome, _ = stale.Signal()
+	if outcome != OutcomeStale {
+		t.Fatalf("old rule timer outcome = %s, want stale", outcome)
 	}
 }
 
@@ -657,6 +1090,42 @@ func heuristicSignal(
 	return signal
 }
 
+func screenSignal(
+	t *testing.T,
+	kind Kind,
+	rule string,
+	edge agent.ScreenEdge,
+	at time.Time,
+) Signal {
+	t.Helper()
+	attribution, err := agent.NewScreenAttribution(
+		rule,
+		edge,
+		"viewport.bottom",
+		4312,
+		918,
+		"screen rule",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	vendor := "claude"
+	if len(rule) >= len("codex.") && rule[:len("codex.")] == "codex." {
+		vendor = "codex"
+	}
+	signal, err := NewScreenSignal(Signal{
+		Kind:       kind,
+		Vendor:     vendor,
+		Confidence: 1,
+		ReceivedAt: at,
+		Screen:     &attribution,
+	})
+	if err != nil {
+		t.Fatalf("new screen signal: %v", err)
+	}
+	return signal
+}
+
 func processObservation(
 	t *testing.T,
 	kind Kind,
@@ -685,9 +1154,9 @@ func signalObservation(t *testing.T, signal Signal) Observation {
 	return observation
 }
 
-func timerObservation(t *testing.T, generation uint64, at time.Time) Observation {
+func timerObservation(t *testing.T, ref TimerRef, at time.Time) Observation {
 	t.Helper()
-	observation, err := ObserveTimer(generation, at)
+	observation, err := ObserveTimer(ref, at)
 	if err != nil {
 		t.Fatalf("observe timer: %v", err)
 	}

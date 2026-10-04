@@ -10,8 +10,9 @@
 - 每个运行中会话持有一个 observation actor、一个输出处理器、Detector State 和
   signal token 的 SHA-256 digest；token 只授权该 Agent 的 signal endpoint，并在
   启动失败或退出认领时失效。
-- observation actor 独占容量 64 的 inbox 和真实计时器，一次只提交一个 Decision；
-  Detector 本身不持有 goroutine 或回调。
+- observation actor 独占容量 64 的 inbox 和一个真实计时器，一次只提交一个
+  Decision；每次提交后按 Detector 返回的最早 timer ref 重置计时器，Detector
+  本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent → 持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY → 登记会话并持久化 `working` → 放行输出和退出回调。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
@@ -36,8 +37,9 @@
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
 - 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
   `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。
-- 信号与状态证据 reader 同时接受 v1 和 v2；v2 的 notify 只在 fallback 下确认
-  Idle。adapter 标记为忽略的厂商内部通知不提交事件。
+- 信号与状态证据 reader 同时接受 v1、v2 和 typed screen v3；v2 的 notify
+  只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
+  adapter 标记为忽略的厂商内部通知不提交事件。
 - 状态决策：进程退出决定终态；激活后的 hook 决定 turn 状态；只有进入
   fallback 后才使用达到阈值的启发式。signal 与对应状态迁移必须同批提交。
 

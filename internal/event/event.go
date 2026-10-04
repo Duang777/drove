@@ -380,7 +380,7 @@ type SignalPayloadV1 struct {
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
 func (p SignalPayloadV1) Validate() error {
-	return validateSignalPayload(p, 1, false)
+	return validateSignalPayload(p, 1, false, false)
 }
 
 // SignalPayloadV2 adds the non-authoritative notify source.
@@ -388,16 +388,101 @@ type SignalPayloadV2 SignalPayloadV1
 
 // Validate rejects malformed or privacy-unsafe signal metadata.
 func (p SignalPayloadV2) Validate() error {
-	return validateSignalPayload(SignalPayloadV1(p), 2, true)
+	return validateSignalPayload(SignalPayloadV1(p), 2, true, false)
 }
 
-func validateSignalPayload(p SignalPayloadV1, version int, allowNotify bool) error {
+// ScreenAttributionPayload is bounded static metadata for one screen rule edge.
+type ScreenAttributionPayload struct {
+	Rule          string `json:"rule"`
+	Edge          string `json:"edge"`
+	Region        string `json:"region"`
+	OutputOffset  uint64 `json:"output_offset"`
+	LastOutputSeq uint64 `json:"last_output_seq"`
+	Evidence      string `json:"evidence"`
+}
+
+// Validate rejects malformed or unbounded screen attribution.
+func (p ScreenAttributionPayload) Validate() error {
+	if p.Rule == "" || len(p.Rule) > 64 || !ascii(p.Rule) {
+		return errors.New("event: screen rule must contain 1 to 64 ASCII bytes")
+	}
+	if !oneOf(p.Edge, "present", "cleared") {
+		return fmt.Errorf("event: invalid screen edge %q", p.Edge)
+	}
+	if p.Region == "" || len(p.Region) > 64 || !ascii(p.Region) {
+		return errors.New("event: screen region must contain 1 to 64 ASCII bytes")
+	}
+	if p.OutputOffset == 0 {
+		return errors.New("event: screen output_offset must be positive")
+	}
+	if p.LastOutputSeq == 0 {
+		return errors.New("event: screen last_output_seq must be positive")
+	}
+	if p.Evidence == "" || len(p.Evidence) > 128 || !ascii(p.Evidence) {
+		return errors.New("event: screen evidence must contain 1 to 128 ASCII bytes")
+	}
+	return nil
+}
+
+// SignalPayloadV3 adds optional typed screen attribution.
+type SignalPayloadV3 struct {
+	SignalPayloadV1
+	Screen *ScreenAttributionPayload `json:"screen,omitempty"`
+}
+
+// Validate rejects malformed or mismatched screen signal attribution.
+func (p SignalPayloadV3) Validate() error {
+	base := p.SignalPayloadV1
+	if err := validateSignalPayload(base, 3, true, true); err != nil {
+		return err
+	}
+	if base.Source == "screen" {
+		if p.Screen == nil {
+			return errors.New("event: screen signal requires screen attribution")
+		}
+		if base.Scope != "root" || base.VendorEvent != "screen_rule" {
+			return errors.New("event: screen signal requires root scope and screen_rule event")
+		}
+		if !ascii(base.Vendor) {
+			return errors.New("event: screen signal vendor must be a stable ASCII token")
+		}
+		if err := p.Screen.Validate(); err != nil {
+			return err
+		}
+		if base.Evidence != "" {
+			return errors.New("event: screen signal evidence belongs in its attribution")
+		}
+		if !strings.HasPrefix(p.Screen.Rule, base.Vendor+".") {
+			return errors.New("event: screen rule must belong to its vendor")
+		}
+		if !screenKindMatchesEdge(base.Kind, p.Screen.Edge) {
+			return errors.New("event: screen signal kind and edge are incompatible")
+		}
+		if knownScreenRule(p.Screen.Rule) &&
+			!knownScreenRuleMatchesKind(p.Screen.Rule, base.Kind) {
+			return errors.New("event: known screen rule has an incompatible kind")
+		}
+	} else if p.Screen != nil {
+		return errors.New("event: only screen signals may contain screen attribution")
+	}
+	return nil
+}
+
+func validateSignalPayload(
+	p SignalPayloadV1,
+	version int,
+	allowNotify bool,
+	allowScreen bool,
+) error {
 	if p.Version != version {
 		return fmt.Errorf("event: unsupported signal payload version %d", p.Version)
 	}
 	validSource := oneOf(p.Source, "process", "hook", "heuristic", "timer")
 	if allowNotify {
 		validSource = validSource || p.Source == "notify"
+	}
+	if allowScreen {
+		validSource = validSource || p.Source == "screen"
 	}
 	if !validSource {
 		return fmt.Errorf("event: invalid signal source %q", p.Source)
@@ -459,10 +544,12 @@ func validateSignalPayload(p SignalPayloadV1, version int, allowNotify bool) err
 			return fmt.Errorf("event: invalid signal occurred_at: %w", err)
 		}
 	}
-	if p.Source == "hook" || p.Source == "notify" {
+	if p.Source == "hook" || p.Source == "notify" || p.Source == "screen" {
 		if p.Vendor == "" {
-			return errors.New("event: delivered signal vendor is required")
+			return errors.New("event: delivered or screen signal vendor is required")
 		}
+	}
+	if p.Source == "hook" || p.Source == "notify" {
 		if !canonicalUUID(p.DeliveryID) {
 			return errors.New("event: delivered signal delivery_id must be a canonical UUID")
 		}
@@ -485,6 +572,45 @@ func validateSignalPayload(p SignalPayloadV1, version int, allowNotify bool) err
 	return nil
 }
 
+func screenKindMatchesEdge(kind, edge string) bool {
+	switch kind {
+	case "human_input_required":
+		return edge == "present"
+	case "human_input_resolved":
+		return edge == "cleared"
+	case "interrupted", "idle_prompt":
+		return edge == "present" || edge == "cleared"
+	default:
+		return false
+	}
+}
+
+func knownScreenRule(rule string) bool {
+	switch rule {
+	case "claude.approval_prompt",
+		"claude.idle_prompt",
+		"claude.interrupted",
+		"codex.approval_prompt",
+		"codex.idle_prompt":
+		return true
+	default:
+		return false
+	}
+}
+
+func knownScreenRuleMatchesKind(rule, kind string) bool {
+	switch rule {
+	case "claude.approval_prompt", "codex.approval_prompt":
+		return kind == "human_input_required" || kind == "human_input_resolved"
+	case "claude.idle_prompt", "codex.idle_prompt":
+		return kind == "idle_prompt"
+	case "claude.interrupted":
+		return kind == "interrupted"
+	default:
+		return false
+	}
+}
+
 // StateEvidencePayloadV1 explains one durable state transition.
 type StateEvidencePayloadV1 struct {
 	Version    int     `json:"version"`
@@ -496,7 +622,7 @@ type StateEvidencePayloadV1 struct {
 
 // Validate rejects malformed transition evidence.
 func (p StateEvidencePayloadV1) Validate() error {
-	return validateStateEvidencePayload(p, 1, false)
+	return validateStateEvidencePayload(p, 1, false, false)
 }
 
 // StateEvidencePayloadV2 adds transition evidence from a notify candidate.
@@ -504,13 +630,42 @@ type StateEvidencePayloadV2 StateEvidencePayloadV1
 
 // Validate rejects malformed transition evidence.
 func (p StateEvidencePayloadV2) Validate() error {
-	return validateStateEvidencePayload(StateEvidencePayloadV1(p), 2, true)
+	return validateStateEvidencePayload(StateEvidencePayloadV1(p), 2, true, false)
+}
+
+// StateEvidencePayloadV3 adds optional typed screen attribution.
+type StateEvidencePayloadV3 struct {
+	StateEvidencePayloadV1
+	Screen *ScreenAttributionPayload `json:"screen,omitempty"`
+}
+
+// Validate rejects malformed or mismatched transition attribution.
+func (p StateEvidencePayloadV3) Validate() error {
+	base := p.StateEvidencePayloadV1
+	if err := validateStateEvidencePayload(base, 3, true, true); err != nil {
+		return err
+	}
+	if base.Source == "screen" {
+		if p.Screen == nil {
+			return errors.New("event: screen state evidence requires screen attribution")
+		}
+		if err := p.Screen.Validate(); err != nil {
+			return err
+		}
+		if base.Event != p.Screen.Rule {
+			return errors.New("event: screen state evidence event must match its rule")
+		}
+	} else if p.Screen != nil {
+		return errors.New("event: only screen state evidence may contain screen attribution")
+	}
+	return nil
 }
 
 func validateStateEvidencePayload(
 	p StateEvidencePayloadV1,
 	version int,
 	allowNotify bool,
+	allowScreen bool,
 ) error {
 	if p.Version != version {
 		return fmt.Errorf("event: unsupported state evidence version %d", p.Version)
@@ -526,6 +681,9 @@ func validateStateEvidencePayload(
 	)
 	if allowNotify {
 		validSource = validSource || p.Source == "notify"
+	}
+	if allowScreen {
+		validSource = validSource || p.Source == "screen"
 	}
 	if !validSource {
 		return fmt.Errorf("event: invalid state evidence source %q", p.Source)

@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -116,6 +117,132 @@ func TestObservationActorRunsCommittedTimerPlan(t *testing.T) {
 	}
 }
 
+func TestObservationActorRearmsTheEarliestCandidate(t *testing.T) {
+	target := actorTestAgent(t, agent.StateStarting, agent.HooksOff)
+	st := &memoryCommitStore{}
+	committer := newCommitter(0, st, event.NewHub(0))
+	defer committer.Close()
+	clock := newActorFakeClock(time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC))
+	actor, err := newObservationActor(
+		target,
+		committer,
+		agent.HooksOff,
+		detect.Config{},
+		clock,
+	)
+	if err != nil {
+		t.Fatalf("new observation actor: %v", err)
+	}
+	defer actor.Close()
+
+	started, err := processObservation(
+		detect.KindProcessStarted,
+		clock.Now(),
+		&detect.ProcessFact{},
+	)
+	if err != nil {
+		t.Fatalf("process observation: %v", err)
+	}
+	if err := actor.Deliver(context.Background(), started); err != nil {
+		t.Fatalf("deliver process start: %v", err)
+	}
+	timer := clock.lastTimer(t)
+	if delay := timer.currentDelay(); delay != 60*time.Second {
+		t.Fatalf("fallback delay = %s, want 60s", delay)
+	}
+
+	screen, err := agent.NewScreenAttribution(
+		"claude.approval_prompt",
+		agent.ScreenEdgePresent,
+		"viewport.bottom",
+		4312,
+		918,
+		"approval prompt",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	signal, err := detect.NewScreenSignal(detect.Signal{
+		Kind: detect.KindHumanInputRequired, Vendor: "claude",
+		Confidence: 1, ReceivedAt: clock.Now(), Screen: &screen,
+	})
+	if err != nil {
+		t.Fatalf("new screen signal: %v", err)
+	}
+	observation, err := detect.ObserveSignal(signal)
+	if err != nil {
+		t.Fatalf("observe screen signal: %v", err)
+	}
+	if err := actor.Deliver(context.Background(), observation); err != nil {
+		t.Fatalf("deliver screen signal: %v", err)
+	}
+	if delay := timer.currentDelay(); delay != 750*time.Millisecond {
+		t.Fatalf("screen delay = %s, want 750ms", delay)
+	}
+
+	idleScreen, err := agent.NewScreenAttribution(
+		"claude.idle_prompt",
+		agent.ScreenEdgePresent,
+		"viewport.bottom",
+		4400,
+		919,
+		"idle prompt",
+	)
+	if err != nil {
+		t.Fatalf("new idle attribution: %v", err)
+	}
+	idleSignal, err := detect.NewScreenSignal(detect.Signal{
+		Kind: detect.KindIdlePrompt, Vendor: "claude",
+		Confidence: 1, ReceivedAt: clock.Now(), Screen: &idleScreen,
+	})
+	if err != nil {
+		t.Fatalf("new idle signal: %v", err)
+	}
+	idleObservation, err := detect.ObserveSignal(idleSignal)
+	if err != nil {
+		t.Fatalf("observe idle signal: %v", err)
+	}
+	if err := actor.Deliver(context.Background(), idleObservation); err != nil {
+		t.Fatalf("deliver idle signal: %v", err)
+	}
+	if delay := timer.currentDelay(); delay != 750*time.Millisecond {
+		t.Fatalf("earliest delay = %s, want 750ms", delay)
+	}
+
+	clock.advance(750 * time.Millisecond)
+	timer.fire(clock.Now())
+	deadline := time.Now().Add(time.Second)
+	for {
+		if target.State() == agent.StateBlocked &&
+			timer.currentDelay() == 250*time.Millisecond {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"state=%s next delay=%s",
+				target.State(),
+				timer.currentDelay(),
+			)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	rows := st.Rows()
+	var transition event.StateEvidencePayloadV3
+	found := false
+	for _, row := range rows {
+		if row.Type == string(event.TypeStateChanged) && row.To == string(agent.StateBlocked) {
+			if err := json.Unmarshal([]byte(row.Payload), &transition); err != nil {
+				t.Fatalf("decode screen transition: %v", err)
+			}
+			found = true
+		}
+	}
+	if !found || transition.Screen == nil ||
+		transition.Screen.Rule != "claude.approval_prompt" {
+		t.Fatalf("screen transition payload = %+v", transition)
+	}
+}
+
 func TestObservationActorRejectsAfterTerminalAdmissionClose(t *testing.T) {
 	target := actorTestAgent(t, agent.StateWorking, agent.HooksOff)
 	committer := newCommitter(0, &memoryCommitStore{}, event.NewHub(0))
@@ -173,6 +300,79 @@ func TestObservationActorInboxHasFixedCapacity(t *testing.T) {
 	defer actor.Close()
 	if cap(actor.requests) != 64 {
 		t.Fatalf("observation inbox capacity = %d, want 64", cap(actor.requests))
+	}
+}
+
+func TestEncodeSignalAuditSelectsVersionBySource(t *testing.T) {
+	now := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	screenAttribution, err := agent.NewScreenAttribution(
+		"claude.approval_prompt",
+		agent.ScreenEdgeCleared,
+		"viewport.bottom",
+		4312,
+		918,
+		"approval prompt",
+	)
+	if err != nil {
+		t.Fatalf("new screen attribution: %v", err)
+	}
+	screen, err := detect.NewScreenSignal(detect.Signal{
+		Kind: detect.KindHumanInputResolved, Vendor: "claude",
+		Confidence: 1, ReceivedAt: now, Screen: &screenAttribution,
+	})
+	if err != nil {
+		t.Fatalf("new screen signal: %v", err)
+	}
+	heuristic, err := detect.NewHeuristicSignal(detect.Signal{
+		Kind: detect.KindObserved, VendorEvent: "output_activity",
+		Scope: detect.ScopeRoot, Confidence: 1, ReceivedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("new heuristic signal: %v", err)
+	}
+	notify, err := detect.NewNotifySignal(detect.Signal{
+		Kind: detect.KindTurnStopped, Vendor: "codex",
+		VendorEvent: "agent-turn-complete", Scope: detect.ScopeRoot,
+		Confidence: 1, ReceivedAt: now, DeliveryID: uuid.NewString(),
+	})
+	if err != nil {
+		t.Fatalf("new notify signal: %v", err)
+	}
+
+	for _, test := range []struct {
+		name    string
+		signal  detect.Signal
+		outcome detect.Outcome
+		version int
+	}{
+		{name: "heuristic v1", signal: heuristic, outcome: detect.OutcomeObserved, version: 1},
+		{name: "notify v2", signal: notify, outcome: detect.OutcomeCandidate, version: 2},
+		{name: "screen v3", signal: screen, outcome: detect.OutcomeCandidate, version: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encoded, err := encodeSignalAudit(test.signal, test.outcome)
+			if err != nil {
+				t.Fatalf("encode signal audit: %v", err)
+			}
+			var version struct {
+				Version int `json:"version"`
+			}
+			if err := json.Unmarshal(encoded, &version); err != nil {
+				t.Fatalf("decode signal version: %v", err)
+			}
+			if version.Version != test.version {
+				t.Fatalf("version = %d, want %d", version.Version, test.version)
+			}
+			if test.version == 3 {
+				var payload event.SignalPayloadV3
+				if err := json.Unmarshal(encoded, &payload); err != nil {
+					t.Fatalf("decode screen payload: %v", err)
+				}
+				if err := payload.Validate(); err != nil {
+					t.Fatalf("validate screen payload: %v", err)
+				}
+			}
+		})
 	}
 }
 
@@ -310,4 +510,10 @@ func (t *actorFakeTimer) fire(at time.Time) {
 	t.active = false
 	t.mu.Unlock()
 	t.channel <- at
+}
+
+func (t *actorFakeTimer) currentDelay() time.Duration {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.delay
 }

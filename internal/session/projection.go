@@ -289,6 +289,15 @@ func (p *recoveryProjector) applySignal(row store.EventRow) error {
 			return projectionWrapError(row, "validate signal payload", err)
 		}
 		return nil
+	case 3:
+		var payload event.SignalPayloadV3
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return projectionWrapError(row, "decode signal payload", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return projectionWrapError(row, "validate signal payload", err)
+		}
+		return nil
 	default:
 		p.report.UnknownSignalPayloadVersions++
 		return nil
@@ -339,9 +348,55 @@ func parseStateEvidence(row store.EventRow) (*agent.Evidence, bool, error) {
 			payload.DeliveryID,
 			row,
 		)
+	case 3:
+		var payload event.StateEvidencePayloadV3
+		if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+			return nil, false, projectionWrapError(row, "decode state evidence", err)
+		}
+		if err := payload.Validate(); err != nil {
+			return nil, false, projectionWrapError(row, "validate state evidence", err)
+		}
+		if payload.Source != string(agent.EvidenceScreen) {
+			return agentEvidence(
+				payload.Source,
+				payload.Event,
+				payload.Confidence,
+				payload.DeliveryID,
+				row,
+			)
+		}
+		return screenAgentEvidence(payload, row)
 	default:
 		return nil, false, nil
 	}
+}
+
+func screenAgentEvidence(
+	payload event.StateEvidencePayloadV3,
+	row store.EventRow,
+) (*agent.Evidence, bool, error) {
+	screen, err := agent.NewScreenAttribution(
+		payload.Screen.Rule,
+		agent.ScreenEdge(payload.Screen.Edge),
+		payload.Screen.Region,
+		payload.Screen.OutputOffset,
+		payload.Screen.LastOutputSeq,
+		payload.Screen.Evidence,
+	)
+	if err != nil {
+		return nil, false, projectionWrapError(row, "validate screen attribution", err)
+	}
+	evidence := &agent.Evidence{
+		Source:     agent.EvidenceSource(payload.Source),
+		Event:      payload.Event,
+		Confidence: payload.Confidence,
+		DeliveryID: payload.DeliveryID,
+		Screen:     &screen,
+	}
+	if err := evidence.Validate(); err != nil {
+		return nil, false, projectionWrapError(row, "validate agent evidence", err)
+	}
+	return evidence, true, nil
 }
 
 func agentEvidence(

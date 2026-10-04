@@ -16,6 +16,8 @@
 - `Hub.PublishBatch` 先校验整个连续批次，再向订阅者发布；全局序号由 `internal/session` 的 Committer 独占分配。
 - `agent.signal` 与新 `state_changed` payload 使用版本化、可校验的脱敏元数据；
   v1 覆盖 Phase 1A 来源，v2 增加非权威 notify 来源，恢复层跳过未知审计版本。
+- v3 增加可选的 typed screen attribution；生产 writer 只对 screen 来源写 v3，
+  其他来源继续写原版本。screen attribution 只保存稳定静态元数据和已提交输出位置。
 - 事件带 `Seq` 全局递增序号与 `Timestamp`，是回放（`internal/session`）的排序依据。
 
 ## 约束

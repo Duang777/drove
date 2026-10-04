@@ -290,6 +290,96 @@ func TestSignalPayloadV2ValidatesNotifyOnly(t *testing.T) {
 	}
 }
 
+func TestSignalPayloadV3ValidatesScreenOutcomes(t *testing.T) {
+	base := SignalPayloadV1{
+		Version:     3,
+		Source:      "screen",
+		Kind:        "human_input_resolved",
+		Vendor:      "claude",
+		VendorEvent: "screen_rule",
+		Scope:       "root",
+		Confidence:  1,
+		ReceivedAt:  time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+	}
+	screen := &ScreenAttributionPayload{
+		Rule:          "claude.approval_prompt",
+		Edge:          "cleared",
+		Region:        "viewport.bottom",
+		OutputOffset:  4312,
+		LastOutputSeq: 918,
+		Evidence:      "approval prompt",
+	}
+	for _, outcome := range []string{
+		"candidate",
+		"suppressed",
+		"transitioned",
+		"stale",
+		"terminal",
+	} {
+		payload := SignalPayloadV3{
+			SignalPayloadV1: base,
+			Screen:          screen,
+		}
+		payload.Outcome = outcome
+		if err := payload.Validate(); err != nil {
+			t.Fatalf("validate %s screen outcome: %v", outcome, err)
+		}
+	}
+
+	missing := SignalPayloadV3{SignalPayloadV1: base}
+	missing.Outcome = "candidate"
+	if err := missing.Validate(); err == nil {
+		t.Fatal("screen signal accepted missing attribution")
+	}
+	foreign := SignalPayloadV3{
+		SignalPayloadV1: base,
+		Screen:          screen,
+	}
+	foreign.Source = "heuristic"
+	foreign.Kind = "heuristic_blocked"
+	foreign.Outcome = "candidate"
+	if err := foreign.Validate(); err == nil {
+		t.Fatal("non-screen signal accepted screen attribution")
+	}
+	mismatched := *screen
+	mismatched.Edge = "present"
+	invalid := SignalPayloadV3{
+		SignalPayloadV1: base,
+		Screen:          &mismatched,
+	}
+	invalid.Outcome = "candidate"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("screen signal accepted incompatible kind and edge")
+	}
+	wrongRuleKind := *screen
+	wrongRuleKind.Edge = "present"
+	invalid = SignalPayloadV3{
+		SignalPayloadV1: base,
+		Screen:          &wrongRuleKind,
+	}
+	invalid.Kind = "idle_prompt"
+	invalid.Outcome = "candidate"
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("known screen rule accepted an incompatible kind")
+	}
+	idleCleared := SignalPayloadV3{
+		SignalPayloadV1: base,
+		Screen: &ScreenAttributionPayload{
+			Rule:          "claude.idle_prompt",
+			Edge:          "cleared",
+			Region:        "viewport.bottom",
+			OutputOffset:  4312,
+			LastOutputSeq: 918,
+			Evidence:      "idle prompt",
+		},
+	}
+	idleCleared.Kind = "idle_prompt"
+	idleCleared.Outcome = "suppressed"
+	if err := idleCleared.Validate(); err != nil {
+		t.Fatalf("validate cleared idle edge: %v", err)
+	}
+}
+
 func TestStateEvidencePayloadV1Validation(t *testing.T) {
 	evidence := StateEvidencePayloadV1{
 		Version:    1,
@@ -317,6 +407,33 @@ func TestStateEvidencePayloadV2ValidatesNotify(t *testing.T) {
 	}
 	if err := evidence.Validate(); err != nil {
 		t.Fatalf("validate notify evidence: %v", err)
+	}
+}
+
+func TestStateEvidencePayloadV3ValidatesScreenAttribution(t *testing.T) {
+	screen := &ScreenAttributionPayload{
+		Rule:          "claude.approval_prompt",
+		Edge:          "cleared",
+		Region:        "viewport.bottom",
+		OutputOffset:  4312,
+		LastOutputSeq: 918,
+		Evidence:      "approval prompt",
+	}
+	payload := StateEvidencePayloadV3{
+		StateEvidencePayloadV1: StateEvidencePayloadV1{
+			Version:    3,
+			Source:     "screen",
+			Event:      "claude.approval_prompt",
+			Confidence: 1,
+		},
+		Screen: screen,
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("validate screen evidence: %v", err)
+	}
+	payload.Event = "claude.idle_prompt"
+	if err := payload.Validate(); err == nil {
+		t.Fatal("screen evidence accepted a mismatched event")
 	}
 }
 

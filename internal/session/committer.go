@@ -498,6 +498,17 @@ func encodeStateEvidence(evidence agent.Evidence) ([]byte, error) {
 		Confidence: evidence.Confidence,
 		DeliveryID: evidence.DeliveryID,
 	}
+	if evidence.Source == agent.EvidenceScreen {
+		payload.Version = 3
+		versioned := event.StateEvidencePayloadV3{
+			StateEvidencePayloadV1: payload,
+			Screen:                 screenAttributionPayload(evidence.Screen),
+		}
+		if err := versioned.Validate(); err != nil {
+			return nil, err
+		}
+		return json.Marshal(versioned)
+	}
 	if evidence.Source == agent.EvidenceNotify {
 		payload.Version = 2
 		versioned := event.StateEvidencePayloadV2(payload)

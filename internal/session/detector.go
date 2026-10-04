@@ -192,17 +192,17 @@ func (a *observationActor) run() {
 	defer close(a.done)
 	var timer observationTimer
 	var timerC <-chan time.Time
-	var timerGeneration uint64
+	var timerRef detect.TimerRef
 
 	for {
 		select {
 		case request := <-a.requests:
-			err := a.handle(request.observation, &timer, &timerC, &timerGeneration)
+			err := a.handle(request.observation, &timer, &timerC, &timerRef)
 			request.result <- err
 		case firedAt := <-timerC:
-			observation, err := detect.ObserveTimer(timerGeneration, firedAt)
+			observation, err := detect.ObserveTimer(timerRef, firedAt)
 			if err == nil {
-				_ = a.handle(observation, &timer, &timerC, &timerGeneration)
+				_ = a.handle(observation, &timer, &timerC, &timerRef)
 			}
 		case <-a.stop:
 			for {
@@ -212,7 +212,7 @@ func (a *observationActor) run() {
 						request.observation,
 						&timer,
 						&timerC,
-						&timerGeneration,
+						&timerRef,
 					)
 					request.result <- err
 				default:
@@ -230,7 +230,7 @@ func (a *observationActor) handle(
 	observation detect.Observation,
 	timer *observationTimer,
 	timerC *<-chan time.Time,
-	timerGeneration *uint64,
+	timerRef *detect.TimerRef,
 ) error {
 	decision, err := a.detector.Decide(
 		a.state.Snapshot(),
@@ -267,7 +267,7 @@ func (a *observationActor) handle(
 	if err != nil {
 		return fmt.Errorf("%w: %v", errObservationCommit, err)
 	}
-	a.applyTimer(decision.Timer(), timer, timerC, timerGeneration)
+	a.applyTimer(decision.Timer(), timer, timerC, timerRef)
 	a.notifyStatus()
 	return nil
 }
@@ -276,7 +276,7 @@ func (a *observationActor) applyTimer(
 	plan detect.TimerPlan,
 	timer *observationTimer,
 	timerC *<-chan time.Time,
-	timerGeneration *uint64,
+	timerRef *detect.TimerRef,
 ) {
 	switch plan.Action {
 	case detect.TimerKeep:
@@ -286,7 +286,7 @@ func (a *observationActor) applyTimer(
 			stopAndDrainTimer(*timer)
 		}
 		*timerC = nil
-		*timerGeneration = plan.Generation
+		*timerRef = detect.TimerRef{}
 	case detect.TimerArm:
 		delay := plan.Deadline.Sub(a.clock.Now())
 		if delay < 0 {
@@ -299,7 +299,7 @@ func (a *observationActor) applyTimer(
 			(*timer).Reset(delay)
 		}
 		*timerC = (*timer).C()
-		*timerGeneration = plan.Generation
+		*timerRef = plan.Ref
 	}
 }
 
@@ -355,6 +355,21 @@ func encodeSignalAudit(
 		payload.ExitCode = signal.Process.ExitCode
 		payload.ExitKind = string(signal.Process.ExitKind)
 	}
+	if signal.Source == detect.SourceScreen {
+		payload.Version = 3
+		versioned := event.SignalPayloadV3{
+			SignalPayloadV1: payload,
+			Screen:          screenAttributionPayload(signal.Screen),
+		}
+		if err := versioned.Validate(); err != nil {
+			return nil, fmt.Errorf("session: validate signal audit: %w", err)
+		}
+		encoded, err := json.Marshal(versioned)
+		if err != nil {
+			return nil, fmt.Errorf("session: encode signal audit: %w", err)
+		}
+		return encoded, nil
+	}
 	if signal.Source == detect.SourceNotify {
 		payload.Version = 2
 		versioned := event.SignalPayloadV2(payload)
@@ -375,4 +390,20 @@ func encodeSignalAudit(
 		return nil, fmt.Errorf("session: encode signal audit: %w", err)
 	}
 	return encoded, nil
+}
+
+func screenAttributionPayload(
+	screen *agent.ScreenAttribution,
+) *event.ScreenAttributionPayload {
+	if screen == nil {
+		return nil
+	}
+	return &event.ScreenAttributionPayload{
+		Rule:          screen.Rule,
+		Edge:          string(screen.Edge),
+		Region:        screen.Region,
+		OutputOffset:  screen.OutputOffset,
+		LastOutputSeq: screen.LastOutputSeq,
+		Evidence:      screen.Evidence,
+	}
 }

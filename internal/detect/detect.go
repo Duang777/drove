@@ -33,6 +33,7 @@ const (
 	SourceHook      Source = "hook"
 	SourceNotify    Source = "notify"
 	SourceHeuristic Source = "heuristic"
+	SourceScreen    Source = "screen"
 	SourceTimer     Source = "timer"
 )
 
@@ -121,8 +122,9 @@ type Signal struct {
 	OccurredAt      time.Time
 	ReceivedAt      time.Time
 	DeliveryID      string
-	TimerGeneration uint64
+	Timer           TimerRef
 	Process         *ProcessFact
+	Screen          *agent.ScreenAttribution
 }
 
 // NewHookSignal validates and copies a normalized vendor hook signal.
@@ -130,7 +132,7 @@ func NewHookSignal(signal Signal) (Signal, error) {
 	signal.Version = signalVersion
 	signal.Source = SourceHook
 	signal.Process = nil
-	signal.TimerGeneration = 0
+	signal.Timer = TimerRef{}
 	if err := signal.validate(); err != nil {
 		return Signal{}, err
 	}
@@ -142,7 +144,7 @@ func NewNotifySignal(signal Signal) (Signal, error) {
 	signal.Version = signalVersion
 	signal.Source = SourceNotify
 	signal.Process = nil
-	signal.TimerGeneration = 0
+	signal.Timer = TimerRef{}
 	if err := signal.validate(); err != nil {
 		return Signal{}, err
 	}
@@ -154,7 +156,7 @@ func NewHeuristicSignal(signal Signal) (Signal, error) {
 	signal.Version = signalVersion
 	signal.Source = SourceHeuristic
 	signal.Process = nil
-	signal.TimerGeneration = 0
+	signal.Timer = TimerRef{}
 	signal.DeliveryID = ""
 	if err := signal.validate(); err != nil {
 		return Signal{}, err
@@ -168,24 +170,39 @@ func NewProcessSignal(signal Signal) (Signal, error) {
 	signal.Source = SourceProcess
 	signal.Scope = ScopeRoot
 	signal.DeliveryID = ""
-	signal.TimerGeneration = 0
+	signal.Timer = TimerRef{}
 	if err := signal.validate(); err != nil {
 		return Signal{}, err
 	}
 	return cloneSignal(signal), nil
 }
 
-func newTimerSignal(kind Kind, event string, generation uint64, at time.Time) Signal {
+// NewScreenSignal validates and copies one normalized screen rule edge.
+func NewScreenSignal(signal Signal) (Signal, error) {
+	signal.Version = signalVersion
+	signal.Source = SourceScreen
+	signal.VendorEvent = "screen_rule"
+	signal.Scope = ScopeRoot
+	signal.DeliveryID = ""
+	signal.Timer = TimerRef{}
+	signal.Process = nil
+	if err := signal.validate(); err != nil {
+		return Signal{}, err
+	}
+	return cloneSignal(signal), nil
+}
+
+func newTimerSignal(kind Kind, event string, ref TimerRef, at time.Time) Signal {
 	return Signal{
-		Version:         signalVersion,
-		Source:          SourceTimer,
-		Kind:            kind,
-		VendorEvent:     event,
-		Scope:           ScopeRoot,
-		Evidence:        event,
-		Confidence:      1,
-		ReceivedAt:      at,
-		TimerGeneration: generation,
+		Version:     signalVersion,
+		Source:      SourceTimer,
+		Kind:        kind,
+		VendorEvent: event,
+		Scope:       ScopeRoot,
+		Evidence:    event,
+		Confidence:  1,
+		ReceivedAt:  at,
+		Timer:       ref,
 	}
 }
 
@@ -220,6 +237,9 @@ func (s Signal) validate() error {
 	if s.ReceivedAt.IsZero() {
 		return errors.New("detect: signal receive time is required")
 	}
+	if s.Source != SourceScreen && s.Screen != nil {
+		return errors.New("detect: only screen signals may contain screen attribution")
+	}
 
 	switch s.Source {
 	case SourceHook:
@@ -232,7 +252,7 @@ func (s Signal) validate() error {
 		if !validHookKind(s.Kind) {
 			return fmt.Errorf("detect: hook source cannot report kind %q", s.Kind)
 		}
-		if s.Process != nil || s.TimerGeneration != 0 {
+		if s.Process != nil || !s.Timer.zero() {
 			return errors.New("detect: hook signal contains non-hook metadata")
 		}
 	case SourceNotify:
@@ -249,11 +269,11 @@ func (s Signal) validate() error {
 				s.Scope,
 			)
 		}
-		if s.Process != nil || s.TimerGeneration != 0 {
+		if s.Process != nil || !s.Timer.zero() {
 			return errors.New("detect: notify signal contains foreign metadata")
 		}
 	case SourceHeuristic:
-		if s.DeliveryID != "" || s.Process != nil || s.TimerGeneration != 0 {
+		if s.DeliveryID != "" || s.Process != nil || !s.Timer.zero() {
 			return errors.New("detect: heuristic signal contains foreign metadata")
 		}
 		if s.Kind != KindHeuristicBlocked &&
@@ -273,9 +293,51 @@ func (s Signal) validate() error {
 		if err := s.Process.validate(s.Kind); err != nil {
 			return err
 		}
+	case SourceScreen:
+		if s.Vendor == "" || len(s.Vendor) > maxVendorBytes || !asciiToken(s.Vendor) {
+			return errors.New("detect: screen signal vendor must be a stable ASCII token")
+		}
+		if s.Scope != ScopeRoot {
+			return errors.New("detect: screen signal must target the root scope")
+		}
+		if s.DeliveryID != "" || s.Process != nil || !s.Timer.zero() {
+			return errors.New("detect: screen signal contains foreign metadata")
+		}
+		if s.Screen == nil {
+			return errors.New("detect: screen signal requires screen attribution")
+		}
+		if err := s.Screen.Validate(); err != nil {
+			return fmt.Errorf("detect: screen attribution: %w", err)
+		}
+		if s.VendorEvent != "screen_rule" {
+			return errors.New("detect: screen signal vendor event must be screen_rule")
+		}
+		if s.Evidence != "" {
+			return errors.New("detect: screen signal evidence belongs in its attribution")
+		}
+		if !validScreenKind(s.Kind) {
+			return fmt.Errorf("detect: screen source cannot report kind %q", s.Kind)
+		}
+		if !screenKindMatchesEdge(s.Kind, s.Screen.Edge) {
+			return fmt.Errorf(
+				"detect: screen kind %q cannot report edge %q",
+				s.Kind,
+				s.Screen.Edge,
+			)
+		}
+		if !strings.HasPrefix(s.Screen.Rule, s.Vendor+".") {
+			return errors.New("detect: screen rule must belong to its vendor")
+		}
+		if knownScreenRule(s.Screen.Rule) &&
+			!knownScreenRuleMatchesKind(s.Screen.Rule, s.Kind) {
+			return errors.New("detect: known screen rule has an incompatible kind")
+		}
 	case SourceTimer:
-		if s.DeliveryID != "" || s.Process != nil || s.TimerGeneration == 0 {
+		if s.DeliveryID != "" || s.Process != nil {
 			return errors.New("detect: timer signal requires a generation only")
+		}
+		if err := s.Timer.validate(); err != nil {
+			return fmt.Errorf("detect: timer signal: %w", err)
 		}
 		if s.Kind != KindHookActivationExpired && s.Kind != KindTimerFired {
 			return fmt.Errorf("detect: timer source cannot report kind %q", s.Kind)
@@ -319,8 +381,33 @@ func (p ProcessFact) validate(kind Kind) error {
 
 func validSource(source Source) bool {
 	switch source {
-	case SourceProcess, SourceHook, SourceNotify, SourceHeuristic, SourceTimer:
+	case SourceProcess, SourceHook, SourceNotify, SourceHeuristic, SourceScreen, SourceTimer:
 		return true
+	default:
+		return false
+	}
+}
+
+func validScreenKind(kind Kind) bool {
+	switch kind {
+	case KindHumanInputRequired,
+		KindHumanInputResolved,
+		KindInterrupted,
+		KindIdlePrompt:
+		return true
+	default:
+		return false
+	}
+}
+
+func screenKindMatchesEdge(kind Kind, edge agent.ScreenEdge) bool {
+	switch kind {
+	case KindHumanInputRequired:
+		return edge == agent.ScreenEdgePresent
+	case KindHumanInputResolved:
+		return edge == agent.ScreenEdgeCleared
+	case KindInterrupted, KindIdlePrompt:
+		return edge == agent.ScreenEdgePresent || edge == agent.ScreenEdgeCleared
 	default:
 		return false
 	}
@@ -389,6 +476,10 @@ func cloneSignal(signal Signal) Signal {
 			process.ExitCode = &exitCode
 		}
 		signal.Process = &process
+	}
+	if signal.Screen != nil {
+		screen := *signal.Screen
+		signal.Screen = &screen
 	}
 	return signal
 }
@@ -494,16 +585,70 @@ func fillConfigDefaults(config *Config, defaults Config) {
 	}
 }
 
-type timerKind uint8
+// CandidatePurpose identifies one bounded confirmation or timeout purpose.
+type CandidatePurpose string
 
 const (
-	timerNone timerKind = iota
-	timerHookActivation
-	timerHookIdle
-	timerHookPermission
-	timerHeuristicBlocked
-	timerFallbackIdle
+	CandidateHookActivation   CandidatePurpose = "hook_activation"
+	CandidateHookIdle         CandidatePurpose = "hook_idle"
+	CandidateHookPermission   CandidatePurpose = "hook_permission"
+	CandidateHeuristicBlocked CandidatePurpose = "heuristic_blocked"
+	CandidateFallbackIdle     CandidatePurpose = "fallback_idle"
+	CandidateScreen           CandidatePurpose = "screen_confirmation"
 )
+
+// TimerRef identifies one candidate generation owned by the Detector.
+type TimerRef struct {
+	Purpose    CandidatePurpose
+	Rule       string
+	Generation uint64
+}
+
+func (r TimerRef) zero() bool {
+	return r == (TimerRef{})
+}
+
+func (r TimerRef) validate() error {
+	switch r.Purpose {
+	case CandidateHookActivation,
+		CandidateHookIdle,
+		CandidateHookPermission,
+		CandidateHeuristicBlocked,
+		CandidateFallbackIdle:
+		if r.Rule != "" {
+			return errors.New("detect: non-screen timer reference cannot contain a rule")
+		}
+	case CandidateScreen:
+		if r.Rule == "" || len(r.Rule) > 64 || !asciiToken(r.Rule) {
+			return errors.New("detect: screen timer rule must contain 1 to 64 ASCII bytes")
+		}
+	default:
+		return fmt.Errorf("detect: invalid candidate purpose %q", r.Purpose)
+	}
+	if r.Generation == 0 {
+		return errors.New("detect: timer generation must be positive")
+	}
+	return nil
+}
+
+type candidateKey struct {
+	purpose CandidatePurpose
+	rule    string
+}
+
+func (k candidateKey) ref(generation uint64) TimerRef {
+	return TimerRef{
+		Purpose:    k.purpose,
+		Rule:       k.rule,
+		Generation: generation,
+	}
+}
+
+type candidateState struct {
+	generation uint64
+	deadline   time.Time
+	signal     Signal
+}
 
 type stateData struct {
 	revision uint64
@@ -511,10 +656,8 @@ type stateData struct {
 	status   HookStatus
 	terminal bool
 
-	timerKind       timerKind
-	timerGeneration uint64
-	timerDeadline   time.Time
-	timerCandidate  Signal
+	candidates           map[candidateKey]candidateState
+	candidateGenerations map[candidateKey]uint64
 
 	recentOutput []time.Time
 	deliveries   map[string]Outcome
@@ -540,9 +683,11 @@ func NewState(policy agent.HookPolicy) State {
 		status = HookOff
 	}
 	return State{data: stateData{
-		policy:     policy,
-		status:     status,
-		deliveries: make(map[string]Outcome),
+		policy:               policy,
+		status:               status,
+		candidates:           make(map[candidateKey]candidateState),
+		candidateGenerations: make(map[candidateKey]uint64),
+		deliveries:           make(map[string]Outcome),
 	}}
 }
 
@@ -565,14 +710,11 @@ func (s Snapshot) Terminal() bool {
 
 // Timer returns the active timer, if any.
 func (s Snapshot) Timer() TimerPlan {
-	if s.data.timerKind == timerNone {
-		return TimerPlan{Action: TimerKeep, Generation: s.data.timerGeneration}
+	plan, ok := earliestTimer(s.data)
+	if !ok {
+		return TimerPlan{Action: TimerKeep}
 	}
-	return TimerPlan{
-		Action:     TimerArm,
-		Deadline:   s.data.timerDeadline,
-		Generation: s.data.timerGeneration,
-	}
+	return plan
 }
 
 // ApplyCommitted applies one decision after its event batch is durable.
@@ -592,7 +734,13 @@ func (s *State) ApplyCommitted(decision Decision) error {
 }
 
 func cloneStateData(data stateData) stateData {
-	data.timerCandidate = cloneSignal(data.timerCandidate)
+	candidates := make(map[candidateKey]candidateState, len(data.candidates))
+	for key, candidate := range data.candidates {
+		candidate.signal = cloneSignal(candidate.signal)
+		candidates[key] = candidate
+	}
+	data.candidates = candidates
+	data.candidateGenerations = maps.Clone(data.candidateGenerations)
 	data.recentOutput = append([]time.Time(nil), data.recentOutput...)
 	data.deliveryIDs = append([]string(nil), data.deliveryIDs...)
 	deliveries := make(map[string]Outcome, len(data.deliveries))
@@ -611,11 +759,11 @@ const (
 
 // Observation is a sealed normalized input to Detector.Decide.
 type Observation struct {
-	kind       observationKind
-	signal     Signal
-	vendor     string
-	at         time.Time
-	generation uint64
+	kind     observationKind
+	signal   Signal
+	vendor   string
+	at       time.Time
+	timerRef TimerRef
 }
 
 // ObserveSignal wraps a validated hook, heuristic, or process signal.
@@ -640,15 +788,18 @@ func ObserveOutput(vendor string, at time.Time) (Observation, error) {
 	return Observation{kind: observationOutput, vendor: vendor, at: at}, nil
 }
 
-// ObserveTimer creates a timer firing tagged with its arm generation.
-func ObserveTimer(generation uint64, at time.Time) (Observation, error) {
-	if generation == 0 || at.IsZero() {
-		return Observation{}, errors.New("detect: timer generation and time are required")
+// ObserveTimer creates a firing tagged with its candidate timer reference.
+func ObserveTimer(ref TimerRef, at time.Time) (Observation, error) {
+	if err := ref.validate(); err != nil {
+		return Observation{}, fmt.Errorf("detect: timer reference: %w", err)
+	}
+	if at.IsZero() {
+		return Observation{}, errors.New("detect: timer time is required")
 	}
 	return Observation{
-		kind:       observationTimer,
-		at:         at,
-		generation: generation,
+		kind:     observationTimer,
+		at:       at,
+		timerRef: ref,
 	}, nil
 }
 
@@ -675,9 +826,9 @@ const (
 
 // TimerPlan is an immutable timer update.
 type TimerPlan struct {
-	Action     TimerAction
-	Deadline   time.Time
-	Generation uint64
+	Action   TimerAction
+	Deadline time.Time
+	Ref      TimerRef
 }
 
 // Decision is one immutable signal audit, optional Agent change, and Detector update.
@@ -739,20 +890,26 @@ func (d *Detector) Decide(
 		return Decision{}, errors.New("detect: invalid Agent snapshot")
 	}
 
+	var (
+		decision    Decision
+		decisionErr error
+	)
 	switch observation.kind {
 	case observationSignal:
-		if err := observation.signal.validate(); err != nil {
-			return Decision{}, err
+		if validationErr := observation.signal.validate(); validationErr != nil {
+			return Decision{}, validationErr
 		}
 		switch observation.signal.Source {
 		case SourceHook:
-			return d.decideHook(state, current, observation.signal)
+			decision, decisionErr = d.decideHook(state, current, observation.signal)
 		case SourceNotify:
-			return d.decideNotify(state, current, observation.signal)
+			decision, decisionErr = d.decideNotify(state, current, observation.signal)
 		case SourceHeuristic:
-			return d.decideHeuristic(state, current, observation.signal)
+			decision, decisionErr = d.decideHeuristic(state, current, observation.signal)
 		case SourceProcess:
-			return d.decideProcess(state, current, observation.signal)
+			decision, decisionErr = d.decideProcess(state, current, observation.signal)
+		case SourceScreen:
+			decision, decisionErr = d.decideScreen(state, current, observation.signal)
 		default:
 			return Decision{}, fmt.Errorf(
 				"detect: unsupported observed signal source %q",
@@ -763,7 +920,7 @@ func (d *Detector) Decide(
 		if observation.at.IsZero() {
 			return Decision{}, errors.New("detect: output observation time is required")
 		}
-		signal, err := NewHeuristicSignal(Signal{
+		signal, signalErr := NewHeuristicSignal(Signal{
 			Kind:        KindObserved,
 			Vendor:      observation.vendor,
 			VendorEvent: string(KindOutputActivity),
@@ -772,15 +929,22 @@ func (d *Detector) Decide(
 			Confidence:  1,
 			ReceivedAt:  observation.at,
 		})
-		if err != nil {
-			return Decision{}, err
+		if signalErr != nil {
+			return Decision{}, signalErr
 		}
-		return d.decideHeuristic(state, current, signal)
+		decision, decisionErr = d.decideHeuristic(state, current, signal)
 	case observationTimer:
-		return d.decideTimer(state, current, observation)
+		decision, decisionErr = d.decideTimer(state, current, observation)
 	default:
 		return Decision{}, errors.New("detect: invalid observation")
 	}
+	if decisionErr != nil {
+		return Decision{}, decisionErr
+	}
+	if !decision.duplicate {
+		decision.timer = timerPlanAfterDecision(decision.next)
+	}
+	return decision, nil
 }
 
 func (d *Detector) decideNotify(
@@ -812,9 +976,9 @@ func (d *Detector) decideNotify(
 		decision.outcome = OutcomeSuppressed
 	case state.data.status == HookFallback:
 		if current.State == agent.StateWorking || current.State == agent.StateBlocked {
-			armTimer(
+			armCandidate(
 				&decision,
-				timerHookIdle,
+				candidateKey{purpose: CandidateHookIdle},
 				signal.ReceivedAt.Add(d.config.StopConfirmation),
 				signal,
 			)
@@ -864,37 +1028,49 @@ func (d *Detector) decideHook(
 	}
 	wasActive := decision.next.status == HookActive
 	decision.next.status = HookActive
+	if !wasActive {
+		cancelAllCandidates(&decision)
+	} else {
+		cancelCandidatesByPurpose(&decision, CandidateScreen)
+	}
 
 	switch signal.Kind {
 	case KindTurnStarted, KindHumanInputResolved:
-		cancelTimer(&decision)
+		cancelAllCandidates(&decision)
 		transition(&decision, current, agent.StateWorking, "hook "+signal.VendorEvent, "")
 	case KindToolActivity:
-		cancelTimer(&decision)
 		if signal.Scope == ScopeRoot {
+			cancelAllCandidates(&decision)
 			transition(&decision, current, agent.StateWorking, "hook "+signal.VendorEvent, "")
 		}
 	case KindSubagentStarted:
-		cancelTimer(&decision)
+		cancelAllCandidates(&decision)
 		transition(&decision, current, agent.StateWorking, "hook "+signal.VendorEvent, "")
 	case KindHumanInputRequired:
-		cancelTimer(&decision)
+		cancelAllCandidates(&decision)
 		transition(&decision, current, agent.StateBlocked, "hook "+signal.VendorEvent, "")
 	case KindPermissionRequested:
-		armTimer(&decision, timerHookPermission, signal.ReceivedAt.Add(d.config.PermissionConfirmation), signal)
+		cancelCandidate(&decision, candidateKey{purpose: CandidateHookIdle})
+		armCandidate(
+			&decision,
+			candidateKey{purpose: CandidateHookPermission},
+			signal.ReceivedAt.Add(d.config.PermissionConfirmation),
+			signal,
+		)
 		decision.outcome = OutcomeCandidate
 	case KindPermissionResolved:
-		if decision.next.timerKind == timerHookPermission {
-			cancelTimer(&decision)
-		}
+		cancelCandidate(&decision, candidateKey{purpose: CandidateHookPermission})
 	case KindTurnStopped, KindTurnFailed, KindInterrupted, KindIdlePrompt:
 		if signal.Scope == ScopeRoot {
-			armTimer(&decision, timerHookIdle, signal.ReceivedAt.Add(d.config.StopConfirmation), signal)
+			cancelCandidate(&decision, candidateKey{purpose: CandidateHookPermission})
+			armCandidate(
+				&decision,
+				candidateKey{purpose: CandidateHookIdle},
+				signal.ReceivedAt.Add(d.config.StopConfirmation),
+				signal,
+			)
 			decision.outcome = OutcomeCandidate
 		}
-	}
-	if !wasActive && decision.timer.Action == TimerKeep {
-		cancelTimer(&decision)
 	}
 	rememberDelivery(&decision.next, signal.DeliveryID, decision.outcome, d.config.DeliveryRememberCount)
 	return decision, nil
@@ -914,18 +1090,20 @@ func (d *Detector) decideHeuristic(
 		decision.outcome = OutcomeSuppressed
 		return decision, nil
 	}
-	if decision.next.timerKind == timerHookIdle &&
-		decision.next.timerCandidate.Source == SourceNotify {
-		cancelTimer(&decision)
+	idleKey := candidateKey{purpose: CandidateHookIdle}
+	if candidate, ok := decision.next.candidates[idleKey]; ok &&
+		candidate.signal.Source == SourceNotify {
+		cancelCandidate(&decision, idleKey)
 	}
 
 	if signal.Kind == KindHeuristicBlocked {
 		if current.State == agent.StateWorking || current.State == agent.StateIdle {
 			if signal.Confidence >= d.config.HeuristicConfidence {
-				if decision.next.timerKind != timerHeuristicBlocked {
-					armTimer(
+				key := candidateKey{purpose: CandidateHeuristicBlocked}
+				if _, exists := decision.next.candidates[key]; !exists {
+					armCandidate(
 						&decision,
-						timerHeuristicBlocked,
+						key,
 						signal.ReceivedAt.Add(d.config.HeuristicConfirmation),
 						signal,
 					)
@@ -940,9 +1118,7 @@ func (d *Detector) decideHeuristic(
 		return decision, nil
 	}
 
-	if decision.next.timerKind == timerHeuristicBlocked {
-		cancelTimer(&decision)
-	}
+	cancelCandidate(&decision, candidateKey{purpose: CandidateHeuristicBlocked})
 	if current.State == agent.StateBlocked {
 		pruneOutput(&decision.next, signal.ReceivedAt, d.config.HeuristicRecoveryWindow)
 		decision.next.recentOutput = append(decision.next.recentOutput, signal.ReceivedAt)
@@ -973,6 +1149,7 @@ func (d *Detector) decideProcess(
 ) (Decision, error) {
 	decision := newDecision(state, signal, OutcomeObserved)
 	process := signal.Process
+	cancelAllCandidates(&decision)
 	switch signal.Kind {
 	case KindProcessStarted:
 		transition(&decision, current, agent.StateWorking, "process started", "")
@@ -983,9 +1160,9 @@ func (d *Detector) decideProcess(
 			}, signal.ReceivedAt, d.config.FallbackIdleAfter)
 		case agent.HooksAuto:
 			if process.HookAvailable {
-				armTimer(
+				armCandidate(
 					&decision,
-					timerHookActivation,
+					candidateKey{purpose: CandidateHookActivation},
 					signal.ReceivedAt.Add(d.config.HookActivation),
 					Signal{},
 				)
@@ -996,9 +1173,9 @@ func (d *Detector) decideProcess(
 				}, signal.ReceivedAt, d.config.FallbackIdleAfter)
 			}
 		case agent.HooksRequired:
-			armTimer(
+			armCandidate(
 				&decision,
-				timerHookActivation,
+				candidateKey{purpose: CandidateHookActivation},
 				signal.ReceivedAt.Add(d.config.HookActivation),
 				Signal{},
 			)
@@ -1007,7 +1184,6 @@ func (d *Detector) decideProcess(
 		decision.outcome = OutcomeTerminal
 		decision.next.terminal = true
 		decision.next.status = HookDetached
-		cancelTimer(&decision)
 		transition(
 			&decision,
 			current,
@@ -1019,7 +1195,6 @@ func (d *Detector) decideProcess(
 		decision.outcome = OutcomeTerminal
 		decision.next.terminal = true
 		decision.next.status = HookDetached
-		cancelTimer(&decision)
 
 		target := agent.StateStopped
 		message := process.ErrorMessage
@@ -1041,32 +1216,87 @@ func (d *Detector) decideProcess(
 	return decision, nil
 }
 
+func (d *Detector) decideScreen(
+	state Snapshot,
+	current agent.Snapshot,
+	signal Signal,
+) (Decision, error) {
+	decision := newDecision(state, signal, OutcomeSuppressed)
+	key := candidateKey{
+		purpose: CandidateScreen,
+		rule:    signal.Screen.Rule,
+	}
+	cancelCandidate(&decision, key)
+	if state.data.terminal {
+		decision.outcome = OutcomeTerminal
+		return decision, nil
+	}
+
+	confirmation, known := ScreenRuleConfirmation(
+		signal.Screen.Rule,
+		signal.Kind,
+		signal.Screen.Edge,
+	)
+	if !known {
+		return decision, nil
+	}
+
+	allowed := false
+	switch state.data.status {
+	case HookActive:
+		allowed =
+			isApprovalClearance(signal) && current.State == agent.StateBlocked ||
+				isClaudeInterrupt(signal) && current.State == agent.StateWorking
+	case HookOff, HookFallback:
+		switch {
+		case isApprovalPresence(signal):
+			allowed = current.State == agent.StateWorking || current.State == agent.StateIdle
+		case isApprovalClearance(signal):
+			allowed = current.State == agent.StateBlocked
+		case isIdleOrInterruptPresence(signal):
+			allowed = current.State == agent.StateWorking || current.State == agent.StateBlocked
+		}
+	case HookAwaiting, HookRequiredFailed, HookDetached:
+	}
+	if !allowed {
+		return decision, nil
+	}
+
+	armCandidate(&decision, key, signal.ReceivedAt.Add(confirmation), signal)
+	decision.outcome = OutcomeCandidate
+	return decision, nil
+}
+
 func (d *Detector) decideTimer(
 	state Snapshot,
 	current agent.Snapshot,
 	observation Observation,
 ) (Decision, error) {
-	timer := state.data.timerKind
-	eventName := timerEvent(timer)
+	ref := observation.timerRef
+	eventName := timerEvent(ref.Purpose)
 	kind := KindTimerFired
-	if timer == timerHookActivation {
+	if ref.Purpose == CandidateHookActivation {
 		kind = KindHookActivationExpired
 	}
-	signal := newTimerSignal(kind, eventName, observation.generation, observation.at)
+	signal := newTimerSignal(kind, eventName, ref, observation.at)
 	if err := signal.validate(); err != nil {
 		return Decision{}, err
 	}
 	decision := newDecision(state, signal, OutcomeObserved)
-	if observation.generation != state.data.timerGeneration || timer == timerNone {
+	key := candidateKey{purpose: ref.Purpose, rule: ref.Rule}
+	candidate, exists := state.data.candidates[key]
+	if !exists || candidate.generation != ref.Generation {
 		decision.outcome = OutcomeStale
 		return decision, nil
 	}
+	cancelCandidate(&decision, key)
 
-	switch timer {
-	case timerHookActivation:
+	switch ref.Purpose {
+	case CandidateHookActivation:
 		if state.data.policy == agent.HooksRequired {
 			decision.next.terminal = true
 			decision.next.status = HookRequiredFailed
+			cancelAllCandidates(&decision)
 			transition(
 				&decision,
 				current,
@@ -1074,22 +1304,18 @@ func (d *Detector) decideTimer(
 				"required hook activation timed out",
 				"required hook not observed",
 			)
-			cancelTimer(&decision)
 		} else {
 			decision.next.status = HookFallback
 			if current.State == agent.StateWorking {
-				armTimer(
+				armCandidate(
 					&decision,
-					timerFallbackIdle,
+					candidateKey{purpose: CandidateFallbackIdle},
 					observation.at.Add(d.config.FallbackIdleAfter),
 					Signal{},
 				)
-			} else {
-				cancelTimer(&decision)
 			}
 		}
-	case timerHookPermission:
-		cancelTimer(&decision)
+	case CandidateHookPermission:
 		transition(
 			&decision,
 			current,
@@ -1097,17 +1323,15 @@ func (d *Detector) decideTimer(
 			"hook permission request confirmed",
 			"",
 		)
-	case timerHookIdle:
-		candidate := cloneSignal(state.data.timerCandidate)
-		cancelTimer(&decision)
-		if candidate.Source == SourceNotify {
+	case CandidateHookIdle:
+		if candidate.signal.Source == SourceNotify {
 			transitionWithEvidence(
 				&decision,
 				current,
 				agent.StateIdle,
 				"notify idle confirmed",
 				"",
-				evidence(candidate),
+				evidence(candidate.signal),
 			)
 		} else {
 			transition(
@@ -1118,8 +1342,7 @@ func (d *Detector) decideTimer(
 				"",
 			)
 		}
-	case timerHeuristicBlocked:
-		cancelTimer(&decision)
+	case CandidateHeuristicBlocked:
 		transition(
 			&decision,
 			current,
@@ -1127,14 +1350,26 @@ func (d *Detector) decideTimer(
 			"heuristic blocked confirmed",
 			"",
 		)
-	case timerFallbackIdle:
-		cancelTimer(&decision)
+	case CandidateFallbackIdle:
 		transition(
 			&decision,
 			current,
 			agent.StateIdle,
 			"fallback silence",
 			"",
+		)
+	case CandidateScreen:
+		target, ok := screenCandidateTarget(candidate.signal, current.State)
+		if !ok {
+			return decision, nil
+		}
+		transitionWithEvidence(
+			&decision,
+			current,
+			target,
+			"screen "+candidate.signal.Screen.Rule+" confirmed",
+			"",
+			evidence(candidate.signal),
 		)
 	default:
 		decision.outcome = OutcomeStale
@@ -1151,10 +1386,7 @@ func newDecision(state Snapshot, signal Signal, outcome Outcome) Decision {
 		next:             next,
 		signal:           cloneSignal(signal),
 		outcome:          outcome,
-		timer: TimerPlan{
-			Action:     TimerKeep,
-			Generation: state.data.timerGeneration,
-		},
+		timer:            TimerPlan{Action: TimerKeep},
 	}
 }
 
@@ -1204,18 +1436,25 @@ func transitionWithEvidence(
 		decision.change = agent.MoveTo(target, reason, transitionEvidence)
 	}
 	decision.hasChange = true
+	cancelIncompatibleCandidates(decision, target)
 	if decision.outcome != OutcomeTerminal {
 		decision.outcome = OutcomeTransition
 	}
 }
 
 func evidence(signal Signal) agent.Evidence {
-	return agent.Evidence{
+	result := agent.Evidence{
 		Source:     agent.EvidenceSource(signal.Source),
 		Event:      signal.VendorEvent,
 		Confidence: signal.Confidence,
 		DeliveryID: signal.DeliveryID,
 	}
+	if signal.Screen != nil {
+		screen := *signal.Screen
+		result.Event = screen.Rule
+		result.Screen = &screen
+	}
+	return result
 }
 
 func fallbackEnabled(data stateData) bool {
@@ -1231,55 +1470,222 @@ func armFallbackIdle(
 	if current.State != agent.StateWorking {
 		return
 	}
-	armTimer(decision, timerFallbackIdle, at.Add(delay), Signal{})
+	armCandidate(
+		decision,
+		candidateKey{purpose: CandidateFallbackIdle},
+		at.Add(delay),
+		Signal{},
+	)
 }
 
-func armTimer(
+func armCandidate(
 	decision *Decision,
-	kind timerKind,
+	key candidateKey,
 	deadline time.Time,
 	candidate Signal,
 ) {
-	decision.next.timerGeneration++
-	decision.next.timerKind = kind
-	decision.next.timerDeadline = deadline
-	decision.next.timerCandidate = cloneSignal(candidate)
-	decision.timer = TimerPlan{
-		Action:     TimerArm,
-		Deadline:   deadline,
-		Generation: decision.next.timerGeneration,
+	generation := decision.next.candidateGenerations[key] + 1
+	if generation == 0 {
+		generation = 1
+	}
+	decision.next.candidateGenerations[key] = generation
+	decision.next.candidates[key] = candidateState{
+		generation: generation,
+		deadline:   deadline,
+		signal:     cloneSignal(candidate),
 	}
 }
 
-func cancelTimer(decision *Decision) {
-	if decision.next.timerKind == timerNone {
+func cancelCandidate(decision *Decision, key candidateKey) {
+	if _, exists := decision.next.candidates[key]; !exists {
 		return
 	}
-	decision.next.timerGeneration++
-	decision.next.timerKind = timerNone
-	decision.next.timerDeadline = time.Time{}
-	decision.next.timerCandidate = Signal{}
-	decision.timer = TimerPlan{
-		Action:     TimerCancel,
-		Generation: decision.next.timerGeneration,
+	generation := decision.next.candidateGenerations[key] + 1
+	if generation == 0 {
+		generation = 1
+	}
+	decision.next.candidateGenerations[key] = generation
+	delete(decision.next.candidates, key)
+}
+
+func cancelCandidatesByPurpose(decision *Decision, purpose CandidatePurpose) {
+	for key := range decision.next.candidates {
+		if key.purpose == purpose {
+			cancelCandidate(decision, key)
+		}
 	}
 }
 
-func timerEvent(kind timerKind) string {
-	switch kind {
-	case timerHookActivation:
+func cancelAllCandidates(decision *Decision) {
+	for key := range decision.next.candidates {
+		cancelCandidate(decision, key)
+	}
+}
+
+func cancelIncompatibleCandidates(decision *Decision, state agent.State) {
+	for key, candidate := range decision.next.candidates {
+		compatible := false
+		switch key.purpose {
+		case CandidateHookActivation, CandidateFallbackIdle:
+			compatible = state == agent.StateWorking
+		case CandidateHookIdle:
+			compatible = state == agent.StateWorking || state == agent.StateBlocked
+		case CandidateHookPermission, CandidateHeuristicBlocked:
+			compatible = state == agent.StateWorking || state == agent.StateIdle
+		case CandidateScreen:
+			_, compatible = screenCandidateTarget(candidate.signal, state)
+		}
+		if !compatible {
+			cancelCandidate(decision, key)
+		}
+	}
+}
+
+func timerPlanAfterDecision(data stateData) TimerPlan {
+	if plan, ok := earliestTimer(data); ok {
+		return plan
+	}
+	return TimerPlan{Action: TimerCancel}
+}
+
+func earliestTimer(data stateData) (TimerPlan, bool) {
+	var (
+		earliestKey       candidateKey
+		earliestCandidate candidateState
+		found             bool
+	)
+	for key, candidate := range data.candidates {
+		if !found ||
+			candidate.deadline.Before(earliestCandidate.deadline) ||
+			candidate.deadline.Equal(earliestCandidate.deadline) &&
+				(string(key.purpose) < string(earliestKey.purpose) ||
+					key.purpose == earliestKey.purpose && key.rule < earliestKey.rule) {
+			earliestKey = key
+			earliestCandidate = candidate
+			found = true
+		}
+	}
+	if !found {
+		return TimerPlan{}, false
+	}
+	return TimerPlan{
+		Action:   TimerArm,
+		Deadline: earliestCandidate.deadline,
+		Ref:      earliestKey.ref(earliestCandidate.generation),
+	}, true
+}
+
+func timerEvent(purpose CandidatePurpose) string {
+	switch purpose {
+	case CandidateHookActivation:
 		return string(KindHookActivationExpired)
-	case timerHookIdle:
+	case CandidateHookIdle:
 		return "idle_confirmation"
-	case timerHookPermission:
+	case CandidateHookPermission:
 		return "permission_confirmation"
-	case timerHeuristicBlocked:
+	case CandidateHeuristicBlocked:
 		return "heuristic_blocked_confirmation"
-	case timerFallbackIdle:
+	case CandidateFallbackIdle:
 		return "fallback_idle_timeout"
+	case CandidateScreen:
+		return "screen_confirmation"
 	default:
 		return "stale_timer"
 	}
+}
+
+// ScreenRuleConfirmation returns the fixed Detector duration for a screen edge.
+func ScreenRuleConfirmation(
+	rule string,
+	kind Kind,
+	edge agent.ScreenEdge,
+) (time.Duration, bool) {
+	switch {
+	case (rule == "claude.approval_prompt" || rule == "codex.approval_prompt") &&
+		kind == KindHumanInputRequired &&
+		edge == agent.ScreenEdgePresent:
+		return 750 * time.Millisecond, true
+	case (rule == "claude.approval_prompt" || rule == "codex.approval_prompt") &&
+		kind == KindHumanInputResolved &&
+		edge == agent.ScreenEdgeCleared:
+		return 500 * time.Millisecond, true
+	case (rule == "claude.idle_prompt" || rule == "codex.idle_prompt") &&
+		kind == KindIdlePrompt &&
+		edge == agent.ScreenEdgePresent:
+		return time.Second, true
+	case rule == "claude.interrupted" &&
+		kind == KindInterrupted &&
+		edge == agent.ScreenEdgePresent:
+		return time.Second, true
+	default:
+		return 0, false
+	}
+}
+
+func knownScreenRule(rule string) bool {
+	switch rule {
+	case "claude.approval_prompt",
+		"claude.idle_prompt",
+		"claude.interrupted",
+		"codex.approval_prompt",
+		"codex.idle_prompt":
+		return true
+	default:
+		return false
+	}
+}
+
+func knownScreenRuleMatchesKind(rule string, kind Kind) bool {
+	switch rule {
+	case "claude.approval_prompt", "codex.approval_prompt":
+		return kind == KindHumanInputRequired || kind == KindHumanInputResolved
+	case "claude.idle_prompt", "codex.idle_prompt":
+		return kind == KindIdlePrompt
+	case "claude.interrupted":
+		return kind == KindInterrupted
+	default:
+		return false
+	}
+}
+
+func isApprovalPresence(signal Signal) bool {
+	return signal.Kind == KindHumanInputRequired &&
+		(signal.Screen.Rule == "claude.approval_prompt" ||
+			signal.Screen.Rule == "codex.approval_prompt")
+}
+
+func isApprovalClearance(signal Signal) bool {
+	return signal.Kind == KindHumanInputResolved &&
+		(signal.Screen.Rule == "claude.approval_prompt" ||
+			signal.Screen.Rule == "codex.approval_prompt")
+}
+
+func isClaudeInterrupt(signal Signal) bool {
+	return signal.Kind == KindInterrupted &&
+		signal.Screen.Rule == "claude.interrupted"
+}
+
+func isIdleOrInterruptPresence(signal Signal) bool {
+	return signal.Kind == KindIdlePrompt ||
+		signal.Kind == KindInterrupted
+}
+
+func screenCandidateTarget(signal Signal, current agent.State) (agent.State, bool) {
+	switch signal.Kind {
+	case KindHumanInputRequired:
+		if current == agent.StateWorking || current == agent.StateIdle {
+			return agent.StateBlocked, true
+		}
+	case KindHumanInputResolved:
+		if current == agent.StateBlocked {
+			return agent.StateWorking, true
+		}
+	case KindIdlePrompt, KindInterrupted:
+		if current == agent.StateWorking || current == agent.StateBlocked {
+			return agent.StateIdle, true
+		}
+	}
+	return "", false
 }
 
 func pruneOutput(data *stateData, at time.Time, window time.Duration) {
