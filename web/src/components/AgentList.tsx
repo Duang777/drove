@@ -8,10 +8,16 @@ import type { Event } from '../api/types'
 interface Props {
   agents: AgentStatus[]
   events: Event[]
+  onOpenAgent: (id: string) => void
   onChanged: () => void
 }
 
-export function AgentList({ agents, events, onChanged }: Props) {
+export function AgentList({
+  agents,
+  events,
+  onOpenAgent,
+  onChanged,
+}: Props) {
   const [busyID, setBusyID] = useState<string | null>(null)
   const [vendor, setVendor] = useState('claude')
   const [err, setErr] = useState<string | null>(null)
@@ -76,6 +82,7 @@ export function AgentList({ agents, events, onChanged }: Props) {
               agent={a}
               liveState={liveState(a.agent_id)}
               busy={busyID === a.agent_id}
+              onOpen={onOpenAgent}
               onStop={handleStop}
             />
           ))}

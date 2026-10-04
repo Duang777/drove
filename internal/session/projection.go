@@ -105,6 +105,8 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 		return p.applySignal(row)
 	case event.TypeAgentResized:
 		return p.applyResize(row)
+	case event.TypeAgentAttachment:
+		return p.applyAttachment(row)
 	case event.TypeAgentResumed:
 		return p.applyResume(row)
 	case event.TypeOutput, event.TypeOutputChunk:
@@ -132,6 +134,19 @@ func (p *recoveryProjector) applyResize(row store.EventRow) error {
 		return projectionWrapError(row, "validate resize payload", err)
 	}
 	p.draft(row)
+	return nil
+}
+
+func (p *recoveryProjector) applyAttachment(row store.EventRow) error {
+	if row.SessionID == "" {
+		return projectionError(row, "attachment event has empty session ID")
+	}
+	if err := validateAgentID(row); err != nil {
+		return err
+	}
+	if _, err := event.DecodeAttachmentAuditPayload(row.Payload); err != nil {
+		return projectionWrapError(row, "validate attachment payload", err)
+	}
 	return nil
 }
 
@@ -219,15 +234,21 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	default:
 		return projectionError(row, "unsupported creation metadata version %d", metadata.Version)
 	}
-	if metadata.WorkingDir != "" {
-		if !filepath.IsAbs(metadata.WorkingDir) ||
-			filepath.Clean(metadata.WorkingDir) != metadata.WorkingDir {
+	workingDir := metadata.WorkingDir
+	if workingDir == "" {
+		workingDir = metadata.Dir
+	} else if metadata.Dir != "" && metadata.Dir != workingDir {
+		return projectionError(row, "creation metadata has conflicting working directories")
+	}
+	if workingDir != "" {
+		if !filepath.IsAbs(workingDir) ||
+			filepath.Clean(workingDir) != workingDir {
 			return projectionError(
 				row,
 				"creation metadata working directory is not a clean absolute path",
 			)
 		}
-		draft.workingDir = metadata.WorkingDir
+		draft.workingDir = workingDir
 	}
 
 	draft.name = metadata.Name
@@ -658,6 +679,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			ID:              agent.ID(draft.id),
 			Name:            draft.name,
 			Vendor:          draft.vendor,
+			WorkingDir:      draft.workingDir,
 			RunMode:         draft.runMode,
 			HookPolicy:      draft.hookPolicy,
 			SignalInjection: draft.signalInjection,

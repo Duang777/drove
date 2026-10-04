@@ -2,7 +2,8 @@
 
 ## 职责
 
-**对外 API 面**：REST 管理接口 + WebSocket 事件流。CLI 与（未来的）Web 前端都通过这里与 daemon 通信。
+**对外 API 面**：REST 管理接口 + WebSocket 事件流。CLI 与 Web 前端都通过这里与
+daemon 通信。
 
 ## 关键设计
 
@@ -41,6 +42,14 @@
   通过保留控制槽发送各订阅最后成功写出的 cursor，并以 1013 关闭。
 - resume cursor 只在 writer 成功写完整帧后推进；history 和 live 必须使用同一
   Store tail，订阅建立竞态不得通过 Hub 补洞。
+- v2 raw subscribe 保留 `writable` 字段 presence：省略是无审计 recording
+  reader，显式 `false` 是用户只读 attachment，显式 `true` 是用户可写
+  attachment；selector 不表达 attachment intent。snapshot 使用无审计 recording
+  attachment。
+- user attachment 建立和清理分别提交一条 `agent.attachment`。payload 只含
+  version、action 和 access，不含 attachment ID 或客户端身份。
+- Agent 状态响应中的可选 `dir` 来自 session 的 creation metadata。旧事件没有该
+  字段时省略；API 不推断或补写工作目录。
 - v1 hello、事件和输入错误的逐帧字节形状由
   `testdata/websocket_v1.golden` 锁定。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload

@@ -778,6 +778,52 @@ func TestRecentEventsFiltersBeforeLimitAndReturnsChronologicalEnvelopes(t *testi
 	}
 }
 
+func TestRecentEventsAcceptsAttachmentAuditType(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	row := EventRow{
+		Seq:       1,
+		Timestamp: time.Date(2026, time.October, 4, 13, 0, 0, 0, time.UTC),
+		Type:      string(event.TypeAgentAttachment),
+		SessionID: "s1",
+		AgentID:   "s1",
+		Payload:   `{"version":1,"action":"attached","access":"read_only"}`,
+	}
+	if err := s.AppendEvent(row); err != nil {
+		t.Fatalf("append attachment event: %v", err)
+	}
+
+	recent, err := s.RecentEvents(
+		context.Background(),
+		"s1",
+		[]event.Type{event.TypeAgentAttachment},
+		1,
+	)
+	if err != nil {
+		t.Fatalf("query attachment event: %v", err)
+	}
+	if len(recent) != 1 || recent[0].Seq != row.Seq || recent[0].Payload != row.Payload {
+		t.Fatalf("recent attachment rows = %+v, want %+v", recent, row)
+	}
+	if _, err := event.DecodeAttachmentAuditPayload(recent[0].Payload); err != nil {
+		t.Fatalf("decode recent attachment payload: %v", err)
+	}
+
+	replayed, err := s.Replay("s1")
+	if err != nil {
+		t.Fatalf("replay attachment event: %v", err)
+	}
+	if len(replayed) != 1 ||
+		replayed[0].Type != string(event.TypeAgentAttachment) ||
+		replayed[0].OutputAttachment != nil {
+		t.Fatalf("replayed attachment rows = %+v", replayed)
+	}
+}
+
 func TestRecentEventsNeverHydratesOutputAttachments(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

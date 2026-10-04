@@ -224,12 +224,12 @@ func TestTerminalStreamCommandsAndApplyThenAdvance(t *testing.T) {
 
 	offset := recording.OutputOffset(3)
 	if err := stream.Subscribe(context.Background(), TerminalSubscription{
-		AgentID:  "agent-1",
-		Mode:     TerminalModeRaw,
-		Writable: true,
-		Rows:     50,
-		Columns:  160,
-		Offset:   &offset,
+		AgentID: "agent-1",
+		Mode:    TerminalModeRaw,
+		Access:  TerminalAccessReadWrite,
+		Rows:    50,
+		Columns: 160,
+		Offset:  &offset,
 	}); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -298,6 +298,65 @@ func TestTerminalStreamCommandsAndApplyThenAdvance(t *testing.T) {
 	}
 }
 
+func TestTerminalSubscribeRequestPreservesRawAccess(t *testing.T) {
+	tests := []struct {
+		name         string
+		access       TerminalAccess
+		wantWritable *bool
+	}{
+		{name: "recording", access: TerminalAccessRecording},
+		{
+			name:         "read only user",
+			access:       TerminalAccessReadOnly,
+			wantWritable: terminalBool(false),
+		},
+		{
+			name:         "read write user",
+			access:       TerminalAccessReadWrite,
+			wantWritable: terminalBool(true),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := newTerminalSubscribeRequest(TerminalSubscription{
+				AgentID: "agent-1",
+				Mode:    TerminalModeRaw,
+				Access:  test.access,
+			})
+			if err != nil {
+				t.Fatalf("new subscribe request: %v", err)
+			}
+			if test.wantWritable == nil {
+				if request.Writable != nil {
+					t.Fatalf("writable = %v, want omitted", *request.Writable)
+				}
+			} else if request.Writable == nil ||
+				*request.Writable != *test.wantWritable {
+				t.Fatalf("writable = %v, want %v", request.Writable, *test.wantWritable)
+			}
+			encoded, err := json.Marshal(request)
+			if err != nil {
+				t.Fatalf("marshal subscribe request: %v", err)
+			}
+			wantField := test.wantWritable != nil
+			if got := bytes.Contains(encoded, []byte(`"writable"`)); got != wantField {
+				t.Fatalf("encoded request = %s, writable field = %v", encoded, got)
+			}
+		})
+	}
+
+	if _, err := newTerminalSubscribeRequest(TerminalSubscription{
+		AgentID: "agent-1",
+		Mode:    TerminalModeRaw,
+	}); err == nil {
+		t.Fatal("raw subscription accepted missing access")
+	}
+}
+
+func terminalBool(value bool) *bool {
+	return &value
+}
+
 func TestTerminalStreamRejectsMismatchedSubscriptionResponse(t *testing.T) {
 	serverErrors := make(chan error, 1)
 	release := make(chan struct{})
@@ -357,6 +416,7 @@ func TestTerminalStreamRejectsMismatchedSubscriptionResponse(t *testing.T) {
 	err = stream.Subscribe(context.Background(), TerminalSubscription{
 		AgentID: "agent-1",
 		Mode:    TerminalModeRaw,
+		Access:  TerminalAccessRecording,
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("subscribe error = %v, want response mismatch", err)
@@ -422,6 +482,7 @@ func TestTerminalStreamCloseUnblocksPendingCommandAndNext(t *testing.T) {
 		subscribeResult <- stream.Subscribe(context.Background(), TerminalSubscription{
 			AgentID: "agent-1",
 			Mode:    TerminalModeRaw,
+			Access:  TerminalAccessRecording,
 		})
 	}()
 	select {

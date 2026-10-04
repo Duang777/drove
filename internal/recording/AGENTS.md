@@ -26,6 +26,8 @@
 - frame 始终从 40x120 原点精确回放；可见 snapshot 不得充当可恢复 checkpoint。
   只缓存完成的精确响应，key 包含目标 cursor、view bounds 和 Store retention
   generation；回放前后 generation 变化时丢弃结果并重试。
+- frame 只返回目标时刻的受限可见 cells，不暴露 x/vt 内部状态。客户端只能把它
+  用作预览，不能从 frame 继续精确回放。
 - 50 MiB 冷 frame 的性能基线由 `BenchmarkFrame50MiBColdRandom` 记录。未引入
   可恢复的完整 x/vt checkpoint 前，不得用可见 snapshot 换取速度；后续见 #35。
 

@@ -1216,17 +1216,19 @@ func TestStartRejectsInvalidModeWithoutHistory(t *testing.T) {
 	}
 }
 
-func TestStartPersistsAndReportsRunMode(t *testing.T) {
+func TestStartPersistsAndReportsLaunchMetadata(t *testing.T) {
 	manager, _ := newTestManager(t)
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)
 		}
 	})
+	workingDir := t.TempDir()
 
 	status, err := manager.Start(context.Background(), StartRequest{
 		Name:    "mode-agent",
 		Command: "/bin/cat",
+		Dir:     workingDir,
 		Mode:    agent.RunModeOneshot,
 	})
 	if err != nil {
@@ -1234,6 +1236,9 @@ func TestStartPersistsAndReportsRunMode(t *testing.T) {
 	}
 	if status.Mode != agent.RunModeOneshot {
 		t.Fatalf("status mode = %q, want %q", status.Mode, agent.RunModeOneshot)
+	}
+	if status.Dir != workingDir {
+		t.Fatalf("status dir = %q, want %q", status.Dir, workingDir)
 	}
 
 	rows, err := manager.Replay(status.AgentID)
@@ -1249,6 +1254,9 @@ func TestStartPersistsAndReportsRunMode(t *testing.T) {
 	}
 	if metadata.Mode == nil || *metadata.Mode != agent.RunModeOneshot {
 		t.Fatalf("creation mode = %v, want %q", metadata.Mode, agent.RunModeOneshot)
+	}
+	if metadata.Dir != "" || metadata.WorkingDir != "" {
+		t.Fatalf("public creation metadata exposed working directory: %+v", metadata)
 	}
 }
 

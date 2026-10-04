@@ -724,7 +724,88 @@ cell 的 `term.Snapshot` 当作可恢复状态。完整 x/vt checkpoint 与 offs
 selector 元数据索引由 [Issue #35](https://github.com/Duang777/drove/issues/35)
 继续跟踪。
 
-## 12. 原生恢复与进程组停止
+## 12. CLI attach 与 Web 终端验收
+
+Issue #20 在现有 WebSocket v2 和 recording API 上增加了两个客户端：
+
+- `drove attach <agent-id>` 把本地 TTY 接到 writable raw attachment。
+  `--read-only` 只消费远端字节。
+- Web 详情页持有 live xterm.js 终端、状态时间线和独立的 replay xterm.js 终端。
+
+Bubble Tea 多会话总览不在本批次中。后续工作由
+[Issue #41](https://github.com/Duang777/drove/issues/41) 跟踪。
+
+### 所有权与回放边界
+
+`internal/cliattach` 独占 raw mode、stdin 和 stdout pump、`SIGWINCH` 订阅与退出
+清理。Cobra 只解析 Agent ID 和 `--read-only`。Ctrl-C 原样发送给远端 agent；
+Ctrl-Q 只关闭本地 attachment。
+
+浏览器的 `TerminalSessionController` 独占两个 xterm.js 实例、WebSocket 双流游标、
+重连、输入、resize、seek、播放和释放。React 只通过 external store 读取状态，
+不持有 xterm.js 实例或传输游标。
+
+`SessionTape` 从 origin 保存连续的 output 和 resize 操作，并按事件 sequence 关联
+提交时间。只有 raw 记录和对应事件都存在时，exact frontier 才向前移动。重连可重复
+同一记录，但冲突记录、输出缺口和倒退时间会使录制冻结。
+
+浏览器内存录制的上限是 64 MiB。达到上限后，live 终端继续接收输出，但本地精确
+播放范围不再增长。`Frame` 和 `Snapshot` 都是不可恢复的预览，不能作为
+`SessionTape` 的起点。输出附件过期时，REST client 返回类型化
+`OutputExpiredError`，页面保留 timeline 并标出不可播放范围。
+
+### CLI、审计与清理验收
+
+2026-10-04 的真实 Claude Code 会话完成了以下检查：
+
+- writable attach 先发送 37x103 viewport，再提交 44x112 resize。read-only attach
+  不发送 viewport、resize 或输入。
+- Ctrl-C 产生一份 `{"version":1,"bytes":1}` 输入审计。Ctrl-Q 以状态 0 退出，
+  数据库中没有对应输入。
+- 三次 writable attach 和一次 read-only attach 各产生一对 `attached` 与
+  `detached`。没有重复 detach。
+- `agent.attachment` payload 只含 version、action 和 access。数据库与 WAL 不含
+  attachment ID、客户端身份、cookie、控制 token 或 screen marker。
+- 会话保存了 23 个 `output.chunk`，共 12,888 字节。raw replay 与 live 输出使用
+  相同的已提交字节。
+- 本地 detach 后 Claude 继续运行。daemon 关闭后只提交一次 `idle -> stopped`，
+  子进程、listener 和 Unix socket 都被清理。
+
+直接 pseudo-terminal 测试用 `term.State` 深比较确认所有退出路径恢复原状态。
+macOS 真实控制终端的 `stty` 对比只有内核维护的 `PENDIN` 位不同；输入模式、输出
+模式、控制字符和其余本地标志恢复。stream EOF、context cancellation 和 pump 错误
+都能取消阻塞的 stdin read，并且只执行一次资源清理。
+
+### Web 与工作目录验收
+
+新会话在启动边界把 `--dir` 解析为绝对路径，并把它写入 version 2 creation 的私有
+`working_dir` metadata。恢复投影和 REST status 保留该路径。旧 creation 事件没有
+工作目录时，详情页明确显示工作目录不可用。
+
+浏览器使用真实 daemon 和 PTY 验证了 live output、输入、durable resize、断线重连、
+seek、播放和返回 live。桌面、375 px 和 320 px 视口都没有页面级横向溢出。长工作
+目录在紧凑 header 中省略显示，并通过 `title` 保留完整路径。宽 replay 终端只在自身
+viewport 内滚动。
+
+验收截图使用同一真实会话。桌面视口是 1440x1000，移动视口是 320x900：
+
+![桌面端实时终端与回放控制](assets/terminal-playback-desktop.png)
+
+![320px 移动端实时终端与回放控制](assets/terminal-playback-mobile.png)
+
+单元测试还覆盖以下边界：
+
+- REST 和 WebSocket 响应从 `unknown` 开始严格解码，sequence 和 offset 进入领域层
+  后使用 `bigint`。
+- writable 输入只在 raw stream 发出 `caught_up` 后启用。
+- 只有已经应用到 xterm.js 的消息才能推进本地 cursor。
+- 新 seek 会取消旧 frame 请求和回放构建，dispose 会使旧回调失效。
+- xterm.js 先收到 durable resize 记录，再改变 live 终端尺寸。
+
+大型录制仍需要从 origin 在服务端重建 exact frame。50 MiB 冷回放的 checkpoint
+优化继续由 [Issue #35](https://github.com/Duang777/drove/issues/35) 跟踪。
+
+## 13. 原生恢复与进程组停止
 
 Claude `session_id` 与 Codex `session_id` / `thread_id` 被归一为一个最多 256
 字节的私有 vendor reference。它只在 `agent.signal` 已写入 SQLite 后更新

@@ -31,6 +31,7 @@ type Status struct {
 	AgentID               string                      `json:"agent_id"`
 	Name                  string                      `json:"name"`
 	Vendor                string                      `json:"vendor"`
+	Dir                   string                      `json:"dir,omitempty"`
 	Mode                  agent.RunMode               `json:"mode"`
 	State                 agent.State                 `json:"state"`
 	PID                   int                         `json:"pid,omitempty"`
@@ -68,6 +69,7 @@ type createdPayload struct {
 	Version               int                          `json:"version"`
 	Name                  string                       `json:"name"`
 	Vendor                string                       `json:"vendor"`
+	Dir                   string                       `json:"dir,omitempty"`
 	Mode                  *agent.RunMode               `json:"mode,omitempty"`
 	HookPolicy            *agent.HookPolicy            `json:"hook_policy,omitempty"`
 	SignalInjection       *agent.SignalInjectionMode   `json:"signal_injection,omitempty"`
@@ -354,6 +356,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	a := agent.New(id,
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
+		agent.WithWorkingDir(req.Dir),
 		agent.WithRunMode(req.Mode),
 		agent.WithHookPolicy(req.Hooks),
 		agent.WithSignalInjection(
@@ -940,6 +943,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		AgentID:        string(a.ID()),
 		Name:           a.Name(),
 		Vendor:         a.Vendor(),
+		Dir:            a.WorkingDir(),
 		Mode:           a.RunMode(),
 		State:          state,
 		CreatedAt:      a.CreatedAt(),

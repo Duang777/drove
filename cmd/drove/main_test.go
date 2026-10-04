@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
+	"github.com/Duang777/drove/internal/cliattach"
+	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
@@ -155,6 +158,67 @@ func TestSendCommandIsRegisteredWithStdinFlag(t *testing.T) {
 	flag := command.Flags().Lookup("stdin")
 	if flag == nil || flag.DefValue != "false" {
 		t.Fatalf("stdin flag = %+v, want default false", flag)
+	}
+}
+
+func TestAttachCommandIsRegisteredWithReadOnlyFlag(t *testing.T) {
+	command, _, err := newRootCmd().Find([]string{"attach"})
+	if err != nil {
+		t.Fatalf("find attach command: %v", err)
+	}
+	if command.Name() != "attach" {
+		t.Fatalf("command = %q, want attach", command.Name())
+	}
+	flag := command.Flags().Lookup("read-only")
+	if flag == nil || flag.DefValue != "false" {
+		t.Fatalf("read-only flag = %+v, want default false", flag)
+	}
+}
+
+func TestAttachCommandMapsAgentAndAccessToRunner(t *testing.T) {
+	daemon := &client.Client{}
+	var (
+		factoryContext context.Context
+		runContext     context.Context
+		runClient      *client.Client
+		runAgentID     string
+		runOptions     cliattach.Options
+	)
+	command := newAttachCmdWith(
+		func(ctx context.Context) (*client.Client, error) {
+			factoryContext = ctx
+			return daemon, nil
+		},
+		func(
+			ctx context.Context,
+			gotClient *client.Client,
+			agentID string,
+			options cliattach.Options,
+		) error {
+			runContext = ctx
+			runClient = gotClient
+			runAgentID = agentID
+			runOptions = options
+			return nil
+		},
+	)
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("test"), "attach")
+	command.SetContext(ctx)
+	command.SetArgs([]string{"agent-1", "--read-only"})
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute attach: %v", err)
+	}
+	if factoryContext != ctx || runContext != ctx {
+		t.Fatal("attach command did not preserve its context")
+	}
+	if runClient != daemon || runAgentID != "agent-1" || !runOptions.ReadOnly {
+		t.Fatalf(
+			"runner args client=%p agent=%q options=%+v",
+			runClient,
+			runAgentID,
+			runOptions,
+		)
 	}
 }
 

@@ -26,6 +26,16 @@ const (
 	AttachmentWritable AttachmentMode = "writable"
 )
 
+// AttachmentPurpose distinguishes internal recording readers from users.
+type AttachmentPurpose string
+
+const (
+	// AttachmentPurposeRecording is an unaudited internal recording reader.
+	AttachmentPurposeRecording AttachmentPurpose = "recording"
+	// AttachmentPurposeUser is an audited user-visible terminal attachment.
+	AttachmentPurposeUser AttachmentPurpose = "user"
+)
+
 var (
 	// ErrAttachmentClosed reports an operation on a detached terminal handle.
 	ErrAttachmentClosed = errors.New("session: terminal attachment closed")
@@ -37,17 +47,34 @@ var (
 
 // AttachmentOptions configures a live terminal attachment.
 type AttachmentOptions struct {
+	Purpose AttachmentPurpose
 	Mode    AttachmentMode
 	Rows    int
 	Columns int
 }
 
 type attachmentConfig struct {
+	purpose  AttachmentPurpose
 	mode     AttachmentMode
 	viewport term.Size
 }
 
 func (o AttachmentOptions) validate() (attachmentConfig, error) {
+	switch o.Purpose {
+	case AttachmentPurposeRecording:
+		if o.Mode != AttachmentReadOnly {
+			return attachmentConfig{}, errors.New(
+				"session: recording attachment must be read-only",
+			)
+		}
+	case AttachmentPurposeUser:
+	default:
+		return attachmentConfig{}, fmt.Errorf(
+			"session: invalid attachment purpose %q",
+			o.Purpose,
+		)
+	}
+
 	switch o.Mode {
 	case AttachmentReadOnly:
 		if o.Rows != 0 || o.Columns != 0 {
@@ -55,7 +82,7 @@ func (o AttachmentOptions) validate() (attachmentConfig, error) {
 				"session: read-only attachment cannot propose a terminal size",
 			)
 		}
-		return attachmentConfig{mode: o.Mode}, nil
+		return attachmentConfig{purpose: o.Purpose, mode: o.Mode}, nil
 	case AttachmentWritable:
 	default:
 		return attachmentConfig{}, fmt.Errorf(
@@ -65,7 +92,7 @@ func (o AttachmentOptions) validate() (attachmentConfig, error) {
 	}
 
 	if o.Rows == 0 && o.Columns == 0 {
-		return attachmentConfig{mode: o.Mode}, nil
+		return attachmentConfig{purpose: o.Purpose, mode: o.Mode}, nil
 	}
 	viewport, err := term.NewSize(o.Rows, o.Columns)
 	if err != nil {
@@ -74,10 +101,15 @@ func (o AttachmentOptions) validate() (attachmentConfig, error) {
 			err,
 		)
 	}
-	return attachmentConfig{mode: o.Mode, viewport: viewport}, nil
+	return attachmentConfig{
+		purpose:  o.Purpose,
+		mode:     o.Mode,
+		viewport: viewport,
+	}, nil
 }
 
 type attachmentState struct {
+	purpose   AttachmentPurpose
 	mode      AttachmentMode
 	proposed  term.Size
 	ticket    uint64
@@ -230,6 +262,7 @@ func (p *outputProcessor) attach(
 		proposed = state.effectiveSize
 	}
 	attachment := &attachmentState{
+		purpose:  config.purpose,
 		mode:     config.mode,
 		proposed: proposed,
 		ticket:   p.nextTicket(state),
@@ -241,6 +274,22 @@ func (p *outputProcessor) attach(
 		state.owner = id
 	}
 	state.attachments[id] = attachment
+	if config.purpose == AttachmentPurposeUser {
+		if err := p.commitAttachmentAudit(
+			state,
+			event.AttachmentAttached,
+			config.mode,
+		); err != nil {
+			cleanupErr := p.removeAttachment(state, id)
+			auditErr := fmt.Errorf(
+				"session: commit attached audit for agent %q: %w",
+				p.id,
+				err,
+			)
+			p.manager.committer.Fail(auditErr)
+			return errors.Join(auditErr, cleanupErr)
+		}
+	}
 	return nil
 }
 
@@ -274,14 +323,44 @@ func (p *outputProcessor) detach(
 	if !ok {
 		return nil
 	}
+	localErr := p.removeAttachment(state, id)
+	if attachment.purpose != AttachmentPurposeUser {
+		return localErr
+	}
+	auditErr := p.commitAttachmentAudit(
+		state,
+		event.AttachmentDetached,
+		attachment.mode,
+	)
+	if auditErr != nil {
+		auditErr = fmt.Errorf(
+			"session: commit detached audit for agent %q: %w",
+			p.id,
+			auditErr,
+		)
+		p.manager.committer.Fail(auditErr)
+	}
+	return errors.Join(localErr, auditErr)
+}
+
+func (p *outputProcessor) removeAttachment(
+	state *outputProcessorState,
+	id AttachmentID,
+) error {
+	attachment, ok := state.attachments[id]
+	if !ok {
+		return nil
+	}
 	delete(state.attachments, id)
 	if attachment.snapshots != nil {
 		close(attachment.snapshots)
 	}
-	if state.owner != id {
+	defer func() {
 		if !p.hasSnapshotWatches(state) {
 			p.stopSnapshotTimer(state)
 		}
+	}()
+	if state.owner != id {
 		return nil
 	}
 
@@ -303,18 +382,55 @@ func (p *outputProcessor) detach(
 			return err
 		}
 	}
-	if !p.hasSnapshotWatches(state) {
-		p.stopSnapshotTimer(state)
-	}
 	return nil
 }
 
-func (p *outputProcessor) detachAll(state *outputProcessorState) {
+func (p *outputProcessor) detachAll(state *outputProcessorState) error {
 	state.acceptingAttachments = false
 	state.owner = ""
 	p.stopSnapshotTimer(state)
 	p.closeSnapshotWatches(state)
+
+	drafts := make([]event.Draft, 0, len(state.attachments))
+	var draftErrors []error
+	for _, attachment := range state.attachments {
+		if attachment.purpose != AttachmentPurposeUser {
+			continue
+		}
+		draft, err := attachmentAuditDraft(
+			p.id,
+			event.AttachmentDetached,
+			attachment.mode,
+		)
+		if err != nil {
+			draftErrors = append(draftErrors, err)
+			continue
+		}
+		drafts = append(drafts, draft)
+	}
 	state.attachments = make(map[AttachmentID]*attachmentState)
+	if err := errors.Join(draftErrors...); err != nil {
+		p.manager.committer.Fail(err)
+		return err
+	}
+	if len(drafts) == 0 {
+		return nil
+	}
+	receipt, err := p.manager.committer.CommitEvents(
+		context.Background(),
+		drafts,
+	)
+	if err != nil {
+		auditErr := fmt.Errorf(
+			"session: commit forced detach audits for agent %q: %w",
+			p.id,
+			err,
+		)
+		p.manager.committer.Fail(auditErr)
+		return auditErr
+	}
+	state.lastSeq = receipt.LastSeq
+	return nil
 }
 
 func (p *outputProcessor) sendAttachedInput(
@@ -394,4 +510,49 @@ func (p *outputProcessor) attachedInputAvailable() error {
 func (p *outputProcessor) nextTicket(state *outputProcessorState) uint64 {
 	state.nextActivityTicket++
 	return state.nextActivityTicket
+}
+
+func (p *outputProcessor) commitAttachmentAudit(
+	state *outputProcessorState,
+	action event.AttachmentAction,
+	mode AttachmentMode,
+) error {
+	draft, err := attachmentAuditDraft(p.id, action, mode)
+	if err != nil {
+		return err
+	}
+	receipt, err := p.manager.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{draft},
+	)
+	if err != nil {
+		return err
+	}
+	state.lastSeq = receipt.LastSeq
+	return nil
+}
+
+func attachmentAuditDraft(
+	id agent.ID,
+	action event.AttachmentAction,
+	mode AttachmentMode,
+) (event.Draft, error) {
+	var access event.AttachmentAccess
+	switch mode {
+	case AttachmentReadOnly:
+		access = event.AttachmentReadOnly
+	case AttachmentWritable:
+		access = event.AttachmentReadWrite
+	default:
+		return event.Draft{}, fmt.Errorf(
+			"session: invalid attachment audit mode %q",
+			mode,
+		)
+	}
+	return event.NewAgentAttachmentDraft(
+		string(id),
+		string(id),
+		action,
+		access,
+	)
 }

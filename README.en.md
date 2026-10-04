@@ -20,7 +20,11 @@
 
 Drove is a local daemon and CLI. It starts Claude Code, Codex, or any executable in a real PTY, appends terminal bytes to SQLite, and reports one shared set of states.
 
-The recorder works today: `drove log` replays bytes, and `drove timeline` shows state spans and Blocked jump points. The tower grid, scrubbable playback UI, push notifications, and phone approval are tracked by [Epic #31](https://github.com/Duang777/drove/issues/31) and have no UI yet. There is no release build and no TUI.
+The recorder and single-session controls work today. `drove attach` connects to
+the live terminal. The Web detail page shows a live xterm.js terminal and exact
+time-based playback. The tower grid, push notifications, and phone approval
+remain in [Epic #31](https://github.com/Duang777/drove/issues/31). There are no
+release binaries or multi-session TUI.
 
 ## Status
 
@@ -33,22 +37,23 @@ The recorder works today: `drove log` replays bytes, and `drove timeline` shows 
 | Capability | Status | Where |
 | --- | --- | --- |
 | One PTY per agent, owned by `droved` | Shipped | `internal/pty` |
-| `init` `up` `resume` `ps` `log` `timeline` `explain` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
+| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
 | Per-session Claude / Codex signal injection | Shipped | [#15](https://github.com/Duang777/drove/issues/15) |
 | Terminal byte recording, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` byte replay, `--plain` strips control sequences | Shipped | |
 | Unix local control, Host / Origin checks, cookie login, and token rotation | Shipped | [#21](https://github.com/Duang777/drove/issues/21) |
 | WebSocket v1 events and v2 per-session terminal streams, input, and resize | Shipped | [#19](https://github.com/Duang777/drove/issues/19) |
-| Web skeleton: list, start, stop, live events | Shipped | `web/` |
+| Web console: list, start, stop, live events, live terminal, exact playback | Shipped | `web/` |
 | Terminal emulation, query replies, screen rules, and `drove explain` | Shipped | [#14](https://github.com/Duang777/drove/issues/14), [spec 010](specs/010-terminal-screen-detection/spec.md) |
 | Codex approval-only OSC 9 Blocked candidate | Shipped | [#40](https://github.com/Duang777/drove/issues/40), [spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | State timeline, Blocked jumps, and exact terminal frames | Shipped | [#25](https://github.com/Duang777/drove/issues/25) |
+| `drove attach` and the Web xterm.js single-session terminal | Shipped | [#20](https://github.com/Duang777/drove/issues/20), [spec 012](specs/012-terminal-attach-web-playback/spec.md) |
+| Bubble Tea multi-session overview | Planned | [#41](https://github.com/Duang777/drove/issues/41) |
 | Control-tower grid | Planned | [#26](https://github.com/Duang777/drove/issues/26) |
 | Push notifications | Planned | [#27](https://github.com/Duang777/drove/issues/27) |
 | Approve, deny, or reply from a phone | Planned | [#28](https://github.com/Duang777/drove/issues/28) |
 | Native resume, and process-group SIGTERM with a grace period before SIGKILL | Shipped | [#16](https://github.com/Duang777/drove/issues/16) |
 | Agent processes that survive daemon exit | Planned | [#17](https://github.com/Duang777/drove/issues/17), [#18](https://github.com/Duang777/drove/issues/18) |
-| `drove attach`, a terminal UI, xterm.js | Planned | [#20](https://github.com/Duang777/drove/issues/20) |
 | Away brief, cross-session search, git worktree | Planned | [#29](https://github.com/Duang777/drove/issues/29), [#30](https://github.com/Duang777/drove/issues/30), [#23](https://github.com/Duang777/drove/issues/23) |
 
 ## Architecture
@@ -76,6 +81,7 @@ drove init
 drove up /bin/cat --name demo
 drove ps
 drove send <agent-id> 'hello'
+drove attach <agent-id>
 drove log <agent-id>
 drove log <agent-id> --plain
 drove timeline <agent-id>
@@ -107,6 +113,7 @@ drove up claude --hooks required
 | `drove log <agent-id> --plain` | Strip control sequences with a streaming filter |
 | `drove timeline <agent-id>` | Print state spans, output retention, and one-based Blocked jump points. `--json` prints the full response |
 | `drove explain <agent-id>` | Print recent state decisions and the ephemeral bounded screen for an attached session |
+| `drove attach <agent-id>` | Connect to the live raw terminal. Ctrl-Q only disconnects locally. `--read-only` sends no input or resize |
 | `drove send <agent-id> <text>` | Send that line plus a newline. Prints the byte count |
 | `drove send <agent-id> --stdin` | Read stdin as-is, with no added newline |
 | `drove stop <agent-id>` | Stop that session |
@@ -116,6 +123,9 @@ drove up claude --hooks required
 | `drove version` | Print the version. `make build` fills it from `git describe`. Commit and build time stay `unknown` unless those ldflags are set |
 
 Flags on `drove up`: `--name`, `--dir`, `--oneshot`, `--hooks off|auto|required`.
+`drove attach` requires a terminal on stdin and enters raw mode while connected.
+Ctrl-C reaches the remote agent unchanged. Every exit path restores the local
+terminal. A local disconnect does not stop the agent.
 
 `drove send` accepts valid UTF-8 only, at most 64 KiB. The audit event stores the byte count, not the text. One `drove hook` JSON document is limited to 1 MiB. The hook command does not read the control token and does not start the daemon.
 
@@ -164,6 +174,10 @@ most one frame every 500 ms, and a newer frame replaces an unread frame.
 Snapshots carry `restorable:false`, stay out of the Hub and SQLite, and cannot
 start an exact replay.
 
+Both `drove attach` and the Web detail page use this protocol. The Bubble Tea
+multi-session overview is tracked by
+[#41](https://github.com/Duang777/drove/issues/41).
+
 ### Per-session injection
 
 By default Drove only changes the process it starts. It does not edit `~/.claude`, `~/.codex`, or project config, and it does not accept workspace trust or hook trust for you.
@@ -184,8 +198,9 @@ retention ranges, and Blocked occurrences from event envelopes.
 `GET /api/v1/agents/{id}/timeline/blocked/{number}` returns one Blocked span and a
 jump cursor with a 30-second lead-in. `GET /api/v1/agents/{id}/frame` requires
 exactly one of `seq`, `at`, or `offset`, then replays output and resize records
-from the 40x120 origin. The CLI exposes the timeline but leaves terminal
-playback to #20.
+from the 40x120 origin. The CLI exposes the timeline. The Web detail page uses
+frames for seek previews and builds exact playback terminals from the origin
+prefix held by the browser.
 
 Raw output is kept for 30 days by default. `0` keeps it indefinitely. Cleanup deletes byte attachments only. Sequence numbers, timestamps, offsets, and lengths stay. Cleanup enables SQLite `secure_delete` and truncates the WAL. It does not run `VACUUM`, so allocated database space may not shrink.
 
@@ -193,7 +208,9 @@ After attachment expiry, the timeline remains available and reports the
 missing ranges. A frame that needs missing bytes returns HTTP 410 with
 `output_expired` and the exact ranges. Exact frames use a 64-entry in-memory
 LRU that expires with the Store retention generation. A 50 MiB cold replay is
-still far above the 300 ms target. See the
+still far above the 300 ms target. The browser keeps only one contiguous
+recording from the origin in memory. At the 64 MiB local limit, live output
+continues, but the exact local playback range stops growing. See the
 [technical notes](docs/technical-notes.md#11-terminal-stream-and-replay) and
 [#35](https://github.com/Duang777/drove/issues/35).
 
@@ -291,8 +308,13 @@ drove web
 The page exchanges the code for an HttpOnly, SameSite=Strict cookie and clears
 the fragment. Browser JavaScript never reads `control.token`.
 
-The Vite development server still proxies `/api` and `/ws` to `api_bind` and
-adds a Bearer token from `control.token`. Start the daemon first:
+The page lists, starts, and stops sessions. A selected session shows its name,
+state, working directory, connection state, live xterm.js terminal, and state
+timeline. Writable input stays disabled until the raw stream reaches the
+durable head.
+
+The Vite development server proxies `/api` and `/ws` to `api_bind` and adds a
+Bearer token from `control.token`. Start the daemon first:
 
 ```bash
 drove ps
@@ -301,26 +323,26 @@ npm install
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The page can list, start, and stop sessions, and
-it shows the WebSocket event stream. The repository includes a strict
-`drove.v2` browser client, but the page does not use it yet. An `output.chunk`
-row shows its offset and length, not a terminal. Replay bytes with `drove log`.
+Open `http://127.0.0.1:5173`. The detail page supports seek previews, exact
+seek, play, pause, playback speed, Blocked jumps, and return to live. If output
+has expired or the browser reaches its local limit, the page marks the
+available playback range.
 
 `npm run build` updates `internal/webui/dist/`. Commit the generated assets
 with the frontend source so a clean checkout builds with only the Go toolchain.
 
-A live terminal, scrubbable replay, and the tower grid are [#20](https://github.com/Duang777/drove/issues/20) and [#26](https://github.com/Duang777/drove/issues/26). The approved direction for #20 is web first.
+The tower grid is tracked by [#26](https://github.com/Duang777/drove/issues/26).
 
 ## Roadmap
 
 The approved MVP is [Epic #31, flight recorder + control tower](https://github.com/Duang777/drove/issues/31).
 
-The screen model, WebSocket terminal stream, replay timeline, and control-plane
-hardening are complete.
+The screen model, WebSocket terminal stream, single-session interaction and
+playback, and control-plane hardening are complete.
 The next items are:
 
-1. [#20](https://github.com/Duang777/drove/issues/20) web live terminal and replay
-2. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
+1. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
+2. [#41](https://github.com/Duang777/drove/issues/41) Bubble Tea multi-session overview
 3. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
 4. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
 
@@ -344,6 +366,8 @@ This is a single-user control plane on the local machine.
 - `/signal` accepts only loopback and that session's token. It does not accept the control-plane token.
 - Any process running as the same OS user can read the token file. The token does not defend against other local processes, or against the agent itself.
 - Input audit does not store the text. Raw output may contain source and secrets; attachments are deleted after the default 30 days.
+- `agent.attachment` stores only the attached or detached action and the
+  writable or read-only access. It stores no attachment ID or client identity.
 - Signal tokens in the output stream are redacted with an equal-length replacement.
 - Fully injected Codex OSC 9 retains only fixed approval classification prefixes. Free-form text is redacted before Store, Hub, replay, and raw tail.
 - There is no auto-approve. Phone approval is [#28](https://github.com/Duang777/drove/issues/28), and the default there is still not automatic approval.
@@ -361,7 +385,8 @@ The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-st
 | [spec 009](specs/009-raw-output-chunks/spec.md) | Raw bytes and retention |
 | [spec 010](specs/010-terminal-screen-detection/spec.md) | Screen detection, query replies, and explain |
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | Terminal streams, cursors, timeline, and exact frames |
-| [spec 012](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 detection and body redaction |
+| [spec 012, terminal attach](specs/012-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
+| [spec 012, Codex OSC 9](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 detection and body redaction |
 | [Technical notes](docs/technical-notes.md) | A point-in-time reading. Its opening says the first six sections are not current `main` |
 | [AGENTS.md](AGENTS.md) | Directory responsibilities and engineering constraints |
 
