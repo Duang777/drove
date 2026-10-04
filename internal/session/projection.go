@@ -40,6 +40,7 @@ type sessionDraft struct {
 	id                     string
 	name                   string
 	vendor                 string
+	workingDir             string
 	runMode                agent.RunMode
 	hookPolicy             agent.HookPolicy
 	signalInjection        agent.SignalInjectionMode
@@ -227,6 +228,7 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 
 	draft.name = metadata.Name
 	draft.vendor = metadata.Vendor
+	draft.workingDir = metadata.Dir
 	draft.state = agent.StatePending
 	draft.updatedAt = row.Timestamp
 	draft.hasCreated = true
@@ -553,6 +555,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			ID:              agent.ID(draft.id),
 			Name:            draft.name,
 			Vendor:          draft.vendor,
+			WorkingDir:      draft.workingDir,
 			RunMode:         draft.runMode,
 			HookPolicy:      draft.hookPolicy,
 			SignalInjection: draft.signalInjection,

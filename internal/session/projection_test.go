@@ -1176,6 +1176,38 @@ func TestRecoveryProjectorRestoresPersistedRunMode(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorRestoresPersistedWorkingDirectory(t *testing.T) {
+	base := time.Date(2026, time.October, 3, 4, 5, 6, 7, time.UTC)
+	projector := newRecoveryProjector()
+	if err := projector.Apply(store.EventRow{
+		Seq:       1,
+		Timestamp: base,
+		Type:      string(event.TypeSessionLifecycle),
+		SessionID: "agent-1",
+		AgentID:   "agent-1",
+		Reason:    "created",
+		Payload: `{
+			"version": 2,
+			"name": "agent",
+			"vendor": "generic",
+			"dir": "/workspace/api",
+			"mode": "interactive",
+			"hook_policy": "off"
+		}`,
+	}); err != nil {
+		t.Fatalf("apply creation: %v", err)
+	}
+
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if len(plan.Snapshots) != 1 ||
+		plan.Snapshots[0].WorkingDir != "/workspace/api" {
+		t.Fatalf("snapshots = %+v, want persisted working directory", plan.Snapshots)
+	}
+}
+
 func TestCreationMetadataRemainsReadableByOldVersionTwoDecoder(t *testing.T) {
 	mode := agent.RunModeInteractive
 	policy := agent.HooksAuto
@@ -1186,6 +1218,7 @@ func TestCreationMetadataRemainsReadableByOldVersionTwoDecoder(t *testing.T) {
 		Version:               2,
 		Name:                  "agent",
 		Vendor:                "claude",
+		Dir:                   "/workspace/api",
 		Mode:                  &mode,
 		HookPolicy:            &policy,
 		SignalInjection:       &injection,

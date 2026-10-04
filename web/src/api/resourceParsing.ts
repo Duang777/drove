@@ -49,6 +49,7 @@ export function parseAgentStatus(
       'signal_injection_reason',
     ],
     [
+      'dir',
       'pid',
       'last_error',
       'last_transition',
@@ -62,6 +63,10 @@ export function parseAgentStatus(
     object.last_transition === undefined
       ? undefined
       : parseStateEvidence(object.last_transition, `${name}.last_transition`)
+  const dir =
+    object.dir === undefined
+      ? undefined
+      : requireString(object.dir, `${name}.dir`)
   return {
     agent_id: requireString(object.agent_id, `${name}.agent_id`),
     name: requireString(object.name, `${name}.name`),
@@ -84,6 +89,7 @@ export function parseAgentStatus(
       object.signal_injection_reason,
       `${name}.signal_injection_reason`,
     ),
+    ...(dir === undefined ? {} : { dir }),
     ...(pid === undefined ? {} : { pid }),
     ...(object.last_error === undefined
       ? {}

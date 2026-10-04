@@ -113,11 +113,15 @@ func TestHandleCreateRejectsInvalidModeWithoutHistory(t *testing.T) {
 
 func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 	server, _, _ := newTestServer(t)
+	workingDir := t.TempDir()
 
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/agents",
-		strings.NewReader(`{"vendor":"generic","name":"api-agent","command":"/bin/cat","mode":"oneshot"}`),
+		strings.NewReader(fmt.Sprintf(
+			`{"vendor":"generic","name":"api-agent","command":"/bin/cat","dir":%q,"mode":"oneshot"}`,
+			workingDir,
+		)),
 	)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -130,7 +134,9 @@ func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&status); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if status.Mode != agent.RunModeOneshot || status.PID <= 0 {
+	if status.Mode != agent.RunModeOneshot ||
+		status.Dir != workingDir ||
+		status.PID <= 0 {
 		t.Fatalf("status = %+v, want live oneshot session", status)
 	}
 }

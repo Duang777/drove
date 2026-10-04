@@ -510,6 +510,23 @@ code,
   color: inherit;
 }
 
+.agent-detail-identity .agent-detail-directory {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.agent-detail-directory svg {
+  flex: none;
+}
+
+.agent-detail-directory code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agent-detail-status {
   display: flex;
   align-items: center;

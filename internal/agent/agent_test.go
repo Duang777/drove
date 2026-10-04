@@ -64,14 +64,15 @@ func TestRestoreBuildsSnapshotAndSupportsPlannedTransition(t *testing.T) {
 	updatedAt := createdAt.Add(2 * time.Minute)
 
 	a, err := Restore(RestoreSnapshot{
-		ID:        "agent-1",
-		Name:      "build-api",
-		Vendor:    "generic",
-		RunMode:   RunModeOneshot,
-		State:     StateWorking,
-		LastError: "previous warning",
-		CreatedAt: createdAt,
-		UpdatedAt: updatedAt,
+		ID:         "agent-1",
+		Name:       "build-api",
+		Vendor:     "generic",
+		WorkingDir: "/workspace/api",
+		RunMode:    RunModeOneshot,
+		State:      StateWorking,
+		LastError:  "previous warning",
+		CreatedAt:  createdAt,
+		UpdatedAt:  updatedAt,
 	})
 	if err != nil {
 		t.Fatalf("restore: %v", err)
@@ -79,6 +80,7 @@ func TestRestoreBuildsSnapshotAndSupportsPlannedTransition(t *testing.T) {
 	if a.ID() != "agent-1" ||
 		a.Name() != "build-api" ||
 		a.Vendor() != "generic" ||
+		a.WorkingDir() != "/workspace/api" ||
 		a.RunMode() != RunModeOneshot ||
 		a.State() != StateWorking ||
 		a.LastError() != "previous warning" ||

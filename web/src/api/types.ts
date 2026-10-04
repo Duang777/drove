@@ -85,6 +85,7 @@ export interface AgentStatus {
   agent_id: string
   name: string
   vendor: string
+  dir?: string
   mode: RunMode
   state: AgentState
   pid?: number

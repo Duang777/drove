@@ -432,6 +432,7 @@ type Agent struct {
 	id              ID
 	name            string
 	vendor          string // 适配器厂商标识，如 "claude" / "codex" / "generic"
+	workingDir      string
 	runMode         RunMode
 	hookPolicy      HookPolicy
 	signalInjection SignalInjectionMode
@@ -454,6 +455,7 @@ type RestoreSnapshot struct {
 	ID              ID
 	Name            string
 	Vendor          string
+	WorkingDir      string
 	RunMode         RunMode
 	HookPolicy      HookPolicy
 	SignalInjection SignalInjectionMode
@@ -474,6 +476,11 @@ func WithName(name string) Option {
 // WithVendor 设置厂商标识。
 func WithVendor(vendor string) Option {
 	return func(a *Agent) { a.vendor = vendor }
+}
+
+// WithWorkingDir sets the immutable process working directory.
+func WithWorkingDir(dir string) Option {
+	return func(a *Agent) { a.workingDir = dir }
 }
 
 // WithRunMode 设置 agent 运行模式。
@@ -538,6 +545,7 @@ func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
 		id:              snapshot.ID,
 		name:            snapshot.Name,
 		vendor:          snapshot.Vendor,
+		workingDir:      snapshot.WorkingDir,
 		runMode:         snapshot.RunMode,
 		hookPolicy:      hookPolicy,
 		signalInjection: signalInjection,
@@ -634,6 +642,13 @@ func (a *Agent) Vendor() string {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.vendor
+}
+
+// WorkingDir returns the immutable process working directory.
+func (a *Agent) WorkingDir() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.workingDir
 }
 
 // RunMode 返回 agent 的运行模式。

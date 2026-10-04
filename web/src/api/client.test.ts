@@ -131,6 +131,7 @@ describe('terminal REST parsing', () => {
             agent_id: 'agent-1',
             name: 'worker',
             vendor: 'generic',
+            dir: '/workspace/drove',
             mode: 'interactive',
             state: 'blocked',
             created_at: '2026-10-04T12:00:00Z',
@@ -161,6 +162,7 @@ describe('terminal REST parsing', () => {
     await expect(listAgents()).resolves.toMatchObject([
       {
         agent_id: 'agent-1',
+        dir: '/workspace/drove',
         hook_policy: 'auto',
         signal_injection_reason: 'unsupported',
         last_transition: {

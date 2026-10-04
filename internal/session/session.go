@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -28,6 +29,7 @@ type Status struct {
 	AgentID               string                      `json:"agent_id"`
 	Name                  string                      `json:"name"`
 	Vendor                string                      `json:"vendor"`
+	Dir                   string                      `json:"dir,omitempty"`
 	Mode                  agent.RunMode               `json:"mode"`
 	State                 agent.State                 `json:"state"`
 	PID                   int                         `json:"pid,omitempty"`
@@ -64,6 +66,7 @@ type createdPayload struct {
 	Version               int                          `json:"version"`
 	Name                  string                       `json:"name"`
 	Vendor                string                       `json:"vendor"`
+	Dir                   string                       `json:"dir,omitempty"`
 	Mode                  *agent.RunMode               `json:"mode,omitempty"`
 	HookPolicy            *agent.HookPolicy            `json:"hook_policy,omitempty"`
 	SignalInjection       *agent.SignalInjectionMode   `json:"signal_injection,omitempty"`
@@ -278,6 +281,10 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	if cmdName == "" {
 		return nil, errors.New("session: generic vendor requires explicit command")
 	}
+	req.Dir, err = filepath.Abs(req.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("session: resolve working directory: %w", err)
+	}
 	terminalSize, err := initialTerminalSize()
 	if err != nil {
 		return nil, fmt.Errorf("session: initial terminal size: %w", err)
@@ -307,6 +314,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	a := agent.New(id,
 		agent.WithName(req.Name),
 		agent.WithVendor(req.Vendor),
+		agent.WithWorkingDir(req.Dir),
 		agent.WithRunMode(req.Mode),
 		agent.WithHookPolicy(req.Hooks),
 		agent.WithSignalInjection(
@@ -324,6 +332,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		Version:               2,
 		Name:                  req.Name,
 		Vendor:                req.Vendor,
+		Dir:                   req.Dir,
 		Mode:                  &persistedMode,
 		HookPolicy:            &persistedPolicy,
 		SignalInjection:       &persistedInjection,
@@ -633,6 +642,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		AgentID:        string(a.ID()),
 		Name:           a.Name(),
 		Vendor:         a.Vendor(),
+		Dir:            a.WorkingDir(),
 		Mode:           a.RunMode(),
 		State:          a.State(),
 		CreatedAt:      a.CreatedAt(),

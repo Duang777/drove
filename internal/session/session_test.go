@@ -589,9 +589,22 @@ func TestStartPreservesFailedPTYStartupHistory(t *testing.T) {
 	if rows[0].Seq != 1 ||
 		rows[0].Type != string(event.TypeSessionLifecycle) ||
 		rows[0].Reason != "created" ||
-		rows[0].SessionID != rows[0].AgentID ||
-		rows[0].Payload != `{"version":2,"name":"broken-agent","vendor":"generic","mode":"interactive","hook_policy":"off","signal_injection":"off","signal_injection_status":"off","signal_injection_reason":"hook_policy_off"}` {
+		rows[0].SessionID != rows[0].AgentID {
 		t.Fatalf("creation event = %+v", rows[0])
+	}
+	var metadata createdPayload
+	if err := json.Unmarshal([]byte(rows[0].Payload), &metadata); err != nil {
+		t.Fatalf("decode creation event: %v", err)
+	}
+	if metadata.Version != 2 ||
+		metadata.Name != "broken-agent" ||
+		metadata.Vendor != "generic" ||
+		!filepath.IsAbs(metadata.Dir) ||
+		metadata.Mode == nil ||
+		*metadata.Mode != agent.RunModeInteractive ||
+		metadata.HookPolicy == nil ||
+		*metadata.HookPolicy != agent.HooksOff {
+		t.Fatalf("creation metadata = %+v", metadata)
 	}
 	if rows[1].Seq != 2 ||
 		rows[1].Type != string(event.TypeStateChanged) ||
@@ -680,17 +693,19 @@ func TestStartRejectsInvalidModeWithoutHistory(t *testing.T) {
 	}
 }
 
-func TestStartPersistsAndReportsRunMode(t *testing.T) {
+func TestStartPersistsAndReportsLaunchMetadata(t *testing.T) {
 	manager, _ := newTestManager(t)
 	t.Cleanup(func() {
 		if err := manager.Close(); err != nil {
 			t.Errorf("close manager: %v", err)
 		}
 	})
+	workingDir := t.TempDir()
 
 	status, err := manager.Start(context.Background(), StartRequest{
 		Name:    "mode-agent",
 		Command: "/bin/cat",
+		Dir:     workingDir,
 		Mode:    agent.RunModeOneshot,
 	})
 	if err != nil {
@@ -698,6 +713,9 @@ func TestStartPersistsAndReportsRunMode(t *testing.T) {
 	}
 	if status.Mode != agent.RunModeOneshot {
 		t.Fatalf("status mode = %q, want %q", status.Mode, agent.RunModeOneshot)
+	}
+	if status.Dir != workingDir {
+		t.Fatalf("status dir = %q, want %q", status.Dir, workingDir)
 	}
 
 	rows, err := manager.Replay(status.AgentID)
@@ -713,6 +731,9 @@ func TestStartPersistsAndReportsRunMode(t *testing.T) {
 	}
 	if metadata.Mode == nil || *metadata.Mode != agent.RunModeOneshot {
 		t.Fatalf("creation mode = %v, want %q", metadata.Mode, agent.RunModeOneshot)
+	}
+	if metadata.Dir != workingDir {
+		t.Fatalf("creation dir = %q, want %q", metadata.Dir, workingDir)
 	}
 }
 

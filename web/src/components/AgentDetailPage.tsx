@@ -1,4 +1,4 @@
-import { ArrowLeft } from 'lucide-react'
+import { ArrowLeft, FolderClosed } from 'lucide-react'
 import type { AgentStatus } from '../api/types'
 import {
   useAgentTerminal,
@@ -59,6 +59,13 @@ export function AgentDetailPage({
           <h2>{agent?.name ?? agentID.slice(0, 12)}</h2>
           <p>
             {agent?.vendor ?? 'agent'} · <code>{agentID}</code>
+          </p>
+          <p
+            className="agent-detail-directory"
+            title={agent?.dir ?? '工作目录不可用'}
+          >
+            <FolderClosed size={12} aria-hidden="true" />
+            <code>{agent?.dir ?? '工作目录不可用'}</code>
           </p>
         </div>
         <div className="agent-detail-status">
