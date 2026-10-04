@@ -48,9 +48,9 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	if err := inspectStoragePaths(log, d.cfg.DataDir, d.cfg.DBPath); err != nil {
 		return fmt.Errorf("daemon: storage: %w", err)
 	}
-	controlToken, err := auth.Ensure(d.cfg.DataDir)
+	credentials, err := auth.Open(d.cfg.DataDir, auth.DefaultOptions())
 	if err != nil {
-		return fmt.Errorf("daemon: control token: %w", err)
+		return fmt.Errorf("daemon: control credentials: %w", err)
 	}
 
 	// 1. 存储。
@@ -95,15 +95,6 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		"partial_history", report.PartialHistory,
 		"last_seq", report.LastSeq,
 	)
-
-	// 3. API server。
-	srv := api.NewServer(api.ServerOptions{
-		Manager:        mgr,
-		Hub:            hub,
-		EventBuffer:    d.cfg.EventBuffer,
-		ControlToken:   controlToken,
-		AllowedOrigins: d.cfg.ConsoleOrigins,
-	})
 
 	localListener, err := localipc.Listen(d.cfg.DataDir)
 	if err != nil {
@@ -155,6 +146,32 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		)
 	}
 
+	allowedOrigins := append([]string(nil), d.cfg.ConsoleOrigins...)
+	var browserHosts []string
+	if tcpListener != nil {
+		browserHosts, err = loopbackHosts(tcpListener.Addr().String())
+		if err != nil {
+			closeErr := mgr.Close()
+			hub.Close()
+			return errors.Join(
+				fmt.Errorf("daemon: browser access policy: %w", err),
+				closeListeners(listeners),
+				closeErr,
+			)
+		}
+		for _, host := range browserHosts {
+			allowedOrigins = append(allowedOrigins, "http://"+host)
+		}
+	}
+
+	srv := api.NewServer(api.ServerOptions{
+		Manager:        mgr,
+		Hub:            hub,
+		Auth:           credentials,
+		EventBuffer:    d.cfg.EventBuffer,
+		AllowedOrigins: allowedOrigins,
+	})
+
 	stopRetention, retentionDone := d.startRetentionLoop(st, log)
 
 	// 4. 启动 + 优雅关闭。
@@ -164,7 +181,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	endpoints := []httpEndpoint{{
 		listener: localListener,
 		server: &http.Server{
-			Handler:           srv.Handler(api.LocalAccess),
+			Handler:           srv.Handler(api.LocalAccess, localipc.Authority),
 			ReadHeaderTimeout: 5 * time.Second,
 		},
 	}}
@@ -172,7 +189,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		endpoints = append(endpoints, httpEndpoint{
 			listener: tcpListener,
 			server: &http.Server{
-				Handler:           srv.Handler(api.BrowserAccess),
+				Handler:           srv.Handler(api.BrowserAccess, browserHosts...),
 				ReadHeaderTimeout: 5 * time.Second,
 			},
 		})
@@ -223,6 +240,29 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 type httpEndpoint struct {
 	listener net.Listener
 	server   *http.Server
+}
+
+func loopbackHosts(address string) ([]string, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("split listener address %q: %w", address, err)
+	}
+	candidates := []string{
+		net.JoinHostPort(host, port),
+		net.JoinHostPort("127.0.0.1", port),
+		net.JoinHostPort("localhost", port),
+		net.JoinHostPort("::1", port),
+	}
+	hosts := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		if _, exists := seen[candidate]; exists {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		hosts = append(hosts, candidate)
+	}
+	return hosts, nil
 }
 
 func closeListeners(listeners []net.Listener) error {

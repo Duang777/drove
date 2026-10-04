@@ -698,6 +698,79 @@ func TestExplainCommandRejectsInvalidExplicitLimitBeforeClientSetup(t *testing.T
 	}
 }
 
+func TestTokenRotateCommandUsesLocalDaemon(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "drove-token-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".drove")
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	rotateCalls := 0
+	server := &http.Server{Handler: http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/agents":
+			_, _ = io.WriteString(w, "[]")
+		case r.Method == http.MethodPost &&
+			r.URL.Path == "/api/v1/auth/token/rotate":
+			rotateCalls++
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	cfg := config.Defaults()
+	cfg.DataDir = dataDir
+	cfg.DBPath = ""
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	command := newTokenCmd()
+	command.SetArgs([]string{"rotate"})
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute token rotate: %v", err)
+	}
+	if rotateCalls != 1 {
+		t.Fatalf("rotate calls = %d, want 1", rotateCalls)
+	}
+	if stdout.String() != "control token rotated\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
 func TestWriteLogRowsPlainStripsControlsAcrossChunks(t *testing.T) {
 	first, err := event.HydrateOutputChunkPayload(
 		`{"version":1,"offset":0,"len":8}`,

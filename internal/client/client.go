@@ -117,6 +117,31 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 	return c.delete(ctx, "/api/v1/agents/"+id)
 }
 
+// RotateToken atomically rotates the daemon control token.
+func (c *Client) RotateToken(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		c.baseURL+"/api/v1/auth/token/rotate",
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if err := c.authorize(req, false); err != nil {
+		return err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return ErrDaemonUnreachable
+	}
+	defer resp.Body.Close()
+	if err := c.responseError(resp, "/api/v1/auth/token/rotate"); err != nil {
+		return err
+	}
+	return drain(resp.Body)
+}
+
 type inputRequest struct {
 	Data string `json:"data"`
 }

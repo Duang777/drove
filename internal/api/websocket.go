@@ -54,6 +54,7 @@ type webSocketControl struct {
 
 // handleWS serves the compatible event stream and versioned input protocol.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	grant := requestGrant(r)
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 4096,
@@ -65,10 +66,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+	closeCode := websocket.CloseNormalClosure
+	closeReason := ""
 	defer func() {
 		_ = conn.WriteControl(
 			websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			websocket.FormatCloseMessage(closeCode, closeReason),
 			time.Now().Add(webSocketWriteTimeout),
 		)
 	}()
@@ -108,6 +111,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	defer ping.Stop()
 	for {
 		select {
+		case <-grant.Done():
+			closeCode = websocket.ClosePolicyViolation
+			closeReason = "authorization expired"
+			return
 		case <-readerDone:
 			return
 		case response := <-responses:
@@ -332,15 +339,7 @@ func writeWebSocketText(conn *websocket.Conn, payload []byte) error {
 }
 
 func (s *Server) checkWebSocketOrigin(r *http.Request) bool {
-	origins := r.Header.Values("Origin")
-	if len(origins) == 0 {
-		return true
-	}
-	if len(origins) != 1 {
-		return false
-	}
-	_, allowed := s.allowedOrigins[origins[0]]
-	return allowed
+	return s.originAllowed(r)
 }
 
 func validResponseRequestID(requestID string) string {

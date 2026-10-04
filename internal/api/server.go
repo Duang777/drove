@@ -30,10 +30,10 @@ type ServerOptions struct {
 	Manager *session.Manager
 	// Hub 提供实时事件流。
 	Hub *event.Hub
+	// Auth owns control-plane credentials and their revocation lifecycle.
+	Auth *auth.Controller
 	// EventBuffer 是每个 WS 订阅的缓冲行数。
 	EventBuffer int
-	// ControlToken 认证 REST 与 WebSocket 控制面请求。
-	ControlToken string
 	// AllowedOrigins 是 WebSocket 可接受的精确 Origin。
 	AllowedOrigins []string
 }
@@ -56,6 +56,9 @@ const (
 )
 
 type accessContextKey struct{}
+type grantContextKey struct{}
+
+const sessionCookieName = "drove_session"
 
 // NewServer 创建 Server（路由已注册）。
 func NewServer(opts ServerOptions) *Server {
@@ -81,24 +84,57 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
+	mux.HandleFunc("POST /api/v1/auth/token/rotate", s.handleRotateToken)
 	mux.HandleFunc("GET /ws", s.handleWS)
 }
 
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		values := r.Header.Values("Authorization")
-		if len(values) != 1 || !auth.Verify(s.opts.ControlToken, values[0]) {
+		var (
+			grant auth.Grant
+			ok    bool
+		)
+		switch {
+		case len(values) == 1:
+			grant, ok = s.opts.Auth.AuthorizeBearer(values[0])
+		case len(values) == 0 && requestAccess(r) == BrowserAccess:
+			cookie, err := r.Cookie(sessionCookieName)
+			if err == nil {
+				grant, ok = s.opts.Auth.AuthorizeCookie(cookie.Value)
+			}
+		}
+		if !ok {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
-		next.ServeHTTP(w, r)
+		if grant.Kind() == auth.CookieAccess &&
+			requiresOrigin(r) &&
+			len(r.Header.Values("Origin")) == 0 {
+			writeErr(w, http.StatusForbidden, "origin required")
+			return
+		}
+		ctx := context.WithValue(r.Context(), grantContextKey{}, grant)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // Handler returns the route tree bound to one accepted transport.
-func (s *Server) Handler(access Access) http.Handler {
+func (s *Server) Handler(access Access, allowedHosts ...string) http.Handler {
+	hosts := make(map[string]struct{}, len(allowedHosts))
+	for _, host := range allowedHosts {
+		hosts[host] = struct{}{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := hosts[r.Host]; !ok {
+			writeErr(w, http.StatusForbidden, "host not allowed")
+			return
+		}
+		if access == BrowserAccess && !s.originAllowed(r) {
+			writeErr(w, http.StatusForbidden, "origin not allowed")
+			return
+		}
 		ctx := context.WithValue(r.Context(), accessContextKey{}, access)
 		s.mux.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -196,6 +232,18 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.opts.Manager.Stop(agent.ID(id)); err != nil {
 		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleRotateToken(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != LocalAccess {
+		writeErr(w, http.StatusForbidden, "token rotation requires local access")
+		return
+	}
+	if err := s.opts.Auth.Rotate(); err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -411,6 +459,35 @@ func isLoopbackRemote(remoteAddr string) bool {
 func requestAccess(r *http.Request) Access {
 	access, _ := r.Context().Value(accessContextKey{}).(Access)
 	return access
+}
+
+func requestGrant(r *http.Request) auth.Grant {
+	grant, _ := r.Context().Value(grantContextKey{}).(auth.Grant)
+	return grant
+}
+
+func (s *Server) originAllowed(r *http.Request) bool {
+	origins := r.Header.Values("Origin")
+	if len(origins) == 0 {
+		return true
+	}
+	if len(origins) != 1 {
+		return false
+	}
+	_, allowed := s.allowedOrigins[origins[0]]
+	return allowed
+}
+
+func requiresOrigin(r *http.Request) bool {
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		return true
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
 }
 
 // -- helpers --

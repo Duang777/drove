@@ -63,6 +63,7 @@ func newRootCmd() *cobra.Command {
 		newSendCmd(),
 		newHookCmd(),
 		newStopCmd(),
+		newTokenCmd(),
 		newVersionCmd(),
 	)
 	return root
@@ -385,6 +386,30 @@ func newStopCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newTokenCmd() *cobra.Command {
+	token := &cobra.Command{
+		Use:   "token",
+		Short: "管理本地控制令牌",
+	}
+	token.AddCommand(&cobra.Command{
+		Use:   "rotate",
+		Short: "轮换本地控制令牌",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			c, err := newClient(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if err := c.RotateToken(cmd.Context()); err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), "control token rotated")
+			return err
+		},
+	})
+	return token
 }
 
 func newSendCmd() *cobra.Command {

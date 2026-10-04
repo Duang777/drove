@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -392,6 +393,22 @@ func TestRunStopsAfterRuntimeEventCommitFailure(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("daemon continued running after event commit failure")
+	}
+}
+
+func TestLoopbackHostsIncludesConfiguredAddressAndAliases(t *testing.T) {
+	hosts, err := loopbackHosts("127.0.0.2:7373")
+	if err != nil {
+		t.Fatalf("loopback hosts: %v", err)
+	}
+	want := []string{
+		"127.0.0.2:7373",
+		"127.0.0.1:7373",
+		"localhost:7373",
+		"[::1]:7373",
+	}
+	if !slices.Equal(hosts, want) {
+		t.Fatalf("hosts = %#v, want %#v", hosts, want)
 	}
 }
 
