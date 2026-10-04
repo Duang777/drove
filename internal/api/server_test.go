@@ -22,6 +22,7 @@ import (
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -241,6 +242,226 @@ func TestHandleExplainReturnsDetachedHistoryAndUnknownVersion(t *testing.T) {
 		*last.UnsupportedVersion != 91 ||
 		strings.Contains(rec.Body.String(), "not-forwarded") {
 		t.Fatalf("detached explanation = %+v; body=%s", explanation, rec.Body.String())
+	}
+}
+
+func TestHandleTimelineBlockedAndFrameContracts(t *testing.T) {
+	server, _, st := newTestServer(t)
+	base := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "created",
+		},
+		{
+			Seq: 2, Timestamp: base.Add(time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1",
+			From: string(agent.StatePending), To: string(agent.StateStarting),
+			Reason:  "starting",
+			Payload: `{"version":1,"source":"session","event":"session_start","confidence":1}`,
+		},
+		{
+			Seq: 3, Timestamp: base.Add(2 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1",
+			From: string(agent.StateStarting), To: string(agent.StateWorking),
+			Reason:  "working",
+			Payload: `{"version":1,"source":"process","event":"process_started","confidence":1}`,
+		},
+		{
+			Seq: 4, Timestamp: base.Add(5 * time.Second), Type: string(event.TypeOutputChunk),
+			SessionID: "agent-1", AgentID: "agent-1",
+			Payload:          `{"version":1,"offset":0,"len":5}`,
+			OutputAttachment: []byte("hello"),
+		},
+		{
+			Seq: 5, Timestamp: base.Add(40 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1",
+			From: string(agent.StateWorking), To: string(agent.StateBlocked),
+			Reason:  "waiting",
+			Payload: `{"version":1,"source":"timer","event":"blocked_timeout","confidence":1}`,
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("append timeline fixture: %v", err)
+	}
+
+	timelineResponse := httptest.NewRecorder()
+	serveAuthorized(
+		server,
+		timelineResponse,
+		httptest.NewRequest(http.MethodGet, "/api/v1/agents/agent-1/timeline", nil),
+	)
+	if timelineResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"timeline response = %d %q",
+			timelineResponse.Code,
+			timelineResponse.Body.String(),
+		)
+	}
+	var timeline recording.Timeline
+	if err := json.NewDecoder(timelineResponse.Body).Decode(&timeline); err != nil {
+		t.Fatalf("decode timeline: %v", err)
+	}
+	if timeline.Captured != (recording.Cursor{Seq: 5, NextOffset: 5}) ||
+		len(timeline.Blocked) != 1 {
+		t.Fatalf("timeline = %+v", timeline)
+	}
+
+	blockedResponse := httptest.NewRecorder()
+	serveAuthorized(
+		server,
+		blockedResponse,
+		httptest.NewRequest(
+			http.MethodGet,
+			"/api/v1/agents/agent-1/timeline/blocked/1",
+			nil,
+		),
+	)
+	if blockedResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"blocked response = %d %q",
+			blockedResponse.Code,
+			blockedResponse.Body.String(),
+		)
+	}
+	var blocked recording.BlockedOccurrence
+	if err := json.NewDecoder(blockedResponse.Body).Decode(&blocked); err != nil {
+		t.Fatalf("decode blocked occurrence: %v", err)
+	}
+	if blocked.Number != 1 ||
+		blocked.Jump != (recording.Cursor{Seq: 4, NextOffset: 5}) {
+		t.Fatalf("blocked occurrence = %+v", blocked)
+	}
+
+	frameResponse := httptest.NewRecorder()
+	serveAuthorized(
+		server,
+		frameResponse,
+		httptest.NewRequest(http.MethodGet, "/api/v1/agents/agent-1/frame?seq=4", nil),
+	)
+	if frameResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"frame response = %d %q",
+			frameResponse.Code,
+			frameResponse.Body.String(),
+		)
+	}
+	var frame recording.Frame
+	if err := json.NewDecoder(frameResponse.Body).Decode(&frame); err != nil {
+		t.Fatalf("decode frame: %v", err)
+	}
+	if frame.Cursor != (recording.Cursor{Seq: 4, NextOffset: 5}) ||
+		len(frame.Lines) != 1 ||
+		frame.Lines[0] != "hello" {
+		t.Fatalf("frame = %+v", frame)
+	}
+
+	if _, err := st.PruneOutputAttachments(
+		context.Background(),
+		base.Add(10*time.Second),
+	); err != nil {
+		t.Fatalf("prune output: %v", err)
+	}
+	expiredResponse := httptest.NewRecorder()
+	serveAuthorized(
+		server,
+		expiredResponse,
+		httptest.NewRequest(http.MethodGet, "/api/v1/agents/agent-1/frame?seq=5", nil),
+	)
+	if expiredResponse.Code != http.StatusGone {
+		t.Fatalf(
+			"expired response = %d %q",
+			expiredResponse.Code,
+			expiredResponse.Body.String(),
+		)
+	}
+	var expired struct {
+		Code      string                  `json:"code"`
+		SessionID string                  `json:"session_id"`
+		Missing   []recording.OutputRange `json:"missing"`
+	}
+	if err := json.NewDecoder(expiredResponse.Body).Decode(&expired); err != nil {
+		t.Fatalf("decode expiry response: %v", err)
+	}
+	if expired.Code != "output_expired" ||
+		expired.SessionID != "agent-1" ||
+		len(expired.Missing) != 1 ||
+		expired.Missing[0] != (recording.OutputRange{Start: 0, End: 5}) {
+		t.Fatalf("expiry response = %+v", expired)
+	}
+}
+
+func TestHandleTimelineAndFrameMapLookupAndSelectorErrors(t *testing.T) {
+	server, _, st := newTestServer(t)
+	base := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+	if err := st.AppendEvent(store.EventRow{
+		Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+		SessionID: "agent-1", AgentID: "agent-1", Reason: "created",
+	}); err != nil {
+		t.Fatalf("append session: %v", err)
+	}
+
+	for _, path := range []string{
+		"/api/v1/agents/missing/timeline",
+		"/api/v1/agents/missing/frame?seq=0",
+		"/api/v1/agents/agent-1/timeline/blocked/1",
+	} {
+		response := httptest.NewRecorder()
+		serveAuthorized(
+			server,
+			response,
+			httptest.NewRequest(http.MethodGet, path, nil),
+		)
+		if response.Code != http.StatusNotFound {
+			t.Fatalf("%s response = %d %q, want 404", path, response.Code, response.Body.String())
+		}
+	}
+
+	for _, path := range []string{
+		"/api/v1/agents/agent-1/frame",
+		"/api/v1/agents/agent-1/frame?seq=0&offset=0",
+		"/api/v1/agents/agent-1/frame?seq=01",
+		"/api/v1/agents/agent-1/frame?at=not-a-time",
+		"/api/v1/agents/agent-1/frame?offset=0&extra=1",
+		"/api/v1/agents/agent-1/timeline/blocked/0",
+	} {
+		response := httptest.NewRecorder()
+		serveAuthorized(
+			server,
+			response,
+			httptest.NewRequest(http.MethodGet, path, nil),
+		)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s response = %d %q, want 400", path, response.Code, response.Body.String())
+		}
+	}
+
+	if _, err := st.AppendEvents(context.Background(), 1, []store.EventRow{
+		{
+			Seq: 2, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+			SessionID: "corrupt", AgentID: "corrupt", Reason: "created",
+		},
+		{
+			Seq: 3, Timestamp: base.Add(time.Second), Type: string(event.TypeOutputChunk),
+			SessionID: "corrupt", AgentID: "corrupt",
+			Payload:          `{"version":1,"offset":0,"len":2}`,
+			OutputAttachment: []byte("bad"),
+		},
+	}); err != nil {
+		t.Fatalf("append corrupt recording: %v", err)
+	}
+	corruptResponse := httptest.NewRecorder()
+	serveAuthorized(
+		server,
+		corruptResponse,
+		httptest.NewRequest(http.MethodGet, "/api/v1/agents/corrupt/frame?seq=3", nil),
+	)
+	if corruptResponse.Code != http.StatusInternalServerError {
+		t.Fatalf(
+			"corrupt frame response = %d %q, want 500",
+			corruptResponse.Code,
+			corruptResponse.Body.String(),
+		)
 	}
 }
 

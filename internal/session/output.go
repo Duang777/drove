@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/agent"
@@ -13,18 +15,76 @@ import (
 	"github.com/Duang777/drove/internal/term"
 )
 
+const outputInboxSize = 64
+
+var (
+	errOutputProcessorClosed = errors.New("session: output processor closed")
+	errOutputStreamEnded     = errors.New("session: output stream ended")
+)
+
+type outputOperation uint8
+
+const (
+	outputFeed outputOperation = iota + 1
+	outputEnd
+	outputResize
+	outputAttach
+	outputDetach
+	outputDetachAll
+	outputAttachedInput
+	outputWatchSnapshots
+	outputClose
+)
+
+type outputRequest struct {
+	operation    outputOperation
+	chunk        []byte
+	offset       uint64
+	size         term.Size
+	attachmentID AttachmentID
+	attachment   attachmentConfig
+	inputPayload string
+	result       chan outputResult
+}
+
+type outputResult struct {
+	input     InputResult
+	snapshots <-chan LiveSnapshot
+	err       error
+}
+
 type outputProcessor struct {
 	manager *Manager
 	id      agent.ID
 	running *runningSession
 
 	redactor streamingRedactor
+	requests chan outputRequest
+	done     chan struct{}
+
+	admissionMu sync.RWMutex
+	closing     bool
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+type outputProcessorState struct {
+	redactor streamingRedactor
 
 	nextSourceOffset uint64
 	nextOutputOffset uint64
+	lastSeq          uint64
 	pendingActivity  int
 	ended            bool
-	failed           bool
+	failure          error
+
+	effectiveSize        term.Size
+	attachments          map[AttachmentID]*attachmentState
+	owner                AttachmentID
+	nextActivityTicket   uint64
+	acceptingAttachments bool
+	snapshotTimer        observationTimer
+	snapshotTimerC       <-chan time.Time
 }
 
 func newOutputProcessor(
@@ -33,75 +93,333 @@ func newOutputProcessor(
 	running *runningSession,
 	signalToken string,
 ) *outputProcessor {
-	return &outputProcessor{
+	processor := &outputProcessor{
 		manager:  manager,
 		id:       id,
 		running:  running,
 		redactor: newStreamingRedactor([]byte(signalToken)),
+		requests: make(chan outputRequest, outputInboxSize),
+		done:     make(chan struct{}),
 	}
+	go processor.run()
+	return processor
 }
 
 func (p *outputProcessor) Feed(chunk []byte, offset uint64) error {
-	if p.ended {
-		return fmt.Errorf("session: output received after stream end")
-	}
-	if p.failed {
-		return fmt.Errorf("session: output processor has failed")
-	}
 	if len(chunk) == 0 {
 		return fmt.Errorf("session: empty PTY output callback")
 	}
-	if offset != p.nextSourceOffset {
-		return p.failOffset("chunk", offset)
+	result, err := p.submit(context.Background(), outputRequest{
+		operation: outputFeed,
+		chunk:     append([]byte(nil), chunk...),
+		offset:    offset,
+	})
+	if err != nil {
+		return err
 	}
-
-	p.nextSourceOffset += uint64(len(chunk))
-	p.pendingActivity++
-	output := p.redactor.Feed(chunk)
-	if len(output) == 0 {
-		return nil
-	}
-	return p.commitAndObserve(output)
+	return result.err
 }
 
 func (p *outputProcessor) End(offset uint64) error {
-	if p.ended {
-		return fmt.Errorf("session: output stream ended more than once")
+	result, err := p.submit(context.Background(), outputRequest{
+		operation: outputEnd,
+		offset:    offset,
+	})
+	if err != nil {
+		return err
 	}
-	if p.failed {
-		return fmt.Errorf("session: output processor has failed")
-	}
-	if offset != p.nextSourceOffset {
-		return p.failOffset("end", offset)
-	}
-	p.ended = true
+	return result.err
+}
 
-	output := p.redactor.Flush()
+func (p *outputProcessor) Resize(ctx context.Context, size term.Size) error {
+	result, err := p.submit(ctx, outputRequest{
+		operation: outputResize,
+		size:      size,
+	})
+	if err != nil {
+		return err
+	}
+	return result.err
+}
+
+func (p *outputProcessor) Attach(
+	ctx context.Context,
+	id AttachmentID,
+	config attachmentConfig,
+) error {
+	result, err := p.submit(ctx, outputRequest{
+		operation:    outputAttach,
+		attachmentID: id,
+		attachment:   config,
+	})
+	if err != nil {
+		return err
+	}
+	return result.err
+}
+
+func (p *outputProcessor) ResizeAttachment(
+	ctx context.Context,
+	id AttachmentID,
+	size term.Size,
+) error {
+	result, err := p.submit(ctx, outputRequest{
+		operation:    outputResize,
+		attachmentID: id,
+		size:         size,
+	})
+	if err != nil {
+		return err
+	}
+	return result.err
+}
+
+func (p *outputProcessor) SendAttachedInput(
+	ctx context.Context,
+	id AttachmentID,
+	data []byte,
+	payload string,
+) (InputResult, error) {
+	result, err := p.submit(ctx, outputRequest{
+		operation:    outputAttachedInput,
+		attachmentID: id,
+		chunk:        append([]byte(nil), data...),
+		inputPayload: payload,
+	})
+	if err != nil {
+		return InputResult{}, err
+	}
+	return result.input, result.err
+}
+
+func (p *outputProcessor) WatchSnapshots(
+	ctx context.Context,
+	id AttachmentID,
+) (<-chan LiveSnapshot, error) {
+	result, err := p.submit(ctx, outputRequest{
+		operation:    outputWatchSnapshots,
+		attachmentID: id,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.snapshots, result.err
+}
+
+func (p *outputProcessor) Detach(ctx context.Context, id AttachmentID) error {
+	result, err := p.submit(ctx, outputRequest{
+		operation:    outputDetach,
+		attachmentID: id,
+	})
+	if err != nil {
+		return err
+	}
+	return result.err
+}
+
+func (p *outputProcessor) DetachAll() error {
+	result, err := p.submit(context.Background(), outputRequest{
+		operation: outputDetachAll,
+	})
+	if err != nil {
+		return err
+	}
+	return result.err
+}
+
+func (p *outputProcessor) Close() error {
+	p.closeOnce.Do(func() {
+		request := outputRequest{
+			operation: outputClose,
+			result:    make(chan outputResult, 1),
+		}
+		p.admissionMu.Lock()
+		p.closing = true
+		p.requests <- request
+		p.admissionMu.Unlock()
+		p.closeErr = (<-request.result).err
+		<-p.done
+	})
+	return p.closeErr
+}
+
+func (p *outputProcessor) submit(
+	ctx context.Context,
+	request outputRequest,
+) (outputResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	request.result = make(chan outputResult, 1)
+
+	p.admissionMu.RLock()
+	if p.closing {
+		p.admissionMu.RUnlock()
+		return outputResult{}, errOutputProcessorClosed
+	}
+	select {
+	case p.requests <- request:
+		p.admissionMu.RUnlock()
+	case <-ctx.Done():
+		p.admissionMu.RUnlock()
+		return outputResult{}, fmt.Errorf(
+			"session: admit recording operation: %w",
+			ctx.Err(),
+		)
+	}
+	return <-request.result, nil
+}
+
+func (p *outputProcessor) run() {
+	defer close(p.done)
+	initialSize, err := initialTerminalSize()
+	if err != nil {
+		panic(err)
+	}
+	state := outputProcessorState{
+		redactor:             p.redactor,
+		effectiveSize:        initialSize,
+		attachments:          make(map[AttachmentID]*attachmentState),
+		acceptingAttachments: true,
+	}
+
+	for {
+		select {
+		case request := <-p.requests:
+			if request.operation == outputClose {
+				p.stopSnapshotTimer(&state)
+				p.closeSnapshotWatches(&state)
+				request.result <- outputResult{}
+				return
+			}
+			request.result <- p.handle(&state, request)
+		case <-state.snapshotTimerC:
+			state.snapshotTimerC = nil
+			p.publishSnapshots(&state)
+			if p.hasSnapshotWatches(&state) && !state.ended {
+				p.armSnapshotTimer(&state)
+			}
+		}
+	}
+}
+
+func (p *outputProcessor) handle(
+	state *outputProcessorState,
+	request outputRequest,
+) outputResult {
+	if state.failure != nil &&
+		request.operation != outputDetach &&
+		request.operation != outputDetachAll {
+		return outputResult{err: state.failure}
+	}
+
+	switch request.operation {
+	case outputFeed:
+		return outputResult{err: p.feed(state, request.chunk, request.offset)}
+	case outputEnd:
+		return outputResult{err: p.end(state, request.offset)}
+	case outputResize:
+		if request.attachmentID == "" {
+			return outputResult{err: p.applyResize(state, request.size)}
+		}
+		return outputResult{
+			err: p.resizeAttachment(state, request.attachmentID, request.size),
+		}
+	case outputAttach:
+		return outputResult{
+			err: p.attach(state, request.attachmentID, request.attachment),
+		}
+	case outputDetach:
+		return outputResult{err: p.detach(state, request.attachmentID)}
+	case outputDetachAll:
+		p.detachAll(state)
+		return outputResult{}
+	case outputAttachedInput:
+		input, err := p.sendAttachedInput(
+			state,
+			request.attachmentID,
+			request.chunk,
+			request.inputPayload,
+		)
+		return outputResult{input: input, err: err}
+	case outputWatchSnapshots:
+		snapshots, err := p.watchSnapshots(state, request.attachmentID)
+		return outputResult{snapshots: snapshots, err: err}
+	default:
+		return outputResult{err: fmt.Errorf(
+			"session: unknown recording operation %d",
+			request.operation,
+		)}
+	}
+}
+
+func (p *outputProcessor) feed(
+	state *outputProcessorState,
+	chunk []byte,
+	offset uint64,
+) error {
+	if state.ended {
+		return errOutputStreamEnded
+	}
+	if offset != state.nextSourceOffset {
+		return p.failOffset(state, "chunk", offset)
+	}
+
+	state.nextSourceOffset += uint64(len(chunk))
+	state.pendingActivity++
+	output := state.redactor.Feed(chunk)
+	if len(output) == 0 {
+		return nil
+	}
+	return p.commitAndObserve(state, output)
+}
+
+func (p *outputProcessor) end(
+	state *outputProcessorState,
+	offset uint64,
+) error {
+	if state.ended {
+		return errOutputStreamEnded
+	}
+	if offset != state.nextSourceOffset {
+		return p.failOffset(state, "end", offset)
+	}
+	state.ended = true
+	defer func() {
+		p.stopSnapshotTimer(state)
+		p.closeSnapshotWatches(state)
+	}()
+
+	output := state.redactor.Flush()
 	if len(output) > 0 {
-		if err := p.commitAndObserve(output); err != nil {
+		if err := p.commitAndObserve(state, output); err != nil {
 			return err
 		}
 	}
 	if p.running.terminal != nil {
 		if err := p.running.terminal.EndOutput(
 			context.Background(),
-			p.nextOutputOffset,
+			state.nextOutputOffset,
 		); err != nil {
-			return p.failTerminal("end output", err, false)
+			return p.failTerminal(state, "end output", err, false)
 		}
 	}
 	return nil
 }
 
-func (p *outputProcessor) failOffset(callback string, got uint64) error {
-	p.failed = true
+func (p *outputProcessor) failOffset(
+	state *outputProcessorState,
+	callback string,
+	got uint64,
+) error {
 	streamErr := fmt.Errorf(
 		"session: PTY output %s offset mismatch: got %d, want %d",
 		callback,
 		got,
-		p.nextSourceOffset,
+		state.nextSourceOffset,
 	)
-	_, commitErr := p.manager.committer.CommitEvents(
+	state.failure = streamErr
+	receipt, commitErr := p.manager.committer.CommitEvents(
 		context.Background(),
 		[]event.Draft{event.NewErrorDraft(
 			string(p.id),
@@ -112,12 +430,16 @@ func (p *outputProcessor) failOffset(callback string, got uint64) error {
 	if commitErr != nil {
 		return fmt.Errorf("%v; persist output stream error: %w", streamErr, commitErr)
 	}
+	state.lastSeq = receipt.LastSeq
 	return streamErr
 }
 
-func (p *outputProcessor) commitAndObserve(output []byte) error {
+func (p *outputProcessor) commitAndObserve(
+	state *outputProcessorState,
+	output []byte,
+) error {
 	drafts := make([]event.Draft, 0, len(output)/event.MaxOutputChunkBytes+1)
-	offset := p.nextOutputOffset
+	offset := state.nextOutputOffset
 	for _, chunk := range splitOutputChunks(output) {
 		draft, err := event.NewOutputChunkDraft(
 			string(p.id),
@@ -126,7 +448,7 @@ func (p *outputProcessor) commitAndObserve(output []byte) error {
 			chunk,
 		)
 		if err != nil {
-			p.failed = true
+			state.failure = err
 			return fmt.Errorf("session: create output chunk at offset %d: %w", offset, err)
 		}
 		drafts = append(drafts, draft)
@@ -134,29 +456,34 @@ func (p *outputProcessor) commitAndObserve(output []byte) error {
 	}
 	receipt, err := p.manager.committer.CommitEvents(context.Background(), drafts)
 	if err != nil {
-		p.failed = true
-		return fmt.Errorf("session: commit output at offset %d: %w", p.nextOutputOffset, err)
+		state.failure = err
+		return fmt.Errorf(
+			"session: commit output at offset %d: %w",
+			state.nextOutputOffset,
+			err,
+		)
 	}
 
-	p.nextOutputOffset = offset
 	if p.running.terminal != nil {
 		chunk, err := term.NewCommittedChunk(
 			output,
-			p.nextOutputOffset,
+			offset,
 			receipt.LastSeq,
 			receipt.Timestamp,
 		)
 		if err != nil {
-			return p.failTerminal("create committed chunk", err, true)
+			return p.failTerminal(state, "create committed chunk", err, true)
 		}
 		if err := p.running.terminal.FeedCommitted(
 			context.Background(),
 			chunk,
 		); err != nil {
-			return p.failTerminal("feed committed output", err, true)
+			return p.failTerminal(state, "feed committed output", err, true)
 		}
 	}
-	for range p.pendingActivity {
+	state.nextOutputOffset = offset
+	state.lastSeq = receipt.LastSeq
+	for range state.pendingActivity {
 		if !p.canObserve() {
 			break
 		}
@@ -168,18 +495,19 @@ func (p *outputProcessor) commitAndObserve(output []byte) error {
 			break
 		}
 	}
-	p.pendingActivity = 0
+	state.pendingActivity = 0
 	return nil
 }
 
 func (p *outputProcessor) failTerminal(
+	state *outputProcessorState,
 	operation string,
 	cause error,
 	fatal bool,
 ) error {
-	p.failed = true
 	terminalErr := fmt.Errorf("session: terminal %s: %w", operation, cause)
-	_, commitErr := p.manager.committer.CommitEvents(
+	state.failure = terminalErr
+	receipt, commitErr := p.manager.committer.CommitEvents(
 		context.Background(),
 		[]event.Draft{event.NewErrorDraft(
 			string(p.id),
@@ -193,10 +521,67 @@ func (p *outputProcessor) failTerminal(
 			fmt.Errorf("session: persist terminal error: %w", commitErr),
 		)
 	}
+	state.lastSeq = receipt.LastSeq
 	if fatal {
 		p.manager.committer.Fail(terminalErr)
 	}
 	return terminalErr
+}
+
+func (p *outputProcessor) applyResize(
+	state *outputProcessorState,
+	size term.Size,
+) error {
+	if state.ended {
+		return errOutputStreamEnded
+	}
+	if sameTerminalSize(size, state.effectiveSize) {
+		return nil
+	}
+	if p.running.terminal == nil {
+		return errors.New("session: terminal is unavailable for resize")
+	}
+	rows := size.Rows()
+	columns := size.Columns()
+	if rows <= 0 || columns <= 0 || rows > 1<<16-1 || columns > 1<<16-1 {
+		return errors.New("session: terminal resize requires a validated size")
+	}
+	draft, err := event.NewAgentResizedDraft(
+		string(p.id),
+		string(p.id),
+		uint16(rows),
+		uint16(columns),
+		state.nextOutputOffset,
+	)
+	if err != nil {
+		return fmt.Errorf("session: create terminal resize: %w", err)
+	}
+	if err := p.running.terminal.Resize(context.Background(), size); err != nil {
+		if terminalResizeWasApplied(err) {
+			return p.failTerminal(state, "apply resize", err, true)
+		}
+		return err
+	}
+	receipt, err := p.manager.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{draft},
+	)
+	if err != nil {
+		resizeErr := fmt.Errorf(
+			"session: commit applied terminal resize: %w",
+			err,
+		)
+		state.failure = resizeErr
+		p.manager.committer.Fail(resizeErr)
+		return resizeErr
+	}
+	state.effectiveSize = size
+	state.lastSeq = receipt.LastSeq
+	return nil
+}
+
+func sameTerminalSize(left, right term.Size) bool {
+	return left.Rows() == right.Rows() && left.Columns() == right.Columns()
 }
 
 func (p *outputProcessor) canObserve() bool {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1007,12 +1008,20 @@ func TestPruneOutputAttachmentsKeepsEventHistoryAndOtherAttachments(t *testing.T
 	if err != nil {
 		t.Fatalf("last seq before prune: %v", err)
 	}
+	beforeGeneration := s.OutputRetentionGeneration()
 	deleted, err := s.PruneOutputAttachments(context.Background(), cutoff)
 	if err != nil {
 		t.Fatalf("prune output attachments: %v", err)
 	}
 	if deleted != 1 {
 		t.Fatalf("deleted attachments = %d, want 1", deleted)
+	}
+	if got := s.OutputRetentionGeneration(); got != beforeGeneration+1 {
+		t.Fatalf(
+			"retention generation = %d, want %d",
+			got,
+			beforeGeneration+1,
+		)
 	}
 	afterLastSeq, err := s.LastSeq()
 	if err != nil {
@@ -1091,9 +1100,361 @@ func TestPruneOutputAttachmentsCheckpointsWALWhenNothingExpires(t *testing.T) {
 	if deleted != 0 {
 		t.Fatalf("deleted attachments = %d, want 0", deleted)
 	}
+	if got := s.OutputRetentionGeneration(); got != 0 {
+		t.Fatalf("retention generation = %d, want 0", got)
+	}
 	if info, err := os.Stat(path + "-wal"); err == nil && info.Size() != 0 {
 		t.Fatalf("WAL size after truncate checkpoint = %d, want 0", info.Size())
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("inspect WAL: %v", err)
+	}
+}
+
+func TestSessionBoundaryCapturesDurablePrefix(t *testing.T) {
+	s, base := newRecordingStoreFixture(t)
+
+	boundary, found, err := s.SessionBoundary(context.Background(), "s1", nil)
+	if err != nil {
+		t.Fatalf("read current boundary: %v", err)
+	}
+	if !found {
+		t.Fatal("current boundary did not find session")
+	}
+	if boundary.GlobalSeq != 6 ||
+		boundary.ThroughSeq != 6 ||
+		boundary.FirstSeq != 1 ||
+		boundary.LastSeq != 6 ||
+		boundary.NextOutputOffset != 5 {
+		t.Fatalf("current boundary = %+v", boundary)
+	}
+
+	through := uint64(5)
+	boundary, found, err = s.SessionBoundary(context.Background(), "s1", &through)
+	if err != nil {
+		t.Fatalf("read bounded boundary: %v", err)
+	}
+	if !found || boundary.GlobalSeq != 6 || boundary.ThroughSeq != 5 ||
+		boundary.FirstSeq != 1 || boundary.LastSeq != 5 ||
+		boundary.NextOutputOffset != 3 {
+		t.Fatalf("bounded boundary = %+v, found %v", boundary, found)
+	}
+
+	through = 2
+	boundary, found, err = s.SessionBoundary(context.Background(), "s1", &through)
+	if err != nil {
+		t.Fatalf("read pre-output boundary: %v", err)
+	}
+	if !found || boundary.LastSeq != 1 || boundary.NextOutputOffset != 0 {
+		t.Fatalf("pre-output boundary = %+v, found %v", boundary, found)
+	}
+
+	boundary, found, err = s.SessionBoundary(context.Background(), "missing", nil)
+	if err != nil {
+		t.Fatalf("read missing boundary: %v", err)
+	}
+	if found || boundary.GlobalSeq != 6 {
+		t.Fatalf("missing boundary = %+v, found %v", boundary, found)
+	}
+
+	future := uint64(7)
+	if _, _, err := s.SessionBoundary(
+		context.Background(),
+		"s1",
+		&future,
+	); err == nil {
+		t.Fatal("boundary accepted a sequence beyond the durable head")
+	}
+
+	if !base.Equal(time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf("fixture base changed: %v", base)
+	}
+}
+
+func TestReadSessionRangeBoundsRowsBytesAndRetention(t *testing.T) {
+	s, _ := newRecordingStoreFixture(t)
+
+	first, err := s.ReadSessionRange(
+		context.Background(),
+		"s1",
+		0,
+		6,
+		ReadLimit{Rows: 2, AttachmentBytes: event.MaxOutputChunkBytes},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("read first page: %v", err)
+	}
+	if len(first.Rows) != 2 || first.Rows[0].Seq != 1 || first.Rows[1].Seq != 3 ||
+		!first.More || first.ScannedThrough != 3 || first.AttachmentBytes != 3 {
+		t.Fatalf("first page = %+v", first)
+	}
+	if !first.Rows[1].OutputAttachmentPresent ||
+		!bytes.Equal(first.Rows[1].OutputAttachment, []byte("abc")) {
+		t.Fatalf("first output row = %+v", first.Rows[1])
+	}
+
+	second, err := s.ReadSessionRange(
+		context.Background(),
+		"s1",
+		first.ScannedThrough,
+		6,
+		ReadLimit{Rows: 2, AttachmentBytes: event.MaxOutputChunkBytes},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("read second page: %v", err)
+	}
+	if len(second.Rows) != 2 || second.Rows[0].Seq != 5 || second.Rows[1].Seq != 6 ||
+		second.More || second.ScannedThrough != 6 || second.AttachmentBytes != 2 {
+		t.Fatalf("second page = %+v", second)
+	}
+
+	if _, err := s.db.Exec(`DELETE FROM output_chunks WHERE event_seq = 3`); err != nil {
+		t.Fatalf("expire first output: %v", err)
+	}
+	retained, err := s.ReadSessionRange(
+		context.Background(),
+		"s1",
+		0,
+		6,
+		DefaultReadLimit(),
+		true,
+	)
+	if err != nil {
+		t.Fatalf("read retention page: %v", err)
+	}
+	if retained.Rows[1].OutputAttachmentPresent ||
+		retained.Rows[1].OutputAttachment != nil {
+		t.Fatalf("expired output row = %+v", retained.Rows[1])
+	}
+	if !retained.Rows[3].OutputAttachmentPresent ||
+		!bytes.Equal(retained.Rows[3].OutputAttachment, []byte("de")) {
+		t.Fatalf("retained output row = %+v", retained.Rows[3])
+	}
+
+	metadataOnly, err := s.ReadSessionRange(
+		context.Background(),
+		"s1",
+		0,
+		6,
+		DefaultReadLimit(),
+		false,
+	)
+	if err != nil {
+		t.Fatalf("read metadata page: %v", err)
+	}
+	if !metadataOnly.Rows[3].OutputAttachmentPresent ||
+		metadataOnly.Rows[3].OutputAttachment != nil ||
+		metadataOnly.AttachmentBytes != 0 {
+		t.Fatalf("metadata-only retained output = %+v", metadataOnly.Rows[3])
+	}
+}
+
+func TestReadSessionRangeStopsAtAttachmentByteBudget(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+
+	base := time.Date(2026, time.October, 4, 11, 0, 0, 0, time.UTC)
+	firstData := bytes.Repeat([]byte("a"), 20*1024)
+	secondData := bytes.Repeat([]byte("b"), 20*1024)
+	rows := []EventRow{
+		outputFixtureRow(1, base, "bytes", 0, firstData),
+		outputFixtureRow(2, base.Add(time.Second), "bytes", uint64(len(firstData)), secondData),
+	}
+	if _, err := s.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("append byte fixture: %v", err)
+	}
+
+	page, err := s.ReadSessionRange(
+		context.Background(),
+		"bytes",
+		0,
+		2,
+		ReadLimit{Rows: 10, AttachmentBytes: event.MaxOutputChunkBytes},
+		true,
+	)
+	if err != nil {
+		t.Fatalf("read byte-bounded page: %v", err)
+	}
+	if len(page.Rows) != 1 || !page.More || page.ScannedThrough != 1 ||
+		page.AttachmentBytes != len(firstData) {
+		t.Fatalf("byte-bounded page = %+v", page)
+	}
+}
+
+func TestResolveSessionSelectorsUseCapturedPrefix(t *testing.T) {
+	s, base := newRecordingStoreFixture(t)
+
+	position, found, err := s.ResolveSessionSequence(context.Background(), "s1", 4, 6)
+	if err != nil {
+		t.Fatalf("resolve sequence: %v", err)
+	}
+	if !found || position.Seq != 3 || position.NextOutputOffset != 3 {
+		t.Fatalf("sequence position = %+v, found %v", position, found)
+	}
+
+	position, found, err = s.ResolveSessionTime(
+		context.Background(),
+		"s1",
+		base.Add(2500*time.Millisecond),
+		6,
+	)
+	if err != nil {
+		t.Fatalf("resolve timestamp: %v", err)
+	}
+	if !found || position.Seq != 5 || position.NextOutputOffset != 3 ||
+		!position.Timestamp.Equal(base.Add(2*time.Second)) {
+		t.Fatalf("timestamp position = %+v, found %v", position, found)
+	}
+
+	tests := []struct {
+		offset  uint64
+		found   bool
+		seq     uint64
+		next    uint64
+		partial uint64
+	}{
+		{offset: 0, found: true, seq: 1, next: 0},
+		{offset: 2, found: true, seq: 1, next: 2, partial: 3},
+		{offset: 3, found: true, seq: 5, next: 3},
+		{offset: 5, found: true, seq: 6, next: 5},
+		{offset: 6},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("offset-%d", test.offset), func(t *testing.T) {
+			resolved, found, err := s.ResolveSessionOutputOffset(
+				context.Background(),
+				"s1",
+				test.offset,
+				6,
+			)
+			if err != nil {
+				t.Fatalf("resolve offset: %v", err)
+			}
+			if found != test.found {
+				t.Fatalf("found = %v, want %v", found, test.found)
+			}
+			if !found {
+				return
+			}
+			if resolved.Position.Seq != test.seq ||
+				resolved.Position.NextOutputOffset != test.next ||
+				resolved.PartialOutputSeq != test.partial {
+				t.Fatalf("offset position = %+v", resolved)
+			}
+		})
+	}
+}
+
+func TestReadSessionRangeValidatesBounds(t *testing.T) {
+	s, _ := newRecordingStoreFixture(t)
+	tests := []struct {
+		name      string
+		sessionID string
+		after     uint64
+		through   uint64
+		limit     ReadLimit
+	}{
+		{name: "missing session", through: 1, limit: DefaultReadLimit()},
+		{name: "reversed range", sessionID: "s1", after: 2, through: 1, limit: DefaultReadLimit()},
+		{name: "zero rows", sessionID: "s1", through: 1, limit: ReadLimit{AttachmentBytes: event.MaxOutputChunkBytes}},
+		{name: "too many rows", sessionID: "s1", through: 1, limit: ReadLimit{Rows: MaxRangeRows + 1, AttachmentBytes: event.MaxOutputChunkBytes}},
+		{name: "tiny byte limit", sessionID: "s1", through: 1, limit: ReadLimit{Rows: 1, AttachmentBytes: event.MaxOutputChunkBytes - 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := s.ReadSessionRange(
+				context.Background(),
+				test.sessionID,
+				test.after,
+				test.through,
+				test.limit,
+				true,
+			); err == nil {
+				t.Fatal("range accepted invalid bounds")
+			}
+		})
+	}
+}
+
+func newRecordingStoreFixture(t *testing.T) (*Store, time.Time) {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "recording.db"))
+	if err != nil {
+		t.Fatalf("open recording fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := s.Close(); err != nil {
+			t.Errorf("close recording fixture: %v", err)
+		}
+	})
+
+	base := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	rows := []EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"one","vendor":"generic"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeOutput),
+			SessionID: "s2",
+			AgentID:   "s2",
+			Payload:   "other",
+		},
+		outputFixtureRow(3, base.Add(3*time.Second), "s1", 0, []byte("abc")),
+		{
+			Seq:       4,
+			Timestamp: base.Add(1500 * time.Millisecond),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "s2",
+			AgentID:   "s2",
+			From:      "working",
+			To:        "blocked",
+		},
+		{
+			Seq:       5,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeAgentResized),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1,"rows":50,"columns":160,"output_offset":3}`,
+		},
+		outputFixtureRow(6, base.Add(4*time.Second), "s1", 3, []byte("de")),
+	}
+	if _, err := s.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("append recording fixture: %v", err)
+	}
+	return s, base
+}
+
+func outputFixtureRow(
+	seq uint64,
+	at time.Time,
+	sessionID string,
+	offset uint64,
+	data []byte,
+) EventRow {
+	return EventRow{
+		Seq:              seq,
+		Timestamp:        at,
+		Type:             string(event.TypeOutputChunk),
+		SessionID:        sessionID,
+		AgentID:          sessionID,
+		Payload:          fmt.Sprintf(`{"version":1,"offset":%d,"len":%d}`, offset, len(data)),
+		OutputAttachment: data,
 	}
 }

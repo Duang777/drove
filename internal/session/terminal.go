@@ -24,6 +24,24 @@ var (
 	errTerminalStreamEnded = errors.New("session: terminal output stream ended")
 )
 
+type terminalResizeError struct {
+	afterPTY bool
+	err      error
+}
+
+func (e *terminalResizeError) Error() string {
+	return e.err.Error()
+}
+
+func (e *terminalResizeError) Unwrap() error {
+	return e.err
+}
+
+func terminalResizeWasApplied(err error) bool {
+	var resizeErr *terminalResizeError
+	return errors.As(err, &resizeErr) && resizeErr.afterPTY
+}
+
 type terminalProcess interface {
 	Write([]byte) (int, error)
 	Resize(rows, columns uint16) error
@@ -52,10 +70,11 @@ type terminalRequest struct {
 }
 
 type terminalResult struct {
-	snapshot   term.Snapshot
-	capturedAt time.Time
-	available  bool
-	err        error
+	snapshot     term.Snapshot
+	capturedAt   time.Time
+	outputOffset uint64
+	available    bool
+	err          error
 }
 
 type terminalActor struct {
@@ -78,17 +97,18 @@ type terminalActor struct {
 }
 
 type terminalActorState struct {
-	nextOutputOffset   uint64
-	lastOutputSeq      uint64
-	dirty              bool
-	ended              bool
-	processExited      bool
-	controllerClosed   bool
-	snapshot           term.Snapshot
-	snapshotCapturedAt time.Time
-	snapshotAvailable  bool
-	replyErr           error
-	failure            error
+	nextOutputOffset     uint64
+	lastOutputSeq        uint64
+	dirty                bool
+	ended                bool
+	processExited        bool
+	controllerClosed     bool
+	snapshot             term.Snapshot
+	snapshotCapturedAt   time.Time
+	snapshotOutputOffset uint64
+	snapshotAvailable    bool
+	replyErr             error
+	failure              error
 }
 
 func newTerminalActor(
@@ -164,13 +184,23 @@ func (a *terminalActor) snapshotWithCapturedAt() (
 	time.Time,
 	bool,
 ) {
+	snapshot, capturedAt, _, available := a.snapshotState()
+	return snapshot, capturedAt, available
+}
+
+func (a *terminalActor) snapshotState() (
+	term.Snapshot,
+	time.Time,
+	uint64,
+	bool,
+) {
 	result, err := a.submit(context.Background(), terminalRequest{
 		operation: terminalSnapshot,
 	})
 	if err != nil || result.err != nil {
-		return term.Snapshot{}, time.Time{}, false
+		return term.Snapshot{}, time.Time{}, 0, false
 	}
-	return result.snapshot, result.capturedAt, result.available
+	return result.snapshot, result.capturedAt, result.outputOffset, result.available
 }
 
 func (a *terminalActor) MarkProcessExited() {
@@ -354,9 +384,10 @@ func (a *terminalActor) handle(
 
 	case terminalSnapshot:
 		return terminalResult{
-			snapshot:   state.snapshot,
-			capturedAt: state.snapshotCapturedAt,
-			available:  state.snapshotAvailable && !state.processExited,
+			snapshot:     state.snapshot,
+			capturedAt:   state.snapshotCapturedAt,
+			outputOffset: state.snapshotOutputOffset,
+			available:    state.snapshotAvailable && !state.processExited,
 		}
 
 	case terminalProcessExited:
@@ -402,16 +433,18 @@ func (a *terminalActor) handle(
 			)}
 		}
 		if err := a.process.Resize(uint16(rows), uint16(columns)); err != nil {
-			return terminalResult{err: fmt.Errorf(
-				"session: resize PTY: %w",
-				err,
-			)}
+			return terminalResult{err: &terminalResizeError{
+				err: fmt.Errorf("session: resize PTY: %w", err),
+			}}
 		}
 		if err := a.controller.Resize(request.size); err != nil {
-			return terminalResult{err: fmt.Errorf(
-				"session: resize emulator after PTY: %w",
-				err,
-			)}
+			return terminalResult{err: &terminalResizeError{
+				afterPTY: true,
+				err: fmt.Errorf(
+					"session: resize emulator after PTY: %w",
+					err,
+				),
+			}}
 		}
 		state.snapshotAvailable = false
 		if !state.dirty {
@@ -451,6 +484,7 @@ func (a *terminalActor) sample(
 	}
 	state.snapshot = snapshot
 	state.snapshotCapturedAt = at.UTC()
+	state.snapshotOutputOffset = state.nextOutputOffset
 	state.snapshotAvailable = !state.processExited
 	if state.processExited {
 		return nil

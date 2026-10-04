@@ -52,8 +52,21 @@ type webSocketControl struct {
 	payload     []byte
 }
 
-// handleWS serves the compatible event stream and versioned input protocol.
+// handleWS negotiates the WebSocket protocol before the HTTP upgrade.
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	protocols := websocket.Subprotocols(r)
+	switch {
+	case len(protocols) == 0:
+		s.handleWebSocketV1(w, r)
+	case len(protocols) == 1 && protocols[0] == webSocketV2Protocol:
+		s.handleWebSocketV2(w, r)
+	default:
+		writeErr(w, http.StatusBadRequest, "unsupported WebSocket subprotocol")
+	}
+}
+
+// handleWebSocketV1 serves the original event stream and input protocol.
+func (s *Server) handleWebSocketV1(w http.ResponseWriter, r *http.Request) {
 	grant := requestGrant(r)
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,

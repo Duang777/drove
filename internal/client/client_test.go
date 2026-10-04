@@ -16,6 +16,7 @@ import (
 
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/localipc"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 )
 
@@ -214,6 +215,181 @@ func TestExplainEncodesPathAndOptionalLimit(t *testing.T) {
 				t.Fatalf("explanation = %+v", explanation)
 			}
 		})
+	}
+}
+
+func TestTimelineAndBlockedOccurrenceEncodePaths(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch r.URL.EscapedPath() {
+		case "/api/v1/agents/agent%2Fone/timeline":
+			_, _ = io.WriteString(w, `{
+				"session_id":"agent/one",
+				"agent_id":"agent/one",
+				"captured":{"seq":"9","next_offset":"12"},
+				"captured_at":"2026-10-04T10:00:00Z",
+				"duration_ms":40000,
+				"output":{"range":{"start":"0","end":"12"},"retained":[],"missing":[]},
+				"spans":[],
+				"blocked":[]
+			}`)
+		case "/api/v1/agents/agent%2Fone/timeline/blocked/2":
+			_, _ = io.WriteString(w, `{
+				"number":2,
+				"span":{"state":"blocked","start":{"seq":"8","next_offset":"12"},"start_at":"2026-10-04T09:59:50Z"},
+				"jump":{"seq":"3","next_offset":"4"},
+				"frame_available":true
+			}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	timeline, err := c.Timeline(context.Background(), "agent/one")
+	if err != nil {
+		t.Fatalf("timeline: %v", err)
+	}
+	if timeline.Captured != (recording.Cursor{Seq: 9, NextOffset: 12}) {
+		t.Fatalf("timeline = %+v", timeline)
+	}
+	blocked, err := c.BlockedOccurrence(context.Background(), "agent/one", 2)
+	if err != nil {
+		t.Fatalf("blocked occurrence: %v", err)
+	}
+	if blocked.Number != 2 ||
+		blocked.Jump != (recording.Cursor{Seq: 3, NextOffset: 4}) {
+		t.Fatalf("blocked occurrence = %+v", blocked)
+	}
+	if _, err := c.BlockedOccurrence(
+		context.Background(),
+		"agent/one",
+		0,
+	); !errors.Is(err, recording.ErrInvalidBlockedOccurrence) {
+		t.Fatalf("zero blocked occurrence error = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestFrameEncodesEachSelector(t *testing.T) {
+	base := time.Date(2026, time.October, 4, 10, 0, 0, 123, time.UTC)
+	sequence := recording.Seq(9007199254740993)
+	offset := recording.OutputOffset(17)
+	tests := []struct {
+		name      string
+		input     recording.SelectorInput
+		wantQuery string
+	}{
+		{
+			name:      "sequence",
+			input:     recording.SelectorInput{Seq: &sequence},
+			wantQuery: "seq=9007199254740993",
+		},
+		{
+			name:      "time",
+			input:     recording.SelectorInput{At: &base},
+			wantQuery: "at=2026-10-04T10%3A00%3A00.000000123Z",
+		},
+		{
+			name:      "offset",
+			input:     recording.SelectorInput{Offset: &offset},
+			wantQuery: "offset=17",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			selector, err := recording.NewSelector(test.input)
+			if err != nil {
+				t.Fatalf("new selector: %v", err)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.EscapedPath() != "/api/v1/agents/agent%2Fone/frame" {
+					t.Errorf("path = %q", r.URL.EscapedPath())
+				}
+				if r.URL.RawQuery != test.wantQuery {
+					t.Errorf("query = %q, want %q", r.URL.RawQuery, test.wantQuery)
+				}
+				_, _ = io.WriteString(w, `{
+					"session_id":"agent/one",
+					"cursor":{"seq":"4","next_offset":"17"},
+					"rows":40,
+					"columns":120,
+					"lines":["done"],
+					"truncated":false,
+					"fidelity":"exact_origin_replay",
+					"restorable":false
+				}`)
+			}))
+			defer server.Close()
+
+			c := New(strings.TrimPrefix(server.URL, "http://"))
+			frame, err := c.Frame(context.Background(), "agent/one", selector)
+			if err != nil {
+				t.Fatalf("frame: %v", err)
+			}
+			if frame.Cursor != (recording.Cursor{Seq: 4, NextOffset: 17}) ||
+				len(frame.Lines) != 1 ||
+				frame.Lines[0] != "done" {
+				t.Fatalf("frame = %+v", frame)
+			}
+		})
+	}
+}
+
+func TestFrameRejectsCursorSelectorBeforeRequest(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		calls.Add(1)
+	}))
+	defer server.Close()
+	cursor := recording.Origin
+	selector, err := recording.NewSelector(recording.SelectorInput{Cursor: &cursor})
+	if err != nil {
+		t.Fatalf("cursor selector: %v", err)
+	}
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	if _, err := c.Frame(
+		context.Background(),
+		"agent",
+		selector,
+	); !errors.Is(err, recording.ErrInvalidFrameSelector) {
+		t.Fatalf("cursor frame error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("calls = %d, want 0", calls.Load())
+	}
+}
+
+func TestFrameReturnsTypedOutputExpiry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusGone)
+		_, _ = io.WriteString(w, `{
+			"error":"recording: output expired",
+			"code":"output_expired",
+			"session_id":"agent-1",
+			"missing":[{"start":"3","end":"8"}]
+		}`)
+	}))
+	defer server.Close()
+	sequence := recording.Seq(9)
+	selector, err := recording.NewSelector(recording.SelectorInput{Seq: &sequence})
+	if err != nil {
+		t.Fatalf("selector: %v", err)
+	}
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err = c.Frame(context.Background(), "agent-1", selector)
+	var expired *recording.OutputExpiredError
+	if !errors.As(err, &expired) {
+		t.Fatalf("frame error = %v, want OutputExpiredError", err)
+	}
+	if expired.SessionID != "agent-1" ||
+		len(expired.Missing) != 1 ||
+		expired.Missing[0] != (recording.OutputRange{Start: 3, End: 8}) {
+		t.Fatalf("expiry = %+v", expired)
 	}
 }
 

@@ -2,10 +2,12 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/term"
 )
 
 func TestStreamingRedactorMasksTokenAtEverySplit(t *testing.T) {
@@ -584,6 +587,258 @@ func TestOutputProcessorPersistsQueryReplyFailureWithoutInputAudit(t *testing.T)
 	case fatal := <-manager.Fatal():
 		t.Fatalf("query reply failure triggered fail-stop: %v", fatal)
 	default:
+	}
+}
+
+func TestOutputProcessorSerializesOutputAndEffectiveResize(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("ordered-resize")
+	running := attachOutputOnlyRuntime(manager, id, "")
+	process := &terminalTestProcess{}
+	running.process = process
+	running.terminal = newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(50, 0).UTC()),
+		process,
+		&recordingTerminalObserver{},
+	)
+
+	first := []byte("before")
+	second := []byte("after")
+	if err := running.output.Feed(first, 0); err != nil {
+		t.Fatalf("feed before resize: %v", err)
+	}
+	size, err := term.NewSize(24, 80)
+	if err != nil {
+		t.Fatalf("new resize: %v", err)
+	}
+	if err := running.output.Resize(context.Background(), size); err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	if err := running.output.Feed(second, uint64(len(first))); err != nil {
+		t.Fatalf("feed after resize: %v", err)
+	}
+	if err := running.output.End(uint64(len(first) + len(second))); err != nil {
+		t.Fatalf("end output: %v", err)
+	}
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	var recordingTypes []string
+	for _, row := range rows {
+		switch event.Type(row.Type) {
+		case event.TypeOutputChunk:
+			recordingTypes = append(recordingTypes, row.Type)
+		case event.TypeAgentResized:
+			recordingTypes = append(recordingTypes, row.Type)
+			payload, decodeErr := event.DecodeAgentResizedPayload(row.Payload)
+			if decodeErr != nil {
+				t.Fatalf("decode resize: %v", decodeErr)
+			}
+			if payload.Rows != 24 ||
+				payload.Columns != 80 ||
+				payload.OutputOffset != uint64(len(first)) {
+				t.Fatalf("resize payload = %+v", payload)
+			}
+		}
+	}
+	wantTypes := []string{
+		string(event.TypeOutputChunk),
+		string(event.TypeAgentResized),
+		string(event.TypeOutputChunk),
+	}
+	if !slices.Equal(recordingTypes, wantTypes) {
+		t.Fatalf("recording types = %v, want %v", recordingTypes, wantTypes)
+	}
+	if got := process.Resizes(); !slices.Equal(
+		got,
+		[][2]uint16{{24, 80}},
+	) {
+		t.Fatalf("PTY resizes = %v", got)
+	}
+	snapshot, available := running.terminal.Snapshot()
+	if !available || !sameTerminalSize(snapshot.Size(), size) {
+		t.Fatalf("terminal size = %+v, available=%t", snapshot.Size(), available)
+	}
+}
+
+func TestOutputProcessorCloseWaitsForAdmittedRequests(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("ordered-close")
+	running := attachOutputOnlyRuntime(manager, id, "")
+	resizeStarted := make(chan struct{})
+	resizeRelease := make(chan struct{})
+	process := &terminalTestProcess{
+		resizeStarted: resizeStarted,
+		resizeRelease: resizeRelease,
+	}
+	running.process = process
+	running.terminal = newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(55, 0).UTC()),
+		process,
+		&recordingTerminalObserver{},
+	)
+	size, err := term.NewSize(24, 80)
+	if err != nil {
+		t.Fatalf("new resize: %v", err)
+	}
+
+	resizeDone := make(chan error, 1)
+	go func() {
+		resizeDone <- running.output.Resize(context.Background(), size)
+	}()
+	select {
+	case <-resizeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("resize did not reach the PTY")
+	}
+
+	feedDone := make(chan error, 1)
+	go func() {
+		feedDone <- running.output.Feed([]byte("queued"), 0)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(running.output.requests) != 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("feed was not admitted behind resize")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- running.output.Close()
+	}()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close returned before admitted requests: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(resizeRelease)
+
+	for name, result := range map[string]<-chan error{
+		"resize": resizeDone,
+		"feed":   feedDone,
+		"close":  closeDone,
+	} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s result: %v", name, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s request did not receive a result", name)
+		}
+	}
+	if err := running.output.Feed([]byte("late"), 6); !errors.Is(
+		err,
+		errOutputProcessorClosed,
+	) {
+		t.Fatalf("feed after close error = %v", err)
+	}
+}
+
+func TestOutputProcessorResizeFailureBeforeApplyDoesNotFailStop(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("resize-retry")
+	running := attachOutputOnlyRuntime(manager, id, "")
+	resizeErr := errors.New("resize rejected")
+	process := &terminalTestProcess{resizeErr: resizeErr}
+	running.process = process
+	running.terminal = newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(60, 0).UTC()),
+		process,
+		&recordingTerminalObserver{},
+	)
+	size, err := term.NewSize(24, 80)
+	if err != nil {
+		t.Fatalf("new resize: %v", err)
+	}
+	if err := running.output.Resize(context.Background(), size); !errors.Is(err, resizeErr) {
+		t.Fatalf("resize error = %v, want %v", err, resizeErr)
+	}
+	select {
+	case fatal := <-manager.Fatal():
+		t.Fatalf("pre-apply resize triggered fail-stop: %v", fatal)
+	default:
+	}
+
+	output := []byte("still usable")
+	if err := running.output.Feed(output, 0); err != nil {
+		t.Fatalf("feed after rejected resize: %v", err)
+	}
+	if err := running.output.End(uint64(len(output))); err != nil {
+		t.Fatalf("end output: %v", err)
+	}
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type == string(event.TypeAgentResized) {
+			t.Fatalf("rejected resize was persisted: %+v", row)
+		}
+	}
+}
+
+func TestOutputProcessorPostApplyResizeCommitFailureFailsStop(t *testing.T) {
+	storageErr := errors.New("resize store unavailable")
+	st := &memoryCommitStore{appendErr: storageErr}
+	hub := event.NewHub(0)
+	committer := newCommitter(0, st, hub)
+	manager := &Manager{
+		hub:       hub,
+		committer: committer,
+		clock:     systemObservationClock{},
+		agents:    make(map[agent.ID]*agent.Agent),
+		sessions:  make(map[agent.ID]*runningSession),
+	}
+	id := agent.ID("resize-commit-failure")
+	process := &terminalTestProcess{}
+	running := &runningSession{process: process, vendor: "generic"}
+	running.output = newOutputProcessor(manager, id, running, "")
+	running.terminal = newTerminalTestActor(
+		t,
+		"generic",
+		newTerminalTestClock(time.Unix(70, 0).UTC()),
+		process,
+		&recordingTerminalObserver{},
+	)
+	manager.sessions[id] = running
+	t.Cleanup(func() {
+		_ = running.output.Close()
+		_ = running.terminal.Close()
+		committer.Close()
+	})
+
+	size, err := term.NewSize(24, 80)
+	if err != nil {
+		t.Fatalf("new resize: %v", err)
+	}
+	err = running.output.Resize(context.Background(), size)
+	if !errors.Is(err, storageErr) {
+		t.Fatalf("resize error = %v, want %v", err, storageErr)
+	}
+	if got := process.Resizes(); !slices.Equal(
+		got,
+		[][2]uint16{{24, 80}},
+	) {
+		t.Fatalf("PTY resizes = %v", got)
+	}
+	select {
+	case fatal := <-manager.Fatal():
+		if !errors.Is(fatal, storageErr) {
+			t.Fatalf("fatal error = %v, want %v", fatal, storageErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for resize fail-stop")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
@@ -20,6 +21,77 @@ var (
 	errCommitterClosed = errors.New("session: event committer closed")
 	errCommitterFailed = errors.New("session: event committer failed")
 )
+
+type commitClock struct {
+	high atomic.Uint64
+
+	mu      sync.Mutex
+	changed chan struct{}
+	closed  bool
+	err     error
+}
+
+func newCommitClock(initial uint64) *commitClock {
+	clock := &commitClock{changed: make(chan struct{})}
+	clock.high.Store(initial)
+	return clock
+}
+
+func (c *commitClock) High() uint64 {
+	return c.high.Load()
+}
+
+func (c *commitClock) Wait(ctx context.Context, after uint64) (uint64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		c.mu.Lock()
+		if c.closed {
+			err := c.err
+			c.mu.Unlock()
+			return c.high.Load(), err
+		}
+		if high := c.high.Load(); high > after {
+			c.mu.Unlock()
+			return high, nil
+		}
+		changed := c.changed
+		c.mu.Unlock()
+
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return c.high.Load(), fmt.Errorf(
+				"session: wait for committed sequence after %d: %w",
+				after,
+				ctx.Err(),
+			)
+		}
+	}
+}
+
+func (c *commitClock) advance(sequence uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || sequence <= c.high.Load() {
+		return
+	}
+	c.high.Store(sequence)
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *commitClock) close(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	c.err = err
+	close(c.changed)
+}
 
 type commitStore interface {
 	AppendEvents(context.Context, uint64, []store.EventRow) (uint64, error)
@@ -108,6 +180,7 @@ type committer struct {
 	stop     chan struct{}
 	done     chan struct{}
 	fatal    chan error
+	clock    *commitClock
 
 	admissionMu sync.RWMutex
 	stateMu     sync.RWMutex
@@ -124,6 +197,7 @@ func newCommitter(initialSeq uint64, st commitStore, hub *event.Hub) *committer 
 		stop:     make(chan struct{}),
 		done:     make(chan struct{}),
 		fatal:    make(chan error, 1),
+		clock:    newCommitClock(initialSeq),
 	}
 	go c.run(initialSeq)
 	return c
@@ -209,6 +283,17 @@ func (c *committer) Fatal() <-chan error {
 	return c.fatal
 }
 
+func (c *committer) HighWatermark() uint64 {
+	return c.clock.High()
+}
+
+func (c *committer) WaitForCommit(
+	ctx context.Context,
+	after uint64,
+) (uint64, error) {
+	return c.clock.Wait(ctx, after)
+}
+
 func (c *committer) Fail(err error) {
 	if err != nil {
 		c.poison(err)
@@ -227,6 +312,7 @@ func (c *committer) Close() {
 
 func (c *committer) run(lastSeq uint64) {
 	defer close(c.done)
+	defer c.clock.close(errCommitterClosed)
 	for {
 		select {
 		case request := <-c.requests:
@@ -300,6 +386,7 @@ func (c *committer) poison(root error) {
 	c.stateMu.Lock()
 	if c.failure == nil {
 		c.failure = root
+		c.clock.close(fmt.Errorf("%w: %v", errCommitterFailed, root))
 		select {
 		case c.fatal <- root:
 		default:
@@ -354,6 +441,7 @@ func (c *committer) execute(
 			err: fmt.Errorf("session: append event batch after seq %d: %w", lastSeq, err),
 		}
 	}
+	c.clock.advance(newLastSeq)
 	wantLastSeq := lastSeq + uint64(len(committed))
 	if newLastSeq != wantLastSeq {
 		return newLastSeq, commitResult{

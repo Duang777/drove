@@ -25,6 +25,7 @@ import (
 	"github.com/Duang777/drove/internal/client"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
@@ -63,6 +64,7 @@ func newRootCmd() *cobra.Command {
 		newUpCmd(),
 		newPSCmd(),
 		newLogCmd(),
+		newTimelineCmd(),
 		newExplainCmd(),
 		newSendCmd(),
 		newHookCmd(),
@@ -198,6 +200,101 @@ func newLogCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&plain, "plain", false, "移除终端控制序列")
 	return cmd
+}
+
+func newTimelineCmd() *cobra.Command {
+	var asJSON bool
+	cmd := &cobra.Command{
+		Use:   "timeline <agent-id>",
+		Short: "显示 Agent 状态时间线与 Blocked 索引",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			c, err := newClient(ctx)
+			if err != nil {
+				return err
+			}
+			timeline, err := c.Timeline(ctx, args[0])
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				if err := json.NewEncoder(cmd.OutOrStdout()).Encode(timeline); err != nil {
+					return fmt.Errorf("encode timeline: %w", err)
+				}
+				return nil
+			}
+			return writeTimeline(cmd.OutOrStdout(), *timeline)
+		},
+	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "输出 JSON")
+	return cmd
+}
+
+func writeTimeline(w io.Writer, timeline recording.Timeline) error {
+	if _, err := fmt.Fprintf(
+		w,
+		"agent %s captured=%s/%s duration=%s output=[%s,%s)\n",
+		timeline.AgentID,
+		timeline.Captured.Seq,
+		timeline.Captured.NextOffset,
+		time.Duration(timeline.DurationMillis)*time.Millisecond,
+		timeline.Output.Range.Start,
+		timeline.Output.Range.End,
+	); err != nil {
+		return fmt.Errorf("write timeline header: %w", err)
+	}
+	for _, span := range timeline.Spans {
+		end := "live"
+		if span.End != nil {
+			end = span.End.Seq.String() + "/" + span.End.NextOffset.String()
+		}
+		if _, err := fmt.Fprintf(
+			w,
+			"%s start=%s/%s at=%s end=%s source=%s rule=%s reason=%q\n",
+			span.State,
+			span.Start.Seq,
+			span.Start.NextOffset,
+			span.StartAt.UTC().Format(time.RFC3339Nano),
+			end,
+			valueOrDash(span.Source),
+			valueOrDash(span.Rule),
+			span.Reason,
+		); err != nil {
+			return fmt.Errorf("write %s timeline span: %w", span.State, err)
+		}
+	}
+	for _, occurrence := range timeline.Blocked {
+		duration := "live"
+		if occurrence.Span.DurationMillis != nil {
+			duration = (time.Duration(*occurrence.Span.DurationMillis) * time.Millisecond).String()
+		}
+		if _, err := fmt.Fprintf(
+			w,
+			"blocked #%d start=%s/%s duration=%s jump=%s/%s frame_available=%t\n",
+			occurrence.Number,
+			occurrence.Span.Start.Seq,
+			occurrence.Span.Start.NextOffset,
+			duration,
+			occurrence.Jump.Seq,
+			occurrence.Jump.NextOffset,
+			occurrence.FrameAvailable,
+		); err != nil {
+			return fmt.Errorf(
+				"write Blocked occurrence %d: %w",
+				occurrence.Number,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func valueOrDash(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
 }
 
 func newExplainCmd() *cobra.Command {

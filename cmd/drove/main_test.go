@@ -20,6 +20,7 @@ import (
 	"github.com/Duang777/drove/internal/detect"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/localipc"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -518,6 +519,165 @@ func TestExplainCommandIsRegisteredWithFlags(t *testing.T) {
 		if flag == nil || flag.DefValue != wantDefault {
 			t.Fatalf("--%s flag = %+v, want default %q", name, flag, wantDefault)
 		}
+	}
+}
+
+func TestTimelineCommandIsRegisteredWithJSONFlag(t *testing.T) {
+	command, _, err := newRootCmd().Find([]string{"timeline"})
+	if err != nil {
+		t.Fatalf("find timeline command: %v", err)
+	}
+	if command.Name() != "timeline" {
+		t.Fatalf("command = %q, want timeline", command.Name())
+	}
+	flag := command.Flags().Lookup("json")
+	if flag == nil || flag.DefValue != "false" {
+		t.Fatalf("--json flag = %+v, want default false", flag)
+	}
+}
+
+func TestWriteTimelinePrintsSpansAndNumberedBlockedEntries(t *testing.T) {
+	base := time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC)
+	end := recording.Cursor{Seq: 9, NextOffset: 12}
+	endAt := base.Add(20 * time.Second)
+	duration := int64(20000)
+	timeline := recording.Timeline{
+		AgentID:        "agent-1",
+		Captured:       end,
+		DurationMillis: 40000,
+		Output: recording.OutputCoverage{
+			Range: recording.OutputRange{Start: 0, End: 12},
+		},
+		Spans: []recording.StateSpan{{
+			State:          agent.StateBlocked,
+			Start:          recording.Cursor{Seq: 7, NextOffset: 8},
+			End:            &end,
+			StartAt:        base,
+			EndAt:          &endAt,
+			DurationMillis: &duration,
+			Source:         "screen",
+			Rule:           "claude.approval_prompt",
+			Reason:         "waiting",
+		}},
+		Blocked: []recording.BlockedOccurrence{{
+			Number: 1,
+			Span: recording.StateSpan{
+				State:          agent.StateBlocked,
+				Start:          recording.Cursor{Seq: 7, NextOffset: 8},
+				End:            &end,
+				StartAt:        base,
+				EndAt:          &endAt,
+				DurationMillis: &duration,
+			},
+			Jump:           recording.Cursor{Seq: 3, NextOffset: 4},
+			FrameAvailable: true,
+		}},
+	}
+	var output bytes.Buffer
+	if err := writeTimeline(&output, timeline); err != nil {
+		t.Fatalf("write timeline: %v", err)
+	}
+	text := output.String()
+	for _, fragment := range []string{
+		"agent agent-1 captured=9/12 duration=40s output=[0,12)",
+		"blocked start=7/8 at=2026-10-04T10:00:00Z end=9/12",
+		"source=screen rule=claude.approval_prompt",
+		`reason="waiting"`,
+		"blocked #1 start=7/8 duration=20s jump=3/4 frame_available=true",
+	} {
+		if !strings.Contains(text, fragment) {
+			t.Fatalf("timeline output missing %q:\n%s", fragment, text)
+		}
+	}
+}
+
+func TestTimelineCommandJSONKeepsStdoutMachineClean(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "drove-timeline-")
+	if err != nil {
+		t.Fatalf("create home: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(home); err != nil {
+			t.Errorf("remove home: %v", err)
+		}
+	})
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".drove")
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure control token: %v", err)
+	}
+
+	listener, err := localipc.Listen(dataDir)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		switch r.URL.EscapedPath() {
+		case "/api/v1/agents":
+			_, _ = io.WriteString(w, "[]")
+		case "/api/v1/agents/agent%2Fone/timeline":
+			_ = json.NewEncoder(w).Encode(recording.Timeline{
+				SessionID:  "agent/one",
+				AgentID:    "agent/one",
+				Captured:   recording.Cursor{Seq: 9, NextOffset: 12},
+				CapturedAt: time.Date(2026, time.October, 4, 10, 0, 0, 0, time.UTC),
+				Output: recording.OutputCoverage{
+					Range:    recording.OutputRange{Start: 0, End: 12},
+					Retained: []recording.OutputRange{{Start: 0, End: 12}},
+					Missing:  []recording.OutputRange{},
+				},
+				Spans:   []recording.StateSpan{},
+				Blocked: []recording.BlockedOccurrence{},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	})}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+	})
+
+	cfg := config.Defaults()
+	cfg.DataDir = dataDir
+	cfg.DBPath = ""
+	rawConfig, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(config.DefaultPath(), rawConfig, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	command := newTimelineCmd()
+	command.SetArgs([]string{"agent/one", "--json"})
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.SetOut(&stdout)
+	command.SetErr(&stderr)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute timeline: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	decoder := json.NewDecoder(&stdout)
+	var timeline recording.Timeline
+	if err := decoder.Decode(&timeline); err != nil {
+		t.Fatalf("decode stdout: %v; output=%q", err, stdout.String())
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		t.Fatalf("stdout contains non-JSON data: %q", stdout.String())
+	}
+	if timeline.AgentID != "agent/one" ||
+		timeline.Captured != (recording.Cursor{Seq: 9, NextOffset: 12}) {
+		t.Fatalf("timeline = %+v", timeline)
 	}
 }
 

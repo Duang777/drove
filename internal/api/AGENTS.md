@@ -18,6 +18,9 @@
   - `POST /api/v1/auth/login-code`：仅允许 Unix socket 签发一次性浏览器登录码
   - `POST /api/v1/auth/login`：浏览器同源兑换 HttpOnly cookie
   - `POST /api/v1/auth/token/rotate`：仅允许 Unix socket 调用的控制令牌轮换
+  - `GET  /api/v1/agents/{id}/timeline`：状态区间、Blocked 索引与输出保留范围
+  - `GET  /api/v1/agents/{id}/timeline/blocked/{number}`：一基 Blocked 跳转位置
+  - `GET  /api/v1/agents/{id}/frame`：按 seq、at 或 offset 精确重建受限终端帧
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
 - 浏览器 listener 从嵌入文件系统提供 `/`、`/login` 和哈希静态资源；Unix listener
   不提供前端。
@@ -29,10 +32,20 @@
   Unix peer，并使用目标会话的内存 token，不接受控制面 token；请求 envelope
   必须严格校验，只有已提交或重复的 delivery 返回 204。
 - 每个 WebSocket 连接只有一个读协程和一个写协程；写协程独占事件、ack/error、ping/pong 和 close 帧。
-- WebSocket 监听认证 `Grant.Done()`；令牌代际或 cookie session 失效后发送 policy
-  violation close。
+- v1 和 v2 WebSocket 都监听认证 `Grant.Done()`；令牌代际或 cookie session
+  失效后发送 policy violation close。
+- 无子协议继续使用 v1；只有精确协商 `drove.v2` 才启用按 Agent 的 raw、events 和
+  snapshot 订阅。其它显式子协议在 upgrade 前拒绝。
+- v2 的普通出站帧共享 8 MiB 字节预算；溢出会取消该连接的全部订阅、丢弃未写帧，
+  通过保留控制槽发送各订阅最后成功写出的 cursor，并以 1013 关闭。
+- resume cursor 只在 writer 成功写完整帧后推进；history 和 live 必须使用同一
+  Store tail，订阅建立竞态不得通过 Hub 补洞。
+- v1 hello、事件和输入错误的逐帧字节形状由
+  `testdata/websocket_v1.golden` 锁定。
 - REST 回放和 WebSocket 都原样传输已提交的 `output.chunk` 事件；保留期内 payload
   含 Base64 正文，过期回放只含 offset/len 元数据。
+- frame 只接受一个 selector；缺失录制返回 404，selector 错误返回 400，需要的
+  output 已过期时返回带 `output_expired` code 和 missing ranges 的 410。
 - 输入消息必须携带版本、连接内唯一 `request_id` 和 Agent ID；响应以同一 `request_id` 返回稳定 ack/error。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。

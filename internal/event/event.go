@@ -37,6 +37,8 @@ const (
 	TypeAgentInput Type = "agent.input"
 	// TypeAgentSignal 表示 Detector 已接受的脱敏状态信号。
 	TypeAgentSignal Type = "agent.signal"
+	// TypeAgentResized 表示已成功应用到 PTY 和终端模型的尺寸。
+	TypeAgentResized Type = "agent.resized"
 )
 
 // Event 是不可变事件。公开字段供序列化，私有字段保存持久化附件。
@@ -273,6 +275,78 @@ func NewAgentSignalDraft(sessionID, agentID, payload string) Draft {
 	}
 }
 
+const (
+	// AgentResizedPayloadVersion is the current agent.resized payload version.
+	AgentResizedPayloadVersion = 1
+)
+
+// AgentResizedPayloadV1 records one effective terminal size at an output boundary.
+type AgentResizedPayloadV1 struct {
+	Version      int    `json:"version"`
+	Rows         uint16 `json:"rows"`
+	Columns      uint16 `json:"columns"`
+	OutputOffset uint64 `json:"output_offset"`
+}
+
+// Validate rejects malformed agent.resized payloads.
+func (p AgentResizedPayloadV1) Validate() error {
+	if p.Version != AgentResizedPayloadVersion {
+		return fmt.Errorf("event: agent resized version %d is unsupported", p.Version)
+	}
+	if p.Rows == 0 {
+		return errors.New("event: agent resized rows must be positive")
+	}
+	if p.Columns == 0 {
+		return errors.New("event: agent resized columns must be positive")
+	}
+	return nil
+}
+
+// DecodeAgentResizedPayload decodes and validates an agent.resized v1 payload.
+func DecodeAgentResizedPayload(payload string) (AgentResizedPayloadV1, error) {
+	var decoded AgentResizedPayloadV1
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		return AgentResizedPayloadV1{}, fmt.Errorf(
+			"event: decode agent resized payload: %w",
+			err,
+		)
+	}
+	if err := decoded.Validate(); err != nil {
+		return AgentResizedPayloadV1{}, err
+	}
+	return decoded, nil
+}
+
+// NewAgentResizedDraft constructs an uncommitted effective terminal resize.
+func NewAgentResizedDraft(
+	sessionID string,
+	agentID string,
+	rows uint16,
+	columns uint16,
+	outputOffset uint64,
+) (Draft, error) {
+	payload := AgentResizedPayloadV1{
+		Version:      AgentResizedPayloadVersion,
+		Rows:         rows,
+		Columns:      columns,
+		OutputOffset: outputOffset,
+	}
+	if err := payload.Validate(); err != nil {
+		return Draft{}, err
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return Draft{}, fmt.Errorf("event: encode agent resized payload: %w", err)
+	}
+	return Draft{
+		typ:       TypeAgentResized,
+		sessionID: sessionID,
+		agentID:   agentID,
+		reason:    "applied",
+		payload:   string(encoded),
+	}, nil
+}
+
 // Commit seals a copied draft with its durable sequence and timestamp.
 func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	if seq == 0 {
@@ -288,7 +362,8 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		TypeError,
 		TypeSessionLifecycle,
 		TypeAgentInput,
-		TypeAgentSignal:
+		TypeAgentSignal,
+		TypeAgentResized:
 	default:
 		return Event{}, fmt.Errorf("event: invalid draft type %q", draft.typ)
 	}
@@ -328,6 +403,11 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		outputAttachment = append([]byte(nil), draft.outputAttachment...)
 	} else if len(draft.outputAttachment) != 0 || draft.storedPayload != "" {
 		return Event{}, errors.New("event: non-output chunk draft contains private output data")
+	}
+	if draft.typ == TypeAgentResized {
+		if _, err := DecodeAgentResizedPayload(draft.payload); err != nil {
+			return Event{}, err
+		}
 	}
 	return Event{
 		Seq:              seq,

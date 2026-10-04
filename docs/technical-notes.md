@@ -661,3 +661,65 @@ done
 | `~/.codex/hooks.json` | `62a09593618cfe1975a70d180ad05aa1adbcf902b13dbcc8a1ec9e183d9726cf` |
 | 项目 `.codex/config.toml` 和 `hooks.json` | 不存在 |
 | Claude managed settings/hooks 与系统 Codex config/requirements | 不存在 |
+
+## 11. Terminal stream and replay
+
+Spec 011 增加了两类读取路径。WebSocket v2 从 SQLite 读取每个会话的历史和实时
+尾部；timeline 和 frame 则在一次捕获的事件边界内读取。两类路径都把 Committer
+时钟当作唤醒信号，SQLite 事件和 `output_chunks` 仍是唯一事实源。
+
+### 协议与回放验收
+
+`internal/api/websocket_acceptance_test.go` 覆盖以下协议性质：
+
+- subscribe 与 output commit、resize 并发时，history 加 live 字节仍与 Store
+  完全相同；
+- 客户端可从首条流中每一个不同 cursor 重连，且不会重复或遗漏输出；
+- 单个连接的出站队列溢出后返回 `slow_consumer` 和最后写出 cursor，以 1013
+  关闭；另一个连接和后续 Committer 写入继续完成；
+- 无子协议的 v1 hello、事件和 error 帧与逐字节 golden transcript 相同。
+
+`internal/session/snapshot_test.go` 使用可控时钟验证 500 ms 最小间隔和容量为 1
+的 latest-value 合并。`internal/recording/replay_acceptance_test.go` 使用一份包含
+三段 Blocked、分片 UTF-8、跨块 CSI 与 OSC、alternate screen 和 resize 的录制。
+sequence、time 和 partial offset 三种 frame 都与独立的 from-origin 回放相同。
+删除前五个输出附件后，timeline 仍返回三段 Blocked 和缺失范围，frame 返回
+`OutputExpiredError`。
+
+### 50 MiB frame 基准
+
+2026-10-04 在以下环境运行：
+
+- Go `go1.24.13 darwin/arm64`
+- CPU `Apple M5 Pro`
+- 内存 48 GiB
+- `github.com/charmbracelet/x/vt`
+  `v0.0.0-20261004011457-ad85c59fdf4e`
+
+基准创建一份恰好 50 MiB、1600 个最大尺寸 `output.chunk` 的录制。冷请求禁用
+frame cache，并随机选择 offset 从原点回放。暖请求先缓存一个随机的 41.53 MiB
+目标，再重复读取同一精确 frame。
+
+```bash
+go test ./internal/recording -run '^$' \
+  -bench '^BenchmarkFrame50MiBColdRandom$' \
+  -benchmem -benchtime=5x -count=1
+go test ./internal/recording -run '^$' \
+  -bench '^BenchmarkFrame50MiBWarmRandom$' \
+  -benchmem -benchtime=20x -count=1
+```
+
+| 指标 | 冷随机 frame | 暖精确缓存 |
+| --- | ---: | ---: |
+| 样本数 | 5 | 20 |
+| 平均时长 | 27.439 s/op | 3.788 ms/op |
+| p50 | 32.729 s | 3.712 ms |
+| p95 | 36.500 s | 4.064 ms |
+| 平均逻辑回放量 | 36.26 MiB/op | 41.53 MiB/op |
+| 分配字节 | 1,577,616,041 B/op | 2,246,095 B/op |
+| 分配次数 | 14,912,991 allocs/op | 72,816 allocs/op |
+
+冷 p95 没有达到 300 ms 目标。当前实现保留精确 from-origin 语义，不把只含可见
+cell 的 `term.Snapshot` 当作可恢复状态。完整 x/vt checkpoint 与 offset
+selector 元数据索引由 [Issue #35](https://github.com/Duang777/drove/issues/35)
+继续跟踪。

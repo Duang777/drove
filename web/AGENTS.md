@@ -11,6 +11,7 @@
 | `src/api/types.ts` | 与 daemon JSON 契约对齐的类型（**契约唯一事实来源在 Go 端，改动需两侧同步**） |
 | `src/api/client.ts` | REST 客户端（list / start / stop / replay），纯 JSON 透传 |
 | `src/ws/eventStream.ts` | WebSocket 事件流与输入 ack/error 关联：自动重连、超时、连接状态回调、幂等关闭 |
+| `src/ws/terminalStream.ts` | `drove.v2` terminal 客户端：严格解码 raw/event/resize/snapshot，消费成功后推进 cursor |
 | `src/hooks/useAgentEvents.ts` | React hook：订阅事件流 + 本地投影（`latestAgentState`） |
 | `src/components/` | AgentList / AgentCard / StatusBadge / EventLog |
 | `src/App.tsx` | 布局 + 5s 轮询刷新 agent 列表 + 实时事件面板 |
@@ -31,6 +32,8 @@
 
 - 禁止在组件中直接 import daemon 内部结构；类型一律经 `src/api/types.ts`。
 - 事件流消费必须走 `EventStream` 类（含重连与清理）；不得在组件内手写裸 WebSocket。
+- 终端订阅必须走 `TerminalStream`；v2 sequence/offset 始终使用规范十进制字符串，
+  不得转成 JavaScript `number`。
 - 组件卸载必须清理订阅（`useAgentEvents` 已内置）。
 - 新增依赖需说明用途；样式使用单一全局 CSS，不引入 UI 框架。
 
