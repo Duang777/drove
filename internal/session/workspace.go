@@ -2,15 +2,19 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/workspace"
 	"github.com/google/uuid"
 )
+
+const workspaceRemovedReason = "workspace_removed"
 
 var (
 	// ErrWorkspaceUnavailable means the daemon cannot manage Git worktrees.
@@ -37,6 +41,10 @@ type workspaceMetadata struct {
 	Repository string `json:"repository"`
 	Path       string `json:"path"`
 	Branch     string `json:"branch"`
+}
+
+type workspaceRemovedPayload struct {
+	Version int `json:"version"`
 }
 
 type workspaceLifecycle interface {
@@ -146,6 +154,31 @@ func (m *Manager) CleanupWorkspace(
 			err,
 		)
 	default:
+		known := m.markWorkspaceRemoved(agentID)
+		if !known {
+			return removed, nil
+		}
+		payload, encodeErr := json.Marshal(workspaceRemovedPayload{Version: 1})
+		if encodeErr != nil {
+			return workspace.Workspace{}, fmt.Errorf(
+				"session: encode workspace removal: %w",
+				encodeErr,
+			)
+		}
+		if _, commitErr := m.committer.CommitEvents(
+			context.Background(),
+			[]event.Draft{event.NewSessionLifecycleDraft(
+				id,
+				id,
+				workspaceRemovedReason,
+				string(payload),
+			)},
+		); commitErr != nil {
+			return workspace.Workspace{}, fmt.Errorf(
+				"session: persist workspace removal: %w",
+				commitErr,
+			)
+		}
 		return removed, nil
 	}
 }
@@ -158,6 +191,13 @@ func (m *Manager) reserveWorkspaceCleanup(id agent.ID) error {
 	}
 	if _, cleaning := m.cleaning[id]; cleaning {
 		return fmt.Errorf("%w: agent %q cleanup is already running", ErrWorkspaceInUse, id)
+	}
+	if _, creating := m.creating[id]; creating {
+		return fmt.Errorf(
+			"%w: agent %q is being created",
+			ErrWorkspaceInUse,
+			id,
+		)
 	}
 	if managed, ok := m.agents[id]; ok {
 		_, attached := m.sessions[id]
@@ -181,6 +221,30 @@ func (m *Manager) releaseWorkspaceCleanup(id agent.ID) {
 	m.mu.Lock()
 	delete(m.cleaning, id)
 	m.mu.Unlock()
+}
+
+func (m *Manager) reserveWorkspaceCreation(id agent.ID) {
+	m.mu.Lock()
+	m.creating[id] = struct{}{}
+	m.mu.Unlock()
+}
+
+func (m *Manager) releaseWorkspaceCreation(id agent.ID) {
+	m.mu.Lock()
+	delete(m.creating, id)
+	m.mu.Unlock()
+}
+
+func (m *Manager) markWorkspaceRemoved(id agent.ID) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	managed, ok := m.agents[id]
+	if !ok {
+		return false
+	}
+	managed.workspaceRemoved = true
+	managed.resumeOnStart = false
+	return true
 }
 
 func metadataForWorkspace(target *workspace.Workspace) *workspaceMetadata {

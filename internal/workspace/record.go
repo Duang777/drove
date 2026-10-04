@@ -56,29 +56,66 @@ func (m *Manager) writeWorkspaceRecord(target Workspace) error {
 		return fmt.Errorf("workspace: encode record: %w", err)
 	}
 
-	file, err := os.OpenFile(
-		recordPath,
-		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-		0o600,
+	directory := filepath.Dir(recordPath)
+	file, err := os.CreateTemp(
+		directory,
+		"."+filepath.Base(recordPath)+".tmp-*",
 	)
 	if err != nil {
-		return fmt.Errorf("workspace: create record %q: %w", recordPath, err)
+		return fmt.Errorf("workspace: create temporary record %q: %w", recordPath, err)
 	}
-	if _, err := file.Write(raw); err != nil {
+	temporaryPath := file.Name()
+	defer func() {
+		if temporaryPath != "" {
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
-		_ = os.Remove(recordPath)
-		return fmt.Errorf("workspace: write record %q: %w", recordPath, err)
+		return fmt.Errorf("workspace: secure temporary record %q: %w", recordPath, err)
+	}
+	written, err := file.Write(raw)
+	if err != nil {
+		_ = file.Close()
+		return fmt.Errorf("workspace: write temporary record %q: %w", recordPath, err)
+	}
+	if written != len(raw) {
+		_ = file.Close()
+		return fmt.Errorf(
+			"workspace: write temporary record %q: %w",
+			recordPath,
+			io.ErrShortWrite,
+		)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		_ = os.Remove(recordPath)
-		return fmt.Errorf("workspace: sync record %q: %w", recordPath, err)
+		return fmt.Errorf("workspace: sync temporary record %q: %w", recordPath, err)
 	}
 	if err := file.Close(); err != nil {
-		_ = os.Remove(recordPath)
-		return fmt.Errorf("workspace: close record %q: %w", recordPath, err)
+		return fmt.Errorf("workspace: close temporary record %q: %w", recordPath, err)
+	}
+	if err := ensureAbsent(recordPath); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, recordPath); err != nil {
+		return fmt.Errorf("workspace: install record %q: %w", recordPath, err)
+	}
+	temporaryPath = ""
+	if err := syncDirectory(directory); err != nil {
+		return fmt.Errorf("workspace: sync record directory %q: %w", directory, err)
 	}
 	return nil
+}
+
+func syncDirectory(path string) (result error) {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, directory.Close())
+	}()
+	return directory.Sync()
 }
 
 func (m *Manager) readWorkspaceRecord(

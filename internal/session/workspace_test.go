@@ -173,6 +173,19 @@ func TestStartPreservesWorkspaceAfterDurableCreationPublishFails(t *testing.T) {
 	if len(stored) != 2 || stored[0].Reason != "created" {
 		t.Fatalf("stored creation events = %+v", stored)
 	}
+	if _, cleanupErr := manager.CleanupWorkspace(
+		context.Background(),
+		workspaces.prepareAgentID,
+		false,
+	); !errors.Is(cleanupErr, ErrWorkspaceInUse) {
+		t.Fatalf(
+			"cleanup after durable publish failure error = %v, want ErrWorkspaceInUse",
+			cleanupErr,
+		)
+	}
+	if workspaces.cleanupCount != 0 {
+		t.Fatalf("durable workspace cleanup reached lifecycle %d times", workspaces.cleanupCount)
+	}
 }
 
 func TestStartRejectsWorkspaceWhenManagerIsUnavailable(t *testing.T) {
@@ -187,6 +200,45 @@ func TestStartRejectsWorkspaceWhenManagerIsUnavailable(t *testing.T) {
 	}
 	if status != nil {
 		t.Fatalf("status = %+v, want nil", status)
+	}
+}
+
+func TestStartReservesWorkspaceBeforePrepareCompletes(t *testing.T) {
+	manager, _ := newTestManager(t)
+	prepareStarted := make(chan struct{})
+	releasePrepare := make(chan struct{})
+	workspaces := &fakeWorkspaceLifecycle{
+		prepareStarted: prepareStarted,
+		releasePrepare: releasePrepare,
+		prepareErr:     errors.New("prepare stopped"),
+	}
+	manager.workspaces = workspaces
+	source := t.TempDir()
+
+	startResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Start(context.Background(), StartRequest{
+			Command:  "/bin/cat",
+			Dir:      source,
+			Worktree: &WorktreeRequest{},
+		})
+		startResult <- err
+	}()
+	<-prepareStarted
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		workspaces.prepareAgentID,
+		false,
+	); !errors.Is(err, ErrWorkspaceInUse) {
+		t.Fatalf("cleanup during workspace creation error = %v, want ErrWorkspaceInUse", err)
+	}
+	if workspaces.cleanupCount != 0 {
+		t.Fatalf("cleanup reached workspace lifecycle %d times", workspaces.cleanupCount)
+	}
+	close(releasePrepare)
+	if err := <-startResult; !errors.Is(err, ErrWorkspacePrepare) {
+		t.Fatalf("start error = %v, want ErrWorkspacePrepare", err)
 	}
 }
 
@@ -267,6 +319,133 @@ func TestCleanupWorkspacePreventsConcurrentResume(t *testing.T) {
 	}
 }
 
+func TestCleanupWorkspacePersistsRemovalAndDisablesResumeAfterRecovery(t *testing.T) {
+	manager, st := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	mode := agent.RunModeInteractive
+	policy := agent.HooksOff
+	rawCreatedPayload, err := json.Marshal(createdPayload{
+		Version:    2,
+		Name:       "workspace-agent",
+		Vendor:     "claude",
+		Mode:       &mode,
+		HookPolicy: &policy,
+		WorkingDir: "/tmp/drove-workspace",
+		Workspace: &workspaceMetadata{
+			Repository: "/tmp/repository",
+			Path:       "/tmp/drove-workspace",
+			Branch:     "feature/workspace",
+		},
+	})
+	if err != nil {
+		t.Fatalf("encode creation metadata: %v", err)
+	}
+	resumedPayload, err := json.Marshal(event.AgentResumedPayloadV1{
+		Version:          1,
+		VendorSessionRef: "vendor-session",
+	})
+	if err != nil {
+		t.Fatalf("encode resume metadata: %v", err)
+	}
+	if _, err := manager.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{
+			event.NewSessionLifecycleDraft(
+				string(id),
+				string(id),
+				"created",
+				string(rawCreatedPayload),
+			),
+			event.NewStateChangedDraft(
+				string(id),
+				string(id),
+				string(agent.StatePending),
+				string(agent.StateStopped),
+				"test stopped",
+				"",
+			),
+			event.NewAgentResumedDraft(
+				string(id),
+				string(id),
+				string(resumedPayload),
+			),
+		},
+	); err != nil {
+		t.Fatalf("persist resumable session history: %v", err)
+	}
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	managed.workingDir = "/tmp/drove-workspace"
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupResult: workspace.Workspace{
+			AgentID: string(id),
+			Branch:  "feature/workspace",
+		},
+	}
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); err != nil {
+		t.Fatalf("cleanup workspace: %v", err)
+	}
+	status, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status after cleanup: %v", err)
+	}
+	if status.Resumable || status.Dir != "" {
+		t.Fatalf("status after cleanup = %+v, want non-resumable without directory", status)
+	}
+	if _, err := manager.Resume(context.Background(), id); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("resume after cleanup error = %v, want ErrResumeConflict", err)
+	}
+
+	rows, err := st.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay cleanup history: %v", err)
+	}
+	if len(rows) != 4 ||
+		rows[3].Type != string(event.TypeSessionLifecycle) ||
+		rows[3].Reason != workspaceRemovedReason ||
+		rows[3].Payload != `{"version":1}` {
+		t.Fatalf("cleanup history = %+v", rows)
+	}
+
+	registry := manager.reg
+	if err := manager.Close(); err != nil {
+		t.Fatalf("close manager before recovery: %v", err)
+	}
+	recovered, err := Bootstrap(context.Background(), registry, st)
+	if err != nil {
+		t.Fatalf("bootstrap cleaned workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := recovered.Manager.Close(); err != nil {
+			t.Errorf("close recovered manager: %v", err)
+		}
+	})
+	recoveredStatus, err := recovered.Manager.Status(id)
+	if err != nil {
+		t.Fatalf("recovered status: %v", err)
+	}
+	if recoveredStatus.Resumable || recoveredStatus.Dir != "" {
+		t.Fatalf(
+			"recovered status = %+v, want non-resumable without directory",
+			recoveredStatus,
+		)
+	}
+	recoveredManaged, ok := recovered.Manager.managed(id)
+	if !ok || recoveredManaged.vendorSessionReference() != "vendor-session" {
+		t.Fatalf("recovered session reference = %+v", recoveredManaged)
+	}
+	if _, err := recovered.Manager.Resume(
+		context.Background(),
+		id,
+	); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("recovered resume error = %v, want ErrResumeConflict", err)
+	}
+}
+
 type fakeWorkspaceLifecycle struct {
 	prepared workspace.Workspace
 
@@ -274,6 +453,8 @@ type fakeWorkspaceLifecycle struct {
 	prepareBranch  string
 	prepareAgentID string
 	prepareErr     error
+	prepareStarted chan struct{}
+	releasePrepare chan struct{}
 	discardCount   int
 	discarded      workspace.Workspace
 	cleanupCount   int
@@ -286,7 +467,7 @@ type fakeWorkspaceLifecycle struct {
 }
 
 func (f *fakeWorkspaceLifecycle) Prepare(
-	_ context.Context,
+	ctx context.Context,
 	source string,
 	branch string,
 	agentID string,
@@ -294,6 +475,16 @@ func (f *fakeWorkspaceLifecycle) Prepare(
 	f.prepareSource = source
 	f.prepareBranch = branch
 	f.prepareAgentID = agentID
+	if f.prepareStarted != nil {
+		close(f.prepareStarted)
+	}
+	if f.releasePrepare != nil {
+		select {
+		case <-ctx.Done():
+			return workspace.Workspace{}, ctx.Err()
+		case <-f.releasePrepare:
+		}
+	}
 	if f.prepareErr != nil {
 		return workspace.Workspace{}, f.prepareErr
 	}

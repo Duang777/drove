@@ -14,6 +14,7 @@ type managedAgent struct {
 	refMu            sync.RWMutex
 	vendorSessionRef string
 	resumeOnStart    bool
+	workspaceRemoved bool
 }
 
 func newManagedAgent(target *agent.Agent) *managedAgent {

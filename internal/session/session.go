@@ -194,6 +194,7 @@ type Manager struct {
 	sessions map[agent.ID]*runningSession
 	resuming map[agent.ID]struct{}
 	cleaning map[agent.ID]struct{}
+	creating map[agent.ID]struct{}
 	closed   bool
 
 	starts    sync.WaitGroup
@@ -238,6 +239,7 @@ func NewManager(
 		sessions:      make(map[agent.ID]*runningSession),
 		resuming:      make(map[agent.ID]struct{}),
 		cleaning:      make(map[agent.ID]struct{}),
+		creating:      make(map[agent.ID]struct{}),
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
 		newCredential: generateSignalCredential,
@@ -280,6 +282,7 @@ func Bootstrap(
 		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
 		managed.workingDir = plan.WorkingDirs[string(snapshot.ID)]
 		managed.resumeOnStart = plan.ResumeOnStart[string(snapshot.ID)]
+		managed.workspaceRemoved = plan.WorkspaceRemoved[string(snapshot.ID)]
 		restoredAgents[snapshot.ID] = managed
 	}
 
@@ -348,6 +351,14 @@ func (m *Manager) Start(
 
 	// 2. 生成会话专属配置，再持久化会话元数据。
 	id := agent.ID(uuid.NewString())
+	workspaceCommitted := false
+	m.reserveWorkspaceCreation(id)
+	creationReserved := true
+	defer func() {
+		if creationReserved && !workspaceCommitted {
+			m.releaseWorkspaceCreation(id)
+		}
+	}()
 	preparedWorkspace, err := m.prepareWorkspace(
 		ctx,
 		string(id),
@@ -357,7 +368,6 @@ func (m *Manager) Start(
 	if err != nil {
 		return nil, err
 	}
-	workspaceCommitted := false
 	defer func() {
 		if resultErr == nil || workspaceCommitted {
 			return
@@ -474,7 +484,9 @@ func (m *Manager) Start(
 	m.mu.Lock()
 	m.agents[id] = managed
 	m.sessions[id] = running
+	delete(m.creating, id)
 	m.mu.Unlock()
+	creationReserved = false
 
 	if err := m.activate(ctx, activation{
 		id:           id,
@@ -805,6 +817,13 @@ func (m *Manager) reserveResume(
 			id,
 		)
 	}
+	if managed.workspaceRemoved {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q workspace was removed",
+			ErrResumeConflict,
+			id,
+		)
+	}
 	if managed.agent.State() != agent.StateStopped {
 		return nil, adapter.Entry{}, "", fmt.Errorf(
 			"%w: agent %q is not stopped",
@@ -973,19 +992,25 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	state := a.State()
 	ref := managed.vendorSessionReference()
 	entry, exactVendor := m.reg.Lookup(a.Vendor())
+	workspaceRemoved := managed.workspaceRemoved
 	resumable := state == agent.StateStopped &&
 		sess == nil &&
 		!reserved &&
+		!workspaceRemoved &&
 		ref != "" &&
 		exactVendor &&
 		entry.SupportsResume()
 	m.mu.RUnlock()
 
+	workingDir := a.WorkingDir()
+	if workspaceRemoved {
+		workingDir = ""
+	}
 	st := &Status{
 		AgentID:        string(a.ID()),
 		Name:           a.Name(),
 		Vendor:         a.Vendor(),
-		Dir:            a.WorkingDir(),
+		Dir:            workingDir,
 		Mode:           a.RunMode(),
 		State:          state,
 		CreatedAt:      a.CreatedAt(),

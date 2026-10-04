@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -51,6 +52,7 @@ type Workspace struct {
 type Manager struct {
 	root string
 	git  string
+	mu   sync.Mutex
 }
 
 // New creates a worktree manager without changing the filesystem.
@@ -78,6 +80,17 @@ func New(dataDir string) (*Manager, error) {
 
 // Prepare creates a worktree for one Agent. An empty branch gets a stable default.
 func (m *Manager) Prepare(
+	ctx context.Context,
+	repository string,
+	branch string,
+	agentID string,
+) (Workspace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.prepare(ctx, repository, branch, agentID)
+}
+
+func (m *Manager) prepare(
 	ctx context.Context,
 	repository string,
 	branch string,
@@ -165,18 +178,24 @@ func (m *Manager) Prepare(
 	if err := m.writeWorkspaceRecord(result); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return Workspace{}, errors.Join(err, m.Discard(cleanupCtx, result))
+		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
 	if err := m.copyIncludedFiles(ctx, result); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return Workspace{}, errors.Join(err, m.Discard(cleanupCtx, result))
+		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
 	return result, nil
 }
 
 // List returns all valid worktrees below this manager's root.
 func (m *Manager) List(ctx context.Context) ([]Workspace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.list(ctx)
+}
+
+func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
 	info, err := os.Lstat(m.root)
 	if errors.Is(err, os.ErrNotExist) {
 		return []Workspace{}, nil
@@ -280,10 +299,20 @@ func (m *Manager) Cleanup(
 	agentID string,
 	force bool,
 ) (Workspace, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cleanup(ctx, agentID, force)
+}
+
+func (m *Manager) cleanup(
+	ctx context.Context,
+	agentID string,
+	force bool,
+) (Workspace, error) {
 	if err := validateAgentID(agentID); err != nil {
 		return Workspace{}, err
 	}
-	all, err := m.List(ctx)
+	all, err := m.list(ctx)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -306,6 +335,16 @@ func (m *Manager) Cleanup(
 	target := matches[0]
 	if target.Dirty && !force {
 		return Workspace{}, fmt.Errorf("%w: %s", ErrDirty, target.Path)
+	}
+	if !target.Missing && !force {
+		current, err := m.inspect(ctx, target.Path, &target)
+		if err != nil {
+			return Workspace{}, err
+		}
+		if current.Dirty {
+			return Workspace{}, fmt.Errorf("%w: %s", ErrDirty, target.Path)
+		}
+		target = current
 	}
 	if target.Missing {
 		registered, err := m.worktreeRegistered(
@@ -353,6 +392,12 @@ func (m *Manager) Cleanup(
 
 // Discard rolls back a prepared worktree before its session metadata commits.
 func (m *Manager) Discard(ctx context.Context, target Workspace) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.discard(ctx, target)
+}
+
+func (m *Manager) discard(ctx context.Context, target Workspace) error {
 	if err := m.validateManagedPath(target); err != nil {
 		return err
 	}
@@ -392,7 +437,7 @@ func (m *Manager) Discard(ctx context.Context, target Workspace) error {
 			worktreeRemoved = true
 		}
 	} else if pathExists {
-		if err := os.RemoveAll(target.Path); err != nil {
+		if err := m.removeManagedPath(target); err != nil {
 			result = errors.Join(
 				result,
 				fmt.Errorf("workspace: remove partial worktree: %w", err),
@@ -438,7 +483,7 @@ func (m *Manager) rollbackFailedAdd(
 	ctx context.Context,
 	target Workspace,
 ) error {
-	return m.Discard(ctx, target)
+	return m.discard(ctx, target)
 }
 
 func (m *Manager) inspect(
