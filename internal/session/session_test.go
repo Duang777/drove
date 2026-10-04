@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
+	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
 )
@@ -201,6 +203,64 @@ func TestBootstrapRestoresLegacySessionIdempotently(t *testing.T) {
 	}
 	if got := second.Hub.LastSeq(); got != 3 {
 		t.Fatalf("hub last seq = %d, want 3", got)
+	}
+}
+
+func TestBootstrapAcceptsPreUpgradeUnicodeVendorSessionID(t *testing.T) {
+	st := newTestStore(t)
+	base := time.Date(2026, time.October, 3, 6, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"legacy","vendor":"claude",` +
+				`"mode":"interactive","hook_policy":"off"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "observed",
+			Payload: `{"version":1,"source":"hook","kind":"session_started","vendor":"claude",` +
+				`"vendor_event":"SessionStart","scope":"root","vendor_session_id":"旧会话 ",` +
+				`"confidence":1,"received_at":"2026-10-03T06:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440000","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("seed legacy session: %v", err)
+	}
+
+	result, err := Bootstrap(context.Background(), adapter.NewRegistry(), st)
+	if err != nil {
+		t.Fatalf("bootstrap legacy session: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := result.Manager.Close(); err != nil {
+			t.Errorf("close manager: %v", err)
+		}
+	})
+	managed, ok := result.Manager.managed("agent-1")
+	if !ok {
+		t.Fatal("restored agent is missing")
+	}
+	if got := managed.vendorSessionReference(); got != "旧会话 " {
+		t.Fatalf("restored vendor session reference = %q", got)
 	}
 }
 
@@ -732,6 +792,185 @@ func TestResumeUsesNativeCommandAndKeepsAgentID(t *testing.T) {
 	}
 }
 
+func TestResumeContinuesDurableOutputOffset(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	initial, err := event.NewOutputChunkDraft(
+		"agent-1",
+		"agent-1",
+		0,
+		[]byte("old"),
+	)
+	if err != nil {
+		t.Fatalf("create initial output: %v", err)
+	}
+	if _, err := manager.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{initial},
+	); err != nil {
+		t.Fatalf("commit initial output: %v", err)
+	}
+
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	if _, err := manager.Resume(context.Background(), managed.agent.ID()); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	started.OnOutput([]byte("new"), 0)
+	started.OnOutputEnd(3)
+
+	rows, err := st.Replay("agent-1")
+	if err != nil {
+		t.Fatalf("replay stored output: %v", err)
+	}
+	var offsets []uint64
+	for _, row := range rows {
+		if row.Type != string(event.TypeOutputChunk) {
+			continue
+		}
+		payload, err := event.DecodeOutputChunkPayload(row.Payload)
+		if err != nil {
+			t.Fatalf("decode output at seq %d: %v", row.Seq, err)
+		}
+		offsets = append(offsets, payload.Offset)
+	}
+	if len(offsets) != 2 || offsets[0] != 0 || offsets[1] != 3 {
+		t.Fatalf("output offsets = %v, want [0 3]", offsets)
+	}
+
+	timeline, err := manager.Timeline(context.Background(), "agent-1")
+	if err != nil {
+		t.Fatalf("timeline: %v", err)
+	}
+	if timeline.Captured.NextOffset != 6 ||
+		timeline.Output.Range != (recording.OutputRange{End: 6}) {
+		t.Fatalf("timeline output = %+v", timeline.Output)
+	}
+
+	tail, err := manager.TailRaw(context.Background(), "agent-1", nil)
+	if err != nil {
+		t.Fatalf("tail raw: %v", err)
+	}
+	defer tail.Close()
+	var tailed []byte
+tailLoop:
+	for {
+		item, err := tail.Next()
+		if err != nil {
+			t.Fatalf("tail next: %v", err)
+		}
+		switch typed := item.(type) {
+		case recording.RawOutput:
+			tailed = append(tailed, typed.Data...)
+		case recording.CaughtUp:
+			if typed.Cursor.NextOffset != 6 {
+				t.Fatalf("caught-up cursor = %+v", typed.Cursor)
+			}
+			break tailLoop
+		}
+	}
+	if string(tailed) != "oldnew" {
+		t.Fatalf("tailed output = %q, want oldnew", tailed)
+	}
+
+	offset := recording.OutputOffset(6)
+	selector, err := recording.NewSelector(recording.SelectorInput{Offset: &offset})
+	if err != nil {
+		t.Fatalf("frame selector: %v", err)
+	}
+	frame, err := manager.Frame(context.Background(), "agent-1", selector)
+	if err != nil {
+		t.Fatalf("frame: %v", err)
+	}
+	if frame.Cursor.NextOffset != 6 ||
+		len(frame.Lines) == 0 ||
+		!strings.Contains(strings.Join(frame.Lines, "\n"), "oldnew") {
+		t.Fatalf("frame = %+v", frame)
+	}
+}
+
+func TestResumeWaitsForPreviousOutputToDrain(t *testing.T) {
+	manager, st := newTestManager(t)
+	var started []pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = append(started, config)
+		return &fakeProcessSession{}, nil
+	}
+	status, err := manager.Start(context.Background(), StartRequest{
+		Vendor:  "claude",
+		Command: "fake-claude",
+		Hooks:   agent.HooksOff,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	id := agent.ID(status.AgentID)
+	managed, ok := manager.managed(id)
+	if !ok {
+		t.Fatal("started agent is missing")
+	}
+	managed.setVendorSessionReference("vendor-ref")
+	previous := started[0]
+	previous.OnOutput([]byte("old"), 0)
+
+	exited := make(chan struct{})
+	go func() {
+		previous.OnExit(pty.ExitInfo{PID: 1, Code: 0})
+		close(exited)
+	}()
+	waitForState(t, manager, id, agent.StateStopped)
+	draining, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status while draining: %v", err)
+	}
+	if draining.Resumable {
+		t.Fatalf("draining session is resumable: %+v", draining)
+	}
+	if _, err := manager.Resume(context.Background(), id); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("resume while draining error = %v, want ErrResumeConflict", err)
+	}
+
+	previous.OnOutputEnd(3)
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("exit callback did not finish after output drained")
+	}
+	drained := waitForDetachedState(t, manager, id, agent.StateStopped)
+	if !drained.Resumable {
+		t.Fatalf("drained session is not resumable: %+v", drained)
+	}
+
+	if _, err := manager.Resume(context.Background(), id); err != nil {
+		t.Fatalf("resume after drain: %v", err)
+	}
+	resumed := started[1]
+	resumed.OnOutput([]byte("new"), 0)
+	resumed.OnOutputEnd(3)
+
+	rows, err := st.Replay(status.AgentID)
+	if err != nil {
+		t.Fatalf("replay output: %v", err)
+	}
+	var offsets []uint64
+	for _, row := range rows {
+		if row.Type != string(event.TypeOutputChunk) {
+			continue
+		}
+		payload, err := event.DecodeOutputChunkPayload(row.Payload)
+		if err != nil {
+			t.Fatalf("decode output at seq %d: %v", row.Seq, err)
+		}
+		offsets = append(offsets, payload.Offset)
+	}
+	if len(offsets) != 2 || offsets[0] != 0 || offsets[1] != 3 {
+		t.Fatalf("output offsets = %v, want [0 3]", offsets)
+	}
+}
+
 func TestBootstrapResumeUsesPersistedWorkingDirectory(t *testing.T) {
 	st := newTestStore(t)
 	base := time.Date(2026, time.October, 4, 15, 0, 0, 0, time.UTC)
@@ -839,6 +1078,28 @@ func TestResumeFailureReturnsAgentToResumableStoppedState(t *testing.T) {
 		rows[3].Type != string(event.TypeError) ||
 		rows[4].To != string(agent.StateStopped) {
 		t.Fatalf("failed resume history = %+v", rows)
+	}
+}
+
+func TestResumeCommitFailureClosesPreparedOutputProcessor(t *testing.T) {
+	manager, _ := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	manager.committer.Close()
+	before := outputProcessorGoroutines()
+
+	if _, err := manager.Resume(context.Background(), managed.agent.ID()); err == nil {
+		t.Fatal("resume succeeded with a closed committer")
+	}
+	deadline := time.Now().Add(time.Second)
+	for outputProcessorGoroutines() != before {
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"output processor goroutines = %d, want %d",
+				outputProcessorGoroutines(),
+				before,
+			)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -2000,6 +2261,21 @@ func (s *fakeProcessSession) PID() int {
 
 func (s *fakeProcessSession) Resize(uint16, uint16) error {
 	return nil
+}
+
+func outputProcessorGoroutines() int {
+	size := 64 * 1024
+	for {
+		stack := make([]byte, size)
+		n := runtime.Stack(stack, true)
+		if n < len(stack) {
+			return strings.Count(
+				string(stack[:n]),
+				"github.com/Duang777/drove/internal/session.(*outputProcessor).run",
+			)
+		}
+		size *= 2
+	}
 }
 
 type cancelAfterAppendStore struct {

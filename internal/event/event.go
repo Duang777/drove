@@ -288,12 +288,14 @@ func NewAgentInputDraft(sessionID, agentID, payload string) Draft {
 
 // NewAgentSignalDraft constructs an uncommitted signal audit event.
 func NewAgentSignalDraft(sessionID, agentID, payload string) Draft {
+	publicPayload, _ := PublicPayload(TypeAgentSignal, "observed", payload)
 	return Draft{
-		typ:       TypeAgentSignal,
-		sessionID: sessionID,
-		agentID:   agentID,
-		reason:    "observed",
-		payload:   payload,
+		typ:           TypeAgentSignal,
+		sessionID:     sessionID,
+		agentID:       agentID,
+		reason:        "observed",
+		payload:       publicPayload,
+		storedPayload: payload,
 	}
 }
 
@@ -436,6 +438,19 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		}
 		storedPayload = draft.storedPayload
 		outputAttachment = append([]byte(nil), draft.outputAttachment...)
+	} else if draft.typ == TypeAgentSignal {
+		publicPayload, err := PublicPayload(
+			TypeAgentSignal,
+			draft.reason,
+			draft.storedPayload,
+		)
+		if err != nil {
+			return Event{}, err
+		}
+		if draft.payload != publicPayload {
+			return Event{}, errors.New("event: invalid public agent.signal payload")
+		}
+		storedPayload = draft.storedPayload
 	} else if draft.typ == TypeAgentResumed {
 		if _, err := DecodeAgentResumedPayload(draft.storedPayload); err != nil {
 			return Event{}, err
@@ -534,6 +549,52 @@ func RedactAgentResumedPayload(raw string) (string, error) {
 		return "", err
 	}
 	return agentResumedPublicPayload, nil
+}
+
+// PublicPayload removes private fields from a stored event payload.
+func PublicPayload(typ Type, reason, raw string) (string, error) {
+	switch {
+	case typ == TypeAgentSignal:
+		return removePayloadFields(
+			raw,
+			"vendor_session_ref",
+			"vendor_session_id",
+		)
+	case typ == TypeAgentResumed:
+		return RedactAgentResumedPayload(raw)
+	case typ == TypeSessionLifecycle && reason == "created":
+		if raw == "" {
+			return "", nil
+		}
+		return removePayloadFields(raw, "working_dir")
+	default:
+		return raw, nil
+	}
+}
+
+func removePayloadFields(raw string, fields ...string) (string, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", fmt.Errorf("event: decode private payload: %w", err)
+	}
+	if payload == nil {
+		return "", errors.New("event: private payload must be one JSON object")
+	}
+	changed := false
+	for _, field := range fields {
+		if _, ok := payload[field]; ok {
+			delete(payload, field)
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, nil
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("event: encode public payload: %w", err)
+	}
+	return string(encoded), nil
 }
 
 // SignalPayloadV1 is the redacted audit payload for TypeAgentSignal.
@@ -721,11 +782,6 @@ func validateSignalPayload(
 	if p.VendorSessionRef != "" && !ascii(p.VendorSessionRef) {
 		return errors.New(
 			"event: vendor_session_ref must contain printable ASCII without surrounding whitespace",
-		)
-	}
-	if p.VendorSessionID != "" && !ascii(p.VendorSessionID) {
-		return errors.New(
-			"event: legacy vendor_session_id must contain printable ASCII without surrounding whitespace",
 		)
 	}
 	if p.VendorSessionRef != "" && p.VendorSessionID != "" {

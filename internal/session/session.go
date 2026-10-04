@@ -149,6 +149,8 @@ type runningSession struct {
 	injectionDir   string
 	stopCause      stopCause
 	exitClaimed    bool
+	exitHandled    bool
+	outputDrained  bool
 }
 
 // InputResult 描述一次输入操作已经写入 PTY 的精确字节数。
@@ -457,6 +459,7 @@ type activation struct {
 	dir          string
 	terminalSize term.Size
 	ptySize      pty.Size
+	outputOffset uint64
 }
 
 func (m *Manager) activate(ctx context.Context, plan activation) error {
@@ -476,6 +479,7 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 		},
 		OnOutputEnd: func(offset uint64) {
 			<-running.callbacksReady
+			defer m.markOutputDrained(id, running)
 			_ = running.output.End(offset)
 			_ = running.output.Close()
 			if running.terminal != nil {
@@ -514,7 +518,7 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 	running.process = sess
 	m.mu.Unlock()
 
-	terminalActor, err := newTerminalActor(
+	terminalActor, err := newTerminalActorAtOffset(
 		plan.terminalSize,
 		sess,
 		running.classifier,
@@ -524,6 +528,7 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 		func(actorErr error) {
 			m.failTerminalActor(id, actorErr)
 		},
+		plan.outputOffset,
 	)
 	if err != nil {
 		startErr := fmt.Errorf("session: initialize terminal: %w", err)
@@ -620,6 +625,14 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	if err != nil {
 		return nil, fmt.Errorf("session: initial PTY size: %w", err)
 	}
+	boundary, found, err := m.store.SessionBoundary(ctx, string(id), nil)
+	if err != nil {
+		return nil, fmt.Errorf("session: read resume output boundary: %w", err)
+	}
+	initialOutputOffset := uint64(0)
+	if found {
+		initialOutputOffset = boundary.NextOutputOffset
+	}
 	injection, err := m.prepareSignalInjection(
 		id,
 		entry,
@@ -632,7 +645,11 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	running, processEnv, _, err := m.prepareManagedRuntime(managed, entry)
+	running, processEnv, _, err := m.prepareManagedRuntimeAtOffset(
+		managed,
+		entry,
+		initialOutputOffset,
+	)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
 		return nil, errors.Join(err, cleanupErr)
@@ -644,10 +661,11 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 		VendorSessionRef: ref,
 	})
 	if err != nil {
-		running.observer.Close()
+		runtimeErr := closePreparedRuntime(running)
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
 		return nil, errors.Join(
 			fmt.Errorf("session: encode resume metadata: %w", err),
+			runtimeErr,
 			cleanupErr,
 		)
 	}
@@ -665,10 +683,11 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 			string(resumedPayload),
 		)},
 	); err != nil {
-		running.observer.Close()
+		runtimeErr := closePreparedRuntime(running)
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
 		return nil, errors.Join(
 			fmt.Errorf("session: persist resume: %w", err),
+			runtimeErr,
 			cleanupErr,
 		)
 	}
@@ -689,10 +708,25 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 		dir:          managed.workingDir,
 		terminalSize: terminalSize,
 		ptySize:      initialPTYSize,
+		outputOffset: initialOutputOffset,
 	}); err != nil {
 		return nil, err
 	}
 	return m.Status(id)
+}
+
+func closePreparedRuntime(running *runningSession) error {
+	if running == nil {
+		return nil
+	}
+	var outputErr error
+	if running.output != nil {
+		outputErr = running.output.Close()
+	}
+	if running.observer != nil {
+		running.observer.Close()
+	}
+	return outputErr
 }
 
 func (m *Manager) reserveResume(
@@ -985,31 +1019,19 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 		return nil, err
 	}
 	for i := range rows {
-		if rows[i].Type == string(event.TypeSessionLifecycle) &&
-			rows[i].Reason == "created" {
-			payload, err := redactCreationPayload(rows[i].Payload)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"session: redact creation payload at seq %d: %w",
-					rows[i].Seq,
-					err,
-				)
-			}
-			rows[i].Payload = payload
-			continue
+		payload, err := event.PublicPayload(
+			event.Type(rows[i].Type),
+			rows[i].Reason,
+			rows[i].Payload,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"session: redact public payload at seq %d: %w",
+				rows[i].Seq,
+				err,
+			)
 		}
-		if rows[i].Type == string(event.TypeAgentResumed) {
-			payload, err := event.RedactAgentResumedPayload(rows[i].Payload)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"session: redact agent.resumed payload at seq %d: %w",
-					rows[i].Seq,
-					err,
-				)
-			}
-			rows[i].Payload = payload
-			continue
-		}
+		rows[i].Payload = payload
 		if rows[i].Type != string(event.TypeOutputChunk) {
 			continue
 		}
@@ -1052,22 +1074,6 @@ func resolveWorkingDirectory(dir string) (string, error) {
 		return "", fmt.Errorf("session: resolve working directory %q: %w", dir, err)
 	}
 	return filepath.Clean(absolute), nil
-}
-
-func redactCreationPayload(raw string) (string, error) {
-	var metadata createdPayload
-	if err := json.Unmarshal([]byte(raw), &metadata); err != nil {
-		return "", fmt.Errorf("decode creation metadata: %w", err)
-	}
-	if metadata.WorkingDir == "" {
-		return raw, nil
-	}
-	metadata.WorkingDir = ""
-	encoded, err := json.Marshal(metadata)
-	if err != nil {
-		return "", fmt.Errorf("encode public creation metadata: %w", err)
-	}
-	return string(encoded), nil
 }
 
 // TailRaw opens an independently cancelable durable output and resize stream.
@@ -1304,7 +1310,7 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	if running.terminal != nil {
 		running.terminal.MarkProcessExited()
 	}
-	defer m.detach(id, running)
+	defer m.markExitHandled(id, running)
 	defer m.finalizeSignalInjection(id, running)
 	if running.observer == nil {
 		return
@@ -1442,6 +1448,28 @@ func (m *Manager) claimExit(id agent.ID, running *runningSession) (stopCause, bo
 func (m *Manager) detach(id agent.ID, running *runningSession) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.detachLocked(id, running)
+}
+
+func (m *Manager) markExitHandled(id agent.ID, running *runningSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	running.exitHandled = true
+	if running.outputDrained {
+		m.detachLocked(id, running)
+	}
+}
+
+func (m *Manager) markOutputDrained(id agent.ID, running *runningSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	running.outputDrained = true
+	if running.exitHandled {
+		m.detachLocked(id, running)
+	}
+}
+
+func (m *Manager) detachLocked(id agent.ID, running *runningSession) {
 	if m.sessions[id] == running {
 		running.signalDigest = signalTokenDigest{}
 		running.hasSignalToken = false

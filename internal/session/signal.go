@@ -156,6 +156,14 @@ func (m *Manager) prepareManagedRuntime(
 	managed *managedAgent,
 	entry adapter.Entry,
 ) (*runningSession, []string, string, error) {
+	return m.prepareManagedRuntimeAtOffset(managed, entry, 0)
+}
+
+func (m *Manager) prepareManagedRuntimeAtOffset(
+	managed *managedAgent,
+	entry adapter.Entry,
+	initialOutputOffset uint64,
+) (*runningSession, []string, string, error) {
 	if managed == nil || managed.agent == nil {
 		return nil, nil, "", errors.New("session: managed Agent is required")
 	}
@@ -194,7 +202,13 @@ func (m *Manager) prepareManagedRuntime(
 		vendor:         a.Vendor(),
 	}
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
-		running.output = newOutputProcessor(m, a.ID(), running, "")
+		running.output = newOutputProcessorAtOffset(
+			m,
+			a.ID(),
+			running,
+			"",
+			initialOutputOffset,
+		)
 		return running, nil, "", nil
 	}
 
@@ -210,7 +224,13 @@ func (m *Manager) prepareManagedRuntime(
 	}
 	running.signalDigest = digest
 	running.hasSignalToken = true
-	running.output = newOutputProcessor(m, a.ID(), running, token)
+	running.output = newOutputProcessorAtOffset(
+		m,
+		a.ID(),
+		running,
+		token,
+		initialOutputOffset,
+	)
 	environment := []string{
 		SignalAgentIDEnv + "=" + string(a.ID()),
 		SignalURLEnv + "=" + signalURL,

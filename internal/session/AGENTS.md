@@ -29,7 +29,8 @@
   等待 required hook。
 - `Resume(ctx, id)` 在同一 Agent ID 下预留一次恢复，提交私有 `agent.resumed` 与 typed
   `Stopped -> Starting` 后复用 Start 的 PTY 激活路径；`Status.Resumable` 只由已停止、
-  未连接、未预留、有已提交 ref 且 exact adapter 支持恢复的会话派生。
+  未连接、未预留、有已提交 ref 且 exact adapter 支持恢复的会话派生。恢复后的 PTY
+  源偏移重新从 0 计数，持久 output offset 则从 Store 的 session boundary 继续。
 - Start 把清理后的绝对工作目录放进创建事件的私有持久载荷；Hub 与公开 replay
   删除该字段。恢复投影把目录放回 managed record，Resume 用它配置 PTY。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
@@ -74,7 +75,8 @@
 - live snapshot 仅存在内存中，每个 attachment 最多 2 Hz、channel 容量为 1，
   新值覆盖未读旧值；携带 cursor、尺寸和 `restorable:false`，在 detach 或输出结束时关闭。
 - 进程退出先同步调用 `MarkProcessExited`，再终止 Detector。尾部输出仍持久化并更新
-  私有 emulator，但不能产生 screen signal；detach 后 snapshot 不可用。
+  私有 emulator，但不能产生 screen signal；只有 `OnOutputEnd` 完成后才 detach 并允许
+  原生恢复，detach 后 snapshot 不可用。
 - 用户输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；用户调用者
   不在该锁后排队。PTY 输出和 terminal query reply 不参与该锁。
 - 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；

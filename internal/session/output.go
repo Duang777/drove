@@ -58,9 +58,10 @@ type outputProcessor struct {
 	id      agent.ID
 	running *runningSession
 
-	redactor streamingRedactor
-	requests chan outputRequest
-	done     chan struct{}
+	redactor            streamingRedactor
+	initialOutputOffset uint64
+	requests            chan outputRequest
+	done                chan struct{}
 
 	admissionMu sync.RWMutex
 	closing     bool
@@ -93,13 +94,24 @@ func newOutputProcessor(
 	running *runningSession,
 	signalToken string,
 ) *outputProcessor {
+	return newOutputProcessorAtOffset(manager, id, running, signalToken, 0)
+}
+
+func newOutputProcessorAtOffset(
+	manager *Manager,
+	id agent.ID,
+	running *runningSession,
+	signalToken string,
+	initialOutputOffset uint64,
+) *outputProcessor {
 	processor := &outputProcessor{
-		manager:  manager,
-		id:       id,
-		running:  running,
-		redactor: newStreamingRedactor([]byte(signalToken)),
-		requests: make(chan outputRequest, outputInboxSize),
-		done:     make(chan struct{}),
+		manager:             manager,
+		id:                  id,
+		running:             running,
+		redactor:            newStreamingRedactor([]byte(signalToken)),
+		initialOutputOffset: initialOutputOffset,
+		requests:            make(chan outputRequest, outputInboxSize),
+		done:                make(chan struct{}),
 	}
 	go processor.run()
 	return processor
@@ -283,6 +295,7 @@ func (p *outputProcessor) run() {
 	}
 	state := outputProcessorState{
 		redactor:             p.redactor,
+		nextOutputOffset:     p.initialOutputOffset,
 		effectiveSize:        initialSize,
 		attachments:          make(map[AttachmentID]*attachmentState),
 		acceptingAttachments: true,
