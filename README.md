@@ -52,28 +52,12 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 
 ## 架构
 
-```mermaid
-flowchart LR
-  cli["drove CLI"]
-  web["web/ 开发骨架"]
-  daemon["droved"]
-  session["session"]
-  detect["detect"]
-  store["SQLite 事件日志"]
-  pty["PTY"]
-  agent["claude / codex / 可执行文件"]
-  hook["drove hook"]
-
-  cli -->|"REST + Bearer"| daemon
-  web -->|"Vite 代理 /api 与 /ws"| daemon
-  daemon --> session
-  session --> detect
-  session --> store
-  session --> pty
-  pty --> agent
-  agent -->|"DROVE_SIGNAL_*"| hook
-  hook -->|"loopback + 会话 token"| daemon
-```
+<p>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/architecture-dark.png">
+    <img alt="架构图。drove CLI 经 REST 与 Bearer 连接 droved，web 开发骨架经 Vite 代理连接 droved。droved 连接 session。session 连接 detect、SQLite 事件日志和 PTY。PTY 连接 claude、codex 或可执行文件。agent 经 DROVE_SIGNAL 连接 drove hook，hook 再经 loopback 与会话 token 回到 droved。" src="docs/assets/architecture.png" width="720">
+  </picture>
+</p>
 
 CLI 是短命令。`droved` 被自动拉起后一直持有 PTY。状态和输出先写入 SQLite，再经 Hub 推给 WebSocket 订阅者。厂商差异只在 `internal/adapter`。
 

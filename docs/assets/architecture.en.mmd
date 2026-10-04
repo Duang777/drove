@@ -1,0 +1,20 @@
+flowchart LR
+  cli["drove CLI"]
+  web["web/ dev skeleton"]
+  daemon["droved"]
+  session["session"]
+  detect["detect"]
+  store["SQLite event log"]
+  pty["PTY"]
+  agent["claude / codex / executable"]
+  hook["drove hook"]
+
+  cli -->|"REST + Bearer"| daemon
+  web -->|"Vite proxy for /api and /ws"| daemon
+  daemon --> session
+  session --> detect
+  session --> store
+  session --> pty
+  pty --> agent
+  agent -->|"DROVE_SIGNAL_*"| hook
+  hook -->|"loopback + session token"| daemon
