@@ -239,6 +239,17 @@ func run(
 		collected = append(collected, result)
 	case <-ctx.Done():
 	}
+	for len(collected) < pumpCount {
+		select {
+		case result := <-results:
+			collected = append(collected, result)
+		default:
+			goto shutdown
+		}
+	}
+
+shutdown:
+	primaryCount := len(collected)
 	shutdown()
 	for len(collected) < pumpCount {
 		collected = append(collected, <-results)
@@ -248,7 +259,7 @@ func run(
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		pumpErr = ctxErr
 	}
-	for _, result := range collected {
+	for _, result := range collected[:primaryCount] {
 		if err := significantPumpError(result.err); err != nil {
 			pumpErr = errors.Join(
 				pumpErr,

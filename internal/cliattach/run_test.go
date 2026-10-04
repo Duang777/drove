@@ -51,6 +51,20 @@ func TestRunReadOnlySendsNoInputOrViewport(t *testing.T) {
 	assertCleanupCounts(t, stream, reader, lifecycle)
 }
 
+func TestAttachLocalDetachIgnoresOutputCloseRace(t *testing.T) {
+	stream := newFakeTerminalStream()
+	stream.closeReadErr = errors.New("use of closed network connection")
+	reader := newFakeCancelReader()
+	reader.Send([]byte{localDetachByte})
+	lifecycle := &fakeLifecycle{}
+	deps := newFakeRunnerDependencies(stream, reader, io.Discard, lifecycle)
+
+	if err := run(context.Background(), "agent-1", Options{}, deps); err != nil {
+		t.Fatalf("run local detach: %v", err)
+	}
+	assertCleanupCounts(t, stream, reader, lifecycle)
+}
+
 func TestAttachTTYRejectsNonTerminalBeforeSetup(t *testing.T) {
 	opened := false
 	deps := runnerDependencies{
@@ -213,11 +227,12 @@ type fakeTerminalStream struct {
 	inputs       []string
 	resizes      []terminalResize
 
-	messages   chan client.TerminalMessage
-	closed     chan struct{}
-	subscribed chan struct{}
-	closeOnce  sync.Once
-	closeCount atomic.Int32
+	messages     chan client.TerminalMessage
+	closed       chan struct{}
+	subscribed   chan struct{}
+	closeReadErr error
+	closeOnce    sync.Once
+	closeCount   atomic.Int32
 }
 
 func newFakeTerminalStream() *fakeTerminalStream {
@@ -243,6 +258,10 @@ func (s *fakeTerminalStream) Next(
 	ctx context.Context,
 	apply func(client.TerminalMessage) error,
 ) error {
+	if s.closeReadErr != nil {
+		<-s.closed
+		return s.closeReadErr
+	}
 	select {
 	case message := <-s.messages:
 		return apply(message)
