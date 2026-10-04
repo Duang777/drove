@@ -7,14 +7,24 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/workspace"
+	"github.com/google/uuid"
 )
 
 var (
 	// ErrWorkspaceUnavailable means the daemon cannot manage Git worktrees.
 	ErrWorkspaceUnavailable = errors.New("session: workspace manager unavailable")
+	// ErrWorkspaceRequest means a worktree request has an invalid repository or branch.
+	ErrWorkspaceRequest = errors.New("session: invalid workspace request")
 	// ErrWorkspacePrepare means a requested Git worktree could not be prepared.
 	ErrWorkspacePrepare = errors.New("session: prepare workspace")
+	// ErrWorkspaceInUse means an active or resuming session still owns the worktree.
+	ErrWorkspaceInUse = errors.New("session: workspace is in use")
+	// ErrWorkspaceDirty means cleanup requires explicit force.
+	ErrWorkspaceDirty = errors.New("session: workspace has uncommitted changes")
+	// ErrWorkspaceNotFound means no managed worktree matches the Agent ID.
+	ErrWorkspaceNotFound = errors.New("session: workspace not found")
 )
 
 // WorktreeRequest asks Start to create an isolated Git worktree.
@@ -37,6 +47,7 @@ type workspaceLifecycle interface {
 		string,
 	) (workspace.Workspace, error)
 	Discard(context.Context, workspace.Workspace) error
+	Cleanup(context.Context, string, bool) (workspace.Workspace, error)
 }
 
 // WithWorkspaces enables managed Git worktrees below dataDir.
@@ -73,6 +84,10 @@ func (m *Manager) prepareWorkspace(
 		id,
 	)
 	if err != nil {
+		if errors.Is(err, workspace.ErrNotRepository) ||
+			errors.Is(err, workspace.ErrInvalidBranch) {
+			return nil, errors.Join(ErrWorkspaceRequest, err)
+		}
 		return nil, errors.Join(ErrWorkspacePrepare, err)
 	}
 	return &prepared, nil
@@ -90,6 +105,84 @@ func (m *Manager) discardWorkspace(target *workspace.Workspace) error {
 	return nil
 }
 
+// CleanupWorkspace removes a terminal Agent's managed worktree.
+func (m *Manager) CleanupWorkspace(
+	ctx context.Context,
+	id string,
+	force bool,
+) (workspace.Workspace, error) {
+	parsed, err := uuid.Parse(id)
+	if err != nil || parsed.String() != id {
+		return workspace.Workspace{}, fmt.Errorf(
+			"%w: invalid Agent ID %q",
+			ErrWorkspaceRequest,
+			id,
+		)
+	}
+	if m.workspaceErr != nil {
+		return workspace.Workspace{}, errors.Join(
+			ErrWorkspaceUnavailable,
+			m.workspaceErr,
+		)
+	}
+	if m.workspaces == nil {
+		return workspace.Workspace{}, ErrWorkspaceUnavailable
+	}
+	agentID := agent.ID(id)
+	if err := m.reserveWorkspaceCleanup(agentID); err != nil {
+		return workspace.Workspace{}, err
+	}
+	defer m.releaseWorkspaceCleanup(agentID)
+
+	removed, err := m.workspaces.Cleanup(ctx, id, force)
+	switch {
+	case errors.Is(err, workspace.ErrDirty):
+		return workspace.Workspace{}, errors.Join(ErrWorkspaceDirty, err)
+	case errors.Is(err, workspace.ErrNotFound):
+		return workspace.Workspace{}, errors.Join(ErrWorkspaceNotFound, err)
+	case err != nil:
+		return workspace.Workspace{}, fmt.Errorf(
+			"session: cleanup workspace: %w",
+			err,
+		)
+	default:
+		return removed, nil
+	}
+}
+
+func (m *Manager) reserveWorkspaceCleanup(id agent.ID) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrManagerClosed
+	}
+	if _, cleaning := m.cleaning[id]; cleaning {
+		return fmt.Errorf("%w: agent %q cleanup is already running", ErrWorkspaceInUse, id)
+	}
+	if managed, ok := m.agents[id]; ok {
+		_, attached := m.sessions[id]
+		_, resuming := m.resuming[id]
+		state := managed.agent.State()
+		if attached || resuming ||
+			(state != agent.StateDone && state != agent.StateStopped) {
+			return fmt.Errorf(
+				"%w: agent %q is %s",
+				ErrWorkspaceInUse,
+				id,
+				state,
+			)
+		}
+	}
+	m.cleaning[id] = struct{}{}
+	return nil
+}
+
+func (m *Manager) releaseWorkspaceCleanup(id agent.ID) {
+	m.mu.Lock()
+	delete(m.cleaning, id)
+	m.mu.Unlock()
+}
+
 func metadataForWorkspace(target *workspace.Workspace) *workspaceMetadata {
 	if target == nil {
 		return nil
@@ -101,7 +194,10 @@ func metadataForWorkspace(target *workspace.Workspace) *workspaceMetadata {
 	}
 }
 
-func validateWorkspaceMetadata(metadata *workspaceMetadata) error {
+func validateWorkspaceMetadata(
+	metadata *workspaceMetadata,
+	workingDir string,
+) error {
 	if metadata == nil {
 		return nil
 	}
@@ -113,6 +209,9 @@ func validateWorkspaceMetadata(metadata *workspaceMetadata) error {
 	}
 	if metadata.Branch == "" {
 		return errors.New("workspace branch is empty")
+	}
+	if metadata.Path != workingDir {
+		return errors.New("workspace path does not match working directory")
 	}
 	return nil
 }

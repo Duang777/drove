@@ -491,12 +491,15 @@ func TestTypedCommitterPoisonsAfterPublishFailure(t *testing.T) {
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
 
-	_, err := committer.CommitEvents(
+	receipt, err := committer.CommitEvents(
 		context.Background(),
 		[]event.Draft{event.NewOutputDraft("agent-1", "agent-1", "line")},
 	)
 	if !errors.Is(err, event.ErrHubClosed) {
 		t.Fatalf("commit error = %v, want closed Hub", err)
+	}
+	if !receipt.Durable || receipt.FirstSeq != 1 || receipt.LastSeq != 1 {
+		t.Fatalf("receipt = %+v, want durable sequence 1", receipt)
 	}
 	rows := st.Rows()
 	if len(rows) != 1 || rows[0].Seq != 1 {

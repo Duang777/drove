@@ -606,14 +606,12 @@ func newWorktreeRemoveCmd() *cobra.Command {
 		Short: "删除一个 Drove worktree，保留其分支",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			manager, err := newWorkspaceManager()
+			ctx := cmd.Context()
+			daemonClient, err := newClient(ctx)
 			if err != nil {
 				return err
 			}
-			removed, err := manager.Cleanup(cmd.Context(), args[0], force)
-			if errors.Is(err, workspace.ErrDirty) {
-				return fmt.Errorf("%w; rerun with --force to discard changes", err)
-			}
+			removed, err := daemonClient.CleanupWorktree(ctx, args[0], force)
 			if err != nil {
 				return err
 			}
@@ -1005,10 +1003,11 @@ func isKnownVendor(s string) bool {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }
 
 func shortID(id string) string {

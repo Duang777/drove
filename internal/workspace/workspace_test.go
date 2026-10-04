@@ -70,7 +70,7 @@ func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list worktrees: %v", err)
 	}
-	if len(listed) != 1 || listed[0].Dirty || listed[0].Branch != prepared.Branch {
+	if len(listed) != 1 || !listed[0].Dirty || listed[0].Branch != prepared.Branch {
 		t.Fatalf("listed worktrees = %+v", listed)
 	}
 
@@ -95,6 +95,74 @@ func TestPrepareListAndCleanupWorktree(t *testing.T) {
 		t.Fatalf("removed worktree still exists or inspect failed: %v", err)
 	}
 	runGit(t, repository, "show-ref", "--verify", "refs/heads/"+prepared.Branch)
+}
+
+func TestPrepareRejectsIncludedPathThroughTrackedSymlink(t *testing.T) {
+	repository := newTestRepository(t)
+	outside := t.TempDir()
+	link := filepath.Join(repository, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("create tracked symlink: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte(".env\nignored.key\nlocal/\nescape/\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("extend gitignore: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, ".worktreeinclude"),
+		[]byte(".env\nlocal/*.pem\nescape/*.txt\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("extend worktree include: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore", ".worktreeinclude", "escape")
+	runGit(t, repository, "commit", "-m", "add tracked symlink")
+
+	if err := os.Remove(link); err != nil {
+		t.Fatalf("replace tracked symlink: %v", err)
+	}
+	if err := os.Mkdir(link, 0o700); err != nil {
+		t.Fatalf("create replacement directory: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(link, "escaped.txt"),
+		[]byte("must stay inside\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write included file: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	_, err = manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err == nil || !strings.Contains(err.Error(), "not a real directory") {
+		t.Fatalf("prepare through tracked symlink error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "escaped.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("included file escaped worktree or inspect failed: %v", err)
+	}
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/drove/"+testAgentID,
+	)
+	if err := command.Run(); err == nil {
+		t.Fatal("failed prepare retained its branch")
+	}
 }
 
 func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
@@ -156,6 +224,126 @@ func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
 	}
 }
 
+func TestListAndCleanupDetachedWorktree(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	runGit(t, prepared.Path, "checkout", "--detach")
+
+	listed, err := manager.List(context.Background())
+	if err != nil {
+		t.Fatalf("list detached worktree: %v", err)
+	}
+	if len(listed) != 1 ||
+		!listed[0].Detached ||
+		listed[0].Branch != prepared.Branch {
+		t.Fatalf("detached worktrees = %+v", listed)
+	}
+	if _, err := manager.Cleanup(
+		context.Background(),
+		testAgentID,
+		false,
+	); err != nil {
+		t.Fatalf("cleanup detached worktree: %v", err)
+	}
+	runGit(t, repository, "show-ref", "--verify", "refs/heads/"+prepared.Branch)
+}
+
+func TestCleanupRepairsMissingWorktreeRegistration(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := os.RemoveAll(prepared.Path); err != nil {
+		t.Fatalf("remove worktree directory externally: %v", err)
+	}
+
+	listed, err := manager.List(context.Background())
+	if err != nil {
+		t.Fatalf("list missing worktree: %v", err)
+	}
+	if len(listed) != 1 || !listed[0].Missing {
+		t.Fatalf("missing worktrees = %+v", listed)
+	}
+	if _, err := manager.Cleanup(
+		context.Background(),
+		testAgentID,
+		false,
+	); err != nil {
+		t.Fatalf("cleanup missing worktree: %v", err)
+	}
+	if strings.Contains(
+		runGit(t, repository, "worktree", "list", "--porcelain"),
+		prepared.Path,
+	) {
+		t.Fatalf("Git retained missing worktree registration for %q", prepared.Path)
+	}
+	runGit(t, repository, "show-ref", "--verify", "refs/heads/"+prepared.Branch)
+}
+
+func TestPrepareRollsBackBranchWhenCheckoutFails(t *testing.T) {
+	repository := newTestRepository(t)
+	runGit(t, repository, "config", "filter.reject.smudge", "false")
+	runGit(t, repository, "config", "filter.reject.clean", "cat")
+	runGit(t, repository, "config", "filter.reject.required", "true")
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitattributes"),
+		[]byte("tracked.txt filter=reject\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write attributes: %v", err)
+	}
+	runGit(t, repository, "add", ".gitattributes", "tracked.txt")
+	runGit(t, repository, "commit", "-m", "require failing checkout filter")
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	_, err = manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err == nil {
+		t.Fatal("prepare succeeded with a failing required smudge filter")
+	}
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/drove/"+testAgentID,
+	)
+	if err := command.Run(); err == nil {
+		t.Fatal("failed checkout retained its new branch")
+	}
+}
+
 func TestDiscardRollsBackNewBranch(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
@@ -188,6 +376,40 @@ func TestDiscardRollsBackNewBranch(t *testing.T) {
 	)
 	if err := command.Run(); err == nil {
 		t.Fatalf("discarded branch %q still exists", prepared.Branch)
+	}
+}
+
+func TestDiscardPreservesWorkspaceWhenRegistrationCheckFails(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := manager.Discard(ctx, prepared); err == nil {
+		t.Fatal("discard succeeded with a canceled registration check")
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("failed discard removed worktree: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("failed discard removed recovery record: %v", err)
+	}
+	runGit(t, repository, "show-ref", "--verify", "refs/heads/"+prepared.Branch)
+
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("cleanup preserved worktree: %v", err)
 	}
 }
 
@@ -246,6 +468,51 @@ func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {
 	}
 	if err := manager.Discard(context.Background(), prepared); err != nil {
 		t.Fatalf("discard nested worktree: %v", err)
+	}
+}
+
+func TestPrepareSupportsSubmoduleRepository(t *testing.T) {
+	submoduleRepository := newTestRepository(t)
+	superRepository := newTestRepository(t)
+	runGit(
+		t,
+		superRepository,
+		"-c",
+		"protocol.file.allow=always",
+		"submodule",
+		"add",
+		submoduleRepository,
+		"modules/sub",
+	)
+	runGit(t, superRepository, "commit", "-m", "add submodule")
+	submodulePath := filepath.Join(superRepository, "modules", "sub")
+	resolvedSubmodulePath, err := filepath.EvalSymlinks(submodulePath)
+	if err != nil {
+		t.Fatalf("resolve submodule path: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		submodulePath,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare submodule worktree: %v", err)
+	}
+	if prepared.Repository != resolvedSubmodulePath {
+		t.Fatalf(
+			"repository = %q, want submodule root %q",
+			prepared.Repository,
+			resolvedSubmodulePath,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard submodule worktree: %v", err)
 	}
 }
 

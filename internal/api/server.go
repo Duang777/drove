@@ -96,6 +96,7 @@ func NewServer(opts ServerOptions) *Server {
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents", s.handleList)
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
+	mux.HandleFunc("DELETE /api/v1/worktrees/{id}", s.handleWorkspaceDelete)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDelete)
 	mux.HandleFunc("POST /api/v1/agents/{id}/resume", s.handleResume)
@@ -183,7 +184,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, session.ErrInvalidMode),
 			errors.Is(err, session.ErrInvalidHookPolicy),
 			errors.Is(err, session.ErrHookUnsupported),
-			errors.Is(err, session.ErrWorkspacePrepare):
+			errors.Is(err, session.ErrWorkspaceRequest):
 			writeErr(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, session.ErrHookRequired),
 			errors.Is(err, session.ErrManagerClosed),
@@ -262,6 +263,67 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type workspaceCleanupResponse struct {
+	AgentID string `json:"agent_id"`
+	Branch  string `json:"branch"`
+}
+
+func (s *Server) handleWorkspaceDelete(w http.ResponseWriter, r *http.Request) {
+	if requestAccess(r) != LocalAccess {
+		writeErr(w, http.StatusForbidden, "worktree cleanup requires local access")
+		return
+	}
+	force, err := parseWorkspaceForce(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	removed, err := s.opts.Manager.CleanupWorkspace(
+		r.Context(),
+		r.PathValue("id"),
+		force,
+	)
+	if err != nil {
+		switch {
+		case errors.Is(err, session.ErrWorkspaceRequest):
+			writeErr(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, session.ErrWorkspaceNotFound):
+			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, session.ErrWorkspaceDirty),
+			errors.Is(err, session.ErrWorkspaceInUse):
+			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, session.ErrWorkspaceUnavailable),
+			errors.Is(err, session.ErrManagerClosed):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeErr(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, workspaceCleanupResponse{
+		AgentID: removed.AgentID,
+		Branch:  removed.Branch,
+	})
+}
+
+func parseWorkspaceForce(r *http.Request) (bool, error) {
+	query := r.URL.Query()
+	for key := range query {
+		if key != "force" {
+			return false, fmt.Errorf("unsupported query parameter %q", key)
+		}
+	}
+	values, exists := query["force"]
+	if !exists {
+		return false, nil
+	}
+	if len(values) != 1 ||
+		(values[0] != "true" && values[0] != "false") {
+		return false, errors.New("force must be one boolean")
+	}
+	return values[0] == "true", nil
 }
 
 func (s *Server) handleRotateToken(w http.ResponseWriter, r *http.Request) {

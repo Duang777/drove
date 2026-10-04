@@ -39,9 +39,12 @@
   删除该字段。恢复投影把目录放回 managed record，Resume 用它配置 PTY。
 - `StartRequest.Worktree` 存在时，Manager 在生成 Agent ID 后调用
   `internal/workspace` 创建独立 worktree，并把 Agent 工作目录切到该路径。创建事件
-  提交前的失败会回滚 worktree 和本次新建的分支；事件已提交后由用户显式清理。
+  持久化前的失败会回滚 worktree 和本次新建的分支；SQLite append 成功后，即使投影
+  或 Hub 发布失败也不得回滚，后续由用户显式清理。
+- `CleanupWorkspace` 只接受终态或无会话的 Agent，并在执行 Git 清理期间登记
+  reservation；`Resume` 必须拒绝同一 Agent，避免恢复进程与目录删除并发。
 - 创建事件的私有 `workspace` 元数据记录仓库、路径和分支；Hub 与公开 replay 删除
-  整个对象，恢复投影仍校验其中的绝对路径和分支。
+  整个对象，恢复投影仍校验其中的绝对路径、分支及其路径与 working directory 一致。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在

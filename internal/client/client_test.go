@@ -81,6 +81,54 @@ func TestSendInputRejectsInvalidUTF8BeforeRequest(t *testing.T) {
 	}
 }
 
+func TestCleanupWorktreeUsesAuthenticatedDelete(t *testing.T) {
+	dataDir := t.TempDir()
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1/worktrees/agent%2Fone" {
+			t.Errorf("path = %q, want escaped worktree path", r.URL.EscapedPath())
+		}
+		if r.URL.RawQuery != "force=true" {
+			t.Errorf("query = %q, want force=true", r.URL.RawQuery)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(
+			w,
+			`{"agent_id":"agent/one","branch":"feature/isolated"}`,
+		)
+	}))
+	defer server.Close()
+
+	c := New(
+		strings.TrimPrefix(server.URL, "http://"),
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	removed, err := c.CleanupWorktree(
+		context.Background(),
+		"agent/one",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("cleanup worktree: %v", err)
+	}
+	if removed.AgentID != "agent/one" ||
+		removed.Branch != "feature/isolated" {
+		t.Fatalf("removed worktree = %+v", removed)
+	}
+}
+
 func TestRotateTokenUsesAuthenticatedPost(t *testing.T) {
 	dataDir := t.TempDir()
 	token, err := auth.Ensure(dataDir)

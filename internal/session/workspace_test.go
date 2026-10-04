@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/pty"
 	"github.com/Duang777/drove/internal/store"
@@ -87,6 +88,16 @@ func TestStartPreparesWorkspaceAndPersistsPrivateMetadata(t *testing.T) {
 	if workspaces.discardCount != 0 {
 		t.Fatalf("successful workspace was discarded %d times", workspaces.discardCount)
 	}
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		status.AgentID,
+		false,
+	); !errors.Is(err, ErrWorkspaceInUse) {
+		t.Fatalf("active workspace cleanup error = %v, want ErrWorkspaceInUse", err)
+	}
+	if workspaces.cleanupCount != 0 {
+		t.Fatalf("active workspace cleanup reached lifecycle %d times", workspaces.cleanupCount)
+	}
 }
 
 func TestStartDiscardsWorkspaceWhenCreationCannotPersist(t *testing.T) {
@@ -120,6 +131,47 @@ func TestStartDiscardsWorkspaceWhenCreationCannotPersist(t *testing.T) {
 	if workspaces.discardCount != 1 ||
 		workspaces.discarded.Path != workspaces.prepared.Path {
 		t.Fatalf("discard calls = %+v", workspaces)
+	}
+}
+
+func TestStartPreservesWorkspaceAfterDurableCreationPublishFails(t *testing.T) {
+	manager, st := newTestManager(t)
+	source := t.TempDir()
+	workspaces := &fakeWorkspaceLifecycle{
+		prepared: workspace.Workspace{
+			Repository: source,
+			Path:       filepath.Join(t.TempDir(), "worktree"),
+			Branch:     "feature/durable",
+		},
+	}
+	manager.workspaces = workspaces
+	manager.hub.Close()
+
+	status, err := manager.Start(context.Background(), StartRequest{
+		Command: "/bin/cat",
+		Dir:     source,
+		Worktree: &WorktreeRequest{
+			Branch: "feature/durable",
+		},
+	})
+	if err == nil {
+		t.Fatal("start succeeded with a closed event Hub")
+	}
+	if status != nil {
+		t.Fatalf("status = %+v, want nil", status)
+	}
+	if workspaces.discardCount != 0 {
+		t.Fatalf(
+			"durable workspace was discarded %d times",
+			workspaces.discardCount,
+		)
+	}
+	stored, replayErr := st.Replay(workspaces.prepareAgentID)
+	if replayErr != nil {
+		t.Fatalf("replay durable creation: %v", replayErr)
+	}
+	if len(stored) != 2 || stored[0].Reason != "created" {
+		t.Fatalf("stored creation events = %+v", stored)
 	}
 }
 
@@ -157,6 +209,64 @@ func TestRecoveryProjectorValidatesWorkspaceMetadata(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorRejectsMismatchedWorkspaceDirectory(t *testing.T) {
+	projector := newRecoveryProjector()
+	err := projector.Apply(store.EventRow{
+		Seq:       1,
+		Timestamp: time.Now().UTC(),
+		Type:      string(event.TypeSessionLifecycle),
+		SessionID: "agent-1",
+		AgentID:   "agent-1",
+		Reason:    "created",
+		Payload: `{"version":2,"name":"agent","vendor":"generic",` +
+			`"mode":"interactive","hook_policy":"off",` +
+			`"working_dir":"/tmp/other","workspace":{` +
+			`"repository":"/tmp/repository","path":"/tmp/worktree",` +
+			`"branch":"feature"}}`,
+	})
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"workspace path does not match working directory",
+	) {
+		t.Fatalf("projection error = %v, want workspace directory mismatch", err)
+	}
+}
+
+func TestCleanupWorkspacePreventsConcurrentResume(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	cleanupStarted := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	workspaces := &fakeWorkspaceLifecycle{
+		cleanupStarted: cleanupStarted,
+		releaseCleanup: releaseCleanup,
+		cleanupResult: workspace.Workspace{
+			AgentID: string(id),
+			Branch:  "feature/cleanup",
+		},
+	}
+	manager.workspaces = workspaces
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := manager.CleanupWorkspace(context.Background(), string(id), false)
+		result <- err
+	}()
+	<-cleanupStarted
+
+	if _, err := manager.Resume(context.Background(), id); !errors.Is(
+		err,
+		ErrResumeConflict,
+	) {
+		t.Fatalf("resume during cleanup error = %v, want ErrResumeConflict", err)
+	}
+	close(releaseCleanup)
+	if err := <-result; err != nil {
+		t.Fatalf("cleanup workspace: %v", err)
+	}
+}
+
 type fakeWorkspaceLifecycle struct {
 	prepared workspace.Workspace
 
@@ -166,6 +276,13 @@ type fakeWorkspaceLifecycle struct {
 	prepareErr     error
 	discardCount   int
 	discarded      workspace.Workspace
+	cleanupCount   int
+	cleanupAgentID string
+	cleanupForce   bool
+	cleanupStarted chan struct{}
+	releaseCleanup chan struct{}
+	cleanupResult  workspace.Workspace
+	cleanupErr     error
 }
 
 func (f *fakeWorkspaceLifecycle) Prepare(
@@ -192,4 +309,25 @@ func (f *fakeWorkspaceLifecycle) Discard(
 	f.discardCount++
 	f.discarded = target
 	return nil
+}
+
+func (f *fakeWorkspaceLifecycle) Cleanup(
+	ctx context.Context,
+	agentID string,
+	force bool,
+) (workspace.Workspace, error) {
+	f.cleanupCount++
+	f.cleanupAgentID = agentID
+	f.cleanupForce = force
+	if f.cleanupStarted != nil {
+		close(f.cleanupStarted)
+	}
+	if f.releaseCleanup != nil {
+		select {
+		case <-ctx.Done():
+			return workspace.Workspace{}, ctx.Err()
+		case <-f.releaseCleanup:
+		}
+	}
+	return f.cleanupResult, f.cleanupErr
 }

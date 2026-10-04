@@ -17,16 +17,43 @@ func (m *Manager) copyIncludedFiles(ctx context.Context, target Workspace) error
 	if sourceRoot == "" {
 		sourceRoot = target.Repository
 	}
+	paths, err := m.includedPaths(ctx, sourceRoot)
+	if err != nil {
+		return err
+	}
+	for _, relative := range paths {
+		if err := copyIncludedPath(
+			filepath.Join(sourceRoot, relative),
+			filepath.Join(target.Path, relative),
+			target.Path,
+		); err != nil {
+			return fmt.Errorf("workspace: copy included path %q: %w", relative, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) includedPaths(
+	ctx context.Context,
+	sourceRoot string,
+) ([]string, error) {
 	includePath := filepath.Join(sourceRoot, worktreeIncludeFile)
 	info, err := os.Lstat(includePath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return nil, nil
 	}
 	if err != nil {
-		return fmt.Errorf("workspace: inspect %s: %w", worktreeIncludeFile, err)
+		return nil, fmt.Errorf(
+			"workspace: inspect %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("workspace: %s must be a regular file", worktreeIncludeFile)
+		return nil, fmt.Errorf(
+			"workspace: %s must be a regular file",
+			worktreeIncludeFile,
+		)
 	}
 
 	output, err := m.run(
@@ -41,24 +68,24 @@ func (m *Manager) copyIncludedFiles(ctx context.Context, target Workspace) error
 		"--exclude-from="+worktreeIncludeFile,
 	)
 	if err != nil {
-		return fmt.Errorf("workspace: evaluate %s: %w", worktreeIncludeFile, err)
+		return nil, fmt.Errorf(
+			"workspace: evaluate %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
 	}
+	var paths []string
 	for _, rawPath := range strings.Split(string(output), "\x00") {
 		if rawPath == "" {
 			continue
 		}
 		relative, err := validateIncludedPath(rawPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := copyIncludedPath(
-			filepath.Join(sourceRoot, relative),
-			filepath.Join(target.Path, relative),
-		); err != nil {
-			return fmt.Errorf("workspace: copy included path %q: %w", rawPath, err)
-		}
+		paths = append(paths, relative)
 	}
-	return nil
+	return paths, nil
 }
 
 func validateIncludedPath(path string) (string, error) {
@@ -73,13 +100,13 @@ func validateIncludedPath(path string) (string, error) {
 	return clean, nil
 }
 
-func copyIncludedPath(source string, destination string) error {
+func copyIncludedPath(source string, destination string, root string) error {
 	info, err := os.Lstat(source)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
-		return fmt.Errorf("create destination directory: %w", err)
+	if err := ensureSafeDestinationParent(root, destination); err != nil {
+		return err
 	}
 
 	switch {
@@ -97,6 +124,51 @@ func copyIncludedPath(source string, destination string) error {
 	default:
 		return fmt.Errorf("source mode %s is unsupported", info.Mode())
 	}
+}
+
+func ensureSafeDestinationParent(root string, destination string) error {
+	relative, err := filepath.Rel(root, destination)
+	if err != nil {
+		return fmt.Errorf("resolve destination path: %w", err)
+	}
+	relative, err = validateIncludedPath(relative)
+	if err != nil {
+		return err
+	}
+
+	current := root
+	for _, component := range strings.Split(
+		filepath.Dir(relative),
+		string(filepath.Separator),
+	) {
+		if component == "." || component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if err := os.Mkdir(current, 0o700); err != nil {
+				return fmt.Errorf(
+					"create destination directory %q: %w",
+					current,
+					err,
+				)
+			}
+		case err != nil:
+			return fmt.Errorf(
+				"inspect destination directory %q: %w",
+				current,
+				err,
+			)
+		case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
+			return fmt.Errorf(
+				"destination parent %q is not a real directory",
+				current,
+			)
+		}
+	}
+	return nil
 }
 
 func copyIncludedFile(source string, destination string, mode os.FileMode) (result error) {

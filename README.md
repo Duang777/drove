@@ -138,13 +138,15 @@ drove up claude --worktree --branch feature/api
 `<data_dir>/worktrees/<repo-hash>/<agent-id>`，Agent 进程直接在这个目录启动。
 
 仓库根目录存在 `.worktreeinclude` 时，Drove 按 gitignore 语义把匹配的未跟踪文件
-复制到新 worktree，例如 `.env` 或本地证书。没有匹配的未跟踪文件不会复制。创建
-事件在 SQLite 中私有记录仓库、worktree 路径和分支；REST、WebSocket 和公开回放
-会删除这些字段。
+复制到新 worktree，例如 `.env` 或本地证书。没有匹配的未跟踪文件不会复制。因为
+Git 不跟踪这些本地文件，含匹配文件的 worktree 会保守标记为 dirty，删除时必须显式
+使用 `--force`。创建事件在 SQLite 中私有记录仓库、worktree 路径和分支；REST、
+WebSocket 和公开回放会删除这些字段。
 
-会话退出后 worktree 不会自动删除。`drove worktree rm` 默认拒绝 dirty worktree；
-`--force` 只允许删除含未提交更改的目录。两种方式都保留分支，Drove 不自动 merge、
-rebase、push 或删除分支。
+会话退出后 worktree 不会自动删除。`drove worktree rm` 由 daemon 原子确认对应会话
+已经停止并执行清理，避免与恢复操作并发；它默认拒绝 dirty worktree，`--force`
+只放宽 dirty 检查。两种方式都保留分支，Drove 不自动 merge、rebase、push 或删除
+分支。
 
 ### 状态
 

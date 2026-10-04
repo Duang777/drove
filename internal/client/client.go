@@ -136,6 +136,49 @@ func (c *Client) Stop(ctx context.Context, id string) error {
 	return c.delete(ctx, "/api/v1/agents/"+id)
 }
 
+// RemovedWorktree identifies a worktree removed by the daemon.
+type RemovedWorktree struct {
+	AgentID string `json:"agent_id"`
+	Branch  string `json:"branch"`
+}
+
+// CleanupWorktree atomically checks session ownership and removes one worktree.
+func (c *Client) CleanupWorktree(
+	ctx context.Context,
+	id string,
+	force bool,
+) (*RemovedWorktree, error) {
+	path := "/api/v1/worktrees/" + url.PathEscape(id)
+	if force {
+		path += "?force=true"
+	}
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodDelete,
+		c.baseURL+path,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.authorize(req, false); err != nil {
+		return nil, err
+	}
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, ErrDaemonUnreachable
+	}
+	defer resp.Body.Close()
+	if err := c.responseError(resp, path); err != nil {
+		return nil, err
+	}
+	var removed RemovedWorktree
+	if err := json.NewDecoder(resp.Body).Decode(&removed); err != nil {
+		return nil, fmt.Errorf("client: decode removed worktree: %w", err)
+	}
+	return &removed, nil
+}
+
 // RotateToken atomically rotates the daemon control token.
 func (c *Client) RotateToken(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(

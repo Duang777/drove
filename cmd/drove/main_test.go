@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
@@ -192,6 +193,16 @@ func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
 	force := command.Flags().Lookup("force")
 	if force == nil || force.DefValue != "false" {
 		t.Fatalf("--force flag = %+v, want default false", force)
+	}
+}
+
+func TestTruncatePreservesUTF8(t *testing.T) {
+	truncated := truncate("功能分支名称很长", 5)
+	if !utf8.ValidString(truncated) {
+		t.Fatalf("truncate returned invalid UTF-8: %q", truncated)
+	}
+	if truncated != "功能分支名…" {
+		t.Fatalf("truncate = %q, want %q", truncated, "功能分支名…")
 	}
 }
 

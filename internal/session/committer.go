@@ -139,6 +139,7 @@ type commitReceipt struct {
 	FirstSeq  uint64
 	LastSeq   uint64
 	Timestamp time.Time
+	Durable   bool
 }
 
 func newEventsOperation(drafts []event.Draft) eventsOperation {
@@ -441,10 +442,17 @@ func (c *committer) execute(
 			err: fmt.Errorf("session: append event batch after seq %d: %w", lastSeq, err),
 		}
 	}
+	receipt := commitReceipt{
+		FirstSeq:  committed[0].Seq,
+		LastSeq:   committed[len(committed)-1].Seq,
+		Timestamp: committed[len(committed)-1].Timestamp,
+		Durable:   true,
+	}
 	c.clock.advance(newLastSeq)
 	wantLastSeq := lastSeq + uint64(len(committed))
 	if newLastSeq != wantLastSeq {
 		return newLastSeq, commitResult{
+			receipt: receipt,
 			err: fmt.Errorf(
 				"session: store returned last seq %d, want %d",
 				newLastSeq,
@@ -455,6 +463,7 @@ func (c *committer) execute(
 	if apply != nil {
 		if err := apply(committed); err != nil {
 			return newLastSeq, commitResult{
+				receipt: receipt,
 				err: fmt.Errorf(
 					"session: apply committed projection at seq %d: %w",
 					newLastSeq,
@@ -465,16 +474,11 @@ func (c *committer) execute(
 	}
 	if err := c.hub.PublishBatch(committed); err != nil {
 		return newLastSeq, commitResult{
-			err: fmt.Errorf("session: publish committed batch at seq %d: %w", newLastSeq, err),
+			receipt: receipt,
+			err:     fmt.Errorf("session: publish committed batch at seq %d: %w", newLastSeq, err),
 		}
 	}
-	return newLastSeq, commitResult{
-		receipt: commitReceipt{
-			FirstSeq:  committed[0].Seq,
-			LastSeq:   committed[len(committed)-1].Seq,
-			Timestamp: committed[len(committed)-1].Timestamp,
-		},
-	}
+	return newLastSeq, commitResult{receipt: receipt}
 }
 
 func prepareCommitOperation(

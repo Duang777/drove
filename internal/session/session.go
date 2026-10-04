@@ -191,6 +191,7 @@ type Manager struct {
 	agents   map[agent.ID]*managedAgent
 	sessions map[agent.ID]*runningSession
 	resuming map[agent.ID]struct{}
+	cleaning map[agent.ID]struct{}
 	closed   bool
 
 	starts    sync.WaitGroup
@@ -234,6 +235,7 @@ func NewManager(
 		agents:        make(map[agent.ID]*managedAgent),
 		sessions:      make(map[agent.ID]*runningSession),
 		resuming:      make(map[agent.ID]struct{}),
+		cleaning:      make(map[agent.ID]struct{}),
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
 		newCredential: generateSignalCredential,
@@ -436,7 +438,7 @@ func (m *Manager) Start(
 		return nil, errors.Join(err, cleanupErr)
 	}
 	running.injectionDir = injection.dir
-	if _, err := m.committer.CommitAgent(
+	receipt, err := m.committer.CommitAgent(
 		ctx,
 		a,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
@@ -451,7 +453,11 @@ func (m *Manager) Start(
 			string(publicPayload),
 			string(storedPayload),
 		)},
-	); err != nil {
+	)
+	if receipt.Durable {
+		workspaceCommitted = true
+	}
+	if err != nil {
 		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
@@ -461,7 +467,6 @@ func (m *Manager) Start(
 			cleanupErr,
 		)
 	}
-	workspaceCommitted = true
 
 	m.mu.Lock()
 	m.agents[id] = managed
@@ -786,6 +791,13 @@ func (m *Manager) reserveResume(
 	if _, reserved := m.resuming[id]; reserved {
 		return nil, adapter.Entry{}, "", fmt.Errorf(
 			"%w: agent %q is already resuming",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if _, cleaning := m.cleaning[id]; cleaning {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q workspace is being removed",
 			ErrResumeConflict,
 			id,
 		)

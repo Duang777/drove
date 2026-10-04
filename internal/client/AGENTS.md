@@ -6,8 +6,9 @@
 
 ## 关键设计
 
-- `Client` 封装 REST 调用（List / Start / Resume / Status / Stop / SendInput / Replay /
-  Explain / Timeline / BlockedOccurrence / Frame / RotateToken / IssueLoginCode）；
+- `Client` 封装 REST 调用（List / Start / Resume / Status / Stop / CleanupWorktree /
+  SendInput / Replay / Explain / Timeline / BlockedOccurrence / Frame / RotateToken /
+  IssueLoginCode）；
   CLI 使用 `NewLocal` 经
   `$DataDir/run/droved.sock` 调用，
   TCP 构造器保留给测试与浏览器边界；Explain 仅编码路径、可选 limit 并解码类型化
@@ -32,5 +33,6 @@
 - 禁止在本包解析 agent 状态机/事件结构——只做 JSON 透传。
 - 自动拉起只允许出现在 `EnsureDaemon`；其它路径不得隐式启动进程。
 - 导出类型：`Client`、`HookRelay`、`HookRelayConfig`、
+  `RemovedWorktree`、
   `TerminalStream`、`TerminalSubscription`、`TerminalMessage`、
   `TerminalStreamError`、`ErrDaemonUnreachable`。

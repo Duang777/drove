@@ -16,8 +16,9 @@ resume / timeline / explain / stop / worktree / token rotate / web / version）�
   切换为单次执行，`--hooks` 选择 `off|auto|required`；未知厂商名仍视为
   generic 命令。`--worktree` 把调用方目录解析为绝对仓库路径，`--branch` 只在
   worktree 模式有效。
-- `drove worktree ls|rm` 直接调用 `internal/workspace`，不启动 daemon；`rm`
-  默认拒绝 dirty worktree，`--force` 允许删除目录但仍保留分支。
+- `drove worktree ls` 直接调用 `internal/workspace`；`rm` 通过 daemon 原子确认
+  会话已停止并执行清理，避免与原生恢复并发。它默认拒绝 dirty worktree，`--force`
+  允许删除目录但仍保留分支。
 - `drove send <id> <text>` 向运行中的 agent 发送一行输入；`--stdin` 保留标准输入的原始换行。
 - `drove hook --vendor <vendor>` 默认从 stdin 读取一个 hook JSON 文档；
   `--payload-argv` 改为读取唯一位置参数，`--managed-by drove/v1` 只作受管命令标记。
