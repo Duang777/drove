@@ -167,4 +167,4 @@
 - [x] Both remote CI lanes pass.
 - [x] Every implementation commit is pushed before the next begins.
 - [x] A Bubble Tea follow-up issue is linked from Issue #20.
-- [ ] Issue #20 contains final evidence and is closed.
+- [x] Issue #20 contains final evidence and is closed.
