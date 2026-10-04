@@ -90,6 +90,9 @@ type terminalActor struct {
 	stop     chan struct{}
 	done     chan struct{}
 
+	replyErrors chan error
+	replyDone   chan struct{}
+
 	admissionMu sync.RWMutex
 	closing     bool
 	closeOnce   sync.Once
@@ -131,33 +134,57 @@ func newTerminalActor(
 	if clock == nil {
 		clock = systemObservationClock{}
 	}
-	controller, err := term.NewController(size, func(frame []byte) error {
-		written, writeErr := process.Write(frame)
-		if writeErr != nil {
-			return writeErr
-		}
-		if written != len(frame) {
-			return io.ErrShortWrite
-		}
-		return nil
-	})
+	controller, err := term.NewController(size)
 	if err != nil {
 		return nil, fmt.Errorf("session: create terminal controller: %w", err)
 	}
 	actor := &terminalActor{
-		controller: controller,
-		classifier: classifier,
-		process:    process,
-		observer:   observer,
-		vendor:     vendor,
-		clock:      clock,
-		fail:       fail,
-		requests:   make(chan terminalRequest, terminalInboxSize),
-		stop:       make(chan struct{}),
-		done:       make(chan struct{}),
+		controller:  controller,
+		classifier:  classifier,
+		process:     process,
+		observer:    observer,
+		vendor:      vendor,
+		clock:       clock,
+		fail:        fail,
+		requests:    make(chan terminalRequest, terminalInboxSize),
+		stop:        make(chan struct{}),
+		done:        make(chan struct{}),
+		replyErrors: make(chan error, 1),
+		replyDone:   make(chan struct{}),
 	}
+	go actor.forwardReplies()
 	go actor.run()
 	return actor, nil
+}
+
+func (a *terminalActor) forwardReplies() {
+	defer close(a.replyDone)
+	defer close(a.replyErrors)
+
+	failed := false
+	for frame := range a.controller.Replies() {
+		if failed {
+			continue
+		}
+		data := frame.Bytes()
+		written, err := a.process.Write(data)
+		if err == nil && written == len(data) {
+			continue
+		}
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		select {
+		case a.replyErrors <- fmt.Errorf(
+			"session: write terminal reply %d/%d bytes: %w",
+			written,
+			len(data),
+			err,
+		):
+		default:
+		}
+		failed = true
+	}
 }
 
 func (a *terminalActor) FeedCommitted(
@@ -277,7 +304,8 @@ func (a *terminalActor) run() {
 	state := terminalActorState{}
 	var timer observationTimer
 	var timerC <-chan time.Time
-	replyErrors := a.controller.Errors()
+	controllerReplyErrors := a.controller.Errors()
+	replyWriteErrors := (<-chan error)(a.replyErrors)
 
 	closeController := func() {
 		if state.controllerClosed {
@@ -287,12 +315,23 @@ func (a *terminalActor) run() {
 		if err := a.controller.Close(); err != nil {
 			a.closeErr = errors.Join(a.closeErr, err)
 		}
-		for err := range replyErrors {
-			if state.replyErr == nil {
-				state.replyErr = err
+		<-a.replyDone
+		if controllerReplyErrors != nil {
+			for err := range controllerReplyErrors {
+				if state.replyErr == nil {
+					state.replyErr = err
+				}
 			}
 		}
-		replyErrors = nil
+		controllerReplyErrors = nil
+		if replyWriteErrors != nil {
+			for err := range replyWriteErrors {
+				if state.replyErr == nil {
+					state.replyErr = err
+				}
+			}
+		}
+		replyWriteErrors = nil
 	}
 	defer closeController()
 
@@ -311,9 +350,17 @@ func (a *terminalActor) run() {
 			if err := a.sample(&state, firedAt); err != nil {
 				a.failActor(&state, err)
 			}
-		case err, open := <-replyErrors:
+		case err, open := <-controllerReplyErrors:
 			if !open {
-				replyErrors = nil
+				controllerReplyErrors = nil
+				continue
+			}
+			if state.replyErr == nil {
+				state.replyErr = err
+			}
+		case err, open := <-replyWriteErrors:
+			if !open {
+				replyWriteErrors = nil
 				continue
 			}
 			if state.replyErr == nil {

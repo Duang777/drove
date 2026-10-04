@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -637,6 +638,130 @@ func TestHandleInputWritesAndAuditsWithoutContent(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("input audit or echoed output missing: %+v", rows)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestHandleInputReturnsServiceUnavailableUnderPTYBackpressure(t *testing.T) {
+	server, manager, _ := newTestServer(t)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Name:    "blocked-input-agent",
+		Command: "/bin/sh",
+		Args: []string{
+			"-c",
+			"stty raw -echo; printf READY; kill -STOP $$",
+		},
+		Mode: agent.RunModeInteractive,
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitForOutputText(t, manager, status.AgentID, "READY")
+	t.Cleanup(func() {
+		resumeStoppedAgent(t, manager, status.AgentID)
+	})
+
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/api/v1/agents/"+status.AgentID+"/input",
+			strings.NewReader(
+				`{"data":"`+strings.Repeat("x", session.MaxInputBytes)+`"}`,
+			),
+		)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		serveAuthorized(server, rec, req)
+		firstDone <- rec
+	}()
+
+	select {
+	case rec := <-firstDone:
+		t.Fatalf(
+			"first input returned before PTY deadline: %d %q",
+			rec.Code,
+			rec.Body.String(),
+		)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/agents/"+status.AgentID+"/input",
+		strings.NewReader(`{"data":"second"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+	if rec.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(rec.Body.String(), session.ErrInputBackpressure.Error()) {
+		t.Fatalf("concurrent response = %d %q, want input-backpressure 503", rec.Code, rec.Body.String())
+	}
+
+	select {
+	case first := <-firstDone:
+		if first.Code != http.StatusServiceUnavailable ||
+			!strings.Contains(first.Body.String(), "do not retry") {
+			t.Fatalf(
+				"timed-out response = %d %q, want partial do-not-retry 503",
+				first.Code,
+				first.Body.String(),
+			)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first input remained blocked beyond the PTY deadline")
+	}
+}
+
+func waitForOutputText(
+	t *testing.T,
+	manager *session.Manager,
+	agentID string,
+	text string,
+) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		rows, err := manager.Replay(agentID)
+		if err != nil {
+			t.Fatalf("replay output: %v", err)
+		}
+		for _, row := range rows {
+			if row.Type == string(event.TypeOutputChunk) &&
+				outputPayloadContains(t, row.Payload, text) {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("output %q was not recorded", text)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func resumeStoppedAgent(t *testing.T, manager *session.Manager, agentID string) {
+	t.Helper()
+	current, err := manager.Status(agent.ID(agentID))
+	if err != nil || current.PID == 0 {
+		return
+	}
+	if err := syscall.Kill(current.PID, syscall.SIGCONT); err != nil &&
+		!errors.Is(err, syscall.ESRCH) {
+		t.Errorf("resume stopped agent: %v", err)
+		return
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, err = manager.Status(agent.ID(agentID))
+		if err != nil || current.PID == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("agent remained attached after SIGCONT: %+v", current)
+			return
 		}
 		time.Sleep(time.Millisecond)
 	}

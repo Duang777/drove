@@ -8,7 +8,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -182,28 +181,34 @@ func TestControllerReplyBytesDoNotEnterSnapshot(t *testing.T) {
 	closeController(t, controller)
 }
 
-func TestControllerDrainContinuesAfterSinkError(t *testing.T) {
-	var calls atomic.Int32
-	sinkErr := errors.New("PTY closed")
-	controller, err := NewController(mustSize(t, 10, 20), func([]byte) error {
-		calls.Add(1)
-		return sinkErr
-	})
+func TestControllerReplyMailboxOverflowDoesNotBlock(t *testing.T) {
+	controller, err := NewController(mustSize(t, 10, 20))
 	if err != nil {
 		t.Fatalf("NewController: %v", err)
 	}
+	replies := controller.Replies()
 
+	for count := 1; count <= replyMailboxSize; count++ {
+		writeController(t, controller, "\x1b[6n")
+		waitFor(
+			t,
+			func() bool { return len(replies) == count },
+			fmt.Sprintf("%d queued replies", count),
+		)
+	}
 	writeController(t, controller, "\x1b[6n")
-	writeController(t, controller, "\x1b[c")
-	waitFor(t, func() bool { return calls.Load() == 2 }, "two reply sink calls")
 
 	select {
 	case got := <-controller.Errors():
-		if !errors.Is(got, sinkErr) {
-			t.Fatalf("reply error = %v, want %v", got, sinkErr)
+		if !errors.Is(got, ErrReplyBackpressure) {
+			t.Fatalf("reply error = %v, want ErrReplyBackpressure", got)
 		}
 	case <-time.After(controllerTestDeadline):
 		t.Fatal("timed out waiting for reply error")
+	}
+
+	if _, err := controller.Snapshot(); err != nil {
+		t.Fatalf("Snapshot: %v", err)
 	}
 	closeController(t, controller)
 }
@@ -393,17 +398,13 @@ func TestSnapshotViewRejectsZeroOptions(t *testing.T) {
 	}
 }
 
-func newReplyController(t *testing.T, size Size) (*Controller, <-chan []byte) {
+func newReplyController(t *testing.T, size Size) (*Controller, <-chan ReplyFrame) {
 	t.Helper()
-	replies := make(chan []byte, 16)
-	controller, err := NewController(size, func(frame []byte) error {
-		replies <- append([]byte(nil), frame...)
-		return nil
-	})
+	controller, err := NewController(size)
 	if err != nil {
 		t.Fatalf("NewController: %v", err)
 	}
-	return controller, replies
+	return controller, controller.Replies()
 }
 
 func mustSize(t *testing.T, rows, columns int) Size {
@@ -431,12 +432,12 @@ func writeController(t *testing.T, controller *Controller, data string) {
 	}
 }
 
-func assertReply(t *testing.T, replies <-chan []byte, want string) {
+func assertReply(t *testing.T, replies <-chan ReplyFrame, want string) {
 	t.Helper()
 	select {
 	case got := <-replies:
-		if !bytes.Equal(got, []byte(want)) {
-			t.Fatalf("reply = %q, want %q", got, want)
+		if !bytes.Equal(got.Bytes(), []byte(want)) {
+			t.Fatalf("reply = %q, want %q", got.Bytes(), want)
 		}
 	case <-time.After(controllerTestDeadline):
 		t.Fatalf("timed out waiting for reply %q", want)

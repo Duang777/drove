@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -103,6 +104,8 @@ var (
 	ErrInputTooLarge = errors.New("session: input exceeds maximum size")
 	// ErrInputNotUTF8 表示输入不是合法 UTF-8 文本。
 	ErrInputNotUTF8 = errors.New("session: input is not valid UTF-8")
+	// ErrInputBackpressure 表示输入准入当前不可用或写入已超时。
+	ErrInputBackpressure = errors.New("session: input backpressure")
 	// ErrInputWrite 表示 PTY 未完整接受输入。
 	ErrInputWrite = errors.New("session: input write failed")
 	// ErrInputAudit 表示输入已送达，但审计事件持久化失败。
@@ -148,7 +151,8 @@ type runningSession struct {
 	exitClaimed    bool
 }
 
-// InputResult 描述一次输入操作已经写入 PTY 的字节数。
+// InputResult 描述一次输入操作已经写入 PTY 的精确字节数。
+// 部分写入不产生成功审计，调用方不得重试整段输入。
 type InputResult struct {
 	BytesWritten int
 }
@@ -1147,7 +1151,7 @@ func (m *Manager) Frame(
 	return frame, nil
 }
 
-// SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。
+// SendInput 尝试向已连接的 Agent 写入完整输入，仅在完整成功后记录脱敏审计事件。
 func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	payload, err := validateInput(data)
 	if err != nil {
@@ -1173,7 +1177,9 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
-	running.inputMu.Lock()
+	if !running.inputMu.TryLock() {
+		return InputResult{}, ErrInputBackpressure
+	}
 	defer running.inputMu.Unlock()
 
 	m.mu.RLock()
@@ -1190,27 +1196,8 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 
 	written, err := process.Write(data)
 	result := InputResult{BytesWritten: written}
-	if err != nil {
-		if errors.Is(err, pty.ErrClosed) {
-			return result, fmt.Errorf("%w: %q", ErrNotAttached, id)
-		}
-		return result, fmt.Errorf(
-			"%w: agent %q wrote %d/%d bytes: %w",
-			ErrInputWrite,
-			id,
-			written,
-			len(data),
-			err,
-		)
-	}
-	if written != len(data) {
-		return result, fmt.Errorf(
-			"%w: agent %q wrote %d/%d bytes",
-			ErrInputWrite,
-			id,
-			written,
-			len(data),
-		)
+	if writeErr := classifyInputWrite(id, written, len(data), err); writeErr != nil {
+		return result, writeErr
 	}
 	if _, err := m.committer.CommitEvents(
 		context.Background(),
@@ -1225,6 +1212,60 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 		)
 	}
 	return result, nil
+}
+
+func classifyInputWrite(
+	id agent.ID,
+	written int,
+	total int,
+	err error,
+) error {
+	if err == nil && written == total {
+		return nil
+	}
+	if err == nil {
+		err = io.ErrShortWrite
+	}
+	if written > 0 {
+		if errors.Is(err, pty.ErrWriteBackpressure) {
+			return fmt.Errorf(
+				"%w: agent %q wrote %d/%d bytes; do not retry: %w: %w",
+				ErrInputWrite,
+				id,
+				written,
+				total,
+				ErrInputBackpressure,
+				err,
+			)
+		}
+		return fmt.Errorf(
+			"%w: agent %q wrote %d/%d bytes; do not retry: %w",
+			ErrInputWrite,
+			id,
+			written,
+			total,
+			err,
+		)
+	}
+	if errors.Is(err, pty.ErrClosed) {
+		return fmt.Errorf("%w: %q", ErrNotAttached, id)
+	}
+	if errors.Is(err, pty.ErrWriteBackpressure) {
+		return fmt.Errorf(
+			"%w: agent %q wrote 0/%d bytes: %w",
+			ErrInputBackpressure,
+			id,
+			total,
+			err,
+		)
+	}
+	return fmt.Errorf(
+		"%w: agent %q wrote 0/%d bytes: %w",
+		ErrInputWrite,
+		id,
+		total,
+		err,
+	)
 }
 
 func validateInput(data []byte) (string, error) {

@@ -195,7 +195,7 @@ func replayFixtureDirectly(
 	if err != nil {
 		t.Fatalf("create direct replay terminal size: %v", err)
 	}
-	controller, err := term.NewController(size, func([]byte) error { return nil })
+	controller, err := term.NewController(size)
 	if err != nil {
 		t.Fatalf("create direct replay terminal: %v", err)
 	}

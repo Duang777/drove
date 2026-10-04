@@ -1353,6 +1353,68 @@ func TestSendInputValidatesBeforeLookingUpAgent(t *testing.T) {
 	}
 }
 
+func TestSendInputRejectsConcurrentAdmission(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("agent-1")
+	a := agent.New(
+		id,
+		agent.WithName("agent"),
+		agent.WithVendor("generic"),
+		agent.WithRunMode(agent.RunModeInteractive),
+	)
+	running := &runningSession{process: &fakeProcessSession{writeN: 5}}
+	manager.mu.Lock()
+	manager.agents[id] = newManagedAgent(a)
+	manager.sessions[id] = running
+	manager.mu.Unlock()
+
+	running.inputMu.Lock()
+	result, err := manager.SendInput(id, []byte("input"))
+	running.inputMu.Unlock()
+	if !errors.Is(err, ErrInputBackpressure) {
+		t.Fatalf("send input error = %v, want ErrInputBackpressure", err)
+	}
+	if result.BytesWritten != 0 {
+		t.Fatalf("bytes written = %d, want 0", result.BytesWritten)
+	}
+}
+
+func TestClassifyInputWriteBackpressure(t *testing.T) {
+	t.Run("no bytes", func(t *testing.T) {
+		err := classifyInputWrite(
+			"agent-1",
+			0,
+			5,
+			pty.ErrWriteBackpressure,
+		)
+		if !errors.Is(err, ErrInputBackpressure) {
+			t.Fatalf("error = %v, want ErrInputBackpressure", err)
+		}
+		if errors.Is(err, ErrInputWrite) {
+			t.Fatalf("zero-byte backpressure also reported ErrInputWrite: %v", err)
+		}
+	})
+
+	t.Run("partial delivery", func(t *testing.T) {
+		err := classifyInputWrite(
+			"agent-1",
+			2,
+			5,
+			pty.ErrWriteBackpressure,
+		)
+		if !errors.Is(err, ErrInputBackpressure) ||
+			!errors.Is(err, ErrInputWrite) {
+			t.Fatalf(
+				"error = %v, want ErrInputBackpressure and ErrInputWrite",
+				err,
+			)
+		}
+		if !strings.Contains(err.Error(), "do not retry") {
+			t.Fatalf("partial-delivery error = %v, want do-not-retry guidance", err)
+		}
+	})
+}
+
 func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
 	manager, _ := newTestManager(t)
 	id := agent.ID("agent-1")
@@ -1374,6 +1436,9 @@ func TestSendInputReportsPartialWriteWithoutAudit(t *testing.T) {
 	}
 	if result.BytesWritten != 2 {
 		t.Fatalf("bytes written = %d, want 2", result.BytesWritten)
+	}
+	if !strings.Contains(err.Error(), "do not retry") {
+		t.Fatalf("partial write error = %v, want do-not-retry guidance", err)
 	}
 	rows, err := manager.Replay(string(id))
 	if err != nil {

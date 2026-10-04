@@ -180,6 +180,11 @@ func (p *outputProcessor) SendAttachedInput(
 	data []byte,
 	payload string,
 ) (InputResult, error) {
+	if !p.running.inputMu.TryLock() {
+		return InputResult{}, ErrInputBackpressure
+	}
+	defer p.running.inputMu.Unlock()
+
 	result, err := p.submit(ctx, outputRequest{
 		operation:    outputAttachedInput,
 		attachmentID: id,

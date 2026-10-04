@@ -464,6 +464,8 @@ func (s *Server) handleInput(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, err.Error())
 		case errors.Is(err, session.ErrNotAttached):
 			writeErr(w, http.StatusConflict, err.Error())
+		case errors.Is(err, session.ErrInputBackpressure):
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
 		case errors.Is(err, session.ErrManagerClosed):
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
 		default:

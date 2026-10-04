@@ -178,6 +178,7 @@ func TestTerminalAcceptanceNoGoroutineLeak(t *testing.T) {
 		runtime.GC()
 		afterProfile, after := terminalAcceptanceGoroutines(t)
 		if after.terminalActors <= before.terminalActors &&
+			after.replyForwarders <= before.replyForwarders &&
 			after.replyPumps <= before.replyPumps &&
 			after.observationActors <= before.observationActors &&
 			after.committers <= before.committers {
@@ -680,6 +681,7 @@ func countEventType(rows []store.EventRow, eventType event.Type) int {
 
 type terminalAcceptanceGoroutineCount struct {
 	terminalActors    int
+	replyForwarders   int
 	replyPumps        int
 	observationActors int
 	committers        int
@@ -698,6 +700,10 @@ func terminalAcceptanceGoroutines(
 		terminalActors: strings.Count(
 			text,
 			"internal/session.(*terminalActor).run",
+		),
+		replyForwarders: strings.Count(
+			text,
+			"internal/session.(*terminalActor).forwardReplies",
 		),
 		replyPumps: strings.Count(
 			text,
