@@ -97,20 +97,27 @@ func TestAgentResizedPayloadValidationAndCommit(t *testing.T) {
 		t.Fatalf("decoded resize payload = %+v, want %+v", decoded, payload)
 	}
 
+	draft, err := NewAgentResizedDraft(
+		"agent-1",
+		"agent-1",
+		payload.Rows,
+		payload.Columns,
+		payload.OutputOffset,
+	)
+	if err != nil {
+		t.Fatalf("new resize draft: %v", err)
+	}
 	committed, err := Commit(
 		10,
 		time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC),
-		Draft{
-			typ:       TypeAgentResized,
-			sessionID: "agent-1",
-			agentID:   "agent-1",
-			payload:   string(encoded),
-		},
+		draft,
 	)
 	if err != nil {
 		t.Fatalf("commit resize event: %v", err)
 	}
-	if committed.Type != TypeAgentResized || committed.Payload != string(encoded) {
+	if committed.Type != TypeAgentResized ||
+		committed.Reason != "applied" ||
+		committed.Payload != string(encoded) {
 		t.Fatalf("committed resize event = %+v", committed)
 	}
 

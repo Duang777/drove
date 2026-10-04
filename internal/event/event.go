@@ -317,6 +317,36 @@ func DecodeAgentResizedPayload(payload string) (AgentResizedPayloadV1, error) {
 	return decoded, nil
 }
 
+// NewAgentResizedDraft constructs an uncommitted effective terminal resize.
+func NewAgentResizedDraft(
+	sessionID string,
+	agentID string,
+	rows uint16,
+	columns uint16,
+	outputOffset uint64,
+) (Draft, error) {
+	payload := AgentResizedPayloadV1{
+		Version:      AgentResizedPayloadVersion,
+		Rows:         rows,
+		Columns:      columns,
+		OutputOffset: outputOffset,
+	}
+	if err := payload.Validate(); err != nil {
+		return Draft{}, err
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return Draft{}, fmt.Errorf("event: encode agent resized payload: %w", err)
+	}
+	return Draft{
+		typ:       TypeAgentResized,
+		sessionID: sessionID,
+		agentID:   agentID,
+		reason:    "applied",
+		payload:   string(encoded),
+	}, nil
+}
+
 // Commit seals a copied draft with its durable sequence and timestamp.
 func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 	if seq == 0 {

@@ -354,10 +354,12 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			string(payload),
 		)},
 	); err != nil {
+		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
 		return nil, errors.Join(
 			fmt.Errorf("session: persist creation: %w", err),
+			outputErr,
 			cleanupErr,
 		)
 	}
@@ -381,6 +383,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		OnOutputEnd: func(offset uint64) {
 			<-running.callbacksReady
 			_ = running.output.End(offset)
+			_ = running.output.Close()
 			if running.terminal != nil {
 				_ = running.terminal.Close()
 			}
@@ -407,9 +410,10 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		m.detach(id, running)
 		close(running.signalReady)
 		close(running.callbacksReady)
+		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-		return nil, errors.Join(startErr, commitErr, cleanupErr)
+		return nil, errors.Join(startErr, commitErr, outputErr, cleanupErr)
 	}
 
 	m.mu.Lock()
@@ -442,13 +446,19 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			commitErr = running.observer.Terminate(observation)
 		}
 		m.detach(id, running)
-		running.output.failed = true
+		outputErr := running.output.Close()
 		close(running.signalReady)
 		close(running.callbacksReady)
 		closeErr := sess.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
-		return nil, errors.Join(startErr, commitErr, closeErr, cleanupErr)
+		return nil, errors.Join(
+			startErr,
+			commitErr,
+			outputErr,
+			closeErr,
+			cleanupErr,
+		)
 	}
 	m.mu.Lock()
 	running.terminal = terminalActor
@@ -524,6 +534,18 @@ func (m *Manager) Close() error {
 					closeErrors,
 					fmt.Errorf("session: close agent %q: %w", item.id, err),
 				)
+			}
+			if item.session.output != nil {
+				if err := item.session.output.Close(); err != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf(
+							"session: close recording for agent %q: %w",
+							item.id,
+							err,
+						),
+					)
+				}
 			}
 			if item.session.terminal != nil {
 				if err := item.session.terminal.Close(); err != nil {
@@ -687,18 +709,9 @@ func (m *Manager) Replay(sessionID string) ([]store.EventRow, error) {
 
 // SendInput 向已连接的 Agent 写入完整输入，并记录脱敏审计事件。
 func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
-	if len(data) == 0 {
-		return InputResult{}, ErrInputEmpty
-	}
-	if len(data) > MaxInputBytes {
-		return InputResult{}, fmt.Errorf("%w: %d bytes", ErrInputTooLarge, len(data))
-	}
-	if !utf8.Valid(data) {
-		return InputResult{}, ErrInputNotUTF8
-	}
-	payload, err := json.Marshal(inputAuditPayload{Version: 1, Bytes: len(data)})
+	payload, err := validateInput(data)
 	if err != nil {
-		return InputResult{}, fmt.Errorf("session: encode input audit: %w", err)
+		return InputResult{}, err
 	}
 
 	m.mu.RLock()
@@ -761,7 +774,7 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	}
 	if _, err := m.committer.CommitEvents(
 		context.Background(),
-		[]event.Draft{event.NewAgentInputDraft(string(id), string(id), string(payload))},
+		[]event.Draft{event.NewAgentInputDraft(string(id), string(id), payload)},
 	); err != nil {
 		return result, fmt.Errorf(
 			"%w: agent %q received %d bytes; do not retry: %w",
@@ -774,16 +787,35 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 	return result, nil
 }
 
+func validateInput(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "", ErrInputEmpty
+	}
+	if len(data) > MaxInputBytes {
+		return "", fmt.Errorf("%w: %d bytes", ErrInputTooLarge, len(data))
+	}
+	if !utf8.Valid(data) {
+		return "", ErrInputNotUTF8
+	}
+	payload, err := json.Marshal(inputAuditPayload{Version: 1, Bytes: len(data)})
+	if err != nil {
+		return "", fmt.Errorf("session: encode input audit: %w", err)
+	}
+	return string(payload), nil
+}
+
 // -- 内部回调 --
 
 // onExit 根据运行模式和停止原因记录终态，再移除 PTY。
 func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo) {
 	running.inputMu.Lock()
-	defer running.inputMu.Unlock()
-
 	cause, ok := m.claimExit(id, running)
+	running.inputMu.Unlock()
 	if !ok {
 		return
+	}
+	if running.output != nil {
+		_ = running.output.DetachAll()
 	}
 	if running.processExited != nil {
 		defer close(running.processExited)

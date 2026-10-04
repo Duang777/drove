@@ -422,15 +422,18 @@ func (o *recordingTerminalObserver) WaitForCount(t *testing.T, want int) {
 }
 
 type terminalTestProcess struct {
-	mu           sync.Mutex
-	writes       [][]byte
-	resizes      [][2]uint16
-	writeLimit   int
-	writeErr     error
-	resizeErr    error
-	writeStarted chan struct{}
-	writeRelease <-chan struct{}
-	startOnce    sync.Once
+	mu            sync.Mutex
+	writes        [][]byte
+	resizes       [][2]uint16
+	writeLimit    int
+	writeErr      error
+	resizeErr     error
+	writeStarted  chan struct{}
+	writeRelease  <-chan struct{}
+	resizeStarted chan struct{}
+	resizeRelease <-chan struct{}
+	startOnce     sync.Once
+	resizeOnce    sync.Once
 }
 
 func (p *terminalTestProcess) Write(frame []byte) (int, error) {
@@ -456,10 +459,27 @@ func (p *terminalTestProcess) Write(frame []byte) (int, error) {
 }
 
 func (p *terminalTestProcess) Resize(rows, columns uint16) error {
+	if p.resizeStarted != nil {
+		p.resizeOnce.Do(func() {
+			close(p.resizeStarted)
+		})
+	}
+	if p.resizeRelease != nil {
+		<-p.resizeRelease
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.resizes = append(p.resizes, [2]uint16{rows, columns})
 	return p.resizeErr
+}
+
+func (p *terminalTestProcess) Close() error {
+	return nil
+}
+
+func (p *terminalTestProcess) PID() int {
+	return 1
 }
 
 func (p *terminalTestProcess) Writes() [][]byte {
