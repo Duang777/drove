@@ -139,6 +139,105 @@ func TestAgentResizedPayloadValidationAndCommit(t *testing.T) {
 	}
 }
 
+func TestAttachmentAuditPayloadValidationAndCommit(t *testing.T) {
+	at := time.Date(2026, time.October, 4, 13, 0, 0, 0, time.UTC)
+	tests := []struct {
+		action AttachmentAction
+		access AttachmentAccess
+	}{
+		{action: AttachmentAttached, access: AttachmentReadOnly},
+		{action: AttachmentAttached, access: AttachmentReadWrite},
+		{action: AttachmentDetached, access: AttachmentReadOnly},
+		{action: AttachmentDetached, access: AttachmentReadWrite},
+	}
+	for index, test := range tests {
+		draft, err := NewAgentAttachmentDraft(
+			"agent-1",
+			"agent-1",
+			test.action,
+			test.access,
+		)
+		if err != nil {
+			t.Fatalf("new attachment draft %d: %v", index, err)
+		}
+		committed, err := Commit(uint64(index+1), at, draft)
+		if err != nil {
+			t.Fatalf("commit attachment draft %d: %v", index, err)
+		}
+		if committed.Type != TypeAgentAttachment || committed.Reason != "" {
+			t.Fatalf("committed attachment event = %+v", committed)
+		}
+		payload, err := DecodeAttachmentAuditPayload(committed.Payload)
+		if err != nil {
+			t.Fatalf("decode attachment payload %d: %v", index, err)
+		}
+		want := AttachmentAuditPayloadV1{
+			Version: AttachmentAuditPayloadVersion,
+			Action:  test.action,
+			Access:  test.access,
+		}
+		if payload != want {
+			t.Fatalf("attachment payload %d = %+v, want %+v", index, payload, want)
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(committed.Payload), &fields); err != nil {
+			t.Fatalf("decode attachment fields %d: %v", index, err)
+		}
+		if len(fields) != 3 {
+			t.Fatalf("attachment fields %d = %v, want version, action, access", index, fields)
+		}
+	}
+}
+
+func TestAttachmentAuditPayloadRejectsMalformedOrPrivateFields(t *testing.T) {
+	invalidPayloads := []string{
+		`{"version":2,"action":"attached","access":"read_only"}`,
+		`{"version":1,"action":"opened","access":"read_only"}`,
+		`{"version":1,"action":"attached","access":"owner"}`,
+		`{"version":1,"action":"","access":"read_only"}`,
+		`{"version":1,"action":"attached","access":""}`,
+		`{"version":1,"action":"attached","access":"read_only","input":"secret"}`,
+		`{"version":1,"action":"attached","access":"read_only"}{"extra":true}`,
+		`{"version":1`,
+	}
+	for _, payload := range invalidPayloads {
+		if _, err := DecodeAttachmentAuditPayload(payload); err == nil {
+			t.Fatalf("decode accepted invalid attachment payload %q", payload)
+		}
+	}
+
+	if _, err := NewAgentAttachmentDraft(
+		"agent-1",
+		"agent-1",
+		AttachmentAction("opened"),
+		AttachmentReadOnly,
+	); err == nil {
+		t.Fatal("constructor accepted an invalid attachment action")
+	}
+	if _, err := NewAgentAttachmentDraft(
+		"agent-1",
+		"agent-1",
+		AttachmentAttached,
+		AttachmentAccess("owner"),
+	); err == nil {
+		t.Fatal("constructor accepted an invalid attachment access")
+	}
+
+	draft, err := NewAgentAttachmentDraft(
+		"agent-1",
+		"agent-1",
+		AttachmentAttached,
+		AttachmentReadOnly,
+	)
+	if err != nil {
+		t.Fatalf("new valid attachment draft: %v", err)
+	}
+	draft.payload = `{"version":1,"action":"attached","access":"read_only","client":"private"}`
+	if _, err := Commit(1, time.Now().UTC(), draft); err == nil {
+		t.Fatal("commit accepted a forged attachment payload")
+	}
+}
+
 func TestOutputChunkDraftCopiesPrivateAttachment(t *testing.T) {
 	data := []byte("prompt\x00without newline")
 	draft, err := NewOutputChunkDraft("agent-1", "agent-1", 17, data)

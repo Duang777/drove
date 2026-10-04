@@ -479,7 +479,8 @@ func validEventType(typ event.Type) bool {
 		event.TypeSessionLifecycle,
 		event.TypeAgentInput,
 		event.TypeAgentSignal,
-		event.TypeAgentResized:
+		event.TypeAgentResized,
+		event.TypeAgentAttachment:
 		return true
 	default:
 		return false

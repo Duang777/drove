@@ -62,8 +62,9 @@
 - 进程退出先同步调用 `MarkProcessExited`，再终止 Detector。尾部输出仍持久化并更新
   私有 emulator，但不能产生 screen signal；detach 后 snapshot 不可用。
 - 输入写入和进程退出按会话串行，保证完整输入审计不会落在终态之后；PTY 输出不参与该锁。
-- 恢复投影显式识别 `agent.input` 和 `output.chunk`，但这些事件不改变状态；
-  `output.chunk` 与旧 `output` 一样只更新已有会话的事件事实。
+- 恢复投影显式识别 `agent.input`、`agent.attachment` 和 `output.chunk`；
+  `agent.input` 与 `agent.attachment` 不改变状态，`output.chunk` 与旧 `output`
+  一样只更新已有会话的事件事实。
 - 信号与状态证据 reader 同时接受 v1、v2 和 typed screen v3；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。

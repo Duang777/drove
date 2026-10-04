@@ -29,12 +29,12 @@
 - [x] `writable:false` means a read-only user attachment.
 - [x] `writable:true` means a writable user attachment.
 - [x] Selector presence never expresses attachment intent.
-- [ ] Event draft validation accepts `agent.attachment` before a writer emits
+- [x] Event draft validation accepts `agent.attachment` before a writer emits
   it.
-- [ ] Store validation accepts version 1 attachment payloads.
-- [ ] Recovery treats `agent.attachment` as a known non-state event.
-- [ ] The browser event union accepts `agent.attachment`.
-- [ ] The audit payload contains only version, action, and access.
+- [x] Store event-type filters accept `agent.attachment` envelopes.
+- [x] Recovery treats `agent.attachment` as a known non-state event.
+- [x] The browser event union accepts `agent.attachment`.
+- [x] The audit payload contains only version, action, and access.
 - [ ] Successful user setup writes one attached event.
 - [ ] Every attachment removal path writes one detached event.
 - [ ] Duplicate close paths do not write duplicate detach events.
@@ -149,7 +149,7 @@
 
 ## Verification
 
-- [ ] Reader-first attachment event tests pass.
+- [x] Reader-first attachment event tests pass.
 - [ ] Attachment teardown and exactly-once audit tests pass.
 - [ ] CLI UTF-8 framing and cleanup unit tests pass.
 - [ ] A pseudo-terminal attach acceptance test passes.

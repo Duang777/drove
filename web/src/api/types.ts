@@ -75,6 +75,7 @@ export type EventType =
   | 'agent.input'
   | 'agent.signal'
   | 'agent.resized'
+  | 'agent.attachment'
 
 /** 实时事件（Go: event.Event）。 */
 export interface Event {

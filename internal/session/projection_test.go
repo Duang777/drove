@@ -762,6 +762,50 @@ func TestRecoveryProjectorAcceptsValidatedResizeWithoutChangingState(t *testing.
 	}
 }
 
+func TestRecoveryProjectorAcceptsAttachmentAuditWithoutChangingState(t *testing.T) {
+	projector := newRecoveryProjector()
+	base := time.Date(2026, time.October, 4, 13, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"generic"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentAttachment),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1,"action":"attached","access":"read_write"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeAgentAttachment),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Payload:   `{"version":1,"action":"detached","access":"read_write"}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	draft := projector.sessions["s1"]
+	if draft == nil || draft.state != agent.StatePending || draft.updatedAt != base {
+		t.Fatalf("attachment audit changed recovered state: %+v", draft)
+	}
+	if projector.lastSeq != 3 || projector.report.ScannedEvents != 3 {
+		t.Fatalf("projector position = (%d, %d)", projector.lastSeq, projector.report.ScannedEvents)
+	}
+}
+
 func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	created := func(seq uint64) store.EventRow {
@@ -824,6 +868,11 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 			wantErr: "empty session ID",
 		},
 		{
+			name:    "empty attachment session",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentAttachment)}},
+			wantErr: "empty session ID",
+		},
+		{
 			name:    "mismatched agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeOutput), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
@@ -841,6 +890,11 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 		{
 			name:    "mismatched resize agent",
 			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentResized), SessionID: "s1", AgentID: "a2"}},
+			wantErr: "does not match",
+		},
+		{
+			name:    "mismatched attachment agent",
+			rows:    []store.EventRow{{Seq: 1, Timestamp: base, Type: string(event.TypeAgentAttachment), SessionID: "s1", AgentID: "a2"}},
 			wantErr: "does not match",
 		},
 		{
@@ -866,6 +920,18 @@ func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {
 				Payload:   `{"version":1}`,
 			}},
 			wantErr: "validate signal payload",
+		},
+		{
+			name: "malformed attachment payload",
+			rows: []store.EventRow{{
+				Seq:       1,
+				Timestamp: base,
+				Type:      string(event.TypeAgentAttachment),
+				SessionID: "s1",
+				AgentID:   "s1",
+				Payload:   `{"version":1,"action":"attached","access":"read_only","client":"private"}`,
+			}},
+			wantErr: "validate attachment payload",
 		},
 		{
 			name:    "unknown lifecycle reason",

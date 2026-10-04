@@ -8,7 +8,8 @@
 
 - `Draft` 不含序号和时间；只有 Committer 能通过 `Commit` 把它封成只读 `Event`。
 - `Type` 分类：`StateChanged` / `Output` / `OutputChunk` / `Error` /
-  `SessionLifecycle` / `AgentInput` / `AgentSignal` / `AgentResized`。
+  `SessionLifecycle` / `AgentInput` / `AgentSignal` / `AgentResized` /
+  `AgentAttachment`。
 - `output.chunk` 的公开 payload 使用版本化 Base64；持久化 metadata 与原始附件保存在
   `Event` 的私有字段中，访问器始终返回字节副本。
 - `AgentInput` 只记录脱敏审计元数据，不记录用户输入正文。
@@ -20,6 +21,8 @@
   其他来源继续写原版本。screen attribution 只保存稳定静态元数据和已提交输出位置。
 - `agent.resized` v1 记录成功生效的行列和当时的 exclusive output offset；
   attachment 身份不进入事件。
+- `agent.attachment` v1 只记录 attached/detached 动作和 read_only/read_write
+  权限；attachment ID、客户端身份、输入和终端内容不进入事件。
 - 事件带 `Seq` 全局递增序号与 `Timestamp`，是回放（`internal/session`）的排序依据。
 
 ## 约束
