@@ -27,7 +27,7 @@
 | `internal/auth` | 本地控制令牌生成、持久化与校验 |
 | `internal/detect` | 每会话状态信号融合、去重与计时确认 |
 | `internal/pty` | PTY 生命周期管理与字节流桥接 |
-| `internal/term` | 流式终端控制序列清洗（不做屏幕仿真或查询应答） |
+| `internal/term` | 终端屏幕仿真、查询应答与流式控制序列清洗 |
 | `internal/event` | 事件模型、Hub 扇出、订阅 |
 | `internal/session` | 会话编排：agent 创建、快照、回放 |
 | `internal/store` | 持久化（SQLite，只追加事件日志） |
@@ -41,7 +41,7 @@
 
 ## 4. 工程规范
 
-- **语言**：Go 1.23+。并发一律 goroutine + channel；禁止裸 `sync.Mutex` 保护大段业务逻辑（用 channel 或局部临界区）。
+- **语言**：Go 1.24.2+。并发一律 goroutine + channel；禁止裸 `sync.Mutex` 保护大段业务逻辑（用 channel 或局部临界区）。
 - **错误处理**：错误必须 wrap（`fmt.Errorf("...: %w", err)`），禁止吞错；库代码返回 error，不 log.Fatal。
 - **日志**：使用 `log/slog`；daemon 输出结构化日志，CLI 输出用户可读文本。
 - **命名**：导出符号需注释；缩写遵循 Go 惯例（`ID`、`API`、`PTY`）。

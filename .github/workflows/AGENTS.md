@@ -6,7 +6,8 @@
 
 ## 当前内容
 
-- `ci.yml`：push/PR 触发；矩阵 Go 1.23 / 1.24；gofmt 校验 → go vet → go test -race（含覆盖率 artifact）→ 双二进制编译。
+- `ci.yml`：push/PR 触发；矩阵使用最低版本 Go 1.24.2 与当前 stable；
+  gofmt 校验 → go vet → go test -race（含覆盖率 artifact）→ 双二进制编译。
 
 ## 约束
 

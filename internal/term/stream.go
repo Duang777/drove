@@ -1,4 +1,4 @@
-// Package term provides bounded terminal byte-stream helpers.
+// Package term provides bounded terminal emulation and byte-stream helpers.
 package term
 
 const (

@@ -1,0 +1,22 @@
+{
+  "dsr": {
+    "input": "\u001b[4;7H\u001b[6n",
+    "reply": "\u001b[4;7R"
+  },
+  "osc_10": {
+    "input": "\u001b]10;?\u0007",
+    "reply": "\u001b]10;rgb:ffff/ffff/ffff\u0007"
+  },
+  "osc_11": {
+    "input": "\u001b]11;?\u0007",
+    "reply": "\u001b]11;rgb:0000/0000/0000\u0007"
+  },
+  "device_attributes": {
+    "input": "\u001b[c",
+    "reply": "\u001b[?62;1;6;22c"
+  },
+  "kitty_keyboard": {
+    "input": "\u001b[?u",
+    "reply": "\u001b[?0u"
+  }
+}

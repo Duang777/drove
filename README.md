@@ -10,6 +10,11 @@ Drove 是一个**跨厂商 Agent 指挥台（control plane）**：在一个持�
 
 ## 快速开始
 
+从源码构建需要 Go 1.24.2 或更高版本。终端控制器固定使用
+`github.com/charmbracelet/x/vt`
+`v0.0.0-20261004011457-ad85c59fdf4e`。该版本修复了早期版本的 DSR
+坐标问题并提供查询应答接口，因此项目最低 Go 版本与其要求保持一致。
+
 ```bash
 make build
 ./bin/drove init          # 初始化工作区与配置
