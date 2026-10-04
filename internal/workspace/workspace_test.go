@@ -446,6 +446,54 @@ func TestDiscardRollsBackNewBranch(t *testing.T) {
 	}
 }
 
+func TestPrepareRejectsIncludedSymlink(t *testing.T) {
+	repository := newTestRepository(t)
+	outside := filepath.Join(t.TempDir(), "outside.txt")
+	if err := os.WriteFile(outside, []byte("outside\n"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(repository, "secret.link")); err != nil {
+		t.Skipf("create included symlink: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte(".env\nignored.key\nlocal/\nsecret.link\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("extend gitignore: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, ".worktreeinclude"),
+		[]byte(".env\nlocal/*.pem\nsecret.link\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("extend worktree include: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	_, err = manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("prepare included symlink error = %v", err)
+	}
+	assertFileContents(t, outside, "outside\n")
+	path := filepath.Join(
+		manager.root,
+		repositoryHash(repository),
+		testAgentID,
+	)
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed prepare retained worktree or inspect failed: %v", statErr)
+	}
+}
+
 func TestDiscardPreservesWorkspaceWhenRegistrationCheckFails(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
@@ -495,29 +543,32 @@ func TestDiscardRejectsSymlinkedRepositoryBucket(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
-	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
 
 	bucket := filepath.Dir(prepared.Path)
-	savedBucket := bucket + ".saved"
-	if err := os.Rename(bucket, savedBucket); err != nil {
-		t.Fatalf("move repository bucket: %v", err)
+	outsideBucket := filepath.Join(t.TempDir(), "repository-bucket")
+	if err := os.Rename(bucket, outsideBucket); err != nil {
+		t.Fatalf("move registered repository bucket: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = os.Remove(bucket)
-		_ = os.Rename(savedBucket, bucket)
+		_ = os.Rename(outsideBucket, bucket)
 	})
 
-	outside := t.TempDir()
-	outsideWorkspace := filepath.Join(outside, prepared.AgentID)
-	if err := os.Mkdir(outsideWorkspace, 0o700); err != nil {
-		t.Fatalf("create outside workspace: %v", err)
-	}
+	outsideWorkspace := filepath.Join(outsideBucket, prepared.AgentID)
 	sentinel := filepath.Join(outsideWorkspace, "must-remain.txt")
 	if err := os.WriteFile(sentinel, []byte("outside\n"), 0o600); err != nil {
 		t.Fatalf("write outside sentinel: %v", err)
 	}
-	if err := os.Symlink(outside, bucket); err != nil {
+	if err := os.Symlink(outsideBucket, bucket); err != nil {
 		t.Fatalf("replace repository bucket with symlink: %v", err)
+	}
+	registered, err := manager.worktreeRegistered(
+		context.Background(),
+		prepared.Repository,
+		prepared.Path,
+	)
+	if err != nil || !registered {
+		t.Fatalf("symlinked worktree registration = %v, %v", registered, err)
 	}
 
 	if err := manager.Discard(context.Background(), prepared); err == nil {
@@ -715,7 +766,7 @@ func TestRemoveReturnsPendingAfterPartialGitMutation(t *testing.T) {
 	script := `#!/bin/sh
 case " $* " in
   *" worktree remove "*)
-    rm -rf "$DROVE_TEST_WORKTREE"
+    rm -f "$DROVE_TEST_WORKTREE/tracked.txt"
     exit 1
     ;;
 esac
@@ -734,6 +785,15 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
 		t.Fatalf("partial removal lost sidecar: %v", err)
+	}
+	record, exists, recordErr := manager.readWorkspaceRecord(prepared.Path)
+	if recordErr != nil || !exists || record.Removal == nil {
+		t.Fatalf(
+			"partial removal intent = %+v, exists=%v err=%v",
+			record.Removal,
+			exists,
+			recordErr,
+		)
 	}
 	if !strings.Contains(
 		runGit(t, repository, "worktree", "list", "--porcelain"),
@@ -801,6 +861,59 @@ func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
 		filepath.Join(prepared.Path, "tracked.txt"),
 		"changed after intent\n",
 	)
+}
+
+func TestRemoveUpgradesExistingIntentToForce(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	const operationID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+	record.Removal = &workspaceRemovalRecord{OperationID: operationID}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write non-force removal intent: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "tracked.txt"),
+		[]byte("changed after intent\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("dirty worktree: %v", err)
+	}
+
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("force resume removal = %+v, %v", result, err)
+	}
+	record, exists, err = manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists ||
+		record.Removal == nil ||
+		!record.Removal.Force ||
+		record.Removal.OperationID != operationID {
+		t.Fatalf(
+			"upgraded record = %+v, exists=%v err=%v",
+			record,
+			exists,
+			err,
+		)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge force removal: %v", err)
+	}
 }
 
 func TestReconcileRemovalDeletesPresentUnregisteredPath(t *testing.T) {
@@ -1242,6 +1355,30 @@ func TestPrepareRejectsNonRepository(t *testing.T) {
 	)
 	if !errors.Is(err, ErrNotRepository) {
 		t.Fatalf("prepare non-repository error = %v, want ErrNotRepository", err)
+	}
+}
+
+func TestPrepareReportsMissingGitAsRuntimeFailure(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = filepath.Join(t.TempDir(), "missing-git")
+
+	_, err = manager.Prepare(
+		context.Background(),
+		t.TempDir(),
+		"",
+		testAgentID,
+	)
+	if err == nil {
+		t.Fatal("prepare succeeded without Git")
+	}
+	if errors.Is(err, ErrNotRepository) {
+		t.Fatalf("missing Git error = %v, want runtime failure", err)
+	}
+	if !strings.Contains(err.Error(), "inspect repository") {
+		t.Fatalf("missing Git error = %v, want repository inspection context", err)
 	}
 }
 

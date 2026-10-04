@@ -120,14 +120,7 @@ func copyIncludedPath(source string, destination string, root string) error {
 	case info.Mode().IsRegular():
 		return copyIncludedFile(source, destination, info.Mode().Perm())
 	case info.Mode()&os.ModeSymlink != 0:
-		target, err := os.Readlink(source)
-		if err != nil {
-			return fmt.Errorf("read symlink: %w", err)
-		}
-		if err := os.Symlink(target, destination); err != nil {
-			return fmt.Errorf("create symlink: %w", err)
-		}
-		return nil
+		return errors.New("symbolic links are unsupported")
 	default:
 		return fmt.Errorf("source mode %s is unsupported", info.Mode())
 	}

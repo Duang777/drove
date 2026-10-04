@@ -8,6 +8,47 @@ import (
 	"strings"
 )
 
+func (m *Manager) validateManagedPathLocation(target Workspace) (result error) {
+	if err := m.validateManagedPath(target); err != nil {
+		return err
+	}
+	root, err := openRealRoot(filepath.Dir(m.root), filepath.Base(m.root))
+	if err != nil {
+		return fmt.Errorf("open managed root: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, root.Close())
+	}()
+
+	bucketName := repositoryHash(target.Repository)
+	bucket, err := openRealRootFromRoot(root, bucketName)
+	if err != nil {
+		return fmt.Errorf("open repository bucket: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+
+	info, err := bucket.Lstat(target.AgentID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect managed entry: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%q is not a real directory", target.AgentID)
+	}
+	entry, err := openRealRootFromRoot(bucket, target.AgentID)
+	if err != nil {
+		return fmt.Errorf("open managed entry: %w", err)
+	}
+	if err := entry.Close(); err != nil {
+		return fmt.Errorf("close managed entry: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) removeManagedPath(target Workspace) (result error) {
 	if err := m.validateManagedPath(target); err != nil {
 		return err

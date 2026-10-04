@@ -204,6 +204,32 @@ func TestStartRejectsWorkspaceWhenManagerIsUnavailable(t *testing.T) {
 	}
 }
 
+func TestPrepareWorkspaceTreatsMissingGitAsRuntimeFailure(t *testing.T) {
+	manager, _ := newTestManager(t)
+	workspaces, err := workspace.New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new workspace manager: %v", err)
+	}
+	manager.workspaces = workspaces
+	t.Setenv("PATH", t.TempDir())
+
+	prepared, err := manager.prepareWorkspace(
+		context.Background(),
+		"11111111-1111-4111-8111-111111111111",
+		&WorktreeRequest{},
+		t.TempDir(),
+	)
+	if prepared != nil {
+		t.Fatalf("prepared workspace = %+v, want nil", prepared)
+	}
+	if !errors.Is(err, ErrWorkspacePrepare) {
+		t.Fatalf("prepare error = %v, want ErrWorkspacePrepare", err)
+	}
+	if errors.Is(err, ErrWorkspaceRequest) {
+		t.Fatalf("prepare error = %v, must not be a user request error", err)
+	}
+}
+
 func TestBootstrapRejectsWorkspaceInitializationFailure(t *testing.T) {
 	st := newTestStore(t)
 	initializationErr := errors.New("workspace root unavailable")

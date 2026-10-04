@@ -335,21 +335,31 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 	if err != nil {
 		result = errors.Join(result, err)
 	} else if registered {
-		if _, err := m.run(
-			ctx,
-			"-C",
-			target.Repository,
-			"worktree",
-			"remove",
-			"--force",
-			target.Path,
-		); err != nil {
+		if err := m.validateManagedPathLocation(target); err != nil {
 			result = errors.Join(
 				result,
-				fmt.Errorf("workspace: discard worktree: %w", err),
+				fmt.Errorf(
+					"workspace: validate discarded worktree path: %w",
+					err,
+				),
 			)
 		} else {
-			worktreeRemoved = true
+			if _, err := m.run(
+				ctx,
+				"-C",
+				target.Repository,
+				"worktree",
+				"remove",
+				"--force",
+				target.Path,
+			); err != nil {
+				result = errors.Join(
+					result,
+					fmt.Errorf("workspace: discard worktree: %w", err),
+				)
+			} else {
+				worktreeRemoved = true
+			}
 		}
 	} else if pathExists {
 		if err := m.removeManagedPath(target); err != nil {
@@ -502,7 +512,14 @@ func (m *Manager) repositoryPaths(
 				ctx.Err(),
 			)
 		}
-		return "", "", fmt.Errorf("%w: %s", ErrNotRepository, absolute)
+		if strings.Contains(err.Error(), "fatal: not a git repository") {
+			return "", "", fmt.Errorf("%w: %s", ErrNotRepository, absolute)
+		}
+		return "", "", fmt.Errorf(
+			"workspace: inspect repository %q: %w",
+			absolute,
+			err,
+		)
 	}
 	sourcePath := strings.TrimSpace(string(output))
 	sourcePath, err = filepath.EvalSymlinks(sourcePath)
@@ -655,11 +672,11 @@ func (m *Manager) registeredWorktrees(
 					"workspace: malformed Git worktree listing",
 				)
 			}
-			path, err := resolvePath(strings.TrimPrefix(field, "worktree "))
-			if err != nil {
+			path := filepath.Clean(strings.TrimPrefix(field, "worktree "))
+			if !filepath.IsAbs(path) {
 				return nil, fmt.Errorf(
-					"workspace: resolve registered worktree path: %w",
-					err,
+					"workspace: registered worktree path %q is not absolute",
+					path,
 				)
 			}
 			current = &registeredWorktree{path: path}
@@ -690,13 +707,7 @@ func (m *Manager) worktreeRegistration(
 	if err != nil {
 		return registeredWorktree{}, false, err
 	}
-	path, err = resolvePath(path)
-	if err != nil {
-		return registeredWorktree{}, false, fmt.Errorf(
-			"workspace: resolve worktree path: %w",
-			err,
-		)
-	}
+	path = filepath.Clean(path)
 	for _, registered := range worktrees {
 		if registered.path == path {
 			return registered, true, nil

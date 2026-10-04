@@ -14,8 +14,9 @@
 - 同一 Manager 的 Prepare、List、Remove、ReconcileRemovals 和 Discard 串行执行。
   workspace 记录先写入同目录临时文件并 fsync，原子安装最终文件后再 fsync 父目录。
 - 仓库根目录的 `.worktreeinclude` 使用 gitignore 语义；只有该文件匹配的未跟踪文件会
-  复制到新 worktree，普通未跟踪文件不会复制。创建时选中的规范相对路径保存在
-  version 2 sidecar 中，后续 dirty 检查不得重新解释目标 worktree 的 manifest。
+  复制到新 worktree，普通未跟踪文件不会复制；匹配项必须是普通文件，symlink 一律
+  拒绝。创建时选中的规范相对路径保存在 version 2 sidecar 中，后续 dirty 检查不得
+  重新解释目标 worktree 的 manifest。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
   dirty 状态。每个成功创建的 worktree 都有同目录私有记录，用于识别 detached HEAD
   和修复目录已丢失但 Git 注册仍存在的情况。
@@ -25,12 +26,14 @@
   `AcknowledgeRemoval` 校验 token 并删除。`ReconcileRemovals` 在重启时收敛 path 与
   Git registration 的四种组合。非强制 intent 每次继续前都重新检查；路径存在但
   registration 丢失，或路径丢失但 registration 为 detached 时保留 intent 并
-  fail-stop。清理始终保留分支。
+  fail-stop。显式 force 会原子升级已有的非强制 intent 并保留 operation ID；一旦开始
+  物理删除，失败必须保留 intent 供重启恢复。清理始终保留分支。
 - Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
   因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。未注册残留目录通过已验证的 `os.Root` 相对操作删除，任一中间
-  symlink 或目录替换都会使回滚失败。
+  symlink 或目录替换都会使回滚失败。调用 Git 删除已注册 worktree 前也必须验证
+  root、repository bucket 和 Agent 目录是真实目录。
 - `.worktreeinclude` 匹配文件不受 Git 跟踪；只要 worktree 中存在创建时记录的路径，
   `List` 就保守报告 dirty，清理需要显式 `force`。非强制 Remove 在 Git 删除前再次检查，
   防止首次枚举后出现的 include 文件被当作 ignored 内容删除。

@@ -81,6 +81,20 @@ func (m *Manager) remove(
 	removal := Removal{Workspace: record.workspace()}
 	if record.Removal != nil {
 		removal.operationID = record.Removal.OperationID
+		if force && !record.Removal.Force {
+			upgraded := *record.Removal
+			upgraded.Force = true
+			record.Removal = &upgraded
+			if err := m.replaceWorkspaceRecord(record); err != nil {
+				return RemovalResult{
+						Removal: removal,
+						State:   RemovalPending,
+					}, fmt.Errorf(
+						"workspace: upgrade removal intent to force: %w",
+						err,
+					)
+			}
+		}
 		state, removalErr := m.resumePendingRemoval(ctx, record)
 		return RemovalResult{Removal: removal, State: state}, removalErr
 	}
@@ -123,13 +137,6 @@ func (m *Manager) remove(
 	}
 
 	state, removalErr := m.completeRemoval(ctx, record)
-	if state == RemovalPending && removalErr != nil {
-		rollbackState, rollbackErr := m.rollbackRemovalIntent(ctx, record, before)
-		if rollbackState == RemovalUnchanged {
-			state = RemovalUnchanged
-		}
-		removalErr = errors.Join(removalErr, rollbackErr)
-	}
 	return RemovalResult{Removal: removal, State: state}, removalErr
 }
 
@@ -309,6 +316,14 @@ func (m *Manager) completeRemoval(
 			return RemovalPending, fmt.Errorf(
 				"workspace: revalidate pending removal for agent %q: %w",
 				record.AgentID,
+				err,
+			)
+		}
+	}
+	if facts.registered {
+		if err := m.validateManagedPathLocation(record.workspace()); err != nil {
+			return RemovalPending, fmt.Errorf(
+				"workspace: validate registered worktree path: %w",
 				err,
 			)
 		}

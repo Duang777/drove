@@ -253,6 +253,24 @@ func TestRuntimeFailureUsesRuntimeExitCode(t *testing.T) {
 	}
 }
 
+func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
+	tests := [][]string{
+		{"unknown"},
+		{"worktree", "unknown"},
+	}
+	for _, args := range tests {
+		t.Run(strings.Join(args, "/"), func(t *testing.T) {
+			err := executeRoot(newRootCmd(), args)
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
+				t.Fatalf("execute %v error = %v", args, err)
+			}
+			if got := commandExitCode(err); got != exitUsage {
+				t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+			}
+		})
+	}
+}
+
 func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
 	command, _, err := newRootCmd().Find([]string{"worktree", "rm"})
 	if err != nil {

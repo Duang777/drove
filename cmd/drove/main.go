@@ -58,10 +58,29 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
 	root := newRootCmd()
-	if err := root.Execute(); err != nil {
+	if err := executeRoot(root, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "drove:", err)
 		os.Exit(commandExitCode(err))
 	}
+}
+
+func executeRoot(root *cobra.Command, args []string) error {
+	command, remaining, err := root.Find(args)
+	if err != nil {
+		return markUsageError(err)
+	}
+	if command.HasSubCommands() &&
+		!command.Runnable() &&
+		len(remaining) > 0 &&
+		!strings.HasPrefix(remaining[0], "-") {
+		return markUsageError(fmt.Errorf(
+			"unknown command %q for %q",
+			remaining[0],
+			command.CommandPath(),
+		))
+	}
+	root.SetArgs(args)
+	return root.Execute()
 }
 
 func commandExitCode(err error) int {
