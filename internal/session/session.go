@@ -482,10 +482,16 @@ func (m *Manager) Start(
 	if receipt.Durable {
 		workspaceCommitted = true
 		if preparedWorkspace != nil {
-			err = errors.Join(
-				err,
-				m.workspaces.AcknowledgePreparation(*preparedWorkspace),
-			)
+			if acknowledgeErr := m.workspaces.AcknowledgePreparation(
+				*preparedWorkspace,
+			); acknowledgeErr != nil {
+				acknowledgeErr = fmt.Errorf(
+					"session: acknowledge durable workspace preparation: %w",
+					acknowledgeErr,
+				)
+				m.committer.Fail(acknowledgeErr)
+				err = errors.Join(err, acknowledgeErr)
+			}
 		}
 	}
 	if err != nil {

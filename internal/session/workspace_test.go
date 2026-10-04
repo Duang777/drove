@@ -258,6 +258,14 @@ func TestStartPreservesDurableWorkspaceWhenPreparationAckFails(t *testing.T) {
 			cleanupErr,
 		)
 	}
+	select {
+	case fatalErr := <-manager.Fatal():
+		if !errors.Is(fatalErr, ackErr) {
+			t.Fatalf("fatal error = %v, want acknowledgement failure", fatalErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("manager did not fail-stop after acknowledgement failure")
+	}
 }
 
 func TestStartRejectsWorkspaceWhenManagerIsUnavailable(t *testing.T) {

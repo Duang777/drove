@@ -215,10 +215,10 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 	if facts.pathExists || facts.registered {
 		return errors.New("workspace: cannot acknowledge an incomplete removal")
 	}
-	if err := removeWorkspaceRecord(record.Path); err != nil {
+	if err := m.removeWorkspaceRecord(record.Path); err != nil {
 		return err
 	}
-	if err := removeEmptyDirectory(filepath.Dir(record.Path)); err != nil {
+	if err := m.removeManagedBucketIfEmpty(record.workspace()); err != nil {
 		return err
 	}
 	return nil
@@ -520,6 +520,9 @@ func (m *Manager) workspaceRecords() ([]workspaceRecord, error) {
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("workspace: worktree root %q is not a real directory", m.root)
+	}
+	if err := m.pinDataDirectory(); err != nil {
+		return nil, err
 	}
 	buckets, err := os.ReadDir(m.root)
 	if err != nil {

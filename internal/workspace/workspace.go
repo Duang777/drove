@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,9 +51,10 @@ type Workspace struct {
 
 // Manager owns worktrees below one Drove data directory.
 type Manager struct {
-	root string
-	git  string
-	mu   sync.Mutex
+	root        string
+	git         string
+	dataDirInfo os.FileInfo
+	mu          sync.Mutex
 }
 
 // New creates a worktree manager without changing the filesystem.
@@ -70,9 +70,29 @@ func New(dataDir string) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspace: resolve data directory %q: %w", dataDir, err)
 	}
+	var dataDirInfo os.FileInfo
+	info, err := os.Lstat(absolute)
+	switch {
+	case err == nil:
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf(
+				"workspace: data directory %q is not a real directory",
+				absolute,
+			)
+		}
+		dataDirInfo = info
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return nil, fmt.Errorf(
+			"workspace: inspect data directory %q: %w",
+			absolute,
+			err,
+		)
+	}
 	return &Manager{
-		root: filepath.Join(filepath.Clean(absolute), worktreeDirectory),
-		git:  "git",
+		root:        filepath.Join(filepath.Clean(absolute), worktreeDirectory),
+		git:         "git",
+		dataDirInfo: dataDirInfo,
 	}, nil
 }
 
@@ -107,11 +127,11 @@ func (m *Manager) prepare(
 	if err := m.validateBranch(ctx, branch); err != nil {
 		return Workspace{}, err
 	}
-	if err := ensureDirectory(m.root); err != nil {
+	if err := m.ensureManagedRoot(); err != nil {
 		return Workspace{}, err
 	}
 	bucket := filepath.Join(m.root, repositoryHash(repository))
-	if err := ensureDirectory(bucket); err != nil {
+	if err := m.ensureManagedBucket(repository); err != nil {
 		return Workspace{}, err
 	}
 	path := filepath.Join(bucket, agentID)
@@ -139,6 +159,19 @@ func (m *Manager) prepare(
 	if err != nil {
 		return Workspace{}, err
 	}
+	if err := m.writeWorkspaceRecord(result, includedPaths); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		cleanupTarget := result
+		cleanupTarget.createdBranch = false
+		return Workspace{}, errors.Join(
+			err,
+			m.discard(cleanupCtx, cleanupTarget),
+		)
+	}
 	if createdBranch {
 		if _, err := m.run(
 			ctx,
@@ -148,17 +181,22 @@ func (m *Manager) prepare(
 			branch,
 			"HEAD",
 		); err != nil {
-			return Workspace{}, fmt.Errorf(
-				"workspace: create branch %q: %w",
-				branch,
-				err,
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			cleanupTarget := result
+			cleanupTarget.createdBranch = false
+			return Workspace{}, errors.Join(
+				fmt.Errorf(
+					"workspace: create branch %q: %w",
+					branch,
+					err,
+				),
+				m.discard(cleanupCtx, cleanupTarget),
 			)
 		}
-	}
-	if err := m.writeWorkspaceRecord(result, includedPaths); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
 	arguments := []string{"-C", sourcePath, "worktree", "add", "--quiet"}
 	arguments = append(arguments, path, branch)
@@ -201,6 +239,9 @@ func (m *Manager) list(ctx context.Context) ([]Workspace, error) {
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("workspace: worktree root %q is not a real directory", m.root)
+	}
+	if err := m.pinDataDirectory(); err != nil {
+		return nil, err
 	}
 	buckets, err := os.ReadDir(m.root)
 	if err != nil {
@@ -388,7 +429,7 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 		}
 	}
 	if worktreeRemoved {
-		if err := removeWorkspaceRecord(target.Path); err != nil {
+		if err := m.removeWorkspaceRecord(target.Path); err != nil {
 			result = errors.Join(
 				result,
 				err,
@@ -416,7 +457,7 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 		}
 	}
 	if worktreeRemoved {
-		if err := removeEmptyDirectory(filepath.Dir(target.Path)); err != nil {
+		if err := m.removeManagedBucketIfEmpty(target); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
@@ -912,15 +953,4 @@ func ensureAbsent(path string) error {
 	default:
 		return fmt.Errorf("workspace: target %q already exists", path)
 	}
-}
-
-func removeEmptyDirectory(path string) error {
-	err := os.Remove(path)
-	if err == nil || errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EEXIST) {
-		return nil
-	}
-	return fmt.Errorf("workspace: remove empty directory %q: %w", path, err)
 }

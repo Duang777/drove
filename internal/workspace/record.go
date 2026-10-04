@@ -93,16 +93,20 @@ func (m *Manager) replaceWorkspaceRecord(record workspaceRecord) error {
 func (m *Manager) installWorkspaceRecord(
 	record workspaceRecord,
 	requireAbsent bool,
-) error {
+) (result error) {
 	if err := m.validateWorkspaceRecord(record); err != nil {
 		return err
 	}
 	recordPath := workspaceRecordPath(record.Path)
-	if requireAbsent {
-		if err := ensureAbsent(recordPath); err != nil {
-			return err
-		}
-	} else if err := ensureRegularRecord(recordPath); err != nil {
+	bucket, agentID, err := m.openRecordBucket(record.Path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	name := agentID + workspaceRecordSuffix
+	if err := checkRecordTarget(bucket, name, recordPath, requireAbsent); err != nil {
 		return err
 	}
 	raw, err := json.Marshal(record)
@@ -117,31 +121,34 @@ func (m *Manager) installWorkspaceRecord(
 		)
 	}
 
-	directory := filepath.Dir(recordPath)
-	file, err := os.CreateTemp(
-		directory,
-		"."+filepath.Base(recordPath)+".tmp-*",
+	temporaryName := "." + name + ".tmp-" + uuid.NewString()
+	file, err := bucket.OpenFile(
+		temporaryName,
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
+		0o600,
 	)
 	if err != nil {
 		return fmt.Errorf("workspace: create temporary record %q: %w", recordPath, err)
 	}
-	temporaryPath := file.Name()
+	fileOpen := true
 	defer func() {
-		if temporaryPath != "" {
-			_ = os.Remove(temporaryPath)
+		if fileOpen {
+			result = errors.Join(result, file.Close())
+		}
+		if temporaryName != "" {
+			if err := bucket.Remove(temporaryName); !errors.Is(
+				err,
+				os.ErrNotExist,
+			) {
+				result = errors.Join(result, err)
+			}
 		}
 	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("workspace: secure temporary record %q: %w", recordPath, err)
-	}
 	written, err := file.Write(raw)
 	if err != nil {
-		_ = file.Close()
 		return fmt.Errorf("workspace: write temporary record %q: %w", recordPath, err)
 	}
 	if written != len(raw) {
-		_ = file.Close()
 		return fmt.Errorf(
 			"workspace: write temporary record %q: %w",
 			recordPath,
@@ -149,31 +156,64 @@ func (m *Manager) installWorkspaceRecord(
 		)
 	}
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
 		return fmt.Errorf("workspace: sync temporary record %q: %w", recordPath, err)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("workspace: close temporary record %q: %w", recordPath, err)
-	}
-	if requireAbsent {
-		if err := ensureAbsent(recordPath); err != nil {
-			return err
-		}
-	} else if err := ensureRegularRecord(recordPath); err != nil {
+	if err := checkRecordTarget(bucket, name, recordPath, requireAbsent); err != nil {
 		return err
 	}
-	if err := os.Rename(temporaryPath, recordPath); err != nil {
+	directory, err := bucket.Open(".")
+	if err != nil {
+		return fmt.Errorf("workspace: open record directory %q: %w", recordPath, err)
+	}
+	if err := renameRecordFile(
+		directory,
+		file,
+		temporaryName,
+		name,
+	); err != nil {
+		_ = directory.Close()
 		return fmt.Errorf("workspace: install record %q: %w", recordPath, err)
 	}
-	temporaryPath = ""
-	if err := syncDirectory(directory); err != nil {
-		return fmt.Errorf("workspace: sync record directory %q: %w", directory, err)
+	temporaryName = ""
+	closeErr := file.Close()
+	fileOpen = false
+	if closeErr != nil {
+		_ = directory.Close()
+		return fmt.Errorf(
+			"workspace: close installed record %q: %w",
+			recordPath,
+			closeErr,
+		)
+	}
+	syncErr := directory.Sync()
+	directoryCloseErr := directory.Close()
+	if err := errors.Join(syncErr, directoryCloseErr); err != nil {
+		return fmt.Errorf(
+			"workspace: sync record directory %q: %w",
+			filepath.Dir(recordPath),
+			err,
+		)
 	}
 	return nil
 }
 
-func ensureRegularRecord(path string) error {
-	info, err := os.Lstat(path)
+func checkRecordTarget(
+	bucket *os.Root,
+	name string,
+	path string,
+	requireAbsent bool,
+) error {
+	info, err := bucket.Lstat(name)
+	if requireAbsent {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return nil
+		case err != nil:
+			return fmt.Errorf("workspace: inspect target %q: %w", path, err)
+		default:
+			return fmt.Errorf("workspace: target %q already exists", path)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("workspace: inspect record %q: %w", path, err)
 	}
@@ -183,22 +223,26 @@ func ensureRegularRecord(path string) error {
 	return nil
 }
 
-func syncDirectory(path string) (result error) {
-	directory, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		result = errors.Join(result, directory.Close())
-	}()
-	return directory.Sync()
-}
-
 func (m *Manager) readWorkspaceRecord(
 	worktreePath string,
-) (workspaceRecord, bool, error) {
+) (_ workspaceRecord, _ bool, result error) {
 	recordPath := workspaceRecordPath(worktreePath)
-	info, err := os.Lstat(recordPath)
+	bucket, agentID, err := m.openRecordBucket(worktreePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return workspaceRecord{}, false, nil
+	}
+	if err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: open record directory %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	name := agentID + workspaceRecordSuffix
+	info, err := bucket.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return workspaceRecord{}, false, nil
 	}
@@ -222,12 +266,44 @@ func (m *Manager) readWorkspaceRecord(
 			maxWorkspaceRecordSize,
 		)
 	}
-	raw, err := os.ReadFile(recordPath)
+	file, err := bucket.Open(name)
+	if err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: open record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: inspect opened record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: record %q changed while opening",
+			recordPath,
+		)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxWorkspaceRecordSize+1))
 	if err != nil {
 		return workspaceRecord{}, false, fmt.Errorf(
 			"workspace: read record %q: %w",
 			recordPath,
 			err,
+		)
+	}
+	if len(raw) > maxWorkspaceRecordSize {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: record %q exceeds %d bytes",
+			recordPath,
+			maxWorkspaceRecordSize,
 		)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -349,14 +425,52 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 	return nil
 }
 
-func removeWorkspaceRecord(worktreePath string) error {
+func (m *Manager) removeWorkspaceRecord(
+	worktreePath string,
+) (result error) {
 	recordPath := workspaceRecordPath(worktreePath)
-	if err := os.Remove(recordPath); errors.Is(err, os.ErrNotExist) {
+	bucket, agentID, err := m.openRecordBucket(worktreePath)
+	if errors.Is(err, os.ErrNotExist) {
 		return nil
-	} else if err != nil {
+	}
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open record directory %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	name := agentID + workspaceRecordSuffix
+	info, err := bucket.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("workspace: inspect record %q: %w", recordPath, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf(
+			"workspace: record %q is not a regular file",
+			recordPath,
+		)
+	}
+	if err := bucket.Remove(name); err != nil {
 		return fmt.Errorf("workspace: remove record %q: %w", recordPath, err)
 	}
-	if err := syncDirectory(filepath.Dir(recordPath)); err != nil {
+	directory, err := bucket.Open(".")
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open record directory %q for sync: %w",
+			filepath.Dir(recordPath),
+			err,
+		)
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
 		return fmt.Errorf(
 			"workspace: sync record directory %q: %w",
 			filepath.Dir(recordPath),
