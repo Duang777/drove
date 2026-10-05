@@ -86,6 +86,12 @@ func (m *Manager) remove(
 		}
 	}
 
+	if record.Removal == nil {
+		record, err = m.ensureRemovalRepositoryEvidence(ctx, record)
+		if err != nil {
+			return RemovalResult{}, err
+		}
+	}
 	removal := Removal{Workspace: workspaceForRemoval(record)}
 	if record.Removal != nil {
 		removal.operationID = record.Removal.OperationID
@@ -271,15 +277,85 @@ func (m *Manager) removalRepository(
 ) (repositoryCapability, func() error, error) {
 	if record.Version < workspaceRecordVersion ||
 		record.RepositoryEvidence == nil {
-		return pathRepositoryCapability(m, record.Repository),
-			func() error { return nil },
-			nil
+		return repositoryCapability{}, nil, errors.New(
+			"workspace: pending removal has no repository identity evidence",
+		)
 	}
 	lease, err := openRecordedPreparationLease(ctx, m, record)
 	if err != nil {
 		return repositoryCapability{}, nil, err
 	}
 	return lease.repository, lease.Close, nil
+}
+
+func (m *Manager) ensureRemovalRepositoryEvidence(
+	ctx context.Context,
+	record workspaceRecord,
+) (_ workspaceRecord, result error) {
+	if record.Version >= workspaceRecordVersion &&
+		record.RepositoryEvidence != nil {
+		return record, nil
+	}
+	if record.Removal != nil {
+		return workspaceRecord{}, errors.New(
+			"workspace: pending removal has no repository identity evidence",
+		)
+	}
+	root, err := openRealPathRoot(record.Repository)
+	if err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: open removal repository: %w",
+			err,
+		)
+	}
+	rootOwned := true
+	defer func() {
+		if rootOwned {
+			result = errors.Join(result, root.Close())
+		}
+	}()
+	repository, err := m.repositoryRootAtRoot(
+		ctx,
+		record.Repository,
+		root,
+	)
+	if err != nil {
+		return workspaceRecord{}, err
+	}
+	if repository != record.Repository {
+		return workspaceRecord{}, errors.New(
+			"workspace: removal repository changed while opening",
+		)
+	}
+	lease, err := newPreparationLease(
+		ctx,
+		m,
+		record.Repository,
+		root,
+	)
+	if err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: retain removal repository: %w",
+			err,
+		)
+	}
+	rootOwned = false
+	defer func() {
+		result = errors.Join(result, lease.Close())
+	}()
+
+	upgradeWorkspaceRecord(&record)
+	record.RepositoryEvidence = cloneRepositoryEvidence(&lease.evidence)
+	if record.IncludedPaths == nil {
+		record.IncludedPaths = []string{}
+	}
+	if err := m.replaceWorkspaceRecord(record); err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: persist removal repository identity: %w",
+			err,
+		)
+	}
+	return record, nil
 }
 
 func (m *Manager) removalFacts(

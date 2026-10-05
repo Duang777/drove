@@ -1112,15 +1112,40 @@ func (m *Manager) removeRecordAcknowledgementQuarantine(
 	); err != nil {
 		return err
 	}
-	if err := file.Close(); err != nil {
+	directory, err := bucket.Open(".")
+	if err != nil {
 		return fmt.Errorf(
-			"workspace: close quarantined removal record %q: %w",
+			"workspace: open quarantined record directory %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	fileOpen = false
-	if err := bucket.Remove(name); err != nil {
+	deleteName := recordAcknowledgementPrefix(
+		removal.Workspace.AgentID,
+		removal.operationID,
+	) + uuid.NewString()
+	moved, moveErr := moveRecordFile(
+		directory,
+		file,
+		name,
+		deleteName,
+	)
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	if err := errors.Join(moveErr, syncErr, closeErr); err != nil {
+		return fmt.Errorf(
+			"workspace: isolate quarantined record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	if !moved {
+		return fmt.Errorf(
+			"workspace: quarantined record %q was not isolated",
+			recordPath,
+		)
+	}
+	if err := removeRecordPathIfSame(bucket, deleteName, file); err != nil {
 		return fmt.Errorf(
 			"workspace: remove quarantined record %q: %w",
 			recordPath,

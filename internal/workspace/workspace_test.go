@@ -953,7 +953,7 @@ func TestRemoveUpgradesCommittedVersionFourRecord(t *testing.T) {
 		t.Fatalf("read upgraded removal record: exists=%v err=%v", exists, err)
 	}
 	if upgraded.Version != workspaceRecordVersion ||
-		upgraded.RepositoryEvidence != nil ||
+		upgraded.RepositoryEvidence == nil ||
 		upgraded.BranchOperationID != "" ||
 		upgraded.Removal == nil {
 		t.Fatalf("upgraded removal record = %+v", upgraded)
@@ -2007,6 +2007,42 @@ func TestPreparePreservesTrailingSpaceInRepositoryPath(t *testing.T) {
 	}
 	if err := manager.Discard(context.Background(), prepared); err != nil {
 		t.Fatalf("discard trailing-space repository: %v", err)
+	}
+}
+
+func TestPrepareSupportsNewlineInRepositoryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows paths cannot contain a newline")
+	}
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve repository parent: %v", err)
+	}
+	repository := filepath.Join(parent, "repository\nline")
+	initTestRepositoryAt(t, repository)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare newline repository: %v", err)
+	}
+	if prepared.Repository != repository {
+		t.Fatalf(
+			"prepared repository = %q, want %q",
+			prepared.Repository,
+			repository,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard newline repository: %v", err)
 	}
 }
 

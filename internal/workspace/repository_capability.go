@@ -188,38 +188,56 @@ func (r repositoryCapability) repositoryDirectories(
 			err,
 		)
 	}
-	lines := strings.Split(trimGitLineTerminator(output), "\n")
-	if len(lines) != 2 {
+	return parseRepositoryDirectories(output)
+}
+
+func parseRepositoryDirectories(output []byte) (string, string, error) {
+	raw := trimGitLineTerminator(output)
+	type directoryPair struct {
+		git    string
+		common string
+	}
+	var candidates []directoryPair
+	for index := strings.IndexByte(raw, '\n'); index >= 0; {
+		gitPath := raw[:index]
+		commonPath := raw[index+1:]
+		if filepath.IsAbs(gitPath) && filepath.IsAbs(commonPath) {
+			resolvedGit, gitErr := resolveExistingDirectory(gitPath)
+			resolvedCommon, commonErr := resolveExistingDirectory(commonPath)
+			if gitErr == nil && commonErr == nil {
+				candidates = append(candidates, directoryPair{
+					git:    resolvedGit,
+					common: resolvedCommon,
+				})
+			}
+		}
+		next := strings.IndexByte(raw[index+1:], '\n')
+		if next < 0 {
+			break
+		}
+		index += next + 1
+	}
+	if len(candidates) != 1 {
 		return "", "", errors.New(
 			"workspace: Git directory query returned an invalid response",
 		)
 	}
-	resolve := func(kind string, path string) (string, error) {
-		if !filepath.IsAbs(path) {
-			return "", fmt.Errorf(
-				"workspace: %s Git directory is not absolute",
-				kind,
-			)
-		}
-		resolved, resolveErr := resolvePath(path)
-		if resolveErr != nil {
-			return "", fmt.Errorf(
-				"workspace: resolve %s Git directory: %w",
-				kind,
-				resolveErr,
-			)
-		}
-		return resolved, nil
-	}
-	gitPath, err := resolve("source", lines[0])
+	return candidates[0].git, candidates[0].common, nil
+}
+
+func resolveExistingDirectory(path string) (string, error) {
+	resolved, err := resolvePath(path)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	commonPath, err := resolve("common", lines[1])
+	root, err := openRealPathRoot(resolved)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	return gitPath, commonPath, nil
+	if err := root.Close(); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 func (r repositoryCapability) headOID(

@@ -4,6 +4,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,11 +67,7 @@ func TestPrepareRollsBackRootedWorktreeAfterPostSuccessSourceSwap(
 	if err != nil {
 		t.Fatalf("resolve source: %v", err)
 	}
-	targetPath := filepath.Join(
-		manager.root,
-		repositoryHash(canonicalSource),
-		testAgentID,
-	)
+	targetPath := filepath.Join(manager.root, repositoryHash(canonicalSource), testAgentID)
 	manager.git = postSuccessSwapGitWrapper(
 		t,
 		parent,
@@ -258,21 +255,20 @@ func TestPrepareRemovesPrecreatedTargetWhenWorktreeAddFails(t *testing.T) {
 	invoked := filepath.Join(parent, "worktree-add-invoked")
 	wrapper := filepath.Join(parent, "git-wrapper-add-failure")
 	script := `#!/bin/sh
-saw_worktree=
+next_target=
 for argument in "$@"; do
-  if [ "$saw_worktree" = "1" ] && [ "$argument" = "add" ]; then
-    test -d "$DROVE_TEST_TARGET" || exit 98
-    : > "$DROVE_TEST_INVOKED"
+  if [ -n "$next_target" ]; then
+    test -d "$argument" || exit 98
+    printf '%s' "$argument" > "$DROVE_TEST_INVOKED"
     exit 97
   fi
-  [ "$argument" = "worktree" ] && saw_worktree=1
+  [ "$argument" = "--no-checkout" ] && next_target=1
 done
 exec "$DROVE_TEST_REAL_GIT" "$@"
 `
 	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
 		t.Fatalf("write Git wrapper: %v", err)
 	}
-	t.Setenv("DROVE_TEST_TARGET", targetPath)
 	t.Setenv("DROVE_TEST_INVOKED", invoked)
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 	manager.git = wrapper
@@ -287,6 +283,13 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 	if _, err := os.Lstat(invoked); err != nil {
 		t.Fatalf("worktree add wrapper was not invoked: %v", err)
+	}
+	stagingPath, err := os.ReadFile(invoked)
+	if err != nil {
+		t.Fatalf("read worktree add target: %v", err)
+	}
+	if _, err := os.Lstat(string(stagingPath)); !os.IsNotExist(err) {
+		t.Fatalf("staging target remains or inspect failed: %v", err)
 	}
 	if _, err := os.Lstat(targetPath); !os.IsNotExist(err) {
 		t.Fatalf("precreated target remains or inspect failed: %v", err)
@@ -307,16 +310,6 @@ func TestPreparePreservesReplacedPrecreatedTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	canonicalSource, err := resolvePath(source)
-	if err != nil {
-		t.Fatalf("resolve source: %v", err)
-	}
-	targetPath := filepath.Join(
-		manager.root,
-		repositoryHash(canonicalSource),
-		testAgentID,
-	)
-	originalPath := targetPath + "-original"
 	replacementPath := filepath.Join(parent, "replacement-target")
 	if err := os.Mkdir(replacementPath, 0o700); err != nil {
 		t.Fatalf("create replacement target: %v", err)
@@ -325,35 +318,36 @@ func TestPreparePreservesReplacedPrecreatedTarget(t *testing.T) {
 	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
 		t.Fatalf("write replacement sentinel: %v", err)
 	}
+	swappedPath := filepath.Join(parent, "swapped-target")
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatalf("find Git: %v", err)
 	}
 	wrapper := filepath.Join(parent, "git-wrapper-target-swap")
 	script := `#!/bin/sh
-matched=
-saw_worktree=
+target=
+next_target=
 for argument in "$@"; do
-  if [ "$saw_worktree" = "1" ] && [ "$argument" = "add" ]; then
-    matched=1
-    break
+  if [ -n "$next_target" ]; then
+    target=$argument
+    next_target=
   fi
-  [ "$argument" = "worktree" ] && saw_worktree=1
+  [ "$argument" = "--no-checkout" ] && next_target=1
 done
 "$DROVE_TEST_REAL_GIT" "$@"
 status=$?
-if [ "$status" -eq 0 ] && [ -n "$matched" ]; then
-  mv "$DROVE_TEST_TARGET" "$DROVE_TEST_ORIGINAL" || exit 91
-  mv "$DROVE_TEST_REPLACEMENT" "$DROVE_TEST_TARGET" || exit 92
+if [ "$status" -eq 0 ] && [ -n "$target" ]; then
+  mv "$target" "$target-opened" || exit 91
+  mv "$DROVE_TEST_REPLACEMENT" "$target" || exit 92
+  printf '%s' "$target" > "$DROVE_TEST_SWAPPED_PATH" || exit 93
 fi
 exit "$status"
 `
 	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
 		t.Fatalf("write Git wrapper: %v", err)
 	}
-	t.Setenv("DROVE_TEST_TARGET", targetPath)
-	t.Setenv("DROVE_TEST_ORIGINAL", originalPath)
 	t.Setenv("DROVE_TEST_REPLACEMENT", replacementPath)
+	t.Setenv("DROVE_TEST_SWAPPED_PATH", swappedPath)
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 	manager.git = wrapper
 
@@ -365,7 +359,15 @@ exit "$status"
 	); err == nil {
 		t.Fatal("prepare accepted a replaced precreated target")
 	}
-	assertFileContents(t, filepath.Join(targetPath, "must-remain"), "replacement\n")
+	rawPath, err := os.ReadFile(swappedPath)
+	if err != nil {
+		t.Fatalf("read swapped target path: %v", err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(string(rawPath), "must-remain"),
+		"replacement\n",
+	)
 }
 
 func TestPrepareRollsBackExistingBranchMovedBeforeWorktreeAdd(t *testing.T) {
@@ -640,6 +642,112 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	assertPreparationRefsAbsent(t, source, prepared.Branch)
 }
 
+func TestReconcileUpgradedRemovalRejectsReplacementSourceRepository(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	dataDir := filepath.Join(parent, "data")
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Version = repositoryWorkspaceRecordVersion
+	record.RepositoryEvidence.GitDirectory = ""
+	record.RepositoryEvidence.GitDirectoryIdentity = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write version 4 workspace record: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper-prune-failure")
+	script := `#!/bin/sh
+saw_worktree=
+for argument in "$@"; do
+  if [ "$saw_worktree" = "1" ] && [ "$argument" = "prune" ]; then
+    exit 97
+  fi
+  [ "$argument" = "worktree" ] && saw_worktree=1
+done
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err == nil || result.State != RemovalPending {
+		t.Fatalf("removal with prune failure = %+v, err=%v", result, err)
+	}
+	upgraded, exists, recordErr := manager.readWorkspaceRecord(prepared.Path)
+	if recordErr != nil || !exists ||
+		upgraded.Version != workspaceRecordVersion ||
+		upgraded.RepositoryEvidence == nil {
+		t.Fatalf(
+			"upgraded removal record = %+v, exists=%v err=%v",
+			upgraded,
+			exists,
+			recordErr,
+		)
+	}
+	manager.git = realGit
+	if err := os.Rename(source, openedSource); err != nil {
+		t.Fatalf("move source repository: %v", err)
+	}
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatalf("install replacement repository: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if _, err := restarted.ReconcileRemovals(
+		context.Background(),
+	); err == nil {
+		t.Fatal("upgraded removal accepted a replacement repository")
+	}
+	if listing := runGit(
+		t,
+		openedSource,
+		"worktree",
+		"list",
+		"--porcelain",
+	); !strings.Contains(listing, prepared.Path) {
+		t.Fatal("original repository registration was unexpectedly pruned")
+	}
+}
+
 func TestAcknowledgeRejectsReplacementCommonGitDirectory(
 	t *testing.T,
 ) {
@@ -752,6 +860,171 @@ func TestAcknowledgeRejectsReplacementSourceGitPointer(t *testing.T) {
 	}
 }
 
+func TestPrepareDoesNotExposeCanonicalTargetToWorktreeAdd(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	dataDir := filepath.Join(parent, "data")
+	outside := filepath.Join(parent, "outside")
+	initSourceSwapRepository(t, source)
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatalf("create outside directory: %v", err)
+	}
+	canonicalSource, err := resolvePath(source)
+	if err != nil {
+		t.Fatalf("resolve source repository: %v", err)
+	}
+	targetPath := filepath.Join(
+		dataDir,
+		worktreeDirectory,
+		repositoryHash(canonicalSource),
+		testAgentID,
+	)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	swapped := filepath.Join(parent, "swapped")
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" worktree add "*)
+    if [ -d "$DROVE_TEST_TARGET" ]; then
+      mv "$DROVE_TEST_TARGET" "$DROVE_TEST_TARGET-opened" || exit 91
+      ln -s "$DROVE_TEST_OUTSIDE" "$DROVE_TEST_TARGET" || exit 92
+      : > "$DROVE_TEST_SWAPPED"
+    fi
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_TARGET", targetPath)
+	t.Setenv("DROVE_TEST_OUTSIDE", outside)
+	t.Setenv("DROVE_TEST_SWAPPED", swapped)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if _, err := os.Lstat(swapped); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canonical target was exposed during worktree add: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, ".git")); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("Git wrote outside the managed bucket: %v", err)
+	}
+	manager.git = realGit
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard prepared workspace: %v", err)
+	}
+}
+
+func TestAcknowledgeRejectsTargetSwapDuringOwnershipCleanup(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	openedTarget := prepared.Path + "-opened"
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	swapped := filepath.Join(parent, "swapped")
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" update-ref -d refs/drove/preparations/"*)
+    if [ ! -e "$DROVE_TEST_SWAPPED" ]; then
+      mv "$DROVE_TEST_TARGET" "$DROVE_TEST_OPENED_TARGET" || exit 91
+      mkdir "$DROVE_TEST_TARGET" || exit 92
+      printf 'replacement\n' > "$DROVE_TEST_TARGET/must-remain" || exit 93
+      : > "$DROVE_TEST_SWAPPED"
+    fi
+    ;;
+esac
+"$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_TARGET", prepared.Path)
+	t.Setenv("DROVE_TEST_OPENED_TARGET", openedTarget)
+	t.Setenv("DROVE_TEST_SWAPPED", swapped)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	err = manager.AcknowledgePreparation(prepared)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"prepared worktree directory identity changed",
+	) {
+		t.Fatalf("acknowledgement target swap error = %v", err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, "must-remain"),
+		"replacement\n",
+	)
+	record, exists, recordErr := manager.readWorkspaceRecord(prepared.Path)
+	if recordErr != nil || !exists ||
+		!record.PreparationCommitted ||
+		record.BranchOperationID == "" {
+		t.Fatalf(
+			"failed acknowledgement record = %+v, exists=%v err=%v",
+			record,
+			exists,
+			recordErr,
+		)
+	}
+
+	if err := os.RemoveAll(prepared.Path); err != nil {
+		t.Fatalf("remove replacement target: %v", err)
+	}
+	if err := os.Rename(openedTarget, prepared.Path); err != nil {
+		t.Fatalf("restore prepared target: %v", err)
+	}
+	manager.git = realGit
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("retry acknowledgement: %v", err)
+	}
+	if _, err := removeWorkspace(
+		t,
+		manager,
+		context.Background(),
+		prepared.AgentID,
+		true,
+	); err != nil {
+		t.Fatalf("remove acknowledged workspace: %v", err)
+	}
+}
+
 func TestAcknowledgeQueriesSourceGitDirectoriesTogether(t *testing.T) {
 	parent := t.TempDir()
 	repository := filepath.Join(parent, "repository")
@@ -796,7 +1069,8 @@ for argument in "$@"; do
   esac
 done
 matched=
-if [ -n "$has_git" ] && [ -z "$has_common" ]; then
+if [ -n "$has_git" ] && [ -z "$has_common" ] &&
+   [ "$GIT_WORK_TREE" = "$DROVE_TEST_SOURCE" ]; then
   count=0
   if [ -f "$DROVE_TEST_COUNTER" ]; then
     count=$(cat "$DROVE_TEST_COUNTER") || exit 90
@@ -824,6 +1098,7 @@ exit "$status"
 		filepath.Join(replacement, ".git"),
 	)
 	t.Setenv("DROVE_TEST_SOURCE_POINTER", sourcePointer)
+	t.Setenv("DROVE_TEST_SOURCE", source)
 	t.Setenv("DROVE_TEST_SWAPPED", swapped)
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 	manager.git = wrapper

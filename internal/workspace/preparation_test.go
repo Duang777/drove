@@ -149,6 +149,71 @@ func TestReconcilePreparationsDiscardsPendingAfterRestart(t *testing.T) {
 	}
 }
 
+func TestReconcilePreparationsDiscardsPromotePendingStagingWorktree(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(prepared.Path), stagingName)
+	if err := os.Rename(prepared.Path, stagingPath); err != nil {
+		t.Fatalf("restore promote-pending staging path: %v", err)
+	}
+	runGit(t, stagingPath, "worktree", "repair", ".")
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile staging preparation: %v", err)
+	}
+	for _, path := range []string{
+		prepared.Path,
+		stagingPath,
+		workspaceRecordPath(prepared.Path),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reconciled path %q remains: %v", path, err)
+		}
+	}
+	if strings.Contains(
+		runGit(t, repository, "worktree", "list", "--porcelain"),
+		stagingPath,
+	) {
+		t.Fatal("staging worktree registration remains")
+	}
+}
+
 func TestReconcilePreparationWithIncompleteGitIdentityFailsClosed(
 	t *testing.T,
 ) {

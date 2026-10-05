@@ -13,7 +13,8 @@
   `drove/<agent-id>`。
 - 指向同一规范 DataDir 的所有进程内 Manager 共享互斥锁；Prepare、List、Remove、
   ReconcilePreparations、AcknowledgePreparation、ReconcileRemovals 和 Discard 串行
-  执行。workspace 记录先写入同目录临时文件并 fsync，原子安装最终文件后再 fsync
+  执行；Windows 的锁 key 必须折叠路径大小写，缺失目录的大小写别名也不能取得不同锁。
+  workspace 记录先写入同目录临时文件并 fsync，原子安装最终文件后再 fsync
   父目录。
 - Prepare 全程固定已打开的源仓库根目录；仓库识别、分支查询与创建、include 匹配和
   `git worktree add` 都必须从该根句柄执行，并禁用 Git hooks。Linux 使用
@@ -22,8 +23,11 @@
   macOS/BSD 上只依赖私有 Git directory 的查询必须从该目录句柄执行，禁止经由使用
   公开私有 Git 路径的 worktree helper；同时依赖 index 与 worktree 的查询必须由两个
   各自固定一侧的视角交叉验证。
-  `git worktree add` 使用 `--no-checkout`，新 worktree 打开后先核对预先持久化的
-  文件系统目录身份，再持久化 Git 私有目录，最后从固定目标根执行 `git reset --hard`。仓库根目录的
+  `git worktree add` 使用 `--no-checkout`，只接收 bucket 内随机且与 Agent ID 同前缀的
+  staging 目录，禁止接触公开 Agent 路径。新 worktree 打开后先核对预先持久化的
+  文件系统目录身份，再持久化 Git 私有目录并从固定目标根执行 `git reset --hard`；
+  初始化完成后把 staging 目录 no-replace 原子提升到公开路径，再从固定 worktree 根执行
+  `git worktree repair .`。仓库根目录的
   `.worktreeinclude` 使用 gitignore 语义，并从已打开文件读取一次。Unix 通过继承的
   只读文件描述符交给 Git，其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按
   源 manifest 路径打开。
@@ -34,7 +38,7 @@
   不得重新解释目标 worktree 的 manifest。目标父目录必须从已固定 worktree root
   向下创建，不能从 repository bucket 重新解析可替换的公开路径。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
-  sidecar，并在受约束 repository bucket 内预创建空目标目录、固定目录身份、同步父目录
+  sidecar，并在受约束 repository bucket 内预创建随机 staging 目录、固定目录身份、同步父目录
   后把身份写回 sidecar。每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager
   的冲突清理。
   version 5 sidecar 记录源 worktree、源私有 Git directory 和 common Git directory
@@ -64,8 +68,9 @@
   目录身份、Git registration、私有 Git directory，以及源 worktree、源私有 Git
   directory 和 common Git directory 的公开路径仍绑定 preparation lease 固定的目录
   实例；源 worktree 的 `.git` 指针还必须重新解析到固定的私有 Git directory 和
-  common Git directory，两个目录必须由同一次 rooted Git 查询取得，禁止跨进程拼接
-  解析结果。提交 sidecar 后和清理 ownership ref 前后也要复核，不能只信 session 携带
+  common Git directory，两个目录必须由同一次 rooted Git 查询取得，输出只接受唯一一对
+  可打开的绝对目录，不能按固定行数切分或跨进程拼接。提交 sidecar 后、清理 ownership ref
+  前后及最终记录更新后都要重新复核目标与仓库，不能只信 session 携带
   的历史值。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
   dirty 状态。每个成功创建的 worktree 都有同目录私有记录，用于识别 detached HEAD
@@ -93,7 +98,9 @@
   sidecar repository evidence 重开的 capability；拒绝未开始的 removal 时必须先验证并
   持久删除目录 marker，再清除 intent。ack sidecar 隔离名在正式记录缺失时必须按
   Agent ID 恢复并回读 operation ID，使 session 重试和重启 reconciliation 能继续；
-  正式记录已存在时不得恢复旧 ack。清理始终保留分支。
+  正式记录已存在时不得恢复旧 ack。对 version 1-4 记录发起新删除时，必须在写 intent
+  前取得并持久化完整的 version 5 repository evidence；已经存在但缺少该证据的 removal
+  intent 只能 fail-stop，禁止在恢复时重新信任记录中的公开仓库路径。清理始终保留分支。
 - Manager 创建不预先查找 Git，也不创建目录；只有实际查询或变更 worktree 时才解析并
   执行 `git`，因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。缺失的
   DataDir 必须从已打开的最近现存祖先通过 `os.Root` 逐级创建，禁止 `MkdirAll` 沿可替换
@@ -103,7 +110,8 @@
   任一中间实目录或 symlink 被替换时必须 fail-stop。List 与 record scan 全程持有固定
   root/bucket 句柄。sidecar 的原子写、确认读取和删除必须在受约束 bucket 句柄内完成。
   初次 sidecar 安装必须使用 no-replace 原语；removal acknowledgement 先把匹配 token 的
-  sidecar 原子移动到 operation ID 隔离名，再校验并删除，崩溃后从隔离名恢复。
+  sidecar 原子移动到 operation ID 隔离名，校验后再移动到同格式的新随机私有名并按已打开
+  文件身份删除，崩溃后从任一隔离名恢复。
   sidecar 安装在原子改名前后都要确认已打开的 repository bucket 仍位于规范 hash 路径，
   文件改名先把已校验源链接到内部随机别名，再从别名安装最终目标；公开临时路径被替换
   只能导致失败，不得覆盖最终记录。清理临时名时也必须确认它仍指向已打开文件。缺少

@@ -300,7 +300,6 @@ func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 		)
 	}
 	draft.workspaceRemoved = true
-	draft.updatedAt = row.Timestamp
 	return nil
 }
 

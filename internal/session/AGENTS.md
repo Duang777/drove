@@ -28,7 +28,8 @@
   本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序。Store batch 成功后，
   Committer 才应用 Agent 投影并按序发布 Hub。workspace removal 使用 typed
-  operation，在 append 后清除 working directory、关闭 Resume，再发布事件。
+  operation，在 append 后清除 working directory、关闭 Resume，再发布事件；该元数据
+  事件不改变 Agent 状态的 UpdatedAt，恢复投影必须保持相同语义。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent →
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →

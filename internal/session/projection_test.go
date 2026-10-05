@@ -1019,6 +1019,60 @@ func TestRecoveryProjectorAcceptsValidatedResizeWithoutChangingState(t *testing.
 	}
 }
 
+func TestRecoveryProjectorWorkspaceRemovalDoesNotChangeStateTimestamp(
+	t *testing.T,
+) {
+	projector := newRecoveryProjector()
+	base := time.Date(2026, time.October, 4, 12, 30, 0, 0, time.UTC)
+	stoppedAt := base.Add(time.Second)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"generic"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: stoppedAt,
+			Type:      string(event.TypeStateChanged),
+			SessionID: "s1",
+			AgentID:   "s1",
+			From:      string(agent.StatePending),
+			To:        string(agent.StateStopped),
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "s1",
+			AgentID:   "s1",
+			Reason:    workspaceRemovedReason,
+			Payload:   `{"version":1}`,
+		},
+	}
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	draft := projector.sessions["s1"]
+	if draft == nil || !draft.updatedAt.Equal(stoppedAt) {
+		t.Fatalf("workspace removal changed recovered state time: %+v", draft)
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if len(plan.Snapshots) != 1 ||
+		!plan.Snapshots[0].UpdatedAt.Equal(stoppedAt) {
+		t.Fatalf("workspace removal snapshot = %+v", plan.Snapshots)
+	}
+}
+
 func TestRecoveryProjectorAcceptsAttachmentAuditWithoutChangingState(t *testing.T) {
 	projector := newRecoveryProjector()
 	base := time.Date(2026, time.October, 4, 13, 0, 0, 0, time.UTC)

@@ -308,7 +308,8 @@ func (m *Manager) prepare(
 			m.discard(cleanupCtx, cleanupTarget),
 		)
 	}
-	if err := m.createPreparedWorktreeTarget(&result); err != nil {
+	preparedTarget, err := m.createPreparedWorktreeTarget(&result)
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
@@ -324,6 +325,33 @@ func (m *Manager) prepare(
 			),
 		)
 	}
+	defer func() {
+		if resultErr != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			cleanupErr := m.cleanupPreparedWorktreeTarget(
+				result,
+				preparedTarget,
+			)
+			pruneErr := sourceRepository.pruneWorktrees(cleanupCtx)
+			discardErr := m.discardWithRepository(
+				cleanupCtx,
+				result,
+				sourceRepository,
+				true,
+			)
+			resultErr = errors.Join(
+				resultErr,
+				cleanupErr,
+				pruneErr,
+				discardErr,
+			)
+		}
+		resultErr = errors.Join(resultErr, preparedTarget.Close())
+	}()
 	if createdBranch {
 		if err := sourceRepository.createOwnedBranch(
 			ctx,
@@ -394,8 +422,14 @@ func (m *Manager) prepare(
 			)
 		}
 	}
-	arguments := []string{"worktree", "add", "--quiet", "--no-checkout"}
-	arguments = append(arguments, path, branch)
+	arguments := []string{
+		"worktree",
+		"add",
+		"--quiet",
+		"--no-checkout",
+		preparedTarget.path,
+		branch,
+	}
 	if _, err := sourceRepository.runForward(
 		ctx,
 		"",
@@ -417,8 +451,32 @@ func (m *Manager) prepare(
 		)
 	}
 
-	if err := m.initializePreparedWorktree(ctx, &result); err != nil {
+	if err := m.initializePreparedWorktree(
+		ctx,
+		&result,
+		preparedTarget,
+	); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return Workspace{}, errors.Join(
+			err,
+			m.discardWithRepository(
+				cleanupCtx,
+				result,
+				sourceRepository,
+				true,
+			),
+		)
+	}
+	if err := m.promotePreparedWorktreeTarget(
+		ctx,
+		result,
+		preparedTarget,
+	); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
 		defer cancel()
 		return Workspace{}, errors.Join(
 			err,
@@ -518,7 +576,8 @@ func (m *Manager) prepare(
 }
 
 func workspaceManagerLock(root string) *sync.Mutex {
-	lock, _ := managerLocks.LoadOrStore(root, &sync.Mutex{})
+	key := workspaceManagerLockKey(root)
+	lock, _ := managerLocks.LoadOrStore(key, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 
@@ -768,11 +827,23 @@ func (m *Manager) discardWithRepository(
 	_, pathErr := os.Lstat(target.Path)
 	pathExists := pathErr == nil
 	pathMissing := errors.Is(pathErr, os.ErrNotExist)
+	activePath := target.Path
 	if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
 		result = errors.Join(
 			result,
 			fmt.Errorf("workspace: inspect discarded worktree: %w", pathErr),
 		)
+	}
+	if pathMissing {
+		stagingPath, exists, stagingErr :=
+			m.preparedWorktreeStagingPath(target, record)
+		if stagingErr != nil {
+			result = errors.Join(result, stagingErr)
+		} else if exists {
+			activePath = stagingPath
+			pathExists = true
+			pathMissing = false
+		}
 	}
 	if pathExists &&
 		(record.DirectoryIdentity == "" ||
@@ -786,7 +857,7 @@ func (m *Manager) discardWithRepository(
 	}
 	registered, err := repository.worktreeRegistered(
 		ctx,
-		target.Path,
+		activePath,
 	)
 	worktreeRemoved := false
 	if err != nil {
@@ -795,7 +866,14 @@ func (m *Manager) discardWithRepository(
 		pathRemoved := pathMissing
 		if pathExists {
 			var removeErr error
-			if repository.root != nil {
+			if activePath != target.Path {
+				removeErr = m.removeStagedPreparedWorktree(
+					ctx,
+					target,
+					record,
+					activePath,
+				)
+			} else if repository.root != nil {
 				removeErr = m.removePreparedWorktreeAtRoot(
 					ctx,
 					target,
@@ -834,7 +912,7 @@ func (m *Manager) discardWithRepository(
 		if pathRemoved {
 			stillRegistered, err := repository.worktreeRegistered(
 				ctx,
-				target.Path,
+				activePath,
 			)
 			if err != nil {
 				result = errors.Join(result, err)

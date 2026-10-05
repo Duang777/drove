@@ -37,9 +37,8 @@ func (m *Manager) acknowledgePreparation(
 	}
 	if record.PreparationCommitted &&
 		record.BranchOperationID == "" &&
-		(target.preparation != nil ||
-			(record.Removal != nil &&
-				record.RepositoryEvidence == nil)) {
+		record.Removal != nil &&
+		record.RepositoryEvidence == nil {
 		return target.preparation.Close()
 	}
 	lease := target.preparation
@@ -73,6 +72,26 @@ func (m *Manager) acknowledgePreparation(
 		}
 		return nil
 	}
+	verifyWorktree := func(stage string) error {
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		if err := m.verifyPreparedWorktreeForAcknowledgement(
+			ctx,
+			record.workspace(),
+			record,
+			lease.repository,
+		); err != nil {
+			return fmt.Errorf(
+				"workspace: verify prepared worktree %s: %w",
+				stage,
+				err,
+			)
+		}
+		return nil
+	}
 	verifyCtx, cancelVerify := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
@@ -98,9 +117,15 @@ func (m *Manager) acknowledgePreparation(
 		if err := verifyRepository("after committing preparation"); err != nil {
 			return err
 		}
+		if err := verifyWorktree("after committing preparation"); err != nil {
+			return err
+		}
 	}
 	if record.BranchOperationID != "" {
 		if err := verifyRepository("before ownership cleanup"); err != nil {
+			return err
+		}
+		if err := verifyWorktree("before ownership cleanup"); err != nil {
 			return err
 		}
 		cleanupCtx, cancel := context.WithTimeout(
@@ -117,12 +142,25 @@ func (m *Manager) acknowledgePreparation(
 		if err := verifyRepository("after ownership cleanup"); err != nil {
 			return err
 		}
+		if err := verifyWorktree("after ownership cleanup"); err != nil {
+			return err
+		}
 		record.BranchOperationID = ""
 		if err := m.replaceWorkspaceRecord(record); err != nil {
 			return fmt.Errorf(
 				"workspace: confirm branch ownership cleanup: %w",
 				err,
 			)
+		}
+		if err := verifyRepository(
+			"after persisting ownership cleanup",
+		); err != nil {
+			return err
+		}
+		if err := verifyWorktree(
+			"after persisting ownership cleanup",
+		); err != nil {
+			return err
 		}
 	}
 	if temporaryLease {

@@ -180,3 +180,44 @@ func TestRenameWindowsHandleAcceptsReadOnlyFile(t *testing.T) {
 	}
 	assertFileContents(t, filepath.Join(rootPath, "target"), "source\n")
 }
+
+func TestMoveRecordFileFlushesThroughRenameHandle(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(rootPath, "source"),
+		[]byte("source\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	source, err := root.Open("source")
+	if err != nil {
+		t.Fatalf("open read-only source: %v", err)
+	}
+	defer source.Close()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	moved, moveErr := moveRecordFile(
+		directory,
+		source,
+		"source",
+		"target",
+	)
+	closeErr := directory.Close()
+	if moveErr != nil || !moved || closeErr != nil {
+		t.Fatalf(
+			"move read-only source = moved %v, move %v, close %v",
+			moved,
+			moveErr,
+			closeErr,
+		)
+	}
+	assertFileContents(t, filepath.Join(rootPath, "target"), "source\n")
+}
