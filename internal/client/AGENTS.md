@@ -25,7 +25,7 @@
 - `OpenTerminal` 协商 `drove.v2`，严格解码 text/binary 帧并提供订阅、取消订阅、
   输入和 resize。`TerminalStream.Next` 只在消费回调成功后推进该订阅 cursor，
   回调失败时保留同一帧供重试；`NewLocal` 创建的终端连接复用同一个 Unix socket
-  dialer。
+  dialer。握手阶段的 hello 读取必须响应调用方 context 取消，不能等固定网络超时。
 - raw `TerminalSubscription` 必须显式选择 `recording`、`read_only` 或
   `read_write` access；client 分别编码为省略 `writable`、`writable:false` 和
   `writable:true`。events 与 snapshot 不接受 access。

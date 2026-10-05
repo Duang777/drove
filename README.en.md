@@ -20,11 +20,12 @@
 
 Drove is a local daemon and CLI. It starts Claude Code, Codex, or any executable in a real PTY, appends terminal bytes to SQLite, and reports one shared set of states.
 
-The recorder and single-session controls work today. `drove attach` connects to
-the live terminal. The Web detail page shows a live xterm.js terminal and exact
-time-based playback. The tower grid, push notifications, and phone approval
-remain in [Epic #31](https://github.com/Duang777/drove/issues/31). There are no
-release binaries or multi-session TUI.
+The recorder and terminal controls work today. `drove tui` shows all sessions,
+`drove attach` connects to one live terminal, and the Web detail page shows a
+live xterm.js terminal with exact time-based playback. The tower grid, push
+notifications, and phone approval remain in
+[Epic #31](https://github.com/Duang777/drove/issues/31). There are no release
+binaries.
 
 ## Status
 
@@ -37,7 +38,7 @@ release binaries or multi-session TUI.
 | Capability | Status | Where |
 | --- | --- | --- |
 | One PTY per agent, owned by `droved` | Shipped | `internal/pty` |
-| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
+| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `tui` `stop` `send` `hook` `web` `token rotate` `version` | Shipped | `cmd/drove` |
 | Per-session Claude / Codex signal injection | Shipped | [#15](https://github.com/Duang777/drove/issues/15) |
 | Terminal byte recording, retained 30 days by default | Shipped | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` byte replay, `--plain` strips control sequences | Shipped | |
@@ -48,7 +49,7 @@ release binaries or multi-session TUI.
 | Codex approval-only OSC 9 Blocked candidate | Shipped | [#40](https://github.com/Duang777/drove/issues/40), [spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | State timeline, Blocked jumps, and exact terminal frames | Shipped | [#25](https://github.com/Duang777/drove/issues/25) |
 | `drove attach` and the Web xterm.js single-session terminal | Shipped | [#20](https://github.com/Duang777/drove/issues/20), [spec 012](specs/012-terminal-attach-web-playback/spec.md) |
-| Bubble Tea multi-session overview | Planned | [#41](https://github.com/Duang777/drove/issues/41) |
+| Bubble Tea multi-session terminal overview | Shipped | [#41](https://github.com/Duang777/drove/issues/41), [spec 014](specs/014-terminal-overview-tui/spec.md) |
 | Control-tower grid | Planned | [#26](https://github.com/Duang777/drove/issues/26) |
 | Push notifications | Planned | [#27](https://github.com/Duang777/drove/issues/27) |
 | Approve, deny, or reply from a phone | Planned | [#28](https://github.com/Duang777/drove/issues/28) |
@@ -80,6 +81,7 @@ export PATH="$PWD/bin:$PATH"
 drove init
 drove up /bin/cat --name demo
 drove ps
+drove tui
 drove send <agent-id> 'hello'
 drove attach <agent-id>
 drove log <agent-id>
@@ -114,6 +116,7 @@ drove up claude --hooks required
 | `drove timeline <agent-id>` | Print state spans, output retention, and one-based Blocked jump points. `--json` prints the full response |
 | `drove explain <agent-id>` | Print recent state decisions and the ephemeral bounded screen for an attached session |
 | `drove attach <agent-id>` | Connect to the live raw terminal. Ctrl-Q only disconnects locally. `--read-only` sends no input or resize |
+| `drove tui` | Open the multi-session terminal overview to filter, send input, stop, explain, or enter writable/read-only attach |
 | `drove send <agent-id> <text>` | Send that line plus a newline. Prints the byte count |
 | `drove send <agent-id> --stdin` | Read stdin as-is, with no added newline |
 | `drove stop <agent-id>` | Stop that session |
@@ -128,6 +131,24 @@ Ctrl-C reaches the remote agent unchanged. Every exit path restores the local
 terminal. A local disconnect does not stop the agent.
 
 `drove send` accepts valid UTF-8 only, at most 64 KiB. The audit event stores the byte count, not the text. One `drove hook` JSON document is limited to 1 MiB. The hook command does not read the control token and does not start the daemon.
+
+### Terminal overview
+
+Run `drove tui` to open the Bubble Tea multi-session overview. The complete
+session list refreshes from the daemon every 500 ms. A failed refresh keeps the
+last successful result. Only the selected session has a bounded, live-only
+snapshot subscription. Changing the selection closes the old subscription, so
+the overview does not continuously fetch every terminal.
+
+| Key | Behavior |
+| --- | --- |
+| `↑` / `k`, `↓` / `j` | Move the session selection |
+| `f`, then `←` / `→` | Choose a state filter; `Enter` or `Esc` returns to the list |
+| `a` / `r` | Enter writable / read-only attach; Ctrl-Q returns to the overview |
+| `s` | Edit and send one line; `Enter` sends and `Esc` cancels |
+| `x` | Request a stop; only `y` confirms, while `n` or `Esc` cancels |
+| `e` | Open the typed state explanation; arrows or Page Up / Page Down scroll, and `Esc` returns |
+| `q` / Ctrl-C | Exit from list focus without stopping any remote agent |
 
 ## How it works
 
@@ -174,9 +195,7 @@ most one frame every 500 ms, and a newer frame replaces an unread frame.
 Snapshots carry `restorable:false`, stay out of the Hub and SQLite, and cannot
 start an exact replay.
 
-Both `drove attach` and the Web detail page use this protocol. The Bubble Tea
-multi-session overview is tracked by
-[#41](https://github.com/Duang777/drove/issues/41).
+`drove attach`, `drove tui`, and the Web detail page use this protocol.
 
 ### Per-session injection
 
@@ -337,14 +356,13 @@ The tower grid is tracked by [#26](https://github.com/Duang777/drove/issues/26).
 
 The approved MVP is [Epic #31, flight recorder + control tower](https://github.com/Duang777/drove/issues/31).
 
-The screen model, WebSocket terminal stream, single-session interaction and
-playback, and control-plane hardening are complete.
+The screen model, WebSocket terminal stream, terminal overview, single-session
+interaction and playback, and control-plane hardening are complete.
 The next items are:
 
 1. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
-2. [#41](https://github.com/Duang777/drove/issues/41) Bubble Tea multi-session overview
-3. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
-4. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
+2. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
+3. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
 
 After the MVP: the shim in [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18), then the away brief [#29](https://github.com/Duang777/drove/issues/29), full-text search [#30](https://github.com/Duang777/drove/issues/30), and worktrees [#23](https://github.com/Duang777/drove/issues/23). Structured state sources [#22](https://github.com/Duang777/drove/issues/22) and the persistent hook installer [#24](https://github.com/Duang777/drove/issues/24) are deferred.
 
@@ -387,6 +405,7 @@ The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-st
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | Terminal streams, cursors, timeline, and exact frames |
 | [spec 012, terminal attach](specs/012-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
 | [spec 012, Codex OSC 9](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 detection and body redaction |
+| [spec 014](specs/014-terminal-overview-tui/spec.md) | Bubble Tea multi-session terminal overview |
 | [Technical notes](docs/technical-notes.md) | A point-in-time reading. Its opening says the first six sections are not current `main` |
 | [AGENTS.md](AGENTS.md) | Directory responsibilities and engineering constraints |
 

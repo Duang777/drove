@@ -25,6 +25,7 @@ import (
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/cliattach"
 	"github.com/Duang777/drove/internal/client"
+	"github.com/Duang777/drove/internal/clitui"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/recording"
@@ -142,6 +143,7 @@ func newRootCmd() *cobra.Command {
 		newExplainCmd(),
 		newSendCmd(),
 		newAttachCmd(),
+		newTUICmd(),
 		newHookCmd(),
 		newStopCmd(),
 		newWorktreeCmd(),
@@ -956,6 +958,32 @@ func newAttachCmdWith(
 	}
 	cmd.Flags().BoolVar(&readOnly, "read-only", false, "只读连接，不发送输入或尺寸")
 	return cmd
+}
+
+type tuiClientFactory func(context.Context) (*client.Client, error)
+
+type tuiRunner func(context.Context, *client.Client) error
+
+func newTUICmd() *cobra.Command {
+	return newTUICmdWith(newClient, clitui.Run)
+}
+
+func newTUICmdWith(
+	clientFactory tuiClientFactory,
+	runner tuiRunner,
+) *cobra.Command {
+	return &cobra.Command{
+		Use:   "tui",
+		Short: "打开 Agent 终端总览",
+		Args:  usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			daemon, err := clientFactory(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return runner(cmd.Context(), daemon)
+		},
+	}
 }
 
 func newHookCmd() *cobra.Command {
