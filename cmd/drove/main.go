@@ -71,6 +71,9 @@ func main() {
 func executeRoot(root *cobra.Command, args []string) error {
 	root.InitDefaultHelpCmd()
 	root.InitDefaultCompletionCmd()
+	if err := validateDefaultHelpArgs(root, args); err != nil {
+		return err
+	}
 	if !isCompletionRequest(args) {
 		command, remaining, err := root.Find(args)
 		if err != nil {
@@ -91,7 +94,25 @@ func executeRoot(root *cobra.Command, args []string) error {
 		}
 	}
 	root.SetArgs(args)
-	return root.Execute()
+	err := root.Execute()
+	if err != nil && len(args) > 0 && args[0] == "completion" {
+		return markUsageError(err)
+	}
+	return err
+}
+
+func validateDefaultHelpArgs(root *cobra.Command, args []string) error {
+	if len(args) < 2 || args[0] != "help" {
+		return nil
+	}
+	_, remaining, err := root.Find(args[1:])
+	if err == nil && len(remaining) == 0 {
+		return nil
+	}
+	return markUsageError(fmt.Errorf(
+		"unknown help topic %q",
+		strings.Join(args[1:], " "),
+	))
 }
 
 func isCompletionRequest(args []string) bool {

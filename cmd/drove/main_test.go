@@ -283,6 +283,31 @@ func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
 	}
 }
 
+func TestExecuteRootTreatsDefaultCommandArgumentErrorsAsUsageErrors(
+	t *testing.T,
+) {
+	tests := [][]string{
+		{"help", "definitely-not-a-command"},
+		{"completion", "bash", "extra"},
+	}
+	for _, args := range tests {
+		t.Run(strings.Join(args, "/"), func(t *testing.T) {
+			err := executeRoot(newRootCmd(), args)
+			if err == nil {
+				t.Fatalf("execute %v succeeded", args)
+			}
+			if got := commandExitCode(err); got != exitUsage {
+				t.Fatalf(
+					"exit code = %d, want %d for %v",
+					got,
+					exitUsage,
+					err,
+				)
+			}
+		})
+	}
+}
+
 func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
 	tests := []struct {
 		name       string
