@@ -105,13 +105,23 @@ func validateDefaultHelpArgs(root *cobra.Command, args []string) error {
 	if len(args) < 2 || args[0] != "help" {
 		return nil
 	}
-	_, remaining, err := root.Find(args[1:])
+	topic := args[1:]
+	for index, argument := range topic {
+		if strings.HasPrefix(argument, "-") {
+			topic = topic[:index]
+			break
+		}
+	}
+	if len(topic) == 0 {
+		return nil
+	}
+	_, remaining, err := root.Find(topic)
 	if err == nil && len(remaining) == 0 {
 		return nil
 	}
 	return markUsageError(fmt.Errorf(
 		"unknown help topic %q",
-		strings.Join(args[1:], " "),
+		strings.Join(topic, " "),
 	))
 }
 

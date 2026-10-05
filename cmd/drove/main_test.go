@@ -320,6 +320,16 @@ func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
 			wantOutput: "Usage:",
 		},
 		{
+			name:       "help command flag",
+			args:       []string{"help", "--help"},
+			wantOutput: "Usage:",
+		},
+		{
+			name:       "help target flag",
+			args:       []string{"help", "worktree", "--help"},
+			wantOutput: "Usage:",
+		},
+		{
 			name:       "completion",
 			args:       []string{"completion", "bash"},
 			wantOutput: "__start_drove",
