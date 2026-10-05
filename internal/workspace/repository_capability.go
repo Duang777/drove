@@ -366,11 +366,13 @@ func (r repositoryCapability) preparedWorktreeGitDirectory(
 	target Workspace,
 	registered registeredWorktree,
 ) (string, error) {
-	worktrees, err := r.registeredWorktrees(ctx)
-	if err != nil {
-		return "", err
-	}
-	for index := 0; index <= len(worktrees)+1; index++ {
+	for index := 0; ; index++ {
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf(
+				"workspace: resolve prepared worktree Git directory: %w",
+				err,
+			)
+		}
 		name := target.AgentID
 		if index != 0 {
 			name += strconv.Itoa(index)
@@ -385,9 +387,6 @@ func (r repositoryCapability) preparedWorktreeGitDirectory(
 			return path, nil
 		}
 	}
-	return "", errors.New(
-		"workspace: cannot resolve the prepared worktree Git directory",
-	)
 }
 
 func (r repositoryCapability) verifyPreparedWorktree(

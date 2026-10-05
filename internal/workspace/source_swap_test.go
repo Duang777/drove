@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -124,6 +125,70 @@ func TestPrepareRollsBackSuffixedWorktreeAfterPostSuccessSourceSwap(
 	)
 	if err := os.RemoveAll(stalePath); err != nil {
 		t.Fatalf("remove stale worktree path: %v", err)
+	}
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	canonicalSource, err := resolvePath(source)
+	if err != nil {
+		t.Fatalf("resolve source: %v", err)
+	}
+	targetPath := filepath.Join(
+		manager.root,
+		repositoryHash(canonicalSource),
+		testAgentID,
+	)
+	manager.git = postSuccessSwapGitWrapper(
+		t,
+		parent,
+		source,
+		replacement,
+		openedSource,
+		"worktree-add",
+	)
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare accepted a replaced source repository")
+	}
+
+	if _, err := os.Lstat(targetPath); !os.IsNotExist(err) {
+		t.Fatalf("prepared worktree remains or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(targetPath)); !os.IsNotExist(err) {
+		t.Fatalf("preparation record remains or inspect failed: %v", err)
+	}
+	assertWorktreeUnregistered(t, openedSource, targetPath)
+	branch := "drove/" + testAgentID
+	assertPreparationRefsAbsent(t, openedSource, branch)
+	assertPreparationRefsAbsent(t, source, branch)
+}
+
+func TestPrepareRollsBackAfterUnlistedAdminDirectoryCollisions(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+	for index := 0; index <= 10; index++ {
+		name := testAgentID
+		if index != 0 {
+			name += strconv.Itoa(index)
+		}
+		if err := os.MkdirAll(
+			filepath.Join(source, ".git", "worktrees", name),
+			0o700,
+		); err != nil {
+			t.Fatalf("create stale admin directory %q: %v", name, err)
+		}
 	}
 
 	manager, err := New(filepath.Join(parent, "data"))
