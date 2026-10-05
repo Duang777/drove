@@ -889,7 +889,7 @@ Bubbles viewport 显示类型化 explain。`q` 和 Ctrl-C 只退出本地总览�
 
 ### 自动验收
 
-Commit `f98bdb0` 的自动测试覆盖以下行为：
+自动测试覆盖以下行为：
 
 - 第二次 500 ms 刷新后的 10 个变更会话在一秒期限内完成渲染。
 - writable 和 read-only attach 返回后都保留原选择。
@@ -899,6 +899,5 @@ Commit `f98bdb0` 的自动测试覆盖以下行为：
 - 真实 pseudo-terminal 连续经过两次 `tea.Exec` 交接，最终终端状态与启动前逐字段
   相同。
 
-`go test ./internal/clitui ./cmd/drove -race -count=20`、全仓库 race、
-`go vet ./...` 和 `make build` 均通过。全仓库 race 中
-`internal/workspace` 用时 475.669 秒。
+`go test ./internal/clitui ./cmd/drove -race -count=20`、串行全仓库 race、
+`go vet ./...` 和 `make build` 均通过。

@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/cliattach"
 	"github.com/Duang777/drove/internal/session"
 )
@@ -85,6 +86,7 @@ type model struct {
 	actionKind   actionKind
 	actionSerial uint64
 	actionBusy   bool
+	actionCancel context.CancelFunc
 	notice       string
 
 	explanation    *session.Explanation
@@ -328,6 +330,9 @@ func (m *model) handleFleetKey(message tea.KeyMsg) tea.Cmd {
 	case "f":
 		m.focus = focusFilter
 	case "s":
+		if m.actionBusy {
+			return nil
+		}
 		if id, ok := m.selectedAgentID(); ok {
 			m.beginAction(actionSend, id)
 			m.focus = focusSend
@@ -335,17 +340,29 @@ func (m *model) handleFleetKey(message tea.KeyMsg) tea.Cmd {
 			return m.input.Focus()
 		}
 	case "x":
+		if m.actionBusy {
+			return nil
+		}
 		if id, ok := m.selectedAgentID(); ok {
 			m.beginAction(actionStop, id)
 			m.focus = focusStop
 		}
 	case "e":
+		if m.actionBusy {
+			return nil
+		}
 		if id, ok := m.selectedAgentID(); ok {
 			return m.startExplain(id)
 		}
 	case "a":
+		if m.actionBusy {
+			return nil
+		}
 		return m.startAttach(false)
 	case "r":
+		if m.actionBusy {
+			return nil
+		}
 		return m.startAttach(true)
 	}
 	return nil
@@ -439,18 +456,36 @@ func (m *model) stepFilter(delta int) {
 }
 
 func (m *model) rebuildVisibleRows() {
+	previousRow, hadPreviousRow := m.selectedRow()
 	previous := m.selection.AgentID
 	m.rows = filterProjectedFleet(m.allRows, m.filter)
 	m.selection = reconcileSelection(m.selection, m.rows)
 	if m.selection.AgentID == previous {
+		currentRow, hasCurrentRow := m.selectedRow()
+		if hadPreviousRow &&
+			hasCurrentRow &&
+			(previousRow.PID != currentRow.PID ||
+				(previousRow.State == agent.StateStopped &&
+					currentRow.State != agent.StateStopped)) {
+			m.resetActionFocus()
+			m.replacePreview(m.selection.AgentID)
+		}
 		return
 	}
-	if m.focus == focusSend || m.focus == focusStop || m.focus == focusExplain {
-		m.input.Blur()
-		m.focus = focusFleet
-		m.invalidateAction()
-	}
+	m.resetActionFocus()
 	m.replacePreview(m.selection.AgentID)
+}
+
+func (m *model) resetActionFocus() {
+	if !m.actionBusy &&
+		m.focus != focusSend &&
+		m.focus != focusStop &&
+		m.focus != focusExplain {
+		return
+	}
+	m.input.Blur()
+	m.focus = focusFleet
+	m.invalidateAction()
 }
 
 func filterProjectedFleet(rows []fleetRow, filter fleetFilter) []fleetRow {
@@ -505,14 +540,26 @@ func (m *model) beginAction(kind actionKind, agentID string) {
 	m.actionKind = kind
 }
 
-func (m *model) nextAction(kind actionKind, agentID string) uint64 {
+func (m *model) nextAction(
+	kind actionKind,
+	agentID string,
+) (uint64, context.Context) {
+	if m.actionCancel != nil {
+		m.actionCancel()
+	}
 	m.beginAction(kind, agentID)
 	m.actionSerial++
 	m.actionBusy = true
-	return m.actionSerial
+	actionCtx, cancel := context.WithCancel(m.ctx)
+	m.actionCancel = cancel
+	return m.actionSerial, actionCtx
 }
 
 func (m *model) invalidateAction() {
+	if m.actionCancel != nil {
+		m.actionCancel()
+		m.actionCancel = nil
+	}
 	m.actionSerial++
 	m.actionBusy = false
 	m.actionID = ""
@@ -521,12 +568,12 @@ func (m *model) invalidateAction() {
 }
 
 func (m *model) startSend(agentID string, payload []byte) tea.Cmd {
-	serial := m.nextAction(actionSend, agentID)
+	serial, actionCtx := m.nextAction(actionSend, agentID)
 	return func() tea.Msg {
 		var err error
 		if m.deps.daemon == nil {
 			err = errors.New("clitui: client is required")
-		} else if sendErr := m.deps.daemon.SendInput(m.ctx, agentID, payload); sendErr != nil {
+		} else if sendErr := m.deps.daemon.SendInput(actionCtx, agentID, payload); sendErr != nil {
 			err = fmt.Errorf("clitui: send input: %w", sendErr)
 		}
 		return actionResultMsg{
@@ -539,12 +586,12 @@ func (m *model) startSend(agentID string, payload []byte) tea.Cmd {
 }
 
 func (m *model) startStop(agentID string) tea.Cmd {
-	serial := m.nextAction(actionStop, agentID)
+	serial, actionCtx := m.nextAction(actionStop, agentID)
 	return func() tea.Msg {
 		var err error
 		if m.deps.daemon == nil {
 			err = errors.New("clitui: client is required")
-		} else if stopErr := m.deps.daemon.Stop(m.ctx, agentID); stopErr != nil {
+		} else if stopErr := m.deps.daemon.Stop(actionCtx, agentID); stopErr != nil {
 			err = fmt.Errorf("clitui: stop agent: %w", stopErr)
 		}
 		return actionResultMsg{
@@ -557,7 +604,7 @@ func (m *model) startStop(agentID string) tea.Cmd {
 }
 
 func (m *model) startExplain(agentID string) tea.Cmd {
-	serial := m.nextAction(actionExplain, agentID)
+	serial, actionCtx := m.nextAction(actionExplain, agentID)
 	m.focus = focusExplain
 	m.explanation = nil
 	m.explainErr = nil
@@ -573,7 +620,7 @@ func (m *model) startExplain(agentID string) tea.Cmd {
 			err = errors.New("clitui: client is required")
 		} else {
 			explanation, err = m.deps.daemon.Explain(
-				m.ctx,
+				actionCtx,
 				agentID,
 				session.ExplainOptions{},
 			)
@@ -595,9 +642,16 @@ func (m *model) handleActionResult(message actionResultMsg) tea.Cmd {
 	if message.Serial != m.actionSerial ||
 		message.Kind != m.actionKind ||
 		message.AgentID != m.actionID {
+		if message.Kind == actionSend || message.Kind == actionStop {
+			return m.startFleetRefresh()
+		}
 		return nil
 	}
 	m.actionBusy = false
+	if m.actionCancel != nil {
+		m.actionCancel()
+		m.actionCancel = nil
+	}
 
 	relevant := m.selection.AgentID == message.AgentID
 	switch message.Kind {
@@ -634,10 +688,11 @@ func (m *model) handleActionResult(message actionResultMsg) tea.Cmd {
 
 func (m *model) startAttach(readOnly bool) tea.Cmd {
 	agentID, ok := m.selectedAgentID()
-	if !ok || m.deps.attach == nil {
+	if !ok || m.deps.attach == nil || m.actionBusy {
 		return nil
 	}
 	m.notice = ""
+	m.invalidateAction()
 	m.attachSerial++
 	serial := m.attachSerial
 	command := &attachCommand{
@@ -659,9 +714,10 @@ func (m *model) handleAttachFinished(message attachFinishedMsg) tea.Cmd {
 	if message.Serial != m.attachSerial {
 		return nil
 	}
-	m.selection.AgentID = message.AgentID
-	m.selection = reconcileSelection(m.selection, m.rows)
-	m.replacePreview(m.selection.AgentID)
+	if m.selection.AgentID == message.AgentID {
+		m.selection = reconcileSelection(m.selection, m.rows)
+		m.replacePreview(m.selection.AgentID)
+	}
 	if message.Err != nil && !errors.Is(message.Err, context.Canceled) {
 		m.notice = message.Err.Error()
 	}

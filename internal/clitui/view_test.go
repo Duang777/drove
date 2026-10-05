@@ -196,6 +196,56 @@ func TestViewDistinguishesPreviewStates(t *testing.T) {
 	}
 }
 
+func TestViewSanitizesControlCharactersInDaemonText(t *testing.T) {
+	t.Parallel()
+
+	m := newTestModel(&fakeTUIClient{}, newRecordingPreview())
+	m.resize(100, 24)
+	m.allRows = []fleetRow{{
+		AgentID:         "agent-1",
+		Name:            "first\nsecond\x1b]2;owned\a",
+		Vendor:          "generic\tvendor",
+		State:           agent.StateWorking,
+		TransitionEvent: "changed\rstate",
+		UpdatedAt:       time.Now(),
+	}}
+	m.rebuildVisibleRows()
+	m.previewSnapshot = &clientSnapshot{
+		Rows:       24,
+		Columns:    80,
+		Lines:      []string{"snapshot\nline\x1b]2;owned\a"},
+		CapturedAt: time.Now(),
+	}
+
+	view := m.View()
+	if strings.Contains(view, "\x1b]2;owned\a") {
+		t.Fatal("view retained an injected terminal control sequence")
+	}
+	plain := ansi.Strip(view)
+	for _, want := range []string{
+		"first second",
+		"generic ve",
+		"changed state",
+		"snapshot line ]2;owned ",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("sanitized view omitted %q:\n%s", want, plain)
+		}
+	}
+	assertViewDimensions(t, view, 100, 24)
+}
+
+func TestViewFitsVerySmallTerminalHeights(t *testing.T) {
+	t.Parallel()
+
+	m := newTestModel(&fakeTUIClient{}, newRecordingPreview())
+	seedModel(m, "agent-1")
+	for height := 1; height <= 4; height++ {
+		m.resize(20, height)
+		assertViewDimensions(t, m.View(), 20, height)
+	}
+}
+
 func assertViewDimensions(t *testing.T, view string, width, height int) {
 	t.Helper()
 	lines := strings.Split(view, "\n")

@@ -188,6 +188,50 @@ func TestPollRunsImmediatelyWithoutOverlapAndKeepsLastGoodFleet(t *testing.T) {
 	}
 }
 
+func TestPollReplacesPreviewWhenSelectedAgentProcessChanges(t *testing.T) {
+	t.Parallel()
+
+	preview := newRecordingPreview()
+	m := newTestModel(&fakeTUIClient{}, preview)
+	first := newFleetStatus("agent-1", agent.StateWorking, time.Now())
+	first.PID = 101
+	m.fleetInFlight = true
+	m.fleetRequestID = 1
+	_, _ = m.Update(fleetResultMsg{
+		RequestID: 1,
+		Statuses:  []*session.Status{first},
+	})
+	m.previewSnapshot = &clientSnapshot{Lines: []string{"old process"}}
+	m.beginAction(actionStop, "agent-1")
+	m.focus = focusStop
+
+	resumed := newFleetStatus("agent-1", agent.StateWorking, time.Now())
+	resumed.PID = 202
+	m.fleetInFlight = true
+	m.fleetRequestID = 2
+	_, _ = m.Update(fleetResultMsg{
+		RequestID: 2,
+		Statuses:  []*session.Status{resumed},
+	})
+
+	if m.previewSnapshot != nil {
+		t.Fatal("process replacement retained the previous snapshot")
+	}
+	if m.focus != focusFleet || m.actionID != "" {
+		t.Fatalf(
+			"process replacement retained action focus=%d agent=%q",
+			m.focus,
+			m.actionID,
+		)
+	}
+	if got := preview.lastReplacement(t); got != (previewTarget{
+		AgentID:    "agent-1",
+		Generation: 2,
+	}) {
+		t.Fatalf("replacement target = %+v", got)
+	}
+}
+
 func TestActionSendAddsExactlyOneNewlineAndEnforcesByteLimit(t *testing.T) {
 	t.Parallel()
 
@@ -214,7 +258,7 @@ func TestActionSendAddsExactlyOneNewlineAndEnforcesByteLimit(t *testing.T) {
 
 	_, _ = m.Update(keyMessage("s"))
 	_, command = m.Update(keyMessage("enter"))
-	_ = command()
+	_, _ = m.Update(command().(actionResultMsg))
 
 	mu.Lock()
 	gotPayloads := append([][]byte(nil), payloads...)
@@ -232,6 +276,65 @@ func TestActionSendAddsExactlyOneNewlineAndEnforcesByteLimit(t *testing.T) {
 	}
 	if !strings.Contains(m.notice, "maximum") || m.focus != focusSend {
 		t.Fatalf("oversized input notice=%q focus=%d", m.notice, m.focus)
+	}
+}
+
+func TestPendingActionBlocksOtherActionsAndCancellationStopsRequest(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	daemon := &fakeTUIClient{
+		sendFn: func(ctx context.Context, _ string, _ []byte) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	var attachCalls atomic.Int32
+	m := newModelWithDependencies(context.Background(), modelDependencies{
+		daemon:  daemon,
+		preview: newRecordingPreview(),
+		attach: func(context.Context, string, cliattach.Options) error {
+			attachCalls.Add(1)
+			return nil
+		},
+		exec: func(command tea.ExecCommand, callback tea.ExecCallback) tea.Cmd {
+			return func() tea.Msg {
+				return callback(command.Run())
+			}
+		},
+		tick: func(time.Duration, func(time.Time) tea.Msg) tea.Cmd {
+			return nil
+		},
+	})
+	seedModel(m, "agent-1")
+	_, _ = m.Update(keyMessage("s"))
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello")})
+	_, sendCommand := m.Update(keyMessage("enter"))
+	sendResult := make(chan actionResultMsg, 1)
+	go func() {
+		sendResult <- sendCommand().(actionResultMsg)
+	}()
+	receivePreviewSignal(t, started)
+
+	for _, key := range []string{"s", "x", "e", "a", "r"} {
+		_, command := m.Update(keyMessage(key))
+		if command != nil {
+			t.Fatalf("busy action accepted %q", key)
+		}
+	}
+	if got := attachCalls.Load(); got != 0 {
+		t.Fatalf("busy action started attach %d times", got)
+	}
+
+	m.invalidateAction()
+	result := receivePreviewValue(t, sendResult)
+	_, refresh := m.Update(result)
+	if refresh == nil {
+		t.Fatal("stale send completion did not refresh the fleet")
+	}
+	if m.actionBusy {
+		t.Fatal("canceled action remained busy")
 	}
 }
 
@@ -387,6 +490,44 @@ func TestAttachUsesExecModesAndPreservesSelection(t *testing.T) {
 	}
 	if !strings.Contains(m.notice, attachErr.Error()) {
 		t.Fatalf("attach error notice = %q", m.notice)
+	}
+}
+
+func TestAttachCompletionDoesNotOverrideNewSelection(t *testing.T) {
+	t.Parallel()
+
+	preview := newRecordingPreview()
+	m := newModelWithDependencies(context.Background(), modelDependencies{
+		daemon:  &fakeTUIClient{},
+		preview: preview,
+		attach: func(context.Context, string, cliattach.Options) error {
+			return nil
+		},
+		exec: func(command tea.ExecCommand, callback tea.ExecCallback) tea.Cmd {
+			return func() tea.Msg {
+				return callback(command.Run())
+			}
+		},
+		tick: func(time.Duration, func(time.Time) tea.Msg) tea.Cmd {
+			return nil
+		},
+	})
+	seedModel(m, "agent-1", "agent-2")
+	_, command := m.Update(keyMessage("a"))
+	result := command().(attachFinishedMsg)
+	_, _ = m.Update(keyMessage("down"))
+	generation := m.previewTarget.Generation
+
+	_, _ = m.Update(result)
+	if m.selection.AgentID != "agent-2" {
+		t.Fatalf("selection = %q, want agent-2", m.selection.AgentID)
+	}
+	if m.previewTarget.Generation != generation {
+		t.Fatalf(
+			"attach completion replaced generation %d with %d",
+			generation,
+			m.previewTarget.Generation,
+		)
 	}
 }
 

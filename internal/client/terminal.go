@@ -307,9 +307,20 @@ func (c *Client) OpenTerminal(ctx context.Context) (*TerminalStream, error) {
 			terminalProtocol,
 		)
 	}
-	if err := readTerminalHello(conn); err != nil {
+	stopCancel := context.AfterFunc(ctx, func() {
 		_ = conn.Close()
+	})
+	if err := readTerminalHello(conn); err != nil {
+		stopCancel()
+		_ = conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
+	}
+	if !stopCancel() {
+		_ = conn.Close()
+		return nil, ctx.Err()
 	}
 
 	stream := &TerminalStream{

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -66,13 +67,14 @@ func (m *model) View() string {
 		}
 	}
 
-	return strings.Join([]string{
+	rendered := strings.Join([]string{
 		header,
 		fitLine(strings.Repeat("-", width), width),
 		body,
 		status,
 		footer,
 	}, "\n")
+	return renderLines(strings.Split(rendered, "\n"), width, max(1, m.height))
 }
 
 func (m *model) renderHeader(width int) string {
@@ -123,19 +125,20 @@ func (m *model) renderFleetPane(width, height int) string {
 		if name == "" {
 			name = row.AgentID
 		}
+		name = terminalInlineText(name)
 		state := renderState(row.State)
 		age := formatAge(time.Since(row.UpdatedAt))
-		transition := valueOrDash(row.TransitionEvent)
+		transition := valueOrDash(terminalInlineText(row.TransitionEvent))
 		if row.TransitionSource != "" {
-			transition += "/" + string(row.TransitionSource)
+			transition += "/" + terminalInlineText(string(row.TransitionSource))
 		}
 
 		if rowHeight == 1 {
 			line := marker +
 				column(state, 10) +
 				column(name, 18) +
-				column(valueOrDash(row.Vendor), 10) +
-				column(valueOrDash(string(row.HookStatus)), 17) +
+				column(valueOrDash(terminalInlineText(row.Vendor)), 10) +
+				column(valueOrDash(terminalInlineText(string(row.HookStatus))), 17) +
 				column(transition, max(8, width-65)) +
 				age
 			if marker == "> " {
@@ -147,8 +150,8 @@ func (m *model) renderFleetPane(width, height int) string {
 
 		first := marker + state + "  " + name + "  " + dimStyle.Render(age)
 		second := "    " +
-			valueOrDash(row.Vendor) + " | " +
-			valueOrDash(string(row.HookStatus)) + " | " +
+			valueOrDash(terminalInlineText(row.Vendor)) + " | " +
+			valueOrDash(terminalInlineText(string(row.HookStatus))) + " | " +
 			transition
 		if marker == "> " {
 			first = selectedStyle.Render(first)
@@ -171,7 +174,7 @@ func (m *model) renderPreviewPane(width, height int) string {
 		lines = append(lines, dimStyle.Render("No live snapshot for a stopped session."))
 	case m.previewErr != nil:
 		lines = append(lines, errorStyle.Render("Snapshot unavailable."))
-		lines = append(lines, m.previewErr.Error())
+		lines = append(lines, terminalInlineText(m.previewErr.Error()))
 		if m.previewRetryIn > 0 {
 			lines = append(
 				lines,
@@ -196,7 +199,9 @@ func (m *model) renderPreviewPane(width, height int) string {
 		}
 		available := max(1, height-len(lines))
 		start := max(0, len(snapshot.Lines)-available)
-		lines = append(lines, snapshot.Lines[start:]...)
+		for _, line := range snapshot.Lines[start:] {
+			lines = append(lines, terminalInlineText(line))
+		}
 	}
 	return renderLines(lines, width, height)
 }
@@ -206,7 +211,9 @@ func (m *model) renderExplainPane(width, height int) string {
 	if !m.explainLoading {
 		content = m.explainView.View()
 	}
-	lines := []string{titleStyle.Render("EXPLAIN " + valueOrDash(m.actionID))}
+	lines := []string{
+		titleStyle.Render("EXPLAIN " + valueOrDash(terminalInlineText(m.actionID))),
+	}
 	lines = append(lines, strings.Split(content, "\n")...)
 	return renderLines(lines, width, height)
 }
@@ -214,15 +221,22 @@ func (m *model) renderExplainPane(width, height int) string {
 func (m *model) renderStatus() string {
 	switch m.focus {
 	case focusSend:
-		return fmt.Sprintf("SEND %s  %s", m.actionID, m.input.View())
+		return fmt.Sprintf(
+			"SEND %s  %s",
+			terminalInlineText(m.actionID),
+			m.input.View(),
+		)
 	case focusStop:
-		return fmt.Sprintf("STOP %s? [y/N]", m.actionID)
+		return fmt.Sprintf(
+			"STOP %s? [y/N]",
+			terminalInlineText(m.actionID),
+		)
 	}
 	if m.notice != "" {
-		return m.notice
+		return terminalInlineText(m.notice)
 	}
 	if m.fleetErr != nil {
-		return errorStyle.Render(m.fleetErr.Error())
+		return errorStyle.Render(terminalInlineText(m.fleetErr.Error()))
 	}
 	if m.actionBusy {
 		switch m.actionKind {
@@ -254,7 +268,7 @@ func (m *model) renderFooter() string {
 
 func renderExplanation(explanation *session.Explanation, err error) string {
 	if err != nil {
-		return "Explanation unavailable.\n" + err.Error()
+		return "Explanation unavailable.\n" + terminalInlineText(err.Error())
 	}
 	if explanation == nil {
 		return "Explanation unavailable."
@@ -264,8 +278,8 @@ func renderExplanation(explanation *session.Explanation, err error) string {
 	fmt.Fprintf(
 		&output,
 		"state=%s hook=%s attached=%t\n",
-		explanation.State,
-		explanation.HookStatus,
+		terminalInlineText(string(explanation.State)),
+		terminalInlineText(string(explanation.HookStatus)),
 		explanation.Attached,
 	)
 	for _, event := range explanation.Events {
@@ -274,7 +288,7 @@ func renderExplanation(explanation *session.Explanation, err error) string {
 			"%d %s %s",
 			event.Seq,
 			event.Timestamp.Local().Format(time.RFC3339),
-			event.Type,
+			terminalInlineText(string(event.Type)),
 		)
 		appendExplainField(&output, "source", string(event.Source))
 		appendExplainField(&output, "kind", string(event.Kind))
@@ -292,7 +306,12 @@ func renderExplanation(explanation *session.Explanation, err error) string {
 		appendExplainField(&output, "evidence", event.Evidence)
 		appendExplainField(&output, "suppressed", event.SuppressionReason)
 		if event.From != "" || event.To != "" {
-			fmt.Fprintf(&output, " transition=%s->%s", event.From, event.To)
+			fmt.Fprintf(
+				&output,
+				" transition=%s->%s",
+				terminalInlineText(string(event.From)),
+				terminalInlineText(string(event.To)),
+			)
 		}
 		appendExplainField(&output, "reason", event.Reason)
 		if event.UnsupportedVersion != nil {
@@ -308,7 +327,7 @@ func renderExplanation(explanation *session.Explanation, err error) string {
 			explanation.Screen.Truncated,
 		)
 		for _, row := range explanation.Screen.Rows {
-			output.WriteString(row)
+			output.WriteString(terminalInlineText(row))
 			output.WriteByte('\n')
 		}
 	}
@@ -322,13 +341,14 @@ func appendExplainField(output *strings.Builder, name, value string) {
 }
 
 func renderState(state agent.State) string {
+	value := terminalInlineText(string(state))
 	switch state {
 	case agent.StateBlocked:
-		return blockedStyle.Render(string(state))
+		return blockedStyle.Render(value)
 	case agent.StateDone:
-		return doneStyle.Render(string(state))
+		return doneStyle.Render(value)
 	default:
-		return string(state)
+		return value
 	}
 }
 
@@ -387,4 +407,13 @@ func valueOrDash(value string) string {
 		return "-"
 	}
 	return value
+}
+
+func terminalInlineText(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, value)
 }

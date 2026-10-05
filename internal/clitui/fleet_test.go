@@ -23,6 +23,7 @@ func TestRowsCopyDisplayFieldsAndStableBlockedFirst(t *testing.T) {
 	}
 	statuses[1].Name = "waiting"
 	statuses[1].Vendor = "codex"
+	statuses[1].PID = 1234
 	statuses[1].HookStatus = detect.HookActive
 	statuses[1].LastTransition = &agent.Evidence{
 		Source: agent.EvidenceHook,
@@ -41,6 +42,7 @@ func TestRowsCopyDisplayFieldsAndStableBlockedFirst(t *testing.T) {
 		Name:             "waiting",
 		Vendor:           "codex",
 		State:            agent.StateBlocked,
+		PID:              1234,
 		HookStatus:       detect.HookActive,
 		TransitionEvent:  "human_input_required",
 		TransitionSource: agent.EvidenceHook,

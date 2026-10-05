@@ -38,6 +38,7 @@ type fleetRow struct {
 	Name             string
 	Vendor           string
 	State            agent.State
+	PID              int
 	HookStatus       detect.HookStatus
 	TransitionEvent  string
 	TransitionSource agent.EvidenceSource
@@ -62,6 +63,7 @@ func projectFleet(statuses []*session.Status, filter fleetFilter) []fleetRow {
 			Name:       status.Name,
 			Vendor:     status.Vendor,
 			State:      status.State,
+			PID:        status.PID,
 			HookStatus: status.HookStatus,
 			UpdatedAt:  status.UpdatedAt,
 		}
