@@ -48,7 +48,7 @@ binaries.
 | Terminal emulation, query replies, screen rules, and `drove explain` | Shipped | [#14](https://github.com/Duang777/drove/issues/14), [spec 010](specs/010-terminal-screen-detection/spec.md) |
 | Codex approval-only OSC 9 Blocked candidate | Shipped | [#40](https://github.com/Duang777/drove/issues/40), [spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | State timeline, Blocked jumps, and exact terminal frames | Shipped | [#25](https://github.com/Duang777/drove/issues/25) |
-| `drove attach` and the Web xterm.js single-session terminal | Shipped | [#20](https://github.com/Duang777/drove/issues/20), [spec 012](specs/012-terminal-attach-web-playback/spec.md) |
+| `drove attach` and the Web xterm.js single-session terminal | Shipped | [#20](https://github.com/Duang777/drove/issues/20), [spec 013](specs/013-terminal-attach-web-playback/spec.md) |
 | Bubble Tea multi-session terminal overview | Shipped | [#41](https://github.com/Duang777/drove/issues/41), [spec 014](specs/014-terminal-overview-tui/spec.md) |
 | Control-tower grid | Planned | [#26](https://github.com/Duang777/drove/issues/26) |
 | Push notifications | Planned | [#27](https://github.com/Duang777/drove/issues/27) |
@@ -403,9 +403,10 @@ The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-st
 | [spec 009](specs/009-raw-output-chunks/spec.md) | Raw bytes and retention |
 | [spec 010](specs/010-terminal-screen-detection/spec.md) | Screen detection, query replies, and explain |
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | Terminal streams, cursors, timeline, and exact frames |
-| [spec 012, terminal attach](specs/012-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
 | [spec 012, Codex OSC 9](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 detection and body redaction |
+| [spec 013](specs/013-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
 | [spec 014](specs/014-terminal-overview-tui/spec.md) | Bubble Tea multi-session terminal overview |
+| [spec 015](specs/015-control-plane-hardening/spec.md) | Control-plane hardening delivery plan |
 | [Technical notes](docs/technical-notes.md) | A point-in-time reading. Its opening says the first six sections are not current `main` |
 | [AGENTS.md](AGENTS.md) | Directory responsibilities and engineering constraints |
 

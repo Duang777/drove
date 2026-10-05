@@ -46,7 +46,7 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | 终端屏幕仿真、查询应答、屏幕规则和 `drove explain` | 已落地 | [#14](https://github.com/Duang777/drove/issues/14)，[spec 010](specs/010-terminal-screen-detection/spec.md) |
 | Codex approval-only OSC 9 Blocked 候选 | 已落地 | [#40](https://github.com/Duang777/drove/issues/40)，[spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | 状态时间线、Blocked 跳转和精确终端帧 | 已落地 | [#25](https://github.com/Duang777/drove/issues/25) |
-| `drove attach` 与 Web xterm.js 单会话终端 | 已落地 | [#20](https://github.com/Duang777/drove/issues/20)，[spec 012](specs/012-terminal-attach-web-playback/spec.md) |
+| `drove attach` 与 Web xterm.js 单会话终端 | 已落地 | [#20](https://github.com/Duang777/drove/issues/20)，[spec 013](specs/013-terminal-attach-web-playback/spec.md) |
 | Bubble Tea 多会话终端总览 | 已落地 | [#41](https://github.com/Duang777/drove/issues/41)，[spec 014](specs/014-terminal-overview-tui/spec.md) |
 | 塔台网格 | 规划中 | [#26](https://github.com/Duang777/drove/issues/26) |
 | 推送通知 | 规划中 | [#27](https://github.com/Duang777/drove/issues/27) |
@@ -432,9 +432,10 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 | [spec 009](specs/009-raw-output-chunks/spec.md) | 原始字节与保留期 |
 | [spec 010](specs/010-terminal-screen-detection/spec.md) | 屏幕检测、查询应答和解释命令 |
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | 终端流、cursor、时间线和精确帧 |
-| [spec 012，终端 attach](specs/012-terminal-attach-web-playback/spec.md) | CLI attach 与 Web 实时终端和回放 |
 | [spec 012，Codex OSC 9](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 检测与正文打码 |
+| [spec 013](specs/013-terminal-attach-web-playback/spec.md) | CLI attach 与 Web 实时终端和回放 |
 | [spec 014](specs/014-terminal-overview-tui/spec.md) | Bubble Tea 多会话终端总览 |
+| [spec 015](specs/015-control-plane-hardening/spec.md) | 控制面加固交付计划 |
 | [技术笔记](docs/technical-notes.md) | 阶段性阅读笔记。文首说明前六节不代表当前主干 |
 | [AGENTS.md](AGENTS.md) | 目录职责和工程约束 |
 

@@ -19,6 +19,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Spec number uniqueness
+        run: scripts/check-spec-numbers.sh
+
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}
