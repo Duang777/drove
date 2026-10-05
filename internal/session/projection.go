@@ -57,6 +57,8 @@ type sessionDraft struct {
 	lastStateGapGeneration uint64
 	vendorSessionRef       string
 	workingDir             string
+	workspace              *workspaceMetadata
+	workspaceRemoved       bool
 	hasCreated             bool
 	hasState               bool
 }
@@ -65,7 +67,9 @@ type recoveryPlan struct {
 	Snapshots         []agent.RestoreSnapshot
 	VendorSessionRefs map[string]string
 	WorkingDirs       map[string]string
+	Workspaces        map[string]workspaceMetadata
 	ResumeOnStart     map[string]bool
+	WorkspaceRemoved  map[string]bool
 	Reconciliation    []store.EventRow
 	Report            RecoveryReport
 }
@@ -157,10 +161,17 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	if err := validateAgentID(row); err != nil {
 		return err
 	}
-	if row.Reason != "created" {
+	switch row.Reason {
+	case "created":
+		return p.applyCreated(row)
+	case workspaceRemovedReason:
+		return p.applyWorkspaceRemoved(row)
+	default:
 		return projectionError(row, "unknown lifecycle reason %q", row.Reason)
 	}
+}
 
+func (p *recoveryProjector) applyCreated(row store.EventRow) error {
 	draft := p.draft(row)
 	if draft.hasCreated {
 		return projectionError(row, "duplicate creation metadata")
@@ -250,12 +261,46 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 		}
 		draft.workingDir = workingDir
 	}
+	if err := validateWorkspaceMetadata(
+		metadata.Workspace,
+		metadata.WorkingDir,
+	); err != nil {
+		return projectionWrapError(row, "validate workspace metadata", err)
+	}
+	if metadata.Workspace != nil {
+		workspace := *metadata.Workspace
+		draft.workspace = &workspace
+	}
 
 	draft.name = metadata.Name
 	draft.vendor = metadata.Vendor
 	draft.state = agent.StatePending
 	draft.updatedAt = row.Timestamp
 	draft.hasCreated = true
+	return nil
+}
+
+func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
+	draft := p.draft(row)
+	if !draft.hasCreated && !draft.hasState {
+		return projectionError(row, "workspace removal has no session history")
+	}
+	if draft.workspaceRemoved {
+		return projectionError(row, "duplicate workspace removal")
+	}
+	var payload workspaceRemovedPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return projectionWrapError(row, "decode workspace removal", err)
+	}
+	if payload.Version != 1 {
+		return projectionError(
+			row,
+			"unsupported workspace removal version %d",
+			payload.Version,
+		)
+	}
+	draft.workspaceRemoved = true
+	draft.updatedAt = row.Timestamp
 	return nil
 }
 
@@ -611,7 +656,9 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		Snapshots:         make([]agent.RestoreSnapshot, 0, len(drafts)),
 		VendorSessionRefs: make(map[string]string),
 		WorkingDirs:       make(map[string]string),
+		Workspaces:        make(map[string]workspaceMetadata),
 		ResumeOnStart:     make(map[string]bool),
+		WorkspaceRemoved:  make(map[string]bool),
 		Report:            p.report,
 	}
 	nextSeq := p.lastSeq
@@ -631,10 +678,20 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		if draft.vendorSessionRef != "" {
 			plan.VendorSessionRefs[draft.id] = draft.vendorSessionRef
 			plan.ResumeOnStart[draft.id] =
-				state != agent.StateDone && state != agent.StateStopped
+				!draft.workspaceRemoved &&
+					state != agent.StateDone &&
+					state != agent.StateStopped
 		}
-		if draft.workingDir != "" {
-			plan.WorkingDirs[draft.id] = draft.workingDir
+		workingDir := draft.workingDir
+		if draft.workspaceRemoved {
+			workingDir = ""
+			plan.WorkspaceRemoved[draft.id] = true
+		}
+		if workingDir != "" {
+			plan.WorkingDirs[draft.id] = workingDir
+		}
+		if draft.workspace != nil {
+			plan.Workspaces[draft.id] = *draft.workspace
 		}
 		lastError := draft.lastError
 		updatedAt := draft.updatedAt
@@ -679,7 +736,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			ID:              agent.ID(draft.id),
 			Name:            draft.name,
 			Vendor:          draft.vendor,
-			WorkingDir:      draft.workingDir,
+			WorkingDir:      workingDir,
 			RunMode:         draft.runMode,
 			HookPolicy:      draft.hookPolicy,
 			SignalInjection: draft.signalInjection,

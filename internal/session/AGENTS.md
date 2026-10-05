@@ -26,7 +26,9 @@
 - observation actor 独占容量 64 的 inbox 和一个真实计时器，一次只提交一个
   Decision；每次提交后按 Detector 返回的最早 timer ref 重置计时器，Detector
   本身不持有 goroutine 或回调。
-- 一个全局 Committer goroutine 独占运行时事件序号和写入顺序：Store batch 成功后才应用 Agent 投影并按序发布 Hub。
+- 一个全局 Committer goroutine 独占运行时事件序号和写入顺序。Store batch 成功后，
+  Committer 才应用 Agent 投影并按序发布 Hub。workspace removal 使用 typed
+  operation，在 append 后清除 working directory、关闭 Resume，再发布事件。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent →
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →
@@ -38,6 +40,27 @@
 - `Start` 把清理后的绝对工作目录放进 Agent 和创建事件的私有持久载荷；Hub 与公开
   replay 删除该字段。恢复投影把目录放回 Agent 与 managed record，Resume 用它配置
   PTY，`Status.Dir` 对控制客户端返回该目录。
+- `StartRequest.Worktree` 存在时，Manager 在生成 Agent ID 后调用
+  `internal/workspace` 创建独立 worktree，并把 Agent 工作目录切到该路径。创建事件
+  持久化前的失败会回滚 worktree 和本次新建的分支；SQLite append 成功后，即使投影
+  或 Hub 发布失败也不得回滚。创建事件 durable 后必须确认 preparation sidecar；确认
+  失败时保留 creation reservation 并 fail-stop，由 Bootstrap 按私有 workspace metadata
+  采纳。
+- `Start` 从生成 Agent ID 起登记 workspace creation reservation；创建事件 durable
+  后将 reservation 与 Agent/PTY 登记原子交接。durable 后的发布失败保留 reservation
+  直到 daemon fail-stop，防止清理已由事件拥有的目录。
+- `CleanupWorkspace` 只接受终态或无会话的 Agent，并在执行 Git 清理期间登记
+  reservation 与 completion channel。`Resume` 必须拒绝同一 Agent，且
+  `Status.Resumable` 在 reservation 存续期间必须为 false，避免恢复进程与目录删除
+  并发。
+- workspace 先持久化 removal intent，再执行物理删除。已登记 Agent 通过 typed
+  Committer 提交 `session_lifecycle(workspace_removed)`。Store durable 后，
+  `AcknowledgeRemoval` 才删除 sidecar。物理删除 pending 时，运行时立即关闭 Resume。
+- Bootstrap 在返回 Manager 前先调用 `ReconcilePreparations`，按私有 workspace
+  metadata 采纳 durable 创建并回滚无对应事件的 orphan，再调用 `ReconcileRemovals`。
+  removal reconciliation 补写缺失 tombstone；如果事件已存在，则只删除 sidecar。
+- 创建事件的私有 `workspace` 元数据记录仓库、路径和分支；Hub 与公开 replay 删除
+  整个对象，恢复投影仍校验其中的绝对路径、分支及其路径与 working directory 一致。
 - 初始终端尺寸先经 `term.NewSize` 校验，再显式转换为 `pty.Size`；
   PTY 必须在子进程启动前应用该尺寸。
 - session signal injection 在创建事件前向 adapter 请求纯计划，并只在
@@ -51,7 +74,7 @@
   可等待 `starting -> working`，同时防止短进程先提交错误终态。
 - 运行中会话记录停止原因和退出认领状态；`Stop`、`Close` 与自然退出通过同一个锁确定唯一终态。
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
-- `Close()`：拒绝新 Start → 等待进行中的 Start → 关闭全部 PTY 并等待回调 →
+- `Close()`：拒绝新 Start → 等待进行中的 Start 和 workspace cleanup → 关闭全部 PTY 并等待回调 →
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
 - Manager 把同一 `terminationGrace` 传给新建和恢复的 PTY；关闭顺序仍按 Agent ID
   串行，不在 session 层复制信号升级逻辑。
@@ -94,7 +117,8 @@
   `output.chunk`。input 与 attachment 不改变状态；`output.chunk` 与旧 `output`
   只更新已有会话的事件事实。
 - 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
-  只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。
+  只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。候选等待同 Agent
+  cleanup completion，只有成功安装 resume reservation 后才消费；取消等待保留候选。
 - 信号与状态证据 reader 同时接受 v1、v2、typed screen v3 和 typed terminal v4；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。
@@ -109,6 +133,7 @@
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
 - 临时注入路径必须二次校验并拒绝 symlink；adapter 不得直接操作文件系统。
 - 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`、
+  `WorktreeRequest`、
   `ExplainOptions`、`ExplainEvent`、`ExplainScreen`、`Explanation`、
   `AttachmentID`、`AttachmentMode`、`AttachmentPurpose`、`AttachmentOptions`、
   `TerminalAttachment`、`LiveSnapshot`。

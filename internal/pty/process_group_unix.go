@@ -28,7 +28,11 @@ func processGroupAlive(pid int) (bool, error) {
 	switch {
 	case err == nil:
 		return true, nil
-	case errors.Is(err, syscall.ESRCH), errors.Is(err, syscall.EPERM):
+	case errors.Is(err, syscall.EPERM):
+		// EPERM proves neither ownership nor disappearance. Keep polling until
+		// ESRCH or the caller's bounded grace period resolves the ambiguity.
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
 		return false, nil
 	default:
 		return false, err

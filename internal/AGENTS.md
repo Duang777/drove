@@ -8,14 +8,15 @@
 
 ```
 cmd/* ──▶ internal/client ──▶ internal/session
-                                  │
-    ┌──────────┬────────┬────────┼────────┬─────────┬─────────┐
-    ▼          ▼        ▼        ▼        ▼         ▼
-  agent      event    store     pty    adapter ──▶ detect
- (状态机)  (事件Hub) (SQLite) (PTY管理) (跨厂商) (信号融合)
+                                  ├──▶ agent
+                                  ├──▶ event
+                                  ├──▶ store
+                                  ├──▶ pty
+                                  ├──▶ adapter ──▶ detect
+                                  └──▶ workspace
 ```
 
-- `session` 编排一切：agent + pty + adapter + detect + event + store。
+- `session` 编排一切：agent + pty + adapter + detect + event + store + workspace。
 - `daemon` 装配 session/api/config/store/hub（composition root）。
 - `localipc` 封装 Unix listener、peer credential 与客户端 transport，供 daemon
   和 client 依赖。
@@ -25,6 +26,8 @@ cmd/* ──▶ internal/client ──▶ internal/session
   `agent` 快照与 Change。其余叶子包不得反向依赖 `session`。
 - `term` 负责无厂商逻辑的流式控制序列清洗、屏幕仿真和有界终端查询应答，
   供 `adapter`、`recording` 和 `session` 复用。
+- `workspace` 只依赖 Git 与文件系统，负责 Drove 管理的 worktree 生命周期；CLI
+  可直接调用它执行本地 `ls` / `rm`。
 
 ## 约束
 

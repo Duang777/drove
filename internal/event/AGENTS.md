@@ -22,7 +22,8 @@
 - `agent.resumed` 记录显式原生恢复；SQLite 载荷保留 opaque vendor ref 供恢复校验，
   Hub 与其它公开事件视图只暴露版本号。
 - `session_lifecycle(created)` 可分别携带公开 payload 与私有持久 payload；当前私有
-  字段是原始绝对工作目录，Hub 只能发布公开版本。
+  字段是原始绝对工作目录和受管 workspace 的仓库、路径、分支，Hub 只能发布删除
+  这些字段后的公开版本。
 - v3 增加可选的 typed screen attribution；生产 writer 只对 screen 来源写 v3，
   其他来源继续写原版本。screen attribution 只保存稳定静态元数据和已提交输出位置。
 - v4 增加可选的 typed terminal attribution；terminal notify 不使用 delivery ID，

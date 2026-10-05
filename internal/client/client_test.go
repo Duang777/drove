@@ -81,6 +81,178 @@ func TestSendInputRejectsInvalidUTF8BeforeRequest(t *testing.T) {
 	}
 }
 
+func TestCleanupWorktreeUsesAuthenticatedDelete(t *testing.T) {
+	dataDir := t.TempDir()
+	token, err := auth.Ensure(dataDir)
+	if err != nil {
+		t.Fatalf("ensure token: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+		}
+		if r.URL.EscapedPath() != "/api/v1/worktrees/agent%2Fone" {
+			t.Errorf("path = %q, want escaped worktree path", r.URL.EscapedPath())
+		}
+		if r.URL.RawQuery != "force=true" {
+			t.Errorf("query = %q, want force=true", r.URL.RawQuery)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(
+			w,
+			`{"agent_id":"agent/one","branch":"feature/isolated"}`,
+		)
+	}))
+	defer server.Close()
+
+	c := New(
+		strings.TrimPrefix(server.URL, "http://"),
+		WithTokenFile(auth.TokenPath(dataDir)),
+	)
+	c.hc.Timeout = time.Millisecond
+	removed, err := c.CleanupWorktree(
+		context.Background(),
+		"agent/one",
+		true,
+	)
+	if err != nil {
+		t.Fatalf("cleanup worktree: %v", err)
+	}
+	if removed.AgentID != "agent/one" ||
+		removed.Branch != "feature/isolated" {
+		t.Fatalf("removed worktree = %+v", removed)
+	}
+}
+
+func TestCleanupWorktreeReportsOldDaemonRoute(t *testing.T) {
+	server := httptest.NewServer(http.NewServeMux())
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := c.CleanupWorktree(
+		context.Background(),
+		"11111111-1111-4111-8111-111111111111",
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "restart the daemon") {
+		t.Fatalf("cleanup error = %v, want daemon restart guidance", err)
+	}
+	if IsUserError(err) {
+		t.Fatalf("old daemon cleanup error was classified as user error: %v", err)
+	}
+}
+
+func TestCleanupWorktreeKeepsCurrentDaemonNotFoundAsUserError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(
+			w,
+			`{"error":"session: workspace not found"}`,
+			http.StatusNotFound,
+		)
+	}))
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := c.CleanupWorktree(
+		context.Background(),
+		"11111111-1111-4111-8111-111111111111",
+		false,
+	)
+	if err == nil {
+		t.Fatal("cleanup succeeded for an unknown workspace")
+	}
+	if !IsUserError(err) {
+		t.Fatalf("current daemon not-found error was not a user error: %v", err)
+	}
+	if strings.Contains(err.Error(), "restart the daemon") {
+		t.Fatalf("current daemon not-found error requested a restart: %v", err)
+	}
+}
+
+func TestStartUsesDedicatedWorktreeEndpointWithoutClientTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/worktrees" {
+			t.Errorf("path = %q, want worktree endpoint", r.URL.Path)
+		}
+		var request session.StartRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode start request: %v", err)
+		}
+		if request.Worktree == nil {
+			t.Error("worktree request is missing")
+		}
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"agent_id":"worktree-agent"}`)
+	}))
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	c.hc.Timeout = time.Millisecond
+	status, err := c.Start(context.Background(), session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err != nil {
+		t.Fatalf("start worktree session: %v", err)
+	}
+	if status.AgentID != "worktree-agent" {
+		t.Fatalf("worktree status = %+v", status)
+	}
+}
+
+func TestWorktreeStartDoesNotFallBackToOldAgentEndpoint(t *testing.T) {
+	var agentStarts atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents", func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		agentStarts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"agent_id":"unsafe-agent"}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := c.Start(context.Background(), session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "404 Not Found") {
+		t.Fatalf("worktree start error = %v, want 404", err)
+	}
+	if IsUserError(err) {
+		t.Fatalf("old daemon incompatibility was classified as user error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "restart the daemon") {
+		t.Fatalf("worktree start error = %v, want restart guidance", err)
+	}
+	if agentStarts.Load() != 0 {
+		t.Fatalf("old agent endpoint starts = %d, want 0", agentStarts.Load())
+	}
+}
+
 func TestRotateTokenUsesAuthenticatedPost(t *testing.T) {
 	dataDir := t.TempDir()
 	token, err := auth.Ensure(dataDir)
@@ -509,6 +681,20 @@ func TestEnsureDaemonDoesNotAutoStartAfterUnauthorized(t *testing.T) {
 	}
 	if errors.Is(err, ErrDaemonUnreachable) {
 		t.Fatalf("unauthorized error was treated as unreachable: %v", err)
+	}
+}
+
+func TestEnsureDaemonPreservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c := New("127.0.0.1:1")
+	err := c.EnsureDaemon(ctx, "/tmp/config.json")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensure daemon error = %v, want context canceled", err)
+	}
+	if errors.Is(err, ErrDaemonUnreachable) {
+		t.Fatalf("cancellation was classified as daemon unreachable: %v", err)
 	}
 }
 

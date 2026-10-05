@@ -31,6 +31,7 @@
 | `internal/event` | 事件模型、Hub 扇出、订阅 |
 | `internal/session` | 会话编排：agent 创建、快照、回放 |
 | `internal/store` | 持久化（SQLite，只追加事件日志） |
+| `internal/workspace` | Drove 管理的 Git worktree 创建、枚举与显式清理 |
 | `internal/adapter` | 跨厂商适配层（claude/codex/generic/ACP） |
 | `internal/daemon` | daemon 生命周期、IPC |
 | `internal/api` | REST + WebSocket API |

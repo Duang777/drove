@@ -6,8 +6,13 @@
 
 ## 关键设计
 
-- `Client` 封装 REST 调用（List / Start / Resume / Status / Stop / SendInput / Replay /
-  Explain / Timeline / BlockedOccurrence / Frame / RotateToken / IssueLoginCode）；
+- `Client` 封装 REST 调用（List / Start / Resume / Status / Stop / CleanupWorktree /
+  SendInput / Replay / Explain / Timeline / BlockedOccurrence / Frame / RotateToken /
+  IssueLoginCode）；
+  普通 Start 使用 `/api/v1/agents`，带 Worktree 的 Start 使用
+  `/api/v1/worktrees`，避免旧 daemon 忽略未知字段后在原仓库启动进程。worktree 创建和
+  清理不使用 Client 的固定 HTTP timeout，只由调用方 context 控制；旧 daemon 对创建
+  或删除专用路由返回的路由级 404 属于版本不兼容运行错误，不归类为用户输入错误；
   CLI 使用 `NewLocal` 经
   `$DataDir/run/droved.sock` 调用，
   TCP 构造器保留给测试与浏览器边界；Explain 仅编码路径、可选 limit 并解码类型化
@@ -28,12 +33,17 @@
 - `EnsureDaemon(ctx, configPath)`：先探测 `/api/v1/agents`（500ms 超时）；仅网络不可达时自动拉起，认证失败不得启动第二个 daemon。
 - 自动拉起日志与控制令牌使用同一个 DataDir；缺失目录以 `0700` 创建，新日志文件使用
   `0600`，既有目录模式不自动修改。
-- 所有错误转换为 `ErrDaemonUnreachable`（区别于业务错误），CLI 据此提示用户。
+- 网络错误转换为 `ErrDaemonUnreachable`，调用方 context 取消或超时保持原错误；
+  daemon 返回的 400、404、409、413 由
+  `IsUserError` 识别为用户可纠正的请求错误。terminal stream 中 unknown agent、
+  not attached、invalid cursor 等可纠正 code 使用相同分类；internal/protocol
+  错误不降级。CLI 据此选择退出码。
 
 ## 约束
 
 - 禁止在本包解析 agent 状态机/事件结构——只做 JSON 透传。
 - 自动拉起只允许出现在 `EnsureDaemon`；其它路径不得隐式启动进程。
 - 导出类型：`Client`、`HookRelay`、`HookRelayConfig`、
-  `TerminalStream`、`TerminalAccess`、`TerminalSubscription`、`TerminalMessage`、
-  `TerminalStreamError`、`ErrDaemonUnreachable`。
+  `RemovedWorktree`、`TerminalStream`、`TerminalAccess`、`TerminalSubscription`、
+  `TerminalMessage`、
+  `TerminalStreamError`、`IsUserError`、`ErrDaemonUnreachable`。

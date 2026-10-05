@@ -125,6 +125,12 @@ type decisionOperation struct {
 
 func (decisionOperation) isCommitOperation() {}
 
+type workspaceRemovedOperation struct {
+	managed *managedAgent
+}
+
+func (workspaceRemovedOperation) isCommitOperation() {}
+
 type commitRequest struct {
 	operation commitOperation
 	result    chan commitResult
@@ -139,6 +145,7 @@ type commitReceipt struct {
 	FirstSeq  uint64
 	LastSeq   uint64
 	Timestamp time.Time
+	Durable   bool
 }
 
 func newEventsOperation(drafts []event.Draft) eventsOperation {
@@ -246,6 +253,19 @@ func (c *committer) CommitDecision(
 		ctx,
 		newDecisionOperation(target, state, decision, drafts),
 	)
+	return result.receipt, err
+}
+
+func (c *committer) CommitWorkspaceRemoved(
+	ctx context.Context,
+	target *managedAgent,
+) (commitReceipt, error) {
+	if target == nil || target.agent == nil {
+		return commitReceipt{}, errors.New(
+			"session: workspace removal commit requires a managed Agent",
+		)
+	}
+	result, err := c.submit(ctx, workspaceRemovedOperation{managed: target})
 	return result.receipt, err
 }
 
@@ -441,10 +461,17 @@ func (c *committer) execute(
 			err: fmt.Errorf("session: append event batch after seq %d: %w", lastSeq, err),
 		}
 	}
+	receipt := commitReceipt{
+		FirstSeq:  committed[0].Seq,
+		LastSeq:   committed[len(committed)-1].Seq,
+		Timestamp: committed[len(committed)-1].Timestamp,
+		Durable:   true,
+	}
 	c.clock.advance(newLastSeq)
 	wantLastSeq := lastSeq + uint64(len(committed))
 	if newLastSeq != wantLastSeq {
 		return newLastSeq, commitResult{
+			receipt: receipt,
 			err: fmt.Errorf(
 				"session: store returned last seq %d, want %d",
 				newLastSeq,
@@ -455,6 +482,7 @@ func (c *committer) execute(
 	if apply != nil {
 		if err := apply(committed); err != nil {
 			return newLastSeq, commitResult{
+				receipt: receipt,
 				err: fmt.Errorf(
 					"session: apply committed projection at seq %d: %w",
 					newLastSeq,
@@ -465,16 +493,11 @@ func (c *committer) execute(
 	}
 	if err := c.hub.PublishBatch(committed); err != nil {
 		return newLastSeq, commitResult{
-			err: fmt.Errorf("session: publish committed batch at seq %d: %w", newLastSeq, err),
+			receipt: receipt,
+			err:     fmt.Errorf("session: publish committed batch at seq %d: %w", newLastSeq, err),
 		}
 	}
-	return newLastSeq, commitResult{
-		receipt: commitReceipt{
-			FirstSeq:  committed[0].Seq,
-			LastSeq:   committed[len(committed)-1].Seq,
-			Timestamp: committed[len(committed)-1].Timestamp,
-		},
-	}
+	return newLastSeq, commitResult{receipt: receipt}
 }
 
 func prepareCommitOperation(
@@ -583,6 +606,30 @@ func prepareCommitOperation(
 			typed.managed.setVendorSessionReference(signal.VendorSessionRef)
 			return nil
 		}, signal.ReceivedAt, nil
+	case workspaceRemovedOperation:
+		if typed.managed == nil || typed.managed.agent == nil {
+			return nil, nil, time.Time{}, errors.New(
+				"session: workspace removal operation requires a managed Agent",
+			)
+		}
+		payload, encodeErr := json.Marshal(workspaceRemovedPayload{Version: 1})
+		if encodeErr != nil {
+			return nil, nil, time.Time{}, fmt.Errorf(
+				"session: encode workspace removal: %w",
+				encodeErr,
+			)
+		}
+		id := string(typed.managed.agent.ID())
+		draft := event.NewSessionLifecycleDraft(
+			id,
+			id,
+			workspaceRemovedReason,
+			string(payload),
+		)
+		return []event.Draft{draft}, func([]event.Event) error {
+			typed.managed.applyWorkspaceRemoved()
+			return nil
+		}, time.Now().UTC(), nil
 	default:
 		return nil, nil, time.Time{}, fmt.Errorf(
 			"session: unknown commit operation %T",

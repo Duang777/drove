@@ -63,6 +63,8 @@ type StartRequest struct {
 	Mode agent.RunMode `json:"mode,omitempty"`
 	// Hooks controls hook authority; empty selects a capability-based default.
 	Hooks agent.HookPolicy `json:"hooks,omitempty"`
+	// Worktree requests a managed Git worktree rooted at Dir.
+	Worktree *WorktreeRequest `json:"worktree,omitempty"`
 }
 
 type createdPayload struct {
@@ -76,6 +78,7 @@ type createdPayload struct {
 	SignalInjectionStatus *agent.SignalInjectionStatus `json:"signal_injection_status,omitempty"`
 	SignalInjectionReason *agent.SignalInjectionReason `json:"signal_injection_reason,omitempty"`
 	WorkingDir            string                       `json:"working_dir,omitempty"`
+	Workspace             *workspaceMetadata           `json:"workspace,omitempty"`
 }
 
 type inputAuditPayload struct {
@@ -183,14 +186,19 @@ type Manager struct {
 	injectionModes   map[string]agent.SignalInjectionMode
 	injectionFS      signalInjectionFS
 	signalSocketPath string
+	workspaces       workspaceLifecycle
+	workspaceErr     error
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*managedAgent
 	sessions map[agent.ID]*runningSession
 	resuming map[agent.ID]struct{}
+	cleaning map[agent.ID]chan struct{}
+	creating map[agent.ID]struct{}
 	closed   bool
 
 	starts    sync.WaitGroup
+	cleanups  sync.WaitGroup
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -231,6 +239,8 @@ func NewManager(
 		agents:        make(map[agent.ID]*managedAgent),
 		sessions:      make(map[agent.ID]*runningSession),
 		resuming:      make(map[agent.ID]struct{}),
+		cleaning:      make(map[agent.ID]chan struct{}),
+		creating:      make(map[agent.ID]struct{}),
 		detectConfig:  detect.DefaultConfig(),
 		clock:         systemObservationClock{},
 		newCredential: generateSignalCredential,
@@ -271,8 +281,11 @@ func Bootstrap(
 		}
 		managed := newManagedAgent(restored)
 		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
-		managed.workingDir = plan.WorkingDirs[string(snapshot.ID)]
-		managed.resumeOnStart = plan.ResumeOnStart[string(snapshot.ID)]
+		managed.setWorkspaceState(workspaceRuntimeState{
+			workingDir:    plan.WorkingDirs[string(snapshot.ID)],
+			resumeOnStart: plan.ResumeOnStart[string(snapshot.ID)],
+			removed:       plan.WorkspaceRemoved[string(snapshot.ID)],
+		})
 		restoredAgents[snapshot.ID] = managed
 	}
 
@@ -283,6 +296,19 @@ func Bootstrap(
 	hub := event.NewHub(committedLastSeq)
 	manager := NewManager(reg, hub, st, committedLastSeq, options...)
 	manager.agents = restoredAgents
+	if err := manager.reconcileWorkspacePreparations(
+		ctx,
+		plan.Workspaces,
+		plan.WorkspaceRemoved,
+	); err != nil {
+		_ = manager.Close()
+		return nil, err
+	}
+	if err := manager.reconcileWorkspaceRemovals(ctx, plan.Workspaces); err != nil {
+		_ = manager.Close()
+		return nil, err
+	}
+	committedLastSeq = manager.committer.HighWatermark()
 	plan.Report.LastSeq = committedLastSeq
 	return &BootstrapResult{
 		Manager:  manager,
@@ -292,7 +318,10 @@ func Bootstrap(
 }
 
 // Start 启动一个 agent 会话。
-func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) {
+func (m *Manager) Start(
+	ctx context.Context,
+	req StartRequest,
+) (status *Status, resultErr error) {
 	if beginErr := m.beginStart(); beginErr != nil {
 		return nil, fmt.Errorf("session: start: %w", beginErr)
 	}
@@ -338,6 +367,32 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 
 	// 2. 生成会话专属配置，再持久化会话元数据。
 	id := agent.ID(uuid.NewString())
+	workspaceCommitted := false
+	m.reserveWorkspaceCreation(id)
+	creationReserved := true
+	defer func() {
+		if creationReserved && !workspaceCommitted {
+			m.releaseWorkspaceCreation(id)
+		}
+	}()
+	preparedWorkspace, err := m.prepareWorkspace(
+		ctx,
+		string(id),
+		req.Worktree,
+		req.Dir,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if resultErr == nil || workspaceCommitted {
+			return
+		}
+		resultErr = errors.Join(resultErr, m.discardWorkspace(preparedWorkspace))
+	}()
+	if preparedWorkspace != nil {
+		req.Dir = preparedWorkspace.Path
+	}
 	if req.Name == "" {
 		req.Name = req.Vendor + "-" + string(id)[:8]
 	}
@@ -366,7 +421,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		),
 	)
 	managed := newManagedAgent(a)
-	managed.workingDir = req.Dir
+	managed.setWorkspaceState(workspaceRuntimeState{workingDir: req.Dir})
 	persistedMode := req.Mode
 	persistedPolicy := req.Hooks
 	persistedInjection := injection.mode
@@ -382,6 +437,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		SignalInjectionStatus: &persistedInjectionStatus,
 		SignalInjectionReason: &persistedInjectionReason,
 		WorkingDir:            req.Dir,
+		Workspace:             metadataForWorkspace(preparedWorkspace),
 	}
 	storedPayload, err := json.Marshal(metadata)
 	if err != nil {
@@ -392,6 +448,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		)
 	}
 	metadata.WorkingDir = ""
+	metadata.Workspace = nil
 	publicPayload, err := json.Marshal(metadata)
 	if err != nil {
 		cleanupErr := m.cleanupSignalInjection(id, injection.dir)
@@ -410,7 +467,7 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 		return nil, errors.Join(err, cleanupErr)
 	}
 	running.injectionDir = injection.dir
-	if _, err := m.committer.CommitAgent(
+	receipt, err := m.committer.CommitAgent(
 		ctx,
 		a,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
@@ -425,7 +482,23 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 			string(publicPayload),
 			string(storedPayload),
 		)},
-	); err != nil {
+	)
+	if receipt.Durable {
+		workspaceCommitted = true
+		if preparedWorkspace != nil {
+			if acknowledgeErr := m.workspaces.AcknowledgePreparation(
+				*preparedWorkspace,
+			); acknowledgeErr != nil {
+				acknowledgeErr = fmt.Errorf(
+					"session: acknowledge durable workspace preparation: %w",
+					acknowledgeErr,
+				)
+				m.committer.Fail(acknowledgeErr)
+				err = errors.Join(err, acknowledgeErr)
+			}
+		}
+	}
+	if err != nil {
 		outputErr := running.output.Close()
 		running.observer.Close()
 		cleanupErr := m.cleanupSignalInjection(id, running.injectionDir)
@@ -439,7 +512,9 @@ func (m *Manager) Start(ctx context.Context, req StartRequest) (*Status, error) 
 	m.mu.Lock()
 	m.agents[id] = managed
 	m.sessions[id] = running
+	delete(m.creating, id)
 	m.mu.Unlock()
+	creationReserved = false
 
 	if err := m.activate(ctx, activation{
 		id:           id,
@@ -611,6 +686,16 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
+	return m.resumeReserved(ctx, id, managed, entry, ref)
+}
+
+func (m *Manager) resumeReserved(
+	ctx context.Context,
+	id agent.ID,
+	managed *managedAgent,
+	entry adapter.Entry,
+	ref string,
+) (*Status, error) {
 	reserved := true
 	defer func() {
 		if reserved {
@@ -716,7 +801,7 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 		command:      command.Name,
 		args:         injection.args,
 		env:          processEnv,
-		dir:          managed.workingDir,
+		dir:          managed.workspaceState().workingDir,
 		terminalSize: terminalSize,
 		ptySize:      initialPTYSize,
 		outputOffset: initialOutputOffset,
@@ -745,6 +830,12 @@ func (m *Manager) reserveResume(
 ) (*managedAgent, adapter.Entry, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.reserveResumeLocked(id)
+}
+
+func (m *Manager) reserveResumeLocked(
+	id agent.ID,
+) (*managedAgent, adapter.Entry, string, error) {
 	managed, ok := m.agents[id]
 	if !ok {
 		return nil, adapter.Entry{}, "", fmt.Errorf("%w: %q", ErrUnknownAgent, id)
@@ -759,6 +850,28 @@ func (m *Manager) reserveResume(
 	if _, reserved := m.resuming[id]; reserved {
 		return nil, adapter.Entry{}, "", fmt.Errorf(
 			"%w: agent %q is already resuming",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if _, cleaning := m.cleaning[id]; cleaning {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q workspace is being removed",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	workspaceState := managed.workspaceState()
+	if workspaceState.removalPending {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q workspace removal is pending",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if workspaceState.removed {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q workspace was removed",
 			ErrResumeConflict,
 			id,
 		)
@@ -812,6 +925,7 @@ func (m *Manager) Close() error {
 		m.mu.Unlock()
 
 		m.starts.Wait()
+		m.cleanups.Wait()
 
 		type attachedSession struct {
 			id      agent.ID
@@ -920,6 +1034,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	m.mu.RLock()
 	sess, _ := m.sessions[id]
 	_, reserved := m.resuming[id]
+	_, cleaning := m.cleaning[id]
 	var process processSession
 	hookStatus := detect.HookDetached
 	if sess != nil {
@@ -931,19 +1046,24 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 	state := a.State()
 	ref := managed.vendorSessionReference()
 	entry, exactVendor := m.reg.Lookup(a.Vendor())
+	workspaceState := managed.workspaceState()
 	resumable := state == agent.StateStopped &&
 		sess == nil &&
 		!reserved &&
+		!cleaning &&
+		!workspaceState.removalPending &&
+		!workspaceState.removed &&
 		ref != "" &&
 		exactVendor &&
 		entry.SupportsResume()
 	m.mu.RUnlock()
 
+	workingDir := workspaceState.workingDir
 	st := &Status{
 		AgentID:        string(a.ID()),
 		Name:           a.Name(),
 		Vendor:         a.Vendor(),
-		Dir:            a.WorkingDir(),
+		Dir:            workingDir,
 		Mode:           a.RunMode(),
 		State:          state,
 		CreatedAt:      a.CreatedAt(),
@@ -989,23 +1109,25 @@ func (m *Manager) List() []*Status {
 
 // ResumeOnStart attempts each recovery-marked Agent once in creation order.
 func (m *Manager) ResumeOnStart(ctx context.Context) []StartupResumeResult {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	type candidate struct {
 		id        agent.ID
 		createdAt time.Time
 	}
-	m.mu.Lock()
+	m.mu.RLock()
 	candidates := make([]candidate, 0)
 	for id, managed := range m.agents {
-		if !managed.resumeOnStart {
+		if !managed.shouldResumeOnStart() {
 			continue
 		}
-		managed.resumeOnStart = false
 		candidates = append(candidates, candidate{
 			id:        id,
 			createdAt: managed.agent.CreatedAt(),
 		})
 	}
-	m.mu.Unlock()
+	m.mu.RUnlock()
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].createdAt.Equal(candidates[j].createdAt) {
 			return candidates[i].id < candidates[j].id
@@ -1015,13 +1137,69 @@ func (m *Manager) ResumeOnStart(ctx context.Context) []StartupResumeResult {
 
 	results := make([]StartupResumeResult, 0, len(candidates))
 	for _, candidate := range candidates {
-		_, err := m.Resume(ctx, candidate.id)
+		attempted, err := m.resumeOnStart(ctx, candidate.id)
+		if !attempted && err == nil {
+			continue
+		}
 		results = append(results, StartupResumeResult{
 			AgentID: candidate.id,
 			Err:     err,
 		})
 	}
 	return results
+}
+
+func (m *Manager) resumeOnStart(
+	ctx context.Context,
+	id agent.ID,
+) (bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, fmt.Errorf(
+				"session: wait to resume agent %q at startup: %w",
+				id,
+				err,
+			)
+		}
+		if err := m.beginStart(); err != nil {
+			return false, fmt.Errorf("session: resume at startup: %w", err)
+		}
+
+		m.mu.Lock()
+		managed, exists := m.agents[id]
+		if !exists || !managed.shouldResumeOnStart() {
+			m.mu.Unlock()
+			m.endStart()
+			return false, nil
+		}
+		if completion, cleaning := m.cleaning[id]; cleaning {
+			m.mu.Unlock()
+			m.endStart()
+			select {
+			case <-completion:
+				continue
+			case <-ctx.Done():
+				return false, fmt.Errorf(
+					"session: wait for workspace cleanup before resuming agent %q: %w",
+					id,
+					ctx.Err(),
+				)
+			}
+		}
+		managed, entry, ref, err := m.reserveResumeLocked(id)
+		if err == nil {
+			managed.consumeResumeOnStart()
+		}
+		m.mu.Unlock()
+		if err != nil {
+			m.endStart()
+			return false, err
+		}
+
+		_, err = m.resumeReserved(ctx, id, managed, entry, ref)
+		m.endStart()
+		return true, err
+	}
 }
 
 // Replay 返回某会话的事件流（来自 store，按 seq 升序）。

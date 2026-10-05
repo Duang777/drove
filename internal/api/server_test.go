@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -56,6 +57,12 @@ func TestHandleCreateMapsHookConfigurationErrors(t *testing.T) {
 			name:       "signal origin unavailable",
 			body:       `{"vendor":"claude","command":"/bin/true","hooks":"auto"}`,
 			wantStatus: http.StatusServiceUnavailable,
+		},
+		{
+			name:            "workspace manager unavailable",
+			configureOrigin: true,
+			body:            `{"vendor":"generic","command":"/bin/true","worktree":{}}`,
+			wantStatus:      http.StatusServiceUnavailable,
 		},
 	}
 
@@ -109,6 +116,217 @@ func TestHandleCreateRejectsInvalidModeWithoutHistory(t *testing.T) {
 	}
 	if lastSeq != 0 {
 		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestHandleCreateMapsWorkspaceRequestError(t *testing.T) {
+	server, manager, st := newTestServerWithOptions(
+		t,
+		true,
+		auth.DefaultOptions(),
+		session.WithWorkspaces(t.TempDir()),
+	)
+	body, err := json.Marshal(session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Dir:      t.TempDir(),
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/worktrees",
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+
+	if rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), session.ErrWorkspaceRequest.Error()) {
+		t.Fatalf(
+			"response = %d %q, want workspace request 400",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("manager retained %d agents, want 0", len(got))
+	}
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestHandleCreateMapsWorkspaceOperationalError(t *testing.T) {
+	dataDir := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(dataDir, "worktrees"),
+		[]byte("not a directory"),
+		0o600,
+	); err != nil {
+		t.Fatalf("block worktree root: %v", err)
+	}
+	server, manager, st := newTestServerWithOptions(
+		t,
+		true,
+		auth.DefaultOptions(),
+		session.WithWorkspaces(dataDir),
+	)
+	body, err := json.Marshal(session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Dir:      newAPIWorkspaceRepository(t),
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/worktrees",
+		bytes.NewReader(body),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+
+	if rec.Code != http.StatusInternalServerError ||
+		!strings.Contains(rec.Body.String(), session.ErrWorkspacePrepare.Error()) {
+		t.Fatalf(
+			"response = %d %q, want workspace operation 500",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("manager retained %d agents, want 0", len(got))
+	}
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestHandleWorkspaceCreateRequiresWorktreeRequest(t *testing.T) {
+	server, manager, st := newTestServer(t)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/worktrees",
+		strings.NewReader(`{"vendor":"generic","command":"/bin/true"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+
+	if rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), "worktree request is required") {
+		t.Fatalf(
+			"response = %d %q, want missing worktree 400",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("manager retained %d agents, want 0", len(got))
+	}
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestWorkspaceCleanupIsLocalAndRejectsActiveSession(t *testing.T) {
+	dataDir := t.TempDir()
+	server, manager, _ := newTestServerWithOptions(
+		t,
+		true,
+		auth.DefaultOptions(),
+		session.WithWorkspaces(dataDir),
+	)
+	status, err := manager.Start(context.Background(), session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/cat",
+		Dir:      newAPIWorkspaceRepository(t),
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err != nil {
+		t.Fatalf("start workspace session: %v", err)
+	}
+	path := "/api/v1/worktrees/" + status.AgentID
+
+	browserRequest := httptest.NewRequest(http.MethodDelete, path, nil)
+	browserRequest.Host = "127.0.0.1:7373"
+	browserRequest.Header.Set("Authorization", "Bearer "+testControlToken)
+	browserResponse := httptest.NewRecorder()
+	server.Handler(BrowserAccess, "127.0.0.1:7373").
+		ServeHTTP(browserResponse, browserRequest)
+	if browserResponse.Code != http.StatusForbidden {
+		t.Fatalf(
+			"browser cleanup response = %d %q, want 403",
+			browserResponse.Code,
+			browserResponse.Body.String(),
+		)
+	}
+
+	activeRequest := httptest.NewRequest(http.MethodDelete, path, nil)
+	activeRequest.Host = "drove.local"
+	activeRequest.Header.Set("Authorization", "Bearer "+testControlToken)
+	activeResponse := httptest.NewRecorder()
+	server.Handler(LocalAccess, "drove.local").
+		ServeHTTP(activeResponse, activeRequest)
+	if activeResponse.Code != http.StatusConflict ||
+		!strings.Contains(
+			activeResponse.Body.String(),
+			session.ErrWorkspaceInUse.Error(),
+		) {
+		t.Fatalf(
+			"active cleanup response = %d %q, want workspace conflict",
+			activeResponse.Code,
+			activeResponse.Body.String(),
+		)
+	}
+
+	if err := manager.Stop(agent.ID(status.AgentID)); err != nil {
+		t.Fatalf("stop workspace session: %v", err)
+	}
+	waitForDetachedAPIStatus(t, manager, agent.ID(status.AgentID))
+
+	cleanupRequest := httptest.NewRequest(
+		http.MethodDelete,
+		path+"?force=false",
+		nil,
+	)
+	cleanupRequest.Host = "drove.local"
+	cleanupRequest.Header.Set("Authorization", "Bearer "+testControlToken)
+	cleanupResponse := httptest.NewRecorder()
+	server.Handler(LocalAccess, "drove.local").
+		ServeHTTP(cleanupResponse, cleanupRequest)
+	if cleanupResponse.Code != http.StatusOK {
+		t.Fatalf(
+			"cleanup response = %d %q, want 200",
+			cleanupResponse.Code,
+			cleanupResponse.Body.String(),
+		)
+	}
+	var removed workspaceCleanupResponse
+	if err := json.NewDecoder(cleanupResponse.Body).Decode(&removed); err != nil {
+		t.Fatalf("decode cleanup response: %v", err)
+	}
+	if removed.AgentID != status.AgentID || removed.Branch == "" {
+		t.Fatalf("removed workspace = %+v", removed)
 	}
 }
 
@@ -1855,6 +2073,44 @@ func TestWebSocketRequiresAllowedOrigin(t *testing.T) {
 	}
 }
 
+func newAPIWorkspaceRepository(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is unavailable")
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	command := exec.Command(
+		"git",
+		"init",
+		"--initial-branch=main",
+		repository,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("initialize Git repository: %v\n%s", err, output)
+	}
+	command = exec.Command(
+		"git",
+		"-C",
+		repository,
+		"-c",
+		"user.name=Drove Test",
+		"-c",
+		"user.email=drove@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"initial",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("commit Git repository: %v\n%s", err, output)
+	}
+	resolved, err := filepath.EvalSymlinks(repository)
+	if err != nil {
+		t.Fatalf("resolve Git repository: %v", err)
+	}
+	return resolved
+}
+
 func newTestServer(t *testing.T) (*Server, *session.Manager, *store.Store) {
 	t.Helper()
 	return newTestServerWithSignalOrigin(t, true)
@@ -1875,6 +2131,7 @@ func newTestServerWithOptions(
 	t *testing.T,
 	configureOrigin bool,
 	authOptions auth.Options,
+	managerOptions ...session.ManagerOption,
 ) (*Server, *session.Manager, *store.Store) {
 	t.Helper()
 
@@ -1888,6 +2145,7 @@ func newTestServerWithOptions(
 		hub,
 		st,
 		0,
+		managerOptions...,
 	)
 	if configureOrigin {
 		signalOrigin, err := url.Parse("http://127.0.0.1:7373")

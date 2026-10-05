@@ -20,6 +20,8 @@
   Manager 的同 ID 原生恢复；单个失败只记录 Agent ID 与脱敏错误并继续。
 - daemon 把 `session.termination_grace_seconds` 转为 duration 注入 Manager；PTY
   负责进程组信号与升级。
+- daemon 把 DataDir 注入 session workspace manager；没有 worktree 请求时 Git
+  不参与会话启动。
 - 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
 - Store 打开后、投影恢复前执行一次严格的输出附件保留清理；首次失败中止启动。

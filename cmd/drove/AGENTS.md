@@ -3,7 +3,8 @@
 ## 职责
 
 **CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / resume / ps /
-log / timeline / explain / attach / stop / token rotate / web / version），所有会话操作都经
+log / timeline / explain / attach / stop / worktree / token rotate / web / version），
+所有会话操作都经
 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
 
@@ -14,7 +15,11 @@ log / timeline / explain / attach / stop / token rotate / web / version），所
   `~/.drove/config.json`。
 - `drove up <vendor|command>` 启动一个 agent：默认 `interactive`，`--oneshot`
   切换为单次执行，`--hooks` 选择 `off|auto|required`；未知厂商名仍视为
-  generic 命令。
+  generic 命令。`--worktree` 把调用方目录解析为绝对仓库路径，`--branch` 只在
+  worktree 模式有效。
+- `drove worktree ls` 直接调用 `internal/workspace`；`rm` 通过 daemon 原子确认
+  会话已停止并执行清理，避免与原生恢复并发。它默认拒绝 dirty、detached HEAD 和
+  旧版未知保护信息；`--force` 显式允许丢弃这些本地事实，但仍保留分支。
 - `drove send <id> <text>` 向运行中的 agent 发送一行输入；`--stdin` 保留标准输入的原始换行。
 - `drove hook --vendor <vendor>` 默认从 stdin 读取一个 hook JSON 文档；
   `--payload-argv` 改为读取唯一位置参数，`--managed-by drove/v1` 只作受管命令标记。
@@ -35,6 +40,9 @@ log / timeline / explain / attach / stop / token rotate / web / version），所
   signal 或 cleanup 逻辑。
 - 每次命令经 DataDir 下的 Unix socket 调用 daemon，并从同一目录读取控制令牌后调用
   `client.EnsureDaemon`；仅 socket 不可达时后台拉起 `droved`，认证失败直接返回。
+- 根命令使用进程 interrupt context；所有 daemon 请求必须传递 `cmd.Context()`，
+  不得使用不可取消的后台 context。读取 stdin 的命令在 context 取消时关闭可关闭的
+  reader，使 Ctrl+C 不会卡在本地输入。
 - `drove token rotate` 经 Unix socket 请求 daemon 原子轮换令牌；命令本身不读取或
   输出令牌值。
 - `drove web` 经 Unix socket 签发一次性 code，把 code 放在 `/login` URL fragment
@@ -44,6 +52,7 @@ log / timeline / explain / attach / stop / token rotate / web / version），所
 ## 约束
 
 - main 必须保持极薄：解析参数 → 调用 client → 退出码语义化（0 成功 / 1 用户错误 / 2 运行时错误）。
+- 未知顶层或嵌套子命令属于用户输入错误，必须返回退出码 1。
 - 禁止在 cmd 中复制业务逻辑或直接构造 session/pty/store；一律走 `internal/client`。
 - 本地自定义类型必须与 daemon API 的 JSON 契约一致（增删字段需同步 API 层测试）。
 - 导出符号：无（main 包不导出）。

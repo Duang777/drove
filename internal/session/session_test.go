@@ -1127,8 +1127,12 @@ func TestResumeOnStartRunsEligibleAgentsInCreationOrderOnce(t *testing.T) {
 	time.Sleep(time.Millisecond)
 	newer := addStoppedAgent(t, manager, "newer", "codex", "newer-ref")
 	manual := addStoppedAgent(t, manager, "manual", "claude", "manual-ref")
-	older.resumeOnStart = true
-	newer.resumeOnStart = true
+	olderState := older.workspaceState()
+	olderState.resumeOnStart = true
+	older.setWorkspaceState(olderState)
+	newerState := newer.workspaceState()
+	newerState.resumeOnStart = true
+	newer.setWorkspaceState(newerState)
 	var commands []string
 	manager.startPTY = func(config pty.Config) (launchedSession, error) {
 		commands = append(commands, strings.Join(append([]string{config.Command}, config.Args...), " "))

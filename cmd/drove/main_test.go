@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
@@ -26,6 +27,7 @@ import (
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
+	"github.com/Duang777/drove/internal/workspace"
 )
 
 func TestSessionStartRequestMapsRunMode(t *testing.T) {
@@ -37,6 +39,8 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 		wantVendor  string
 		wantCommand string
 		wantMode    agent.RunMode
+		useWorktree bool
+		branch      string
 	}{
 		{
 			name:       "interactive vendor",
@@ -67,6 +71,14 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 			wantCommand: "/usr/local/bin/my-agent",
 			wantMode:    agent.RunModeOneshot,
 		},
+		{
+			name:        "worktree vendor",
+			arg:         "claude",
+			wantVendor:  "claude",
+			wantMode:    agent.RunModeInteractive,
+			useWorktree: true,
+			branch:      "feature/isolated",
+		},
 	}
 
 	for _, test := range tests {
@@ -77,6 +89,8 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 				"/tmp",
 				test.oneshot,
 				test.hooks,
+				test.useWorktree,
+				test.branch,
 			)
 			if req.Vendor != test.wantVendor ||
 				req.Command != test.wantCommand ||
@@ -85,6 +99,13 @@ func TestSessionStartRequestMapsRunMode(t *testing.T) {
 				req.Dir != "/tmp" ||
 				req.Hooks != test.hooks {
 				t.Fatalf("request = %+v", req)
+			}
+			if test.useWorktree {
+				if req.Worktree == nil || req.Worktree.Branch != test.branch {
+					t.Fatalf("worktree request = %+v", req.Worktree)
+				}
+			} else if req.Worktree != nil {
+				t.Fatalf("unexpected worktree request = %+v", req.Worktree)
 			}
 		})
 	}
@@ -136,6 +157,14 @@ func TestUpCommandExposesRunnerAndHookFlags(t *testing.T) {
 	if hooks == nil || hooks.DefValue != "" {
 		t.Fatalf("--hooks flag = %+v, want empty default", hooks)
 	}
+	worktree := flags.Lookup("worktree")
+	if worktree == nil || worktree.DefValue != "false" {
+		t.Fatalf("--worktree flag = %+v, want default false", worktree)
+	}
+	branch := flags.Lookup("branch")
+	if branch == nil || branch.DefValue != "" {
+		t.Fatalf("--branch flag = %+v, want empty default", branch)
+	}
 }
 
 func TestUpCommandRejectsInvalidHookPolicyBeforeClientSetup(t *testing.T) {
@@ -144,6 +173,208 @@ func TestUpCommandRejectsInvalidHookPolicyBeforeClientSetup(t *testing.T) {
 	err := command.Execute()
 	if !errors.Is(err, session.ErrInvalidHookPolicy) {
 		t.Fatalf("up error = %v, want ErrInvalidHookPolicy", err)
+	}
+}
+
+func TestUpCommandRejectsBranchWithoutWorktreeBeforeClientSetup(t *testing.T) {
+	command := newUpCmd()
+	command.SetArgs([]string{"claude", "--branch", "feature/isolated"})
+	err := command.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--branch requires --worktree") {
+		t.Fatalf("up error = %v, want branch dependency error", err)
+	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d", got, exitUsage)
+	}
+}
+
+func TestWorktreeRemoveMissingAgentIDIsUsageError(t *testing.T) {
+	command := newRootCmd()
+	command.SetArgs([]string{"worktree", "rm"})
+	err := command.Execute()
+	if err == nil {
+		t.Fatal("worktree remove succeeded without an Agent ID")
+	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestDaemonBadRequestIsUsageError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		http.Error(w, `{"error":"invalid Agent ID"}`, http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	daemonClient := client.New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := daemonClient.CleanupWorktree(
+		context.Background(),
+		"not-an-agent-id",
+		false,
+	)
+	if err == nil {
+		t.Fatal("cleanup succeeded after daemon bad request")
+	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestTerminalStreamRequestErrorIsUsageError(t *testing.T) {
+	err := fmt.Errorf(
+		"attach failed: %w",
+		&client.TerminalStreamError{
+			Code:    "unknown_agent",
+			Message: "agent does not exist",
+		},
+	)
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestTerminalStreamInternalErrorUsesRuntimeExitCode(t *testing.T) {
+	err := &client.TerminalStreamError{
+		Code:    "internal_error",
+		Message: "terminal failed",
+	}
+	if got := commandExitCode(err); got != exitErr {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitErr, err)
+	}
+}
+
+func TestTerminalStreamBackpressureUsesRuntimeExitCode(t *testing.T) {
+	err := &client.TerminalStreamError{
+		Code:    "input_backpressure",
+		Message: "terminal input is temporarily busy",
+	}
+	if got := commandExitCode(err); got != exitErr {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitErr, err)
+	}
+}
+
+func TestRuntimeFailureUsesRuntimeExitCode(t *testing.T) {
+	err := errors.New("daemon unavailable")
+	if got := commandExitCode(err); got != exitErr {
+		t.Fatalf("exit code = %d, want %d", got, exitErr)
+	}
+}
+
+func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
+	tests := [][]string{
+		{"unknown"},
+		{"worktree", "unknown"},
+		{"--", "unknown"},
+		{"worktree", "--", "unknown"},
+	}
+	for _, args := range tests {
+		t.Run(strings.Join(args, "/"), func(t *testing.T) {
+			err := executeRoot(newRootCmd(), args)
+			if err == nil || !strings.Contains(err.Error(), "unknown command") {
+				t.Fatalf("execute %v error = %v", args, err)
+			}
+			if got := commandExitCode(err); got != exitUsage {
+				t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+			}
+		})
+	}
+}
+
+func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantOutput string
+	}{
+		{
+			name:       "help",
+			args:       []string{"help", "worktree"},
+			wantOutput: "Usage:",
+		},
+		{
+			name:       "completion",
+			args:       []string{"completion", "bash"},
+			wantOutput: "__start_drove",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := newRootCmd()
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+
+			if err := executeRoot(root, test.args); err != nil {
+				t.Fatalf("execute %v: %v", test.args, err)
+			}
+			if !strings.Contains(output.String(), test.wantOutput) {
+				t.Fatalf(
+					"execute %v output does not contain %q",
+					test.args,
+					test.wantOutput,
+				)
+			}
+		})
+	}
+}
+
+func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
+	command, _, err := newRootCmd().Find([]string{"worktree", "rm"})
+	if err != nil {
+		t.Fatalf("find worktree remove command: %v", err)
+	}
+	if command.Name() != "rm" {
+		t.Fatalf("command = %q, want rm", command.Name())
+	}
+	force := command.Flags().Lookup("force")
+	if force == nil || force.DefValue != "false" {
+		t.Fatalf("--force flag = %+v, want default false", force)
+	}
+	for _, want := range []string{
+		"未提交更改",
+		"detached HEAD",
+		"旧版未知保护信息",
+	} {
+		if !strings.Contains(force.Usage, want) {
+			t.Fatalf("--force usage = %q, want %q", force.Usage, want)
+		}
+	}
+}
+
+func TestTruncatePreservesUTF8(t *testing.T) {
+	truncated := truncate("功能分支名称很长", 5)
+	if !utf8.ValidString(truncated) {
+		t.Fatalf("truncate returned invalid UTF-8: %q", truncated)
+	}
+	if truncated != "功能分支名…" {
+		t.Fatalf("truncate = %q, want %q", truncated, "功能分支名…")
+	}
+}
+
+func TestWriteWorktrees(t *testing.T) {
+	branch := "feature/isolated-worktree-with-a-long-name"
+	var output bytes.Buffer
+	err := writeWorktrees(&output, []workspace.Workspace{{
+		AgentID: "11111111-1111-4111-8111-111111111111",
+		Branch:  branch,
+		Path:    "/tmp/drove/worktree",
+		Dirty:   true,
+	}})
+	if err != nil {
+		t.Fatalf("write worktrees: %v", err)
+	}
+	for _, want := range []string{
+		"AGENT ID",
+		branch,
+		"true",
+		"/tmp/drove/worktree",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("output = %q, want %q", output.String(), want)
+		}
 	}
 }
 
@@ -578,7 +809,12 @@ func TestReadSendInput(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := readSendInput(test.args, test.fromStdin, bytes.NewReader(test.stdin))
+			got, err := readSendInput(
+				context.Background(),
+				test.args,
+				test.fromStdin,
+				bytes.NewReader(test.stdin),
+			)
 			if test.wantErr != nil || test.wantAnyErr {
 				if err == nil {
 					t.Fatalf("read input succeeded, want error")
@@ -598,6 +834,31 @@ func TestReadSendInput(t *testing.T) {
 				t.Fatalf("input = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestReadAllWithContextCancelsBlockingInput(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create input pipe: %v", err)
+	}
+	defer writer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := readAllWithContext(ctx, reader, session.MaxInputBytes+1)
+		result <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocking input error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocking input did not stop after cancellation")
 	}
 }
 

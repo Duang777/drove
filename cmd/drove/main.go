@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -31,6 +32,7 @@ import (
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/term"
 	"github.com/Duang777/drove/internal/version"
+	"github.com/Duang777/drove/internal/workspace"
 )
 
 // exitCodes 语义化退出码。
@@ -40,14 +42,81 @@ const (
 	exitErr   = 2
 )
 
+type commandUsageError struct {
+	cause error
+}
+
+func (e *commandUsageError) Error() string {
+	return e.cause.Error()
+}
+
+func (e *commandUsageError) Unwrap() error {
+	return e.cause
+}
+
 func main() {
 	// CLI 静默日志，避免污染输出。
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	root := newRootCmd()
-	if err := root.Execute(); err != nil {
+	root.SetContext(ctx)
+	if err := executeRoot(root, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "drove:", err)
-		os.Exit(exitErr)
+		os.Exit(commandExitCode(err))
+	}
+}
+
+func executeRoot(root *cobra.Command, args []string) error {
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd()
+	command, remaining, err := root.Find(args)
+	if err != nil {
+		return markUsageError(err)
+	}
+	if len(remaining) > 0 && remaining[0] == "--" {
+		remaining = remaining[1:]
+	}
+	if command.HasSubCommands() &&
+		!command.Runnable() &&
+		len(remaining) > 0 &&
+		!strings.HasPrefix(remaining[0], "-") {
+		return markUsageError(fmt.Errorf(
+			"unknown command %q for %q",
+			remaining[0],
+			command.CommandPath(),
+		))
+	}
+	root.SetArgs(args)
+	return root.Execute()
+}
+
+func commandExitCode(err error) int {
+	if err == nil {
+		return exitOK
+	}
+	var usageErr *commandUsageError
+	if errors.As(err, &usageErr) || client.IsUserError(err) {
+		return exitUsage
+	}
+	return exitErr
+}
+
+func markUsageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var usageErr *commandUsageError
+	if errors.As(err, &usageErr) {
+		return err
+	}
+	return &commandUsageError{cause: err}
+}
+
+func usageArgs(validate cobra.PositionalArgs) cobra.PositionalArgs {
+	return func(cmd *cobra.Command, args []string) error {
+		return markUsageError(validate(cmd, args))
 	}
 }
 
@@ -60,6 +129,9 @@ func newRootCmd() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
+	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error {
+		return markUsageError(err)
+	})
 	root.AddCommand(
 		newInitCmd(),
 		newUpCmd(),
@@ -72,6 +144,7 @@ func newRootCmd() *cobra.Command {
 		newAttachCmd(),
 		newHookCmd(),
 		newStopCmd(),
+		newWorktreeCmd(),
 		newTokenCmd(),
 		newWebCmd(),
 		newVersionCmd(),
@@ -121,23 +194,47 @@ func newUpCmd() *cobra.Command {
 	var dir string
 	var oneshot bool
 	var hooks string
+	var useWorktree bool
+	var branch string
 	cmd := &cobra.Command{
 		Use:   "up <vendor|command>",
 		Short: "启动一个 Agent 会话（自动拉起 daemon）",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
 			hookPolicy := agent.HookPolicy(hooks)
 			if hookPolicy != "" && !agent.ValidHookPolicy(hookPolicy) {
-				return fmt.Errorf("%w: %q", session.ErrInvalidHookPolicy, hooks)
+				return markUsageError(
+					fmt.Errorf("%w: %q", session.ErrInvalidHookPolicy, hooks),
+				)
 			}
-			ctx := context.Background()
+			if branch != "" && !useWorktree {
+				return markUsageError(
+					errors.New("--branch requires --worktree"),
+				)
+			}
+			if useWorktree {
+				var err error
+				dir, err = resolveWorktreeSource(dir)
+				if err != nil {
+					return err
+				}
+			}
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
 			}
 			st, err := c.Start(
 				ctx,
-				sessionStartRequest(args[0], name, dir, oneshot, hookPolicy),
+				sessionStartRequest(
+					args[0],
+					name,
+					dir,
+					oneshot,
+					hookPolicy,
+					useWorktree,
+					branch,
+				),
 			)
 			if err != nil {
 				return err
@@ -151,6 +248,8 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().StringVar(&dir, "dir", "", "agent 工作目录")
 	cmd.Flags().BoolVar(&oneshot, "oneshot", false, "以单次执行模式启动 agent")
 	cmd.Flags().StringVar(&hooks, "hooks", "", "hook 策略（off、auto 或 required）")
+	cmd.Flags().BoolVar(&useWorktree, "worktree", false, "在独立 Git worktree 中启动 agent")
+	cmd.Flags().StringVar(&branch, "branch", "", "worktree 使用的本地分支")
 	return cmd
 }
 
@@ -159,7 +258,7 @@ func newPSCmd() *cobra.Command {
 		Use:   "ps",
 		Short: "列出全部 Agent 会话",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -213,7 +312,7 @@ func newResumeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resume <agent-id>",
 		Short: "原生恢复一个已停止的 Agent 会话",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			client, err := newClient(ctx)
@@ -243,9 +342,9 @@ func newLogCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "log <agent-id>",
 		Short: "回放某 Agent 的事件流",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -266,7 +365,7 @@ func newTimelineCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "timeline <agent-id>",
 		Short: "显示 Agent 状态时间线与 Blocked 索引",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			c, err := newClient(ctx)
@@ -362,15 +461,15 @@ func newExplainCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "explain <agent-id>",
 		Short: "解释 Agent 当前状态与最近决策",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("limit") &&
 				(limit <= 0 || limit > session.MaxExplainLimit) {
-				return fmt.Errorf(
+				return markUsageError(fmt.Errorf(
 					"%w: must be between 1 and %d",
 					session.ErrInvalidExplainLimit,
 					session.MaxExplainLimit,
-				)
+				))
 			}
 			ctx := cmd.Context()
 			c, err := newClient(ctx)
@@ -533,9 +632,9 @@ func newStopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop <agent-id>",
 		Short: "停止一个 Agent 会话",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(_ *cobra.Command, args []string) error {
-			ctx := context.Background()
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -549,6 +648,110 @@ func newStopCmd() *cobra.Command {
 	}
 }
 
+func newWorktreeCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "worktree",
+		Short: "管理 Drove 创建的 Git worktree",
+	}
+	command.AddCommand(newWorktreeListCmd(), newWorktreeRemoveCmd())
+	return command
+}
+
+func newWorktreeListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "ls",
+		Short: "列出 Drove 创建的 Git worktree",
+		Args:  usageArgs(cobra.NoArgs),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			manager, err := newWorkspaceManager()
+			if err != nil {
+				return err
+			}
+			worktrees, err := manager.List(cmd.Context())
+			if err != nil {
+				return err
+			}
+			return writeWorktrees(cmd.OutOrStdout(), worktrees)
+		},
+	}
+}
+
+func newWorktreeRemoveCmd() *cobra.Command {
+	var force bool
+	command := &cobra.Command{
+		Use:   "rm <agent-id>",
+		Short: "删除一个 Drove worktree，保留其分支",
+		Args:  usageArgs(cobra.ExactArgs(1)),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			daemonClient, err := newClient(ctx)
+			if err != nil {
+				return err
+			}
+			removed, err := daemonClient.CleanupWorktree(ctx, args[0], force)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(
+				cmd.OutOrStdout(),
+				"removed worktree %s (branch=%s preserved)\n",
+				removed.AgentID,
+				removed.Branch,
+			)
+			return err
+		},
+	}
+	command.Flags().BoolVar(
+		&force,
+		"force",
+		false,
+		"强制删除，允许丢弃未提交更改或 detached HEAD，并绕过旧版未知保护信息检查",
+	)
+	return command
+}
+
+func newWorkspaceManager() (*workspace.Manager, error) {
+	cfg, err := config.Load("")
+	if err != nil {
+		return nil, err
+	}
+	return workspace.New(cfg.DataDir)
+}
+
+func writeWorktrees(w io.Writer, worktrees []workspace.Workspace) error {
+	if len(worktrees) == 0 {
+		_, err := fmt.Fprintln(w, "no managed worktrees")
+		return err
+	}
+	if _, err := fmt.Fprintf(
+		w,
+		"%-38s %-30s %-5s %s\n",
+		"AGENT ID",
+		"BRANCH",
+		"DIRTY",
+		"PATH",
+	); err != nil {
+		return fmt.Errorf("write worktree header: %w", err)
+	}
+	for _, current := range worktrees {
+		if _, err := fmt.Fprintf(
+			w,
+			"%-38s %-30s %-5t %s\n",
+			current.AgentID,
+			current.Branch,
+			current.Dirty,
+			current.Path,
+		); err != nil {
+			return fmt.Errorf(
+				"write worktree for agent %q: %w",
+				current.AgentID,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
 func newTokenCmd() *cobra.Command {
 	token := &cobra.Command{
 		Use:   "token",
@@ -557,7 +760,7 @@ func newTokenCmd() *cobra.Command {
 	token.AddCommand(&cobra.Command{
 		Use:   "rotate",
 		Short: "轮换本地控制令牌",
-		Args:  cobra.NoArgs,
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, err := newClient(cmd.Context())
 			if err != nil {
@@ -579,7 +782,7 @@ func newWebCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "web",
 		Short: "打开 Web 控制台",
-		Args:  cobra.NoArgs,
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, configPath, err := config.LoadResolved("")
 			if err != nil {
@@ -673,7 +876,7 @@ func newSendCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "send <agent-id> [text]",
 		Short: "向运行中的 Agent 发送输入",
-		Args: func(_ *cobra.Command, args []string) error {
+		Args: usageArgs(func(_ *cobra.Command, args []string) error {
 			if fromStdin {
 				if len(args) != 1 {
 					return errors.New("send with --stdin requires exactly one agent ID")
@@ -684,13 +887,23 @@ func newSendCmd() *cobra.Command {
 				return errors.New("send requires an agent ID and text, or --stdin")
 			}
 			return nil
-		},
+		}),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			data, err := readSendInput(args, fromStdin, cmd.InOrStdin())
+			data, err := readSendInput(
+				cmd.Context(),
+				args,
+				fromStdin,
+				cmd.InOrStdin(),
+			)
 			if err != nil {
+				if errors.Is(err, session.ErrInputEmpty) ||
+					errors.Is(err, session.ErrInputTooLarge) ||
+					errors.Is(err, session.ErrInputNotUTF8) {
+					return markUsageError(err)
+				}
 				return err
 			}
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -727,7 +940,7 @@ func newAttachCmdWith(
 	cmd := &cobra.Command{
 		Use:   "attach <agent-id>",
 		Short: "连接到 Agent 的实时终端",
-		Args:  cobra.ExactArgs(1),
+		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			daemon, err := clientFactory(cmd.Context())
 			if err != nil {
@@ -754,7 +967,10 @@ func newHookCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hook [payload]",
 		Short: "转发一个厂商 hook 事件",
-		Args: func(_ *cobra.Command, args []string) error {
+		Args: usageArgs(func(_ *cobra.Command, args []string) error {
+			if vendor == "" {
+				return errors.New("hook requires --vendor")
+			}
 			if managedBy != "" && managedBy != "drove/v1" {
 				return errors.New("hook --managed-by must be drove/v1")
 			}
@@ -768,7 +984,7 @@ func newHookCmd() *cobra.Command {
 				return errors.New("hook reads stdin unless --payload-argv is set")
 			}
 			return nil
-		},
+		}),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if err := forwardHook(cmd, vendor, payloadArgv, args); err != nil {
 				_, _ = fmt.Fprintln(
@@ -806,10 +1022,11 @@ func forwardHook(
 	if payloadArgv {
 		payload = []byte(args[0])
 	} else {
-		payload, err = io.ReadAll(io.LimitReader(
+		payload, err = readAllWithContext(
+			cmd.Context(),
 			cmd.InOrStdin(),
 			client.MaxHookPayloadBytes+1,
-		))
+		)
 		if err != nil {
 			return fmt.Errorf("read hook payload: %w", err)
 		}
@@ -823,14 +1040,19 @@ func forwardHook(
 	return relay.Forward(cmd.Context(), vendor, payload)
 }
 
-func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, error) {
+func readSendInput(
+	ctx context.Context,
+	args []string,
+	fromStdin bool,
+	stdin io.Reader,
+) ([]byte, error) {
 	var data []byte
 	if fromStdin {
 		if len(args) != 1 {
 			return nil, errors.New("send with --stdin requires exactly one agent ID")
 		}
 		var err error
-		data, err = io.ReadAll(io.LimitReader(stdin, session.MaxInputBytes+1))
+		data, err = readAllWithContext(ctx, stdin, session.MaxInputBytes+1)
 		if err != nil {
 			return nil, fmt.Errorf("read input: %w", err)
 		}
@@ -853,6 +1075,28 @@ func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, erro
 	}
 }
 
+func readAllWithContext(
+	ctx context.Context,
+	reader io.Reader,
+	limit int64,
+) ([]byte, error) {
+	stopClose := func() bool {
+		return false
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		stopClose = context.AfterFunc(ctx, func() {
+			_ = closer.Close()
+		})
+	}
+	defer stopClose()
+
+	data, err := io.ReadAll(io.LimitReader(reader, limit))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return data, err
+}
+
 func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
@@ -871,6 +1115,8 @@ func sessionStartRequest(
 	dir string,
 	oneshot bool,
 	hooks agent.HookPolicy,
+	useWorktree bool,
+	branch string,
 ) session.StartRequest {
 	vendor := arg
 	cmdName := ""
@@ -881,7 +1127,7 @@ func sessionStartRequest(
 	if oneshot {
 		mode = agent.RunModeOneshot
 	}
-	return session.StartRequest{
+	request := session.StartRequest{
 		Vendor:  vendor,
 		Name:    name,
 		Command: cmdName,
@@ -889,6 +1135,25 @@ func sessionStartRequest(
 		Mode:    mode,
 		Hooks:   hooks,
 	}
+	if useWorktree {
+		request.Worktree = &session.WorktreeRequest{Branch: branch}
+	}
+	return request
+}
+
+func resolveWorktreeSource(dir string) (string, error) {
+	if dir == "" {
+		current, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("resolve current directory for worktree: %w", err)
+		}
+		dir = current
+	}
+	absolute, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve worktree source %q: %w", dir, err)
+	}
+	return filepath.Clean(absolute), nil
 }
 
 func isKnownVendor(s string) bool {
@@ -900,10 +1165,11 @@ func isKnownVendor(s string) bool {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }
 
 func shortID(id string) string {
