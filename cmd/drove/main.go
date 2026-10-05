@@ -105,12 +105,21 @@ func validateDefaultHelpArgs(root *cobra.Command, args []string) error {
 	if len(args) < 2 || args[0] != "help" {
 		return nil
 	}
-	topic := args[1:]
-	for index, argument := range topic {
-		if strings.HasPrefix(argument, "-") {
-			topic = topic[:index]
-			break
+	topic := make([]string, 0, len(args)-1)
+	afterTerminator := false
+	for _, argument := range args[1:] {
+		if afterTerminator {
+			topic = append(topic, argument)
+			continue
 		}
+		if argument == "--" {
+			afterTerminator = true
+			continue
+		}
+		if strings.HasPrefix(argument, "-") {
+			continue
+		}
+		topic = append(topic, argument)
 	}
 	if len(topic) == 0 {
 		return nil

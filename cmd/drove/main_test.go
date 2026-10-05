@@ -288,6 +288,8 @@ func TestExecuteRootTreatsDefaultCommandArgumentErrorsAsUsageErrors(
 ) {
 	tests := [][]string{
 		{"help", "definitely-not-a-command"},
+		{"help", "--", "definitely-not-a-command"},
+		{"help", "worktree", "--", "definitely-not-a-command"},
 		{"completion", "bash", "extra"},
 	}
 	for _, args := range tests {
