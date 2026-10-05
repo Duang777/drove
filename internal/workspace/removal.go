@@ -359,6 +359,9 @@ func (m *Manager) completeRemoval(
 	if err := validateRemovalPathState(record, facts); err != nil {
 		return RemovalPending, err
 	}
+	if err := validateRemovalRecordIdentity(record, facts); err != nil {
+		return RemovalPending, err
+	}
 	if !facts.pathExists &&
 		facts.quarantineName == "" &&
 		!facts.registered {
@@ -615,6 +618,27 @@ func validateRemovalPathState(
 	)
 }
 
+func validateRemovalRecordIdentity(
+	record workspaceRecord,
+	facts removalFacts,
+) error {
+	if !facts.pathExists && facts.quarantineName == "" {
+		return nil
+	}
+	if record.GitDirectory == "" {
+		return errors.New("workspace: removal record has no Git directory identity")
+	}
+	if record.DirectoryIdentity == "" {
+		return errors.New(
+			"workspace: removal record has no worktree directory identity",
+		)
+	}
+	if record.Removal == nil || record.Removal.DirectoryToken == "" {
+		return errors.New("workspace: removal record has no directory token")
+	}
+	return nil
+}
+
 func (m *Manager) persistRemovalStart(
 	record workspaceRecord,
 	quarantined bool,
@@ -652,8 +676,12 @@ func (m *Manager) validateRemovalIdentity(
 	if err != nil {
 		return err
 	}
-	if record.DirectoryIdentity != "" &&
-		directoryIdentity != record.DirectoryIdentity {
+	if record.DirectoryIdentity == "" {
+		return errors.New(
+			"workspace: removal record has no worktree directory identity",
+		)
+	}
+	if directoryIdentity != record.DirectoryIdentity {
 		return fmt.Errorf(
 			"workspace: directory identity mismatch for removal path %q",
 			path,
@@ -677,8 +705,10 @@ func (m *Manager) validateRemovalIdentity(
 	if err != nil {
 		return err
 	}
-	if record.GitDirectory != "" &&
-		gitDirectory != record.GitDirectory {
+	if record.GitDirectory == "" {
+		return errors.New("workspace: removal record has no Git directory identity")
+	}
+	if gitDirectory != record.GitDirectory {
 		return fmt.Errorf(
 			"workspace: Git directory mismatch for removal path %q",
 			path,

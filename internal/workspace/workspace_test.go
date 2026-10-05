@@ -983,7 +983,8 @@ func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "99999999-9999-4999-8999-999999999999",
+		OperationID:    "99999999-9999-4999-8999-999999999999",
+		DirectoryToken: "98989898-9898-4898-8989-989898989898",
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1031,7 +1032,10 @@ func TestRemoveUpgradesExistingIntentToForce(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	const operationID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
-	record.Removal = &workspaceRemovalRecord{OperationID: operationID}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID:    operationID,
+		DirectoryToken: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write non-force removal intent: %v", err)
 	}
@@ -1146,7 +1150,8 @@ func TestReconcileNonForceRemovalPreservesPresentUnregisteredPath(t *testing.T) 
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		OperationID:    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		DirectoryToken: "a1a1a1a1-a1a1-41a1-81a1-a1a1a1a1a1a1",
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1209,7 +1214,8 @@ func TestReconcileNonForceRemovalPreservesMissingDetachedRegistration(t *testing
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		OperationID:    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+		DirectoryToken: "b1b1b1b1-b1b1-41b1-81b1-b1b1b1b1b1b1",
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1257,8 +1263,9 @@ func TestReconcilePendingRemovalRequiresGit(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-		Force:       true,
+		OperationID:    "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+		DirectoryToken: "c1c1c1c1-c1c1-41c1-81c1-c1c1c1c1c1c1",
+		Force:          true,
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1298,8 +1305,9 @@ func TestReconcileRemovalReturnsAlreadyAbsentWorkspace(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "55555555-5555-4555-8555-555555555555",
-		Force:       true,
+		OperationID:    "55555555-5555-4555-8555-555555555555",
+		DirectoryToken: "54545454-5454-4454-8454-545454545454",
+		Force:          true,
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1380,7 +1388,8 @@ func TestReconcileClearsUnsafeNonForceIntent(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "66666666-6666-4666-8666-666666666666",
+		OperationID:    "66666666-6666-4666-8666-666666666666",
+		DirectoryToken: "67676767-6767-4767-8767-676767676767",
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1669,8 +1678,20 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "12121212-1212-4212-8212-121212121212",
-		Started:     true,
+		OperationID:    "12121212-1212-4212-8212-121212121212",
+		DirectoryToken: "13131313-1313-4313-8313-131313131313",
+		Started:        true,
+	}
+	root, err := openRealPathRoot(prepared.Path)
+	if err != nil {
+		t.Fatalf("open prepared workspace: %v", err)
+	}
+	if err := ensureRemovalMarker(root, record); err != nil {
+		_ = root.Close()
+		t.Fatalf("install removal marker: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatalf("close prepared workspace: %v", err)
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write started removal: %v", err)

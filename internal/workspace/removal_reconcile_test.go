@@ -31,8 +31,9 @@ func TestReconcileAcceptsCompletedRemovalAfterGitError(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "77777777-7777-4777-8777-777777777777",
-		Force:       true,
+		OperationID:    "77777777-7777-4777-8777-777777777777",
+		DirectoryToken: "78787878-7878-4787-8787-787878787878",
+		Force:          true,
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -90,7 +91,8 @@ func TestReconcilePreservesIntentOnInspectionFailure(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "88888888-8888-4888-8888-888888888888",
+		OperationID:    "88888888-8888-4888-8888-888888888888",
+		DirectoryToken: "89898989-8989-4898-8989-898989898989",
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)

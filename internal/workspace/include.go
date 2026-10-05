@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -72,9 +71,9 @@ func (m *Manager) includedPaths(
 
 	output, err := m.runIncludeManifest(
 		ctx,
-		manifest,
-		"-C",
 		sourcePath,
+		sourceRoot,
+		manifest,
 		"ls-files",
 		"--others",
 		"--ignored",
@@ -111,6 +110,8 @@ func (m *Manager) includedPaths(
 
 func (m *Manager) runIncludeManifest(
 	ctx context.Context,
+	sourcePath string,
+	sourceRoot *os.Root,
 	manifest []byte,
 	arguments ...string,
 ) (_ []byte, result error) {
@@ -193,7 +194,22 @@ func (m *Manager) runIncludeManifest(
 		result = errors.Join(result, reader.Close())
 	}()
 
-	command := exec.CommandContext(ctx, m.git)
+	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
+		return nil, err
+	}
+	command, cleanupCommand, err := rootedGitCommand(
+		ctx,
+		m.git,
+		sourcePath,
+		sourceRoot,
+		arguments,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		result = errors.Join(result, cleanupCommand())
+	}()
 	excludePath, unlinkBeforeRun, err := configureIncludeManifestCommand(
 		command,
 		reader,
@@ -211,30 +227,19 @@ func (m *Manager) runIncludeManifest(
 		}
 		name = ""
 	}
-	command.Args = append(command.Args, arguments...)
 	command.Args = append(command.Args, "--exclude-from="+excludePath)
-	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
-	output, commandErr := command.Output()
+	output, commandErr := runGitCommand(command, "")
 
-	verifyErr := verifyIncludeManifest(
-		root,
-		name,
-		reader,
-		readerInfo,
-		manifest,
+	verifyErr := errors.Join(
+		verifyIncludeManifest(
+			root,
+			name,
+			reader,
+			readerInfo,
+			manifest,
+		),
+		verifyRealPathRoot(sourcePath, sourceRoot),
 	)
-	if commandErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(commandErr, &exitErr) {
-			detail := strings.TrimSpace(string(exitErr.Stderr))
-			if len(detail) > 4096 {
-				detail = detail[:4096]
-			}
-			if detail != "" {
-				commandErr = fmt.Errorf("%s: %w", detail, commandErr)
-			}
-		}
-	}
 	if err := errors.Join(commandErr, verifyErr); err != nil {
 		return nil, err
 	}

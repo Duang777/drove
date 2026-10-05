@@ -278,7 +278,7 @@ func ensureRemovalMarker(
 ) (result error) {
 	if record.Removal == nil ||
 		record.Removal.DirectoryToken == "" {
-		return nil
+		return errors.New("workspace: removal record has no directory token")
 	}
 	name := removalMarkerName(record)
 	_, err := root.Lstat(name)
@@ -340,7 +340,7 @@ func verifyRemovalMarker(
 ) (result error) {
 	if record.Removal == nil ||
 		record.Removal.DirectoryToken == "" {
-		return nil
+		return errors.New("workspace: removal record has no directory token")
 	}
 	name := removalMarkerName(record)
 	info, err := root.Lstat(name)

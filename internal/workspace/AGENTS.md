@@ -15,9 +15,15 @@
   ReconcilePreparations、AcknowledgePreparation、ReconcileRemovals 和 Discard 串行
   执行。workspace 记录先写入同目录临时文件并 fsync，原子安装最终文件后再 fsync
   父目录。
-- Prepare 全程固定已打开的源仓库根目录；仓库根目录的 `.worktreeinclude` 使用
-  gitignore 语义，并从已打开文件读取一次。Unix 通过继承的只读文件描述符交给 Git，
-  其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按源 manifest 路径打开。
+- Prepare 全程固定已打开的源仓库根目录；仓库识别、分支查询与创建、include 匹配和
+  `git worktree add` 都必须从该根句柄执行，并禁用 Git hooks。Linux 使用
+  `/proc/self/fd`，其他 Unix 通过继承目录描述符后 `fchdir`，Windows 持有不允许
+  share-delete 的目录句柄并复核目录身份；不能提供等价约束的平台必须 fail-stop。
+  `git worktree add` 使用 `--no-checkout`，新 worktree 打开后先持久化 Git 私有目录和
+  文件系统目录身份，再从固定目标根执行 `git reset --hard`。仓库根目录的
+  `.worktreeinclude` 使用 gitignore 语义，并从已打开文件读取一次。Unix 通过继承的
+  只读文件描述符交给 Git，其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按
+  源 manifest 路径打开。
   只有该文件匹配的未跟踪文件会复制到新 worktree，普通未跟踪文件不会复制；匹配项
   必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 3
   sidecar 中，后续 dirty 检查不得重新解释目标 worktree 的 manifest。
@@ -32,7 +38,8 @@
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
   dirty 状态。每个成功创建的 worktree 都有同目录私有记录，用于识别 detached HEAD
-  和修复目录已丢失但 Git 注册仍存在的情况。
+  和修复目录已丢失但 Git 注册仍存在的情况。路径存在时必须同时匹配记录中的 Git
+  私有目录和文件系统目录身份，复制或替换同名目录必须 fail-stop。
 - `Remove` 默认拒绝 dirty、detached HEAD 和保护来源未知的 version 1 sidecar；
   `force` 可显式放宽这些检查。删除前必须先原子持久化带 operation ID 的 removal
   intent。物理删除完成后保留 sidecar，直到 session tombstone durable 后由
@@ -41,7 +48,9 @@
   registration 丢失，或路径丢失但 registration 为 detached 时保留 intent 并
   fail-stop。显式 force 会原子升级已有的非强制 intent 并保留 operation ID；每个新
   worktree 记录同时持久化 Git 私有目录路径与文件系统目录实例身份，每个 removal intent
-  另有随机目录 token，隔离前写入 worktree 并随原目录移动。调用任何
+  另有随机目录 token，隔离前写入 worktree 并随原目录移动。物理路径存在时，创建
+  removal intent 前必须取得并校验两种身份；任何已开始或待恢复的删除只要缺少任一身份
+  或目录 token 都必须 fail-stop。调用任何
   物理删除前先把已检查的 workspace 原子移动到 operation ID 隔离名，再持久化
   `quarantined + started`；之后只删除隔离名，失败必须保留 intent 并在重启后继续，
   不能再因 dirty 状态回滚。每次恢复和递归删除隔离目录前都必须复核 Git 身份、目录
@@ -62,8 +71,9 @@
   只能导致失败，不得覆盖最终记录。清理临时名时也必须确认它仍指向已打开文件。缺少
   对应原子原语的平台必须返回错误。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
-  本次新建的分支。未注册残留目录通过已验证的 `os.Root` 相对操作删除，任一中间
-  symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理
+  本次新建的分支。路径存在但 preparation sidecar 尚未持久化目录身份时必须 fail-stop，
+  禁止把同名替代目录当作失败创建的残留删除。未注册残留目录通过已验证的 `os.Root`
+  相对操作删除，任一中间 symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理
   目录，再仅调用 `git worktree prune --expire now` 清理 stale registration；禁止把受管
   路径交给 Git 执行删除。
 - `.worktreeinclude` 匹配文件不受 Git 跟踪；只要 worktree 中存在创建时记录的路径，

@@ -479,6 +479,188 @@ func TestRemoveRejectsCopiedWorkspaceDirectory(t *testing.T) {
 	assertFileContents(t, sentinel, "replacement\n")
 }
 
+func TestListRejectsCopiedWorkspaceDirectory(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move original workspace: %v", err)
+	}
+	if err := os.CopyFS(prepared.Path, os.DirFS(originalPath)); err != nil {
+		t.Fatalf("copy workspace directory: %v", err)
+	}
+
+	if listed, err := manager.List(context.Background()); err == nil {
+		t.Fatalf("list accepted copied workspace: %+v", listed)
+	}
+}
+
+func TestReconcilePreparationWithoutIdentityPreservesPresentPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.GitDirectory = ""
+	record.DirectoryIdentity = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("clear recorded identity: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move original workspace: %v", err)
+	}
+	if err := os.CopyFS(prepared.Path, os.DirFS(originalPath)); err != nil {
+		t.Fatalf("copy replacement workspace: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if err := manager.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err == nil {
+		t.Fatal("reconciliation accepted a preparation without identity")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+}
+
+func TestReconcileStartedLegacyRemovalPreservesReplacementPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	legacy := workspaceRecord{
+		Version:         protectedWorkspaceRecordVersion,
+		AgentID:         prepared.AgentID,
+		Repository:      prepared.Repository,
+		Path:            prepared.Path,
+		Branch:          prepared.Branch,
+		ProtectionKnown: true,
+		IncludedPaths:   []string{},
+		Removal: &workspaceRemovalRecord{
+			OperationID: "56565656-5656-4656-8656-565656565656",
+			Force:       true,
+		},
+	}
+	if err := manager.replaceWorkspaceRecord(legacy); err != nil {
+		t.Fatalf("write legacy removal record: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move original workspace: %v", err)
+	}
+	if err := os.CopyFS(prepared.Path, os.DirFS(originalPath)); err != nil {
+		t.Fatalf("copy replacement workspace: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(
+		context.Background(),
+	); err == nil {
+		t.Fatal("reconciliation accepted a legacy removal without identity")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+}
+
+func TestRemoveRejectsCopiedLegacyWorkspaceDirectory(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	legacy := workspaceRecord{
+		Version:         protectedWorkspaceRecordVersion,
+		AgentID:         prepared.AgentID,
+		Repository:      prepared.Repository,
+		Path:            prepared.Path,
+		Branch:          prepared.Branch,
+		ProtectionKnown: true,
+		IncludedPaths:   []string{},
+	}
+	if err := manager.replaceWorkspaceRecord(legacy); err != nil {
+		t.Fatalf("write legacy workspace record: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move original workspace: %v", err)
+	}
+	if err := os.CopyFS(prepared.Path, os.DirFS(originalPath)); err != nil {
+		t.Fatalf("copy replacement workspace: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if _, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	); err == nil {
+		t.Fatal("remove accepted a copied legacy workspace directory")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+}
+
 func TestListRejectsReplacementDataDirectory(t *testing.T) {
 	repository := newTestRepository(t)
 	parent := t.TempDir()
@@ -1027,8 +1209,9 @@ func TestReconcileQuarantinedRemovalPreservesReplacementPath(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "56565656-5656-4656-8656-565656565656",
-		Force:       true,
+		OperationID:    "56565656-5656-4656-8656-565656565656",
+		DirectoryToken: "57575757-5757-4757-8757-575757575757",
+		Force:          true,
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
@@ -1220,10 +1403,11 @@ func TestReconcileAbsentPathRemovalPreservesReplacementPath(t *testing.T) {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
 	}
 	record.Removal = &workspaceRemovalRecord{
-		OperationID: "45454545-4545-4545-8545-454545454545",
-		Force:       true,
-		Started:     true,
-		PathAbsent:  true,
+		OperationID:    "45454545-4545-4545-8545-454545454545",
+		DirectoryToken: "46464646-4646-4646-8646-464646464646",
+		Force:          true,
+		Started:        true,
+		PathAbsent:     true,
 	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write absent-path removal intent: %v", err)
@@ -1325,9 +1509,10 @@ func TestStaleAcknowledgementPreservesNewWorkspaceRecord(t *testing.T) {
 	replacement := newWorkspaceRecord(prepared, nil)
 	replacement.PreparationCommitted = true
 	replacement.Removal = &workspaceRemovalRecord{
-		OperationID: newOperationID,
-		Force:       true,
-		Started:     true,
+		OperationID:    newOperationID,
+		DirectoryToken: "90909090-9090-4090-8090-909090909090",
+		Force:          true,
+		Started:        true,
 	}
 	if err := manager.installWorkspaceRecord(replacement, true); err != nil {
 		t.Fatalf("install replacement record: %v", err)

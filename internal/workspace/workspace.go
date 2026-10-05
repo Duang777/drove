@@ -212,6 +212,19 @@ func (m *Manager) prepare(
 	defer func() {
 		resultErr = errors.Join(resultErr, sourceRoot.Close())
 	}()
+	pinnedRepository, err := m.repositoryRootAtRoot(
+		ctx,
+		sourcePath,
+		sourceRoot,
+	)
+	if err != nil {
+		return Workspace{}, err
+	}
+	if pinnedRepository != repository {
+		return Workspace{}, errors.New(
+			"workspace: source repository changed while opening",
+		)
+	}
 	if branch == "" {
 		branch = "drove/" + agentID
 	}
@@ -233,7 +246,12 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 
-	exists, err := m.branchExists(ctx, repository, branch)
+	exists, err := m.branchExistsAtRoot(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		branch,
+	)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -271,9 +289,10 @@ func (m *Manager) prepare(
 		)
 	}
 	if createdBranch {
-		if err := m.createOwnedBranch(
+		if err := m.createOwnedBranchAtRoot(
 			ctx,
 			sourcePath,
+			sourceRoot,
 			branch,
 			branchOperationID,
 		); err != nil {
@@ -326,9 +345,14 @@ func (m *Manager) prepare(
 			)
 		}
 	}
-	arguments := []string{"-C", sourcePath, "worktree", "add", "--quiet"}
+	arguments := []string{"worktree", "add", "--quiet", "--no-checkout"}
 	arguments = append(arguments, path, branch)
-	if _, err := m.run(ctx, arguments...); err != nil {
+	if _, err := m.runRootedGit(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		arguments...,
+	); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
@@ -340,34 +364,11 @@ func (m *Manager) prepare(
 		)
 	}
 
-	gitDirectory, err := m.worktreeGitDirectory(ctx, result.Path)
-	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
-	}
-	result.gitDirectory = gitDirectory
-	directoryIdentity, err := worktreeDirectoryIdentity(result.Path)
-	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
-	}
-	result.directoryIdentity = directoryIdentity
-	record, exists, err := m.readWorkspaceRecord(result.Path)
-	if err == nil && !exists {
-		err = errors.New("workspace: worktree identity record is missing")
-	}
-	if err == nil {
-		record.GitDirectory = gitDirectory
-		record.DirectoryIdentity = directoryIdentity
-		err = m.replaceWorkspaceRecord(record)
-	}
-	if err != nil {
+	if err := m.initializePreparedWorktree(ctx, &result); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: persist worktree identity: %w", err),
+			err,
 			m.discard(cleanupCtx, result),
 		)
 	}
@@ -596,6 +597,14 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 		result = errors.Join(
 			result,
 			fmt.Errorf("workspace: inspect discarded worktree: %w", pathErr),
+		)
+	}
+	if pathExists && record.DirectoryIdentity == "" {
+		return errors.Join(
+			result,
+			errors.New(
+				"workspace: preparation record has no worktree directory identity",
+			),
 		)
 	}
 	registered, err := m.worktreeRegistered(
@@ -924,6 +933,18 @@ func (m *Manager) inspect(
 	recorded *workspaceRecord,
 ) (Workspace, error) {
 	agentID := filepath.Base(path)
+	directoryIdentity, err := worktreeDirectoryIdentity(path)
+	if err != nil {
+		return Workspace{}, err
+	}
+	if recorded != nil &&
+		recorded.DirectoryIdentity != "" &&
+		recorded.DirectoryIdentity != directoryIdentity {
+		return Workspace{}, fmt.Errorf(
+			"workspace: directory identity mismatch for %q",
+			path,
+		)
+	}
 	repository, err := m.repositoryRoot(ctx, path)
 	if err != nil {
 		return Workspace{}, fmt.Errorf("workspace: inspect repository for %q: %w", path, err)
@@ -938,9 +959,13 @@ func (m *Manager) inspect(
 	if err != nil {
 		return Workspace{}, err
 	}
-	directoryIdentity, err := worktreeDirectoryIdentity(path)
-	if err != nil {
-		return Workspace{}, err
+	if recorded != nil &&
+		recorded.GitDirectory != "" &&
+		recorded.GitDirectory != gitDirectory {
+		return Workspace{}, fmt.Errorf(
+			"workspace: Git directory mismatch for %q",
+			path,
+		)
 	}
 
 	branchOutput, err := m.run(ctx, "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -1174,10 +1199,40 @@ func (m *Manager) repositoryRoot(
 	ctx context.Context,
 	worktreePath string,
 ) (string, error) {
-	bareOutput, err := m.run(
-		ctx,
-		"-C",
+	return m.repositoryRootWith(
 		worktreePath,
+		func(arguments ...string) ([]byte, error) {
+			return m.run(
+				ctx,
+				append([]string{"-C", worktreePath}, arguments...)...,
+			)
+		},
+	)
+}
+
+func (m *Manager) repositoryRootAtRoot(
+	ctx context.Context,
+	worktreePath string,
+	root *os.Root,
+) (string, error) {
+	return m.repositoryRootWith(
+		worktreePath,
+		func(arguments ...string) ([]byte, error) {
+			return m.runRootedGit(
+				ctx,
+				worktreePath,
+				root,
+				arguments...,
+			)
+		},
+	)
+}
+
+func (m *Manager) repositoryRootWith(
+	worktreePath string,
+	run func(...string) ([]byte, error),
+) (string, error) {
+	bareOutput, err := run(
 		"rev-parse",
 		"--is-bare-repository",
 	)
@@ -1191,10 +1246,7 @@ func (m *Manager) repositoryRoot(
 			worktreePath,
 		)
 	}
-	commonOutput, err := m.run(
-		ctx,
-		"-C",
-		worktreePath,
+	commonOutput, err := run(
 		"rev-parse",
 		"--git-common-dir",
 	)
@@ -1213,10 +1265,7 @@ func (m *Manager) repositoryRoot(
 		)
 	}
 
-	worktreeOutput, err := m.run(
-		ctx,
-		"-C",
-		worktreePath,
+	worktreeOutput, err := run(
 		"config",
 		"--path",
 		"--get",
@@ -1368,6 +1417,30 @@ func (m *Manager) branchExists(
 	return false, fmt.Errorf("workspace: inspect branch %q: %w", branch, err)
 }
 
+func (m *Manager) branchExistsAtRoot(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	branch string,
+) (bool, error) {
+	_, err := m.runRootedGit(
+		ctx,
+		path,
+		root,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+branch,
+	)
+	if err == nil {
+		return true, nil
+	}
+	if isExitCode(err, 1) {
+		return false, nil
+	}
+	return false, fmt.Errorf("workspace: inspect branch %q: %w", branch, err)
+}
+
 func (m *Manager) createOwnedBranch(
 	ctx context.Context,
 	repository string,
@@ -1391,6 +1464,41 @@ func (m *Manager) createOwnedBranch(
 		input,
 		"-C",
 		repository,
+		"update-ref",
+		"--create-reflog",
+		"-m",
+		branchOwnershipLogMessage(operationID),
+		"--stdin",
+	); err != nil {
+		return fmt.Errorf("workspace: create owned branch transaction: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) createOwnedBranchAtRoot(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	branch string,
+	operationID string,
+) error {
+	head, err := m.runRootedGit(ctx, path, root, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("workspace: resolve branch start: %w", err)
+	}
+	commit := strings.TrimSpace(string(head))
+	input := fmt.Sprintf(
+		"start\ncreate refs/heads/%s %s\ncreate %s %s\nprepare\ncommit\n",
+		branch,
+		commit,
+		branchOwnershipRef(operationID),
+		commit,
+	)
+	if _, err := m.runRootedGitInput(
+		ctx,
+		path,
+		root,
+		input,
 		"update-ref",
 		"--create-reflog",
 		"-m",
@@ -1562,25 +1670,7 @@ func (m *Manager) runInput(
 	arguments ...string,
 ) ([]byte, error) {
 	command := exec.CommandContext(ctx, m.git, arguments...)
-	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
-	if input != "" {
-		command.Stdin = strings.NewReader(input)
-	}
-	output, err := command.Output()
-	if err == nil {
-		return output, nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
-		detail := strings.TrimSpace(string(exitErr.Stderr))
-		if len(detail) > 4096 {
-			detail = detail[:4096]
-		}
-		if detail != "" {
-			return nil, fmt.Errorf("%s: %w", detail, err)
-		}
-	}
-	return nil, err
+	return runGitCommand(command, input)
 }
 
 func isExitCode(err error, code int) bool {
