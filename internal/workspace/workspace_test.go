@@ -1233,6 +1233,48 @@ func TestReconcileRemovalReturnsAlreadyAbsentWorkspace(t *testing.T) {
 	}
 }
 
+func TestRemoveRecordsInitiallyAbsentPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
+
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove absent workspace = %+v, %v", result, err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists ||
+		record.Removal == nil ||
+		!record.Removal.PathAbsent ||
+		!record.Removal.Started {
+		t.Fatalf(
+			"absent removal record = %+v, exists=%v err=%v",
+			record.Removal,
+			exists,
+			err,
+		)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge absent workspace: %v", err)
+	}
+}
+
 func TestReconcileClearsUnsafeNonForceIntent(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

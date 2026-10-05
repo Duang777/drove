@@ -40,6 +40,7 @@ type workspaceRemovalRecord struct {
 	Force       bool   `json:"force"`
 	Started     bool   `json:"started"`
 	Quarantined bool   `json:"quarantined,omitempty"`
+	PathAbsent  bool   `json:"path_absent,omitempty"`
 }
 
 func workspaceRecordPath(worktreePath string) string {
@@ -193,6 +194,9 @@ func (m *Manager) installWorkspaceRecordState(
 	if err := checkRecordTarget(bucket, name, recordPath, requireAbsent); err != nil {
 		return false, err
 	}
+	if err := m.verifyRecordBucket(record.Path, bucket); err != nil {
+		return false, err
+	}
 	directory, err := bucket.Open(".")
 	if err != nil {
 		return false, fmt.Errorf(
@@ -234,6 +238,9 @@ func (m *Manager) installWorkspaceRecordState(
 			filepath.Dir(recordPath),
 			err,
 		)
+	}
+	if err := m.verifyRecordBucket(record.Path, bucket); err != nil {
+		return true, err
 	}
 	return true, nil
 }
@@ -477,6 +484,11 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 		if record.Removal.Quarantined && !record.Removal.Started {
 			return errors.New(
 				"workspace: quarantined removal has not been started",
+			)
+		}
+		if record.Removal.PathAbsent && record.Removal.Quarantined {
+			return errors.New(
+				"workspace: absent-path removal cannot be quarantined",
 			)
 		}
 	}

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
 	"github.com/google/uuid"
 )
@@ -445,7 +444,7 @@ func (m *Manager) removeManagedBucketIfEmpty(
 		return nil
 	case errors.Is(err, os.ErrNotExist):
 		return nil
-	case errors.Is(err, syscall.ENOTEMPTY), errors.Is(err, syscall.EEXIST):
+	case isDirectoryNotEmptyError(err):
 		return nil
 	default:
 		return fmt.Errorf("remove repository bucket: %w", err)
@@ -494,6 +493,38 @@ func (m *Manager) openRecordBucket(
 		return nil, "", fmt.Errorf("workspace: close managed root: %w", err)
 	}
 	return bucket, components[1], nil
+}
+
+func (m *Manager) verifyRecordBucket(
+	worktreePath string,
+	bucket *os.Root,
+) (result error) {
+	relative, err := filepath.Rel(m.root, worktreePath)
+	if err != nil {
+		return fmt.Errorf("workspace: resolve record path: %w", err)
+	}
+	components := strings.Split(relative, string(filepath.Separator))
+	if len(components) != 2 || !validRepositoryHash(components[0]) {
+		return fmt.Errorf(
+			"workspace: record path %q is outside the managed root",
+			worktreePath,
+		)
+	}
+	root, err := m.openWorktreeRoot()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, root.Close())
+	}()
+	if err := verifyRootEntryUnchanged(
+		root,
+		components[0],
+		bucket,
+	); err != nil {
+		return fmt.Errorf("workspace: verify record bucket: %w", err)
+	}
+	return nil
 }
 
 func openRealPathRoot(path string) (*os.Root, error) {
@@ -608,7 +639,12 @@ func removeAllFromRoot(root *os.Root, name string) (result error) {
 	if err := verifyRootEntryUnchanged(root, name, child); err != nil {
 		return err
 	}
-	if err := removeRootEntries(root, name, entries); err != nil {
+	if err := removeRootDirectoryContents(
+		root,
+		name,
+		child,
+		entries,
+	); err != nil {
 		return err
 	}
 	closeErr = child.Close()
@@ -619,14 +655,24 @@ func removeAllFromRoot(root *os.Root, name string) (result error) {
 	return root.Remove(name)
 }
 
+func removeRootDirectoryContents(
+	parent *os.Root,
+	name string,
+	root *os.Root,
+	entries []os.DirEntry,
+) error {
+	if err := removeRootEntries(root, entries); err != nil {
+		return err
+	}
+	return verifyRootEntryUnchanged(parent, name, root)
+}
+
 func removeRootEntries(
 	root *os.Root,
-	name string,
 	entries []os.DirEntry,
 ) error {
 	for _, entry := range entries {
-		childName := filepath.Join(name, entry.Name())
-		if err := removeAllFromRoot(root, childName); err != nil {
+		if err := removeAllFromRoot(root, entry.Name()); err != nil {
 			return err
 		}
 	}

@@ -157,8 +157,20 @@ func (c *Client) List(ctx context.Context) ([]*session.Status, error) {
 
 // Start 启动一个会话。
 func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.Status, error) {
+	path := "/api/v1/agents"
+	httpClient := c.hc
+	if req.Worktree != nil {
+		path = "/api/v1/worktrees"
+		httpClient = c.longRunningHTTPClient()
+	}
 	var out session.Status
-	if err := c.postJSON(ctx, "/api/v1/agents", req, &out); err != nil {
+	if err := c.postJSONWithClient(
+		ctx,
+		httpClient,
+		path,
+		req,
+		&out,
+	); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -211,7 +223,7 @@ func (c *Client) CleanupWorktree(
 	if err := c.authorize(req, false); err != nil {
 		return nil, err
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := c.longRunningHTTPClient().Do(req)
 	if err != nil {
 		return nil, ErrDaemonUnreachable
 	}
@@ -498,6 +510,16 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
+	return c.postJSONWithClient(ctx, c.hc, path, in, out)
+}
+
+func (c *Client) postJSONWithClient(
+	ctx context.Context,
+	httpClient *http.Client,
+	path string,
+	in any,
+	out any,
+) error {
 	body, err := json.Marshal(in)
 	if err != nil {
 		return err
@@ -510,7 +532,7 @@ func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
 	if err := c.authorize(req, false); err != nil {
 		return err
 	}
-	resp, err := c.hc.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return ErrDaemonUnreachable
 	}
@@ -522,6 +544,14 @@ func (c *Client) postJSON(ctx context.Context, path string, in, out any) error {
 		return drain(resp.Body)
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) longRunningHTTPClient() *http.Client {
+	return &http.Client{
+		Transport:     c.hc.Transport,
+		CheckRedirect: c.hc.CheckRedirect,
+		Jar:           c.hc.Jar,
+	}
 }
 
 func (c *Client) delete(ctx context.Context, path string) error {

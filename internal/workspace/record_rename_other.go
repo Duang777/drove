@@ -3,19 +3,30 @@
 package workspace
 
 import (
+	"errors"
 	"os"
-	"path/filepath"
 )
 
 func renameRecordFile(
-	directory *os.File,
 	_ *os.File,
-	temporaryName string,
-	recordName string,
-) error {
-	return os.Rename(
-		filepath.Join(directory.Name(), temporaryName),
-		filepath.Join(directory.Name(), recordName),
+	_ *os.File,
+	_ string,
+	_ string,
+	_ bool,
+) (bool, error) {
+	return false, errors.New(
+		"identity-preserving record rename is unsupported",
+	)
+}
+
+func moveRecordFile(
+	_ *os.File,
+	_ *os.File,
+	_ string,
+	_ string,
+) (bool, error) {
+	return false, errors.New(
+		"identity-preserving record move is unsupported",
 	)
 }
 

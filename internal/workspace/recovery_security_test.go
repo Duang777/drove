@@ -64,7 +64,7 @@ func TestDiscardRejectsReplacedDataDirectory(t *testing.T) {
 	assertFileContents(t, sentinel, "outside\n")
 }
 
-func TestRemoveRootEntriesDoesNotFollowMovedDirectory(t *testing.T) {
+func TestRemoveRootDirectoryContentsRejectsReplacementParent(t *testing.T) {
 	bucketPath := t.TempDir()
 	workspacePath := filepath.Join(bucketPath, "workspace")
 	nestedPath := filepath.Join(workspacePath, "nested")
@@ -84,30 +84,156 @@ func TestRemoveRootEntriesDoesNotFollowMovedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open workspace root: %v", err)
 	}
+	defer workspace.Close()
 	entries, err := readRootDirectory(workspace)
 	if err != nil {
-		_ = workspace.Close()
 		t.Fatalf("read workspace root: %v", err)
-	}
-	if err := workspace.Close(); err != nil {
-		t.Fatalf("close workspace root: %v", err)
 	}
 	outsidePath := filepath.Join(t.TempDir(), "moved-workspace")
 	if err := os.Rename(workspacePath, outsidePath); err != nil {
 		t.Fatalf("move workspace outside bucket: %v", err)
 	}
-
-	if err := removeRootEntries(bucket, "workspace", entries); err != nil {
-		t.Fatalf("remove anchored child entries: %v", err)
-	}
-	if err := bucket.Remove("workspace"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("remove moved workspace error = %v, want not exist", err)
-	}
-	assertFileContents(
-		t,
-		filepath.Join(outsidePath, "nested", "must-remain"),
-		"outside\n",
+	replacementSentinel := filepath.Join(
+		workspacePath,
+		"nested",
+		"must-remain",
 	)
+	if err := os.MkdirAll(filepath.Dir(replacementSentinel), 0o700); err != nil {
+		t.Fatalf("create replacement workspace: %v", err)
+	}
+	if err := os.WriteFile(
+		replacementSentinel,
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	err = removeRootDirectoryContents(
+		bucket,
+		"workspace",
+		workspace,
+		entries,
+	)
+	if err == nil || !strings.Contains(err.Error(), "changed while in use") {
+		t.Fatalf("remove replaced workspace error = %v", err)
+	}
+	assertFileContents(t, replacementSentinel, "replacement\n")
+	if _, err := os.Lstat(
+		filepath.Join(outsidePath, "nested", "must-remain"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opened original directory was not cleaned: %v", err)
+	}
+}
+
+func TestRenameRecordRejectsReplacedTemporaryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires renaming an open file")
+	}
+	directoryPath := t.TempDir()
+	temporaryName := "record.tmp"
+	temporaryPath := filepath.Join(directoryPath, temporaryName)
+	temporary, err := os.OpenFile(
+		temporaryPath,
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
+		0o600,
+	)
+	if err != nil {
+		t.Fatalf("create temporary record: %v", err)
+	}
+	defer temporary.Close()
+	if _, err := temporary.WriteString("original\n"); err != nil {
+		t.Fatalf("write temporary record: %v", err)
+	}
+	movedPath := temporaryPath + ".moved"
+	if err := os.Rename(temporaryPath, movedPath); err != nil {
+		t.Fatalf("move temporary record: %v", err)
+	}
+	if err := os.WriteFile(
+		temporaryPath,
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("replace temporary record: %v", err)
+	}
+	directory, err := os.Open(directoryPath)
+	if err != nil {
+		t.Fatalf("open record directory: %v", err)
+	}
+	defer directory.Close()
+
+	installed, err := renameRecordFile(
+		directory,
+		temporary,
+		temporaryName,
+		"record.json",
+		false,
+	)
+	if err == nil || installed {
+		t.Fatalf(
+			"rename replaced temporary record = installed %v, err %v",
+			installed,
+			err,
+		)
+	}
+	if _, err := os.Lstat(
+		filepath.Join(directoryPath, "record.json"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("record target exists after rejected rename: %v", err)
+	}
+	assertFileContents(t, temporaryPath, "replacement\n")
+	assertFileContents(t, movedPath, "original\n")
+}
+
+func TestVerifyRecordBucketRejectsMovedCanonicalBucket(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := manager.ensureManagedRoot(); err != nil {
+		t.Fatalf("ensure managed root: %v", err)
+	}
+	if err := manager.ensureManagedBucket(repository); err != nil {
+		t.Fatalf("ensure managed bucket: %v", err)
+	}
+	target := Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path: filepath.Join(
+			manager.root,
+			repositoryHash(repository),
+			testAgentID,
+		),
+		Branch: "record-bucket",
+	}
+	bucket, _, err := manager.openRecordBucket(target.Path)
+	if err != nil {
+		t.Fatalf("open record bucket: %v", err)
+	}
+	defer bucket.Close()
+	bucketPath := filepath.Dir(target.Path)
+	originalPath := bucketPath + "-original"
+	if err := os.Rename(bucketPath, originalPath); err != nil {
+		t.Fatalf("move canonical bucket: %v", err)
+	}
+	if err := os.Mkdir(bucketPath, 0o700); err != nil {
+		t.Fatalf("create replacement bucket: %v", err)
+	}
+	sentinel := filepath.Join(bucketPath, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(bucketPath)
+		_ = os.Rename(originalPath, bucketPath)
+	})
+
+	if err := manager.verifyRecordBucket(target.Path, bucket); err == nil {
+		t.Fatal("record bucket verification accepted a moved bucket")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
 }
 
 func TestAcknowledgeRemovalRejectsReplacedRepositoryBucket(t *testing.T) {
@@ -661,6 +787,62 @@ func TestReconcileQuarantinedRemovalPreservesReplacementPath(t *testing.T) {
 		!current.Removal.Quarantined {
 		t.Fatalf(
 			"removal phase = %+v, exists=%v err=%v",
+			current.Removal,
+			exists,
+			err,
+		)
+	}
+}
+
+func TestReconcileAbsentPathRemovalPreservesReplacementPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: "45454545-4545-4545-8545-454545454545",
+		Force:       true,
+		Started:     true,
+		PathAbsent:  true,
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write absent-path removal intent: %v", err)
+	}
+	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
+	if err := os.Mkdir(prepared.Path, 0o700); err != nil {
+		t.Fatalf("create replacement path: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(
+		context.Background(),
+	); err == nil || !strings.Contains(err.Error(), "appeared after removal began") {
+		t.Fatalf("reconcile replacement path error = %v", err)
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+	current, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists ||
+		current.Removal == nil ||
+		!current.Removal.PathAbsent {
+		t.Fatalf(
+			"absent-path removal = %+v, exists=%v err=%v",
 			current.Removal,
 			exists,
 			err,

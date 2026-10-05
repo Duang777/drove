@@ -103,6 +103,7 @@ func TestCleanupWorktreeUsesAuthenticatedDelete(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer "+token {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
+		time.Sleep(20 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(
 			w,
@@ -115,6 +116,7 @@ func TestCleanupWorktreeUsesAuthenticatedDelete(t *testing.T) {
 		strings.TrimPrefix(server.URL, "http://"),
 		WithTokenFile(auth.TokenPath(dataDir)),
 	)
+	c.hc.Timeout = time.Millisecond
 	removed, err := c.CleanupWorktree(
 		context.Background(),
 		"agent/one",
@@ -126,6 +128,73 @@ func TestCleanupWorktreeUsesAuthenticatedDelete(t *testing.T) {
 	if removed.AgentID != "agent/one" ||
 		removed.Branch != "feature/isolated" {
 		t.Fatalf("removed worktree = %+v", removed)
+	}
+}
+
+func TestStartUsesDedicatedWorktreeEndpointWithoutClientTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/api/v1/worktrees" {
+			t.Errorf("path = %q, want worktree endpoint", r.URL.Path)
+		}
+		var request session.StartRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode start request: %v", err)
+		}
+		if request.Worktree == nil {
+			t.Error("worktree request is missing")
+		}
+		time.Sleep(20 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"agent_id":"worktree-agent"}`)
+	}))
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	c.hc.Timeout = time.Millisecond
+	status, err := c.Start(context.Background(), session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err != nil {
+		t.Fatalf("start worktree session: %v", err)
+	}
+	if status.AgentID != "worktree-agent" {
+		t.Fatalf("worktree status = %+v", status)
+	}
+}
+
+func TestWorktreeStartDoesNotFallBackToOldAgentEndpoint(t *testing.T) {
+	var agentStarts atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/agents", func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		agentStarts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"agent_id":"unsafe-agent"}`)
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := c.Start(context.Background(), session.StartRequest{
+		Vendor:   "generic",
+		Command:  "/bin/true",
+		Worktree: &session.WorktreeRequest{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "404 Not Found") {
+		t.Fatalf("worktree start error = %v, want 404", err)
+	}
+	if agentStarts.Load() != 0 {
+		t.Fatalf("old agent endpoint starts = %d, want 0", agentStarts.Load())
 	}
 }
 

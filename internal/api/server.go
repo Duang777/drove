@@ -96,6 +96,7 @@ func NewServer(opts ServerOptions) *Server {
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/agents", s.handleList)
 	mux.HandleFunc("POST /api/v1/agents", s.handleCreate)
+	mux.HandleFunc("POST /api/v1/worktrees", s.handleWorkspaceCreate)
 	mux.HandleFunc("DELETE /api/v1/worktrees/{id}", s.handleWorkspaceDelete)
 	mux.HandleFunc("GET /api/v1/agents/{id}", s.handleGet)
 	mux.HandleFunc("DELETE /api/v1/agents/{id}", s.handleDelete)
@@ -173,9 +174,28 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
+	s.handleStart(w, r, false)
+}
+
+func (s *Server) handleWorkspaceCreate(
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	s.handleStart(w, r, true)
+}
+
+func (s *Server) handleStart(
+	w http.ResponseWriter,
+	r *http.Request,
+	requireWorktree bool,
+) {
 	var req session.StartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+	if requireWorktree && req.Worktree == nil {
+		writeErr(w, http.StatusBadRequest, "worktree request is required")
 		return
 	}
 	st, err := s.opts.Manager.Start(r.Context(), req)

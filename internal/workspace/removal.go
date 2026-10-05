@@ -118,6 +118,7 @@ func (m *Manager) remove(
 	record.Removal = &workspaceRemovalRecord{
 		OperationID: uuid.NewString(),
 		Force:       force,
+		PathAbsent:  !facts.pathExists,
 	}
 	removal.operationID = record.Removal.OperationID
 	installed, err := m.replaceWorkspaceRecordState(record)
@@ -345,6 +346,9 @@ func (m *Manager) completeRemoval(
 	if err != nil {
 		return RemovalPending, err
 	}
+	if err := validateRemovalPathState(record, facts); err != nil {
+		return RemovalPending, err
+	}
 	if !facts.pathExists &&
 		facts.quarantineName == "" &&
 		!facts.registered {
@@ -411,6 +415,9 @@ func (m *Manager) resumePendingRemoval(
 	}
 	facts, err := m.removalFacts(ctx, record)
 	if err != nil {
+		return RemovalPending, err
+	}
+	if err := validateRemovalPathState(record, facts); err != nil {
 		return RemovalPending, err
 	}
 
@@ -549,6 +556,21 @@ func (m *Manager) resumePendingRemoval(
 		return RemovalPending, err
 	}
 	return m.completeRemoval(ctx, record)
+}
+
+func validateRemovalPathState(
+	record workspaceRecord,
+	facts removalFacts,
+) error {
+	if record.Removal == nil ||
+		!record.Removal.PathAbsent ||
+		(!facts.pathExists && facts.quarantineName == "") {
+		return nil
+	}
+	return fmt.Errorf(
+		"workspace: managed path %q appeared after removal began",
+		record.Path,
+	)
 }
 
 func (m *Manager) persistRemovalStart(

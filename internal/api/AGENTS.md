@@ -10,6 +10,7 @@ daemon 通信。
 - `Server` 封装 `http.Server`，路由：
   - `GET  /api/v1/agents`：列出会话
   - `POST /api/v1/agents`：启动会话（JSON body → StartRequest）
+  - `POST /api/v1/worktrees`：创建 worktree 并在其中启动会话
   - `DELETE /api/v1/worktrees/{id}`：仅限 Unix socket，原子校验会话并清理 worktree
   - `GET  /api/v1/agents/{id}`：单会话状态
   - `DELETE /api/v1/agents/{id}`：停止会话

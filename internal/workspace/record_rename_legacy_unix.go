@@ -5,40 +5,29 @@ package workspace
 import (
 	"errors"
 	"os"
-
-	"golang.org/x/sys/unix"
 )
 
 func renameRecordFile(
-	directory *os.File,
 	_ *os.File,
-	temporaryName string,
-	recordName string,
-	replace bool,
+	_ *os.File,
+	_ string,
+	_ string,
+	_ bool,
 ) (bool, error) {
-	if !replace {
-		return false, errors.New(
-			"atomic no-replace record installation is unsupported",
-		)
-	}
-	fd := int(directory.Fd())
-	if err := unix.Renameat(fd, temporaryName, fd, recordName); err != nil {
-		return false, err
-	}
-	return true, nil
+	return false, errors.New(
+		"identity-preserving record rename is unsupported",
+	)
 }
 
 func moveRecordFile(
-	directory *os.File,
 	_ *os.File,
-	sourceName string,
-	targetName string,
+	_ *os.File,
+	_ string,
+	_ string,
 ) (bool, error) {
-	fd := int(directory.Fd())
-	if err := unix.Renameat(fd, sourceName, fd, targetName); err != nil {
-		return false, err
-	}
-	return true, nil
+	return false, errors.New(
+		"identity-preserving record move is unsupported",
+	)
 }
 
 func syncRecordDirectory(directory *os.File) error {

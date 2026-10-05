@@ -1,4 +1,4 @@
-//go:build aix || dragonfly || freebsd || illumos || netbsd || openbsd || solaris
+//go:build js || plan9 || wasip1
 
 package workspace
 

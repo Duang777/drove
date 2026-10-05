@@ -137,7 +137,7 @@ func TestHandleCreateMapsWorkspaceRequestError(t *testing.T) {
 	}
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/api/v1/agents",
+		"/api/v1/worktrees",
 		bytes.NewReader(body),
 	)
 	req.Header.Set("Content-Type", "application/json")
@@ -190,7 +190,7 @@ func TestHandleCreateMapsWorkspaceOperationalError(t *testing.T) {
 	}
 	req := httptest.NewRequest(
 		http.MethodPost,
-		"/api/v1/agents",
+		"/api/v1/worktrees",
 		bytes.NewReader(body),
 	)
 	req.Header.Set("Content-Type", "application/json")
@@ -201,6 +201,37 @@ func TestHandleCreateMapsWorkspaceOperationalError(t *testing.T) {
 		!strings.Contains(rec.Body.String(), session.ErrWorkspacePrepare.Error()) {
 		t.Fatalf(
 			"response = %d %q, want workspace operation 500",
+			rec.Code,
+			rec.Body.String(),
+		)
+	}
+	if got := manager.List(); len(got) != 0 {
+		t.Fatalf("manager retained %d agents, want 0", len(got))
+	}
+	lastSeq, err := st.LastSeq()
+	if err != nil {
+		t.Fatalf("last seq: %v", err)
+	}
+	if lastSeq != 0 {
+		t.Fatalf("last seq = %d, want 0", lastSeq)
+	}
+}
+
+func TestHandleWorkspaceCreateRequiresWorktreeRequest(t *testing.T) {
+	server, manager, st := newTestServer(t)
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/worktrees",
+		strings.NewReader(`{"vendor":"generic","command":"/bin/true"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	serveAuthorized(server, rec, req)
+
+	if rec.Code != http.StatusBadRequest ||
+		!strings.Contains(rec.Body.String(), "worktree request is required") {
+		t.Fatalf(
+			"response = %d %q, want missing worktree 400",
 			rec.Code,
 			rec.Body.String(),
 		)
