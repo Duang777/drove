@@ -249,6 +249,19 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 	); err != nil {
 		return err
 	}
+	gitDirectory, err := m.worktreeGitDirectoryAtRoot(
+		ctx,
+		target.Path,
+		opened,
+	)
+	if err != nil {
+		return err
+	}
+	if gitDirectory != record.GitDirectory {
+		return errors.New(
+			"workspace: prepared worktree Git directory changed",
+		)
+	}
 	registered, exists, err := repository.worktreeRegistration(
 		ctx,
 		target.Path,

@@ -504,7 +504,7 @@ func TestDiscardUsesRetainedRepositoryAfterPrepareSourceSwap(
 	assertPreparationRefsAbsent(t, source, prepared.Branch)
 }
 
-func TestAcknowledgeUsesRetainedRepositoryAfterPrepareSourceSwap(
+func TestAcknowledgeRejectsBrokenWorktreeAfterPrepareSourceSwap(
 	t *testing.T,
 ) {
 	parent := t.TempDir()
@@ -533,19 +533,34 @@ func TestAcknowledgeUsesRetainedRepositoryAfterPrepareSourceSwap(
 	if err := os.Rename(replacement, source); err != nil {
 		t.Fatalf("install replacement source: %v", err)
 	}
-	if err := manager.AcknowledgePreparation(prepared); err != nil {
-		t.Fatalf("acknowledge through retained repository: %v", err)
+	if err := manager.AcknowledgePreparation(prepared); err == nil {
+		t.Fatal("acknowledgement accepted a broken worktree Git pointer")
 	}
 
 	assertBranchExists(t, openedSource, prepared.Branch)
-	assertOwnershipRefsAbsent(t, openedSource)
+	assertGitRefExists(
+		t,
+		filepath.Join(openedSource, ".git"),
+		branchOwnershipRef(prepared.branchOperationID),
+	)
 	assertPreparationRefsAbsent(t, source, prepared.Branch)
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil {
 		t.Fatalf("read acknowledged record: %v", err)
 	}
-	if !exists || !record.PreparationCommitted {
-		t.Fatalf("acknowledged record = %+v, exists=%v", record, exists)
+	if !exists ||
+		record.PreparationCommitted ||
+		record.BranchOperationID == "" {
+		t.Fatalf("failed acknowledgement record = %+v, exists=%v", record, exists)
+	}
+	if err := os.Rename(source, replacement); err != nil {
+		t.Fatalf("remove replacement source: %v", err)
+	}
+	if err := os.Rename(openedSource, source); err != nil {
+		t.Fatalf("restore source repository: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard restored preparation: %v", err)
 	}
 }
 

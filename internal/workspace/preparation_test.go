@@ -636,6 +636,53 @@ func TestAcknowledgePreparationRejectsReplacementTarget(t *testing.T) {
 	}
 }
 
+func TestAcknowledgePreparationRejectsReplacedGitPointer(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	pointerPath := filepath.Join(prepared.Path, ".git")
+	originalPointer, err := os.ReadFile(pointerPath)
+	if err != nil {
+		t.Fatalf("read prepared Git pointer: %v", err)
+	}
+	if err := os.WriteFile(
+		pointerPath,
+		[]byte("gitdir: "+filepath.Join(repository, ".git")+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("replace prepared Git pointer: %v", err)
+	}
+
+	if err := manager.AcknowledgePreparation(prepared); err == nil {
+		t.Fatal("acknowledgement accepted a replaced Git pointer")
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if record.PreparationCommitted || record.BranchOperationID == "" {
+		t.Fatalf("failed acknowledgement changed record: %+v", record)
+	}
+
+	if err := os.WriteFile(pointerPath, originalPointer, 0o600); err != nil {
+		t.Fatalf("restore prepared Git pointer: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge restored Git pointer: %v", err)
+	}
+}
+
 func TestAcknowledgePreparationDoesNotOverwriteConcurrentRemoval(
 	t *testing.T,
 ) {

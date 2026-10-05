@@ -150,8 +150,10 @@ func (m *Manager) CleanupWorkspace(
 	removed := result.Removal.Workspace
 	switch result.State {
 	case workspace.RemovalUnchanged:
-		if managed, known := m.managed(agentID); known {
-			managed.clearWorkspaceRemovalPending()
+		if errors.Is(removalErr, workspace.ErrDirty) {
+			if managed, known := m.managed(agentID); known {
+				managed.clearWorkspaceRemovalPending()
+			}
 		}
 		if removalErr == nil {
 			removalErr = errors.New(

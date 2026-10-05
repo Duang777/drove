@@ -983,6 +983,35 @@ func TestUnchangedWorkspaceRemovalRestoresStartupResumeCandidate(t *testing.T) {
 	}
 }
 
+func TestUnknownWorkspaceRemovalErrorKeepsResumeBlocked(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	managed.setWorkspaceRemovalPending()
+	recoveryErr := errors.New("acknowledgement recovery failed")
+	manager.workspaces = &fakeWorkspaceLifecycle{
+		cleanupState: workspace.RemovalUnchanged,
+		cleanupErr:   recoveryErr,
+	}
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		false,
+	); !errors.Is(err, recoveryErr) {
+		t.Fatalf("cleanup error = %v, want recovery failure", err)
+	}
+	if !managed.workspaceState().removalPending {
+		t.Fatal("unknown removal error cleared pending workspace state")
+	}
+	if _, err := manager.Resume(context.Background(), id); !errors.Is(
+		err,
+		ErrResumeConflict,
+	) {
+		t.Fatalf("resume error = %v, want conflict", err)
+	}
+}
+
 func TestStartupResumeWaitsForFailedWorkspaceCleanup(t *testing.T) {
 	manager, _ := newTestManager(t)
 	id := agent.ID("11111111-1111-4111-8111-111111111111")
