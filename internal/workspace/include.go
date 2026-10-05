@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -78,7 +79,7 @@ func (m *Manager) includedPaths(
 		"--ignored",
 		"--full-name",
 		"-z",
-		"--exclude-from=/dev/stdin",
+		"--exclude-from="+worktreeIncludeInputPath(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -106,6 +107,13 @@ func (m *Manager) includedPaths(
 		}
 	}
 	return unique, nil
+}
+
+func worktreeIncludeInputPath() string {
+	if runtime.GOOS == "linux" {
+		return "/proc/self/fd/0"
+	}
+	return "/dev/stdin"
 }
 
 func readWorktreeInclude(
