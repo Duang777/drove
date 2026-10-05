@@ -500,8 +500,13 @@ func TestCloseKillsProcessGroupAfterGrace(t *testing.T) {
 
 func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
 	const grace = time.Millisecond
+	type signalCall struct {
+		pid    int
+		signal syscall.Signal
+	}
 	var signalsMu sync.Mutex
-	var signals []syscall.Signal
+	var calls []signalCall
+	exits := make(chan ExitInfo, 1)
 
 	sess, err := startWithProcessGroupSignal(
 		Config{
@@ -509,13 +514,13 @@ func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
 			Args:             []string{"-c", "exit 0"},
 			Size:             testSize(t),
 			TerminationGrace: grace,
+			OnExit: func(info ExitInfo) {
+				exits <- info
+			},
 		},
 		func(pid int, signal syscall.Signal) error {
-			if pid <= 0 {
-				t.Fatalf("process group pid = %d, want positive", pid)
-			}
 			signalsMu.Lock()
-			signals = append(signals, signal)
+			calls = append(calls, signalCall{pid: pid, signal: signal})
 			signalsMu.Unlock()
 			return syscall.EPERM
 		},
@@ -533,6 +538,10 @@ func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
 	if !errors.Is(closeErr, syscall.EPERM) {
 		t.Fatalf("close error = %v, want EPERM", closeErr)
 	}
+	exit := waitExit(t, exits)
+	if !errors.Is(exit.CleanupErr, syscall.EPERM) {
+		t.Fatalf("exit cleanup error = %v, want EPERM", exit.CleanupErr)
+	}
 	for _, message := range []string{
 		"pty: terminate process group",
 		"pty: kill process group",
@@ -545,8 +554,11 @@ func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
 	signalsMu.Lock()
 	defer signalsMu.Unlock()
 	var inspected, terminated, killed bool
-	for _, signal := range signals {
-		switch signal {
+	for _, call := range calls {
+		if call.pid <= 0 {
+			t.Fatalf("process group pid = %d, want positive", call.pid)
+		}
+		switch call.signal {
 		case 0:
 			inspected = true
 		case syscall.SIGTERM:
@@ -558,8 +570,56 @@ func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
 	if !inspected || !terminated || !killed {
 		t.Fatalf(
 			"signals = %v, want probe, SIGTERM, and SIGKILL",
-			signals,
+			calls,
 		)
+	}
+}
+
+func TestCloseSuppressesTermPermissionErrorAfterProcessGroupExits(t *testing.T) {
+	const grace = time.Second
+	var signalsMu sync.Mutex
+	var signals []syscall.Signal
+	probes := 0
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+		},
+		func(_ int, signal syscall.Signal) error {
+			signalsMu.Lock()
+			defer signalsMu.Unlock()
+			signals = append(signals, signal)
+			if signal == 0 {
+				probes++
+				if probes > 1 {
+					return syscall.ESRCH
+				}
+			}
+			return syscall.EPERM
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process group exit")
+	}
+	if closeErr := sess.Close(); closeErr != nil {
+		t.Fatalf("close after process group exit: %v", closeErr)
+	}
+
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	for _, signal := range signals {
+		if signal == syscall.SIGKILL {
+			t.Fatalf("signals = %v, want no SIGKILL after ESRCH", signals)
+		}
 	}
 }
 

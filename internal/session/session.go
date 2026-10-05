@@ -1511,6 +1511,8 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	reason := ""
 	errorMessage := ""
 	switch {
+	case info.CleanupErr != nil:
+		errorMessage = info.CleanupErr.Error()
 	case cause == stopCauseUser:
 		exitKind = detect.ExitStopped
 		reason = "user stop"

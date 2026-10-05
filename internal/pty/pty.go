@@ -24,9 +24,10 @@ const (
 
 // ExitInfo 描述进程退出信息。
 type ExitInfo struct {
-	PID  int
-	Code int
-	Err  error
+	PID        int
+	Code       int
+	Err        error
+	CleanupErr error
 }
 
 // Size 是经过校验的 PTY 行列尺寸。
@@ -291,6 +292,9 @@ func (s *Session) waitLoop() {
 	} else {
 		info.Code = 0
 	}
+	s.mu.Lock()
+	info.CleanupErr = s.closeErr
+	s.mu.Unlock()
 	if s.onExit != nil {
 		s.onExit(info)
 	}
