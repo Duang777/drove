@@ -389,9 +389,10 @@ func (m *Manager) preparedWorktreeStagingPath(
 		result = errors.Join(result, bucket.Close())
 	}()
 	info, err := bucket.Lstat(name)
+	path := filepath.Join(filepath.Dir(target.Path), name)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		return "", false, nil
+		return path, false, nil
 	case err != nil:
 		return "", false, err
 	case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
@@ -399,7 +400,7 @@ func (m *Manager) preparedWorktreeStagingPath(
 			"workspace: prepared worktree staging path is not a real directory",
 		)
 	default:
-		return filepath.Join(filepath.Dir(target.Path), name), true, nil
+		return path, true, nil
 	}
 }
 

@@ -414,7 +414,8 @@ func TestPreparePruneFailurePreservesRecoveryRecord(t *testing.T) {
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
 	initSourceSwapRepository(t, source)
-	manager, err := New(filepath.Join(parent, "data"))
+	dataDir := filepath.Join(parent, "data")
+	manager, err := New(dataDir)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -496,6 +497,31 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	)
 	if err != nil || !marker {
 		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile prunable registration: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(targetPath)); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("reconciled preparation record remains: %v", err)
+	}
+	registered, err = restarted.worktreeRegistered(
+		context.Background(),
+		record.Repository,
+		stagingPath,
+	)
+	if err != nil || registered {
+		t.Fatalf("reconciled staging registration = %v, err=%v", registered, err)
 	}
 }
 

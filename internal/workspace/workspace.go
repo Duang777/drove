@@ -719,47 +719,59 @@ func (m *Manager) discardWithRepository(
 			"workspace: preparation record does not match discard request",
 		)
 	}
-	var result error
+	stagingPath, stagingExists, err :=
+		m.preparedWorktreeStagingPath(target, record)
+	if err != nil {
+		return err
+	}
 	_, pathErr := os.Lstat(target.Path)
 	pathExists := pathErr == nil
-	pathMissing := errors.Is(pathErr, os.ErrNotExist)
-	activePath := target.Path
 	if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
-		result = errors.Join(
-			result,
-			fmt.Errorf("workspace: inspect discarded worktree: %w", pathErr),
+		return fmt.Errorf(
+			"workspace: inspect discarded worktree: %w",
+			pathErr,
 		)
 	}
-	if pathMissing {
-		stagingPath, exists, stagingErr :=
-			m.preparedWorktreeStagingPath(target, record)
-		if stagingErr != nil {
-			return errors.Join(result, stagingErr)
-		} else if exists {
-			activePath = stagingPath
-			pathExists = true
-			pathMissing = false
-		}
+	if pathExists && stagingExists {
+		return errors.New(
+			"workspace: preparation has both public and staging worktree paths",
+		)
+	}
+	activePath := target.Path
+	if stagingExists {
+		activePath = stagingPath
+		pathExists = true
 	}
 	if pathExists &&
 		(record.DirectoryIdentity == "" ||
 			(record.GitDirectory == "" && !allowIncompleteGitIdentity)) {
-		return errors.Join(
-			result,
-			errors.New(
-				"workspace: preparation record has incomplete worktree identity",
-			),
+		return errors.New(
+			"workspace: preparation record has incomplete worktree identity",
 		)
 	}
-	registered, err := repository.worktreeRegistered(
-		ctx,
-		activePath,
-	)
+	registrationPaths := []string{target.Path}
+	if stagingPath != target.Path {
+		registrationPaths = append(registrationPaths, stagingPath)
+	}
+	anyRegistered := func() (bool, error) {
+		for _, path := range registrationPaths {
+			registered, err := repository.worktreeRegistered(ctx, path)
+			if err != nil {
+				return false, err
+			}
+			if registered {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	registered, err := anyRegistered()
+	var result error
 	worktreeRemoved := false
 	if err != nil {
 		result = errors.Join(result, err)
 	} else {
-		pathRemoved := pathMissing
+		pathRemoved := !pathExists
 		if pathExists {
 			var removeErr error
 			if activePath != target.Path {
@@ -794,11 +806,7 @@ func (m *Manager) discardWithRepository(
 				)
 			} else {
 				if !registered {
-					registered, removeErr =
-						repository.worktreeRegistered(
-							ctx,
-							activePath,
-						)
+					registered, removeErr = anyRegistered()
 					if removeErr != nil {
 						result = errors.Join(result, removeErr)
 					}
@@ -816,10 +824,7 @@ func (m *Manager) discardWithRepository(
 			}
 		}
 		if pathRemoved {
-			stillRegistered, err := repository.worktreeRegistered(
-				ctx,
-				activePath,
-			)
+			stillRegistered, err := anyRegistered()
 			if err != nil {
 				result = errors.Join(result, err)
 			} else if stillRegistered {
