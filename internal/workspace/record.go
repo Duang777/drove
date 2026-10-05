@@ -955,27 +955,41 @@ func (m *Manager) removalAcknowledgementPending(
 	defer func() {
 		result = errors.Join(result, bucket.Close())
 	}()
-	_, exists, err := findRecordAcknowledgementQuarantine(
-		bucket,
-		agentID,
-		removal.operationID,
-	)
-	if err != nil || exists {
-		return exists, err
-	}
-	_, err = bucket.Lstat(agentID + workspaceRecordSuffix)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return false, nil
-	case err != nil:
+	entries, err := readRootDirectory(bucket)
+	if err != nil {
 		return false, fmt.Errorf(
-			"workspace: inspect record %q: %w",
+			"workspace: read record directory %q: %w",
 			recordPath,
 			err,
 		)
-	default:
-		return true, nil
 	}
+	recordName := agentID + workspaceRecordSuffix
+	acknowledgementPrefix := "." + recordName + ".ack-"
+	pending := false
+	for _, entry := range entries {
+		if entry.Name() == recordName {
+			pending = true
+			continue
+		}
+		if !strings.HasPrefix(entry.Name(), acknowledgementPrefix) {
+			continue
+		}
+		acknowledgementAgentID, operationID, ok :=
+			recordAcknowledgementIdentity(entry.Name())
+		if !ok || acknowledgementAgentID != agentID {
+			return false, fmt.Errorf(
+				"workspace: acknowledgement record %q is invalid",
+				entry.Name(),
+			)
+		}
+		if operationID != removal.operationID {
+			return false, errors.New(
+				"workspace: removal acknowledgement token does not match quarantined record",
+			)
+		}
+		pending = true
+	}
+	return pending, nil
 }
 
 func recordAcknowledgementPrefix(

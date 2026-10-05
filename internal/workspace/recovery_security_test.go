@@ -1732,6 +1732,50 @@ func TestAcknowledgeRemovalRecoversQuarantinedRecord(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeRemovalRejectsWrongTokenForQuarantinedRecord(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	recordPath := workspaceRecordPath(prepared.Path)
+	quarantineName := recordAcknowledgementPrefix(
+		prepared.AgentID,
+		result.Removal.operationID,
+	) + "69696969-6969-4969-8969-696969696969"
+	quarantinePath := filepath.Join(filepath.Dir(recordPath), quarantineName)
+	if err := os.Rename(recordPath, quarantinePath); err != nil {
+		t.Fatalf("quarantine removal record: %v", err)
+	}
+	wrong := result.Removal
+	wrong.operationID = "70707070-7070-4070-8070-707070707070"
+
+	if err := manager.AcknowledgeRemoval(wrong); err == nil {
+		t.Fatal("wrong token acknowledged a quarantined removal record")
+	}
+	if _, err := os.Lstat(quarantinePath); err != nil {
+		t.Fatalf("wrong token changed acknowledgement quarantine: %v", err)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal with correct token: %v", err)
+	}
+}
+
 func TestReconcileRemovalCoalescesAcknowledgementHardLinks(t *testing.T) {
 	repository := newTestRepository(t)
 	dataDir := filepath.Join(t.TempDir(), "data")

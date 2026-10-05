@@ -340,12 +340,14 @@ func (m *Manager) prepare(
 			var pruneErr, discardErr error
 			if cleanupErr == nil {
 				pruneErr = sourceRepository.pruneWorktrees(cleanupCtx)
-				discardErr = m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				)
+				if pruneErr == nil {
+					discardErr = m.discardWithRepository(
+						cleanupCtx,
+						result,
+						sourceRepository,
+						true,
+					)
+				}
 			}
 			resultErr = errors.Join(
 				resultErr,

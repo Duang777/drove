@@ -410,6 +410,95 @@ exit "$status"
 	assertFileContents(t, sentinel, "replacement\n")
 }
 
+func TestPreparePruneFailurePreservesRecoveryRecord(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	canonicalSource, err := resolvePath(source)
+	if err != nil {
+		t.Fatalf("resolve source: %v", err)
+	}
+	targetPath := filepath.Join(
+		manager.root,
+		repositoryHash(canonicalSource),
+		testAgentID,
+	)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	repairFailed := filepath.Join(parent, "repair-failed")
+	pruneFailed := filepath.Join(parent, "prune-failed")
+	wrapper := filepath.Join(parent, "git-wrapper-repair-prune-failure")
+	script := `#!/bin/sh
+case " $* " in
+  *" worktree repair "*)
+    : > "$DROVE_TEST_REPAIR_FAILED"
+    exit 91
+    ;;
+  *" worktree prune "*)
+    : > "$DROVE_TEST_PRUNE_FAILED"
+    exit 92
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REPAIR_FAILED", repairFailed)
+	t.Setenv("DROVE_TEST_PRUNE_FAILED", pruneFailed)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare succeeded after repair and prune failures")
+	}
+	if _, err := os.Lstat(repairFailed); err != nil {
+		t.Fatalf("repair failure was not reached: %v", err)
+	}
+	if _, err := os.Lstat(pruneFailed); err != nil {
+		t.Fatalf("prune failure was not reached: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(targetPath)
+	if err != nil || !exists {
+		t.Fatalf("recovery record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		record.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(targetPath), stagingName)
+	registered, err := manager.worktreeRegistered(
+		context.Background(),
+		record.Repository,
+		stagingPath,
+	)
+	if err != nil || !registered {
+		t.Fatalf("staging registration = %v, err=%v", registered, err)
+	}
+	marker, err := manager.branchOwnershipMarkerExists(
+		context.Background(),
+		record.Repository,
+		record.BranchOperationID,
+	)
+	if err != nil || !marker {
+		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+}
+
 func TestPrepareRollsBackExistingBranchMovedBeforeWorktreeAdd(t *testing.T) {
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
