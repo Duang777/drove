@@ -16,11 +16,11 @@
   执行。workspace 记录先写入同目录临时文件并 fsync，原子安装最终文件后再 fsync
   父目录。
 - Prepare 全程固定已打开的源仓库根目录；仓库根目录的 `.worktreeinclude` 使用
-  gitignore 语义，并从已打开文件读取一次后经 stdin 交给 Git，禁止 Git 再按 manifest
-  路径打开。只有该文件匹配的未跟踪文件会
-  复制到新 worktree，普通未跟踪文件不会复制；匹配项必须是普通文件，symlink 一律
-  拒绝。创建时选中的规范相对路径保存在 version 3 sidecar 中，后续 dirty 检查不得
-  重新解释目标 worktree 的 manifest。
+  gitignore 语义，并从已打开文件读取一次。Unix 通过继承的只读文件描述符交给 Git，
+  其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按源 manifest 路径打开。
+  只有该文件匹配的未跟踪文件会复制到新 worktree，普通未跟踪文件不会复制；匹配项
+  必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 3
+  sidecar 中，后续 dirty 检查不得重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
   sidecar，每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager 的冲突清理。
   新分支与私有 ownership ref 通过同一 `git update-ref --stdin` transaction 创建，并用

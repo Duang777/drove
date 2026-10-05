@@ -1,13 +1,14 @@
 package workspace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
@@ -69,9 +70,9 @@ func (m *Manager) includedPaths(
 		return nil, nil
 	}
 
-	output, err := m.runInput(
+	output, err := m.runIncludeManifest(
 		ctx,
-		string(manifest),
+		manifest,
 		"-C",
 		sourcePath,
 		"ls-files",
@@ -79,7 +80,6 @@ func (m *Manager) includedPaths(
 		"--ignored",
 		"--full-name",
 		"-z",
-		"--exclude-from="+worktreeIncludeInputPath(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -109,11 +109,177 @@ func (m *Manager) includedPaths(
 	return unique, nil
 }
 
-func worktreeIncludeInputPath() string {
-	if runtime.GOOS == "linux" {
-		return "/proc/self/fd/0"
+func (m *Manager) runIncludeManifest(
+	ctx context.Context,
+	manifest []byte,
+	arguments ...string,
+) (_ []byte, result error) {
+	directory, err := os.MkdirTemp("", "drove-worktreeinclude-")
+	if err != nil {
+		return nil, fmt.Errorf("workspace: create include rule directory: %w", err)
 	}
-	return "/dev/stdin"
+	root, err := openRealPathRoot(directory)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("workspace: open include rule directory: %w", err),
+			os.Remove(directory),
+		)
+	}
+	defer func() {
+		verifyErr := verifyRealPathRoot(directory, root)
+		closeErr := root.Close()
+		var removeErr error
+		if verifyErr == nil {
+			removeErr = os.Remove(directory)
+		}
+		result = errors.Join(result, verifyErr, closeErr, removeErr)
+	}()
+
+	name := "." + worktreeIncludeFile + "-" + uuid.NewString()
+	writer, err := root.OpenFile(
+		name,
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
+		0o600,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("workspace: create include rule file: %w", err)
+	}
+	if _, err := writer.Write(manifest); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("workspace: write include rule file: %w", err),
+			removeRecordPathIfSame(root, name, writer),
+			writer.Close(),
+		)
+	}
+	if err := writer.Sync(); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("workspace: sync include rule file: %w", err),
+			removeRecordPathIfSame(root, name, writer),
+			writer.Close(),
+		)
+	}
+	reader, err := root.Open(name)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("workspace: reopen include rule file: %w", err),
+			removeRecordPathIfSame(root, name, writer),
+			writer.Close(),
+		)
+	}
+	writerInfo, statErr := writer.Stat()
+	readerInfo, readerStatErr := reader.Stat()
+	closeErr := writer.Close()
+	if err := errors.Join(statErr, readerStatErr, closeErr); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("workspace: inspect include rule file: %w", err),
+			removeRecordPathIfSame(root, name, reader),
+			reader.Close(),
+		)
+	}
+	if !os.SameFile(writerInfo, readerInfo) {
+		return nil, errors.Join(
+			errors.New("workspace: include rule file changed while reopening"),
+			removeRecordPathIfSame(root, name, reader),
+			reader.Close(),
+		)
+	}
+	defer func() {
+		if name != "" {
+			result = errors.Join(
+				result,
+				removeRecordPathIfSame(root, name, reader),
+			)
+		}
+		result = errors.Join(result, reader.Close())
+	}()
+
+	command := exec.CommandContext(ctx, m.git)
+	excludePath, unlinkBeforeRun, err := configureIncludeManifestCommand(
+		command,
+		reader,
+		filepath.Join(directory, name),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if unlinkBeforeRun {
+		if err := root.Remove(name); err != nil {
+			return nil, fmt.Errorf(
+				"workspace: unlink include rule file: %w",
+				err,
+			)
+		}
+		name = ""
+	}
+	command.Args = append(command.Args, arguments...)
+	command.Args = append(command.Args, "--exclude-from="+excludePath)
+	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	output, commandErr := command.Output()
+
+	verifyErr := verifyIncludeManifest(
+		root,
+		name,
+		reader,
+		readerInfo,
+		manifest,
+	)
+	if commandErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(commandErr, &exitErr) {
+			detail := strings.TrimSpace(string(exitErr.Stderr))
+			if len(detail) > 4096 {
+				detail = detail[:4096]
+			}
+			if detail != "" {
+				commandErr = fmt.Errorf("%s: %w", detail, commandErr)
+			}
+		}
+	}
+	if err := errors.Join(commandErr, verifyErr); err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func verifyIncludeManifest(
+	root *os.Root,
+	name string,
+	reader *os.File,
+	before os.FileInfo,
+	want []byte,
+) error {
+	after, err := reader.Stat()
+	if err != nil {
+		return fmt.Errorf("workspace: reinspect include rule file: %w", err)
+	}
+	if !os.SameFile(before, after) ||
+		after.Size() != before.Size() ||
+		after.Mode() != before.Mode() ||
+		!after.ModTime().Equal(before.ModTime()) {
+		return errors.New("workspace: include rule file changed while Git read it")
+	}
+	if name != "" {
+		current, err := root.Lstat(name)
+		if err != nil {
+			return fmt.Errorf("workspace: recheck include rule file: %w", err)
+		}
+		if !os.SameFile(after, current) {
+			return errors.New(
+				"workspace: include rule path changed while Git read it",
+			)
+		}
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("workspace: rewind include rule file: %w", err)
+	}
+	got, err := io.ReadAll(io.LimitReader(reader, maxWorktreeIncludeSize+1))
+	if err != nil {
+		return fmt.Errorf("workspace: reread include rule file: %w", err)
+	}
+	if !bytes.Equal(got, want) {
+		return errors.New("workspace: include rules changed while Git read them")
+	}
+	return nil
 }
 
 func readWorktreeInclude(
