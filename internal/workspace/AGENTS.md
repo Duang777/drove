@@ -71,7 +71,9 @@
   只能导致失败，不得覆盖最终记录。清理临时名时也必须确认它仍指向已打开文件。缺少
   对应原子原语的平台必须返回错误。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
-  本次新建的分支。路径存在但 preparation sidecar 尚未持久化目录身份时必须 fail-stop，
+  本次新建的分支。普通或重启后的 Discard 遇到路径存在但 preparation sidecar 尚未持久化
+  完整目录身份时必须 fail-stop；同一次 Prepare 仍持有原始仓库根句柄时，可先从该句柄验证
+  worktree registration、Git 私有目录、分支和 HEAD，再固定并持久化目标目录身份后回滚。
   禁止把同名替代目录当作失败创建的残留删除。未注册残留目录通过已验证的 `os.Root`
   相对操作删除，任一中间 symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理
   目录，再仅调用 `git worktree prune --expire now` 清理 stale registration；禁止把受管

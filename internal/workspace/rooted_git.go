@@ -15,7 +15,14 @@ func (m *Manager) runRootedGit(
 	root *os.Root,
 	arguments ...string,
 ) ([]byte, error) {
-	return m.runRootedGitInput(ctx, path, root, "", arguments...)
+	return m.runRootedGitInputWithPolicy(
+		ctx,
+		path,
+		root,
+		"",
+		true,
+		arguments...,
+	)
 }
 
 func (m *Manager) runRootedGitInput(
@@ -25,8 +32,45 @@ func (m *Manager) runRootedGitInput(
 	input string,
 	arguments ...string,
 ) ([]byte, error) {
-	if err := verifyRealPathRoot(path, root); err != nil {
-		return nil, err
+	return m.runRootedGitInputWithPolicy(
+		ctx,
+		path,
+		root,
+		input,
+		true,
+		arguments...,
+	)
+}
+
+func (m *Manager) runBoundGitInput(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	return m.runRootedGitInputWithPolicy(
+		ctx,
+		path,
+		root,
+		input,
+		false,
+		arguments...,
+	)
+}
+
+func (m *Manager) runRootedGitInputWithPolicy(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	input string,
+	verifyPath bool,
+	arguments ...string,
+) ([]byte, error) {
+	if verifyPath {
+		if err := verifyRealPathRoot(path, root); err != nil {
+			return nil, err
+		}
 	}
 	command, cleanup, err := rootedGitCommand(
 		ctx,
@@ -39,7 +83,10 @@ func (m *Manager) runRootedGitInput(
 		return nil, err
 	}
 	output, commandErr := runGitCommand(command, input)
-	verifyErr := verifyRealPathRoot(path, root)
+	var verifyErr error
+	if verifyPath {
+		verifyErr = verifyRealPathRoot(path, root)
+	}
 	cleanupErr := cleanup()
 	return output, errors.Join(commandErr, verifyErr, cleanupErr)
 }
