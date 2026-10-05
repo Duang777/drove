@@ -40,11 +40,7 @@ func newPreparationLease(
 		return nil, err
 	}
 	repository := rootedRepositoryCapability(manager, path, root)
-	gitPath, err := repository.gitDirectory(ctx)
-	if err != nil {
-		return nil, errors.Join(err, guard.Close())
-	}
-	commonPath, err := repository.commonGitDirectory(ctx)
+	gitPath, commonPath, err := repository.repositoryDirectories(ctx)
 	if err != nil {
 		return nil, errors.Join(err, guard.Close())
 	}
@@ -137,7 +133,8 @@ func newPreparationLease(
 			fmt.Errorf("workspace: verify common Git directory: %w", err),
 		)
 	}
-	confirmedGitPath, err := repository.gitDirectory(ctx)
+	confirmedGitPath, confirmedCommonPath, err :=
+		repository.repositoryDirectories(ctx)
 	if err != nil {
 		return nil, cleanup(err)
 	}
@@ -147,10 +144,6 @@ func newPreparationLease(
 				"workspace: source Git directory changed while opening",
 			),
 		)
-	}
-	confirmedCommonPath, err := repository.commonGitDirectory(ctx)
-	if err != nil {
-		return nil, cleanup(err)
 	}
 	if confirmedCommonPath != commonPath {
 		return nil, cleanup(

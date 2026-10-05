@@ -752,6 +752,97 @@ func TestAcknowledgeRejectsReplacementSourceGitPointer(t *testing.T) {
 	}
 }
 
+func TestAcknowledgeQueriesSourceGitDirectoriesTogether(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	initSourceSwapRepository(t, repository)
+	runGit(t, repository, "worktree", "add", "-b", "source", source)
+	runGit(t, repository, "worktree", "add", "-b", "replacement", replacement)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	sourcePointer := filepath.Join(source, ".git")
+	originalPointer, err := os.ReadFile(sourcePointer)
+	if err != nil {
+		t.Fatalf("read source Git pointer: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	counter := filepath.Join(parent, "separate-directory-queries")
+	swapped := filepath.Join(parent, "swapped")
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+has_git=
+has_common=
+for argument in "$@"; do
+  case "$argument" in
+    --absolute-git-dir) has_git=1 ;;
+    --git-common-dir) has_common=1 ;;
+  esac
+done
+matched=
+if [ -n "$has_git" ] && [ -z "$has_common" ]; then
+  count=0
+  if [ -f "$DROVE_TEST_COUNTER" ]; then
+    count=$(cat "$DROVE_TEST_COUNTER") || exit 90
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$DROVE_TEST_COUNTER" || exit 91
+  if [ "$count" -eq 5 ]; then
+    matched=1
+  fi
+fi
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$matched" ]; then
+  cp "$DROVE_TEST_REPLACEMENT_POINTER" "$DROVE_TEST_SOURCE_POINTER" || exit 92
+  : > "$DROVE_TEST_SWAPPED"
+fi
+exit "$status"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_COUNTER", counter)
+	t.Setenv(
+		"DROVE_TEST_REPLACEMENT_POINTER",
+		filepath.Join(replacement, ".git"),
+	)
+	t.Setenv("DROVE_TEST_SOURCE_POINTER", sourcePointer)
+	t.Setenv("DROVE_TEST_SWAPPED", swapped)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	if _, err := os.Stat(swapped); !os.IsNotExist(err) {
+		t.Fatalf("separate Git directory query window remained: %v", err)
+	}
+	currentPointer, err := os.ReadFile(sourcePointer)
+	if err != nil {
+		t.Fatalf("read acknowledged source Git pointer: %v", err)
+	}
+	if string(currentPointer) != string(originalPointer) {
+		t.Fatal("source Git pointer changed between directory queries")
+	}
+}
+
 func TestAcknowledgeRejectsSourceGitPointerSwapDuringOwnershipCleanup(
 	t *testing.T,
 ) {

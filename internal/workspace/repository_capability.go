@@ -96,7 +96,9 @@ func (r repositoryCapability) verifyBinding(ctx context.Context) error {
 		return err
 	}
 	unbound := rootedRepositoryCapability(r.manager, r.path, r.root)
-	currentGitPath, err := unbound.gitDirectory(ctx)
+	currentGitPath, currentCommonPath, err := unbound.repositoryDirectories(
+		ctx,
+	)
 	if err != nil {
 		return err
 	}
@@ -104,10 +106,6 @@ func (r repositoryCapability) verifyBinding(ctx context.Context) error {
 		return errors.New(
 			"workspace: source Git directory binding changed",
 		)
-	}
-	currentCommonPath, err := unbound.commonGitDirectory(ctx)
-	if err != nil {
-		return err
 	}
 	if currentCommonPath != r.commonPath {
 		return errors.New(
@@ -173,68 +171,56 @@ func (r repositoryCapability) runWorktree(
 	return output, errors.Join(commandErr, cleanup())
 }
 
-func (r repositoryCapability) commonGitDirectory(
+func (r repositoryCapability) repositoryDirectories(
 	ctx context.Context,
-) (string, error) {
-	output, err := r.runForward(
-		ctx,
-		"",
-		"rev-parse",
-		"--path-format=absolute",
-		"--git-common-dir",
-	)
-	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: inspect common Git directory: %w",
-			err,
-		)
-	}
-	path := strings.TrimSpace(string(output))
-	if !filepath.IsAbs(path) {
-		return "", errors.New(
-			"workspace: common Git directory is not absolute",
-		)
-	}
-	path, err = resolvePath(path)
-	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: resolve common Git directory: %w",
-			err,
-		)
-	}
-	return path, nil
-}
-
-func (r repositoryCapability) gitDirectory(
-	ctx context.Context,
-) (string, error) {
+) (string, string, error) {
 	output, err := r.runForward(
 		ctx,
 		"",
 		"rev-parse",
 		"--path-format=absolute",
 		"--absolute-git-dir",
+		"--git-common-dir",
 	)
 	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: inspect source Git directory: %w",
+		return "", "", fmt.Errorf(
+			"workspace: inspect Git directories: %w",
 			err,
 		)
 	}
-	path := strings.TrimSpace(string(output))
-	if !filepath.IsAbs(path) {
-		return "", errors.New(
-			"workspace: source Git directory is not absolute",
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) != 2 {
+		return "", "", errors.New(
+			"workspace: Git directory query returned an invalid response",
 		)
 	}
-	path, err = resolvePath(path)
+	resolve := func(kind string, path string) (string, error) {
+		path = strings.TrimSpace(path)
+		if !filepath.IsAbs(path) {
+			return "", fmt.Errorf(
+				"workspace: %s Git directory is not absolute",
+				kind,
+			)
+		}
+		resolved, resolveErr := resolvePath(path)
+		if resolveErr != nil {
+			return "", fmt.Errorf(
+				"workspace: resolve %s Git directory: %w",
+				kind,
+				resolveErr,
+			)
+		}
+		return resolved, nil
+	}
+	gitPath, err := resolve("source", lines[0])
 	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: resolve source Git directory: %w",
-			err,
-		)
+		return "", "", err
 	}
-	return path, nil
+	commonPath, err := resolve("common", lines[1])
+	if err != nil {
+		return "", "", err
+	}
+	return gitPath, commonPath, nil
 }
 
 func (r repositoryCapability) headOID(
