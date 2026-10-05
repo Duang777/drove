@@ -20,10 +20,10 @@
 
 Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、Codex，或任何一个可执行文件，把终端字节追加进 SQLite，并用同一套状态看它们。
 
-黑匣子和单会话交互已经能用：`drove attach` 连接实时终端，Web 详情页显示实时
-xterm.js 终端并按时间精确回放。塔台网格、推送和手机审批仍在
-[Epic #31](https://github.com/Duang777/drove/issues/31) 中。仓库没有发布包，也没有
-多会话 TUI。
+黑匣子和终端交互已经能用：`drove tui` 总览全部会话，`drove attach` 连接单个
+实时终端，Web 详情页显示实时 xterm.js 终端并按时间精确回放。塔台网格、推送和
+手机审批仍在 [Epic #31](https://github.com/Duang777/drove/issues/31) 中。
+仓库没有发布包。
 
 ## 功能状态
 
@@ -36,7 +36,7 @@ xterm.js 终端并按时间精确回放。塔台网格、推送和手机审批�
 | 能力 | 状态 | 在哪里 |
 | --- | --- | --- |
 | 每个 agent 一个 PTY，由 `droved` 持有 | 已落地 | `internal/pty` |
-| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `stop` `send` `hook` `worktree` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
+| `init` `up` `resume` `ps` `log` `timeline` `explain` `attach` `tui` `stop` `send` `hook` `worktree` `web` `token rotate` `version` | 已落地 | `cmd/drove` |
 | Claude / Codex 按会话注入状态上报 | 已落地 | [#15](https://github.com/Duang777/drove/issues/15) |
 | 终端字节记录，默认保留 30 天 | 已落地 | [#13](https://github.com/Duang777/drove/issues/13) |
 | `drove log` 回放字节，`--plain` 去掉控制序列 | 已落地 | |
@@ -47,7 +47,7 @@ xterm.js 终端并按时间精确回放。塔台网格、推送和手机审批�
 | Codex approval-only OSC 9 Blocked 候选 | 已落地 | [#40](https://github.com/Duang777/drove/issues/40)，[spec 012](specs/012-codex-osc9-notifications/spec.md) |
 | 状态时间线、Blocked 跳转和精确终端帧 | 已落地 | [#25](https://github.com/Duang777/drove/issues/25) |
 | `drove attach` 与 Web xterm.js 单会话终端 | 已落地 | [#20](https://github.com/Duang777/drove/issues/20)，[spec 012](specs/012-terminal-attach-web-playback/spec.md) |
-| Bubble Tea 多会话总览 | 规划中 | [#41](https://github.com/Duang777/drove/issues/41) |
+| Bubble Tea 多会话终端总览 | 已落地 | [#41](https://github.com/Duang777/drove/issues/41)，[spec 014](specs/014-terminal-overview-tui/spec.md) |
 | 塔台网格 | 规划中 | [#26](https://github.com/Duang777/drove/issues/26) |
 | 推送通知 | 规划中 | [#27](https://github.com/Duang777/drove/issues/27) |
 | 手机上批准、拒绝或回一句 | 规划中 | [#28](https://github.com/Duang777/drove/issues/28) |
@@ -84,6 +84,7 @@ export PATH="$PWD/bin:$PATH"
 drove init
 drove up /bin/cat --name demo
 drove ps
+drove tui
 drove send <agent-id> 'hello'
 drove attach <agent-id>
 drove log <agent-id>
@@ -119,6 +120,7 @@ drove up claude --worktree --branch feature/api
 | `drove timeline <agent-id>` | 打印状态区间、输出保留范围和一基 Blocked 跳转点。`--json` 输出完整响应 |
 | `drove explain <agent-id>` | 打印最近的状态决策和 attached 会话的临时受限屏幕 |
 | `drove attach <agent-id>` | 连接实时原始终端。Ctrl-Q 只断开本地连接；`--read-only` 不发送输入或 resize |
+| `drove tui` | 打开多会话终端总览，可筛选、发送输入、停止、解释或进入读写/只读 attach |
 | `drove send <agent-id> <text>` | 发送这一行并自动加上换行。stdout 打印字节数 |
 | `drove send <agent-id> --stdin` | 原样读取标准输入，不追加换行 |
 | `drove stop <agent-id>` | 停止该会话 |
@@ -135,6 +137,22 @@ drove up claude --worktree --branch feature/api
 远端 agent。所有退出路径都会恢复本地终端；本地断开不会停止 agent。
 
 `drove send` 只接受合法 UTF-8，单次最多 64 KiB。审计事件只记字节数，不记正文。`drove hook` 的单份 JSON 上限是 1 MiB。它不读取控制令牌，也不会拉起 daemon。
+
+### 终端总览
+
+运行 `drove tui` 打开 Bubble Tea 多会话总览。会话列表每 500 ms 从 daemon
+完整刷新一次，失败时保留上一次成功结果。只有选中的会话订阅有界、live-only 的
+snapshot；切换选择会关闭旧订阅，因此总览不会为所有会话持续拉取终端画面。
+
+| 按键 | 行为 |
+| --- | --- |
+| `↑` / `k`、`↓` / `j` | 移动会话选择 |
+| `f`，然后 `←` / `→` | 选择状态过滤器；`Enter` 或 `Esc` 返回列表 |
+| `a` / `r` | 进入读写 / 只读 attach；按 Ctrl-Q 返回总览 |
+| `s` | 编辑并发送一行输入；`Enter` 发送，`Esc` 取消 |
+| `x` | 请求停止；只有 `y` 确认，`n` 或 `Esc` 取消 |
+| `e` | 查看类型化状态解释；方向键或 Page Up / Page Down 滚动，`Esc` 返回 |
+| `q` / Ctrl-C | 在列表焦点退出总览，不停止任何远端 Agent |
 
 ## 工作原理
 
@@ -197,8 +215,8 @@ attached 会话最多返回底部 12 行，每行最多 160 个 cells，编码�
 `explain` 只返回持久化的脱敏决策。
 
 WebSocket v2 提供按会话的 raw、events 和 snapshot 订阅，以及 writable raw
-attachment 的 input 和 resize。`drove attach` 和 Web 详情页都使用这套协议。
-Bubble Tea 多会话总览由 [#41](https://github.com/Duang777/drove/issues/41) 跟踪。
+attachment 的 input 和 resize。`drove attach`、`drove tui` 和 Web 详情页使用
+这套协议。
 32 会话实测结果见
 [技术笔记](docs/technical-notes.md#9-terminal-actor-32-session-benchmark)。
 
@@ -363,12 +381,12 @@ Blocked 跳转和返回 live。录制过期或达到浏览器本地上限时，�
 
 已批准的 MVP 是 [Epic #31：黑匣子 + 塔台](https://github.com/Duang777/drove/issues/31)。
 
-屏幕模型、WebSocket 终端流、单会话交互、回放和控制面加固已经完成，下一步是：
+屏幕模型、WebSocket 终端流、终端总览、单会话交互、回放和控制面加固已经完成，
+下一步是：
 
 1. [#26](https://github.com/Duang777/drove/issues/26) 塔台网格
-2. [#41](https://github.com/Duang777/drove/issues/41) Bubble Tea 多会话总览
-3. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准、拒绝或回复
-4. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
+2. [#27](https://github.com/Duang777/drove/issues/27) 推送，[#28](https://github.com/Duang777/drove/issues/28) 手机上的批准、拒绝或回复
+3. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
 
 MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18) 的 shim，然后是 [#29](https://github.com/Duang777/drove/issues/29) 离开简报和 [#30](https://github.com/Duang777/drove/issues/30) 全文搜索。[#22](https://github.com/Duang777/drove/issues/22) 结构化状态源和 [#24](https://github.com/Duang777/drove/issues/24) 持久 hook 安装器推迟。
 
@@ -416,6 +434,7 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 | [spec 011](specs/011-terminal-stream-replay/spec.md) | 终端流、cursor、时间线和精确帧 |
 | [spec 012，终端 attach](specs/012-terminal-attach-web-playback/spec.md) | CLI attach 与 Web 实时终端和回放 |
 | [spec 012，Codex OSC 9](specs/012-codex-osc9-notifications/spec.md) | Codex approval OSC 9 检测与正文打码 |
+| [spec 014](specs/014-terminal-overview-tui/spec.md) | Bubble Tea 多会话终端总览 |
 | [技术笔记](docs/technical-notes.md) | 阶段性阅读笔记。文首说明前六节不代表当前主干 |
 | [AGENTS.md](AGENTS.md) | 目录职责和工程约束 |
 
