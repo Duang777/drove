@@ -60,6 +60,7 @@ func (m *Manager) includedPaths(
 	ctx context.Context,
 	sourcePath string,
 	sourceRoot *os.Root,
+	repository repositoryCapability,
 ) ([]string, error) {
 	manifest, exists, err := readWorktreeInclude(sourceRoot)
 	if err != nil {
@@ -73,6 +74,7 @@ func (m *Manager) includedPaths(
 		ctx,
 		sourcePath,
 		sourceRoot,
+		repository,
 		manifest,
 		"ls-files",
 		"--others",
@@ -112,6 +114,7 @@ func (m *Manager) runIncludeManifest(
 	ctx context.Context,
 	sourcePath string,
 	sourceRoot *os.Root,
+	repository repositoryCapability,
 	manifest []byte,
 	arguments ...string,
 ) (_ []byte, result error) {
@@ -197,12 +200,9 @@ func (m *Manager) runIncludeManifest(
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
 		return nil, err
 	}
-	command, cleanupCommand, err := rootedGitCommand(
+	command, cleanupCommand, err := repository.worktreeCommand(
 		ctx,
-		m.git,
-		sourcePath,
-		sourceRoot,
-		arguments,
+		arguments...,
 	)
 	if err != nil {
 		return nil, err
@@ -227,7 +227,12 @@ func (m *Manager) runIncludeManifest(
 		}
 		name = ""
 	}
-	command.Args = append(command.Args, "--exclude-from="+excludePath)
+	command.Args = append(
+		command.Args,
+		"--exclude-from="+excludePath,
+		"--",
+		":(top)",
+	)
 	output, commandErr := runGitCommand(command, "")
 
 	verifyErr := errors.Join(

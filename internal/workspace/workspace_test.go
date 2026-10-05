@@ -893,6 +893,76 @@ func TestVersionOneRecordRequiresForceEvenWhenPathIsMissing(t *testing.T) {
 	}
 }
 
+func TestRemoveUpgradesCommittedVersionFourRecord(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	record.Version = repositoryWorkspaceRecordVersion
+	record.RepositoryEvidence.GitDirectory = ""
+	record.RepositoryEvidence.GitDirectoryIdentity = ""
+	record.PreparationCommitted = true
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write committed version 4 record: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove version 4 workspace = %+v, %v", result, err)
+	}
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	expected := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	); err != nil {
+		t.Fatalf("adopt upgraded removal record: %v", err)
+	}
+	upgraded, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read upgraded removal record: exists=%v err=%v", exists, err)
+	}
+	if upgraded.Version != workspaceRecordVersion ||
+		upgraded.RepositoryEvidence != nil ||
+		upgraded.BranchOperationID != "" ||
+		upgraded.Removal == nil {
+		t.Fatalf("upgraded removal record = %+v", upgraded)
+	}
+	if err := restarted.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
 func TestRemoveReturnsPendingAfterPartialGitMutation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires a POSIX shell")
@@ -1505,6 +1575,54 @@ func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {
 	}
 	if err := manager.Discard(context.Background(), prepared); err != nil {
 		t.Fatalf("discard nested worktree: %v", err)
+	}
+}
+
+func TestPrepareFromLinkedWorktreeUsesSourceIndexForIncludes(t *testing.T) {
+	repository := newTestRepository(t)
+	const includedPath = "linked-local.env"
+	if err := os.WriteFile(
+		filepath.Join(repository, includedPath),
+		[]byte("linked local value\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write main worktree file: %v", err)
+	}
+	runGit(t, repository, "add", includedPath)
+	runGit(t, repository, "commit", "-m", "track linked include candidate")
+
+	source := filepath.Join(t.TempDir(), "source-worktree")
+	runGit(t, repository, "worktree", "add", "-b", "source-branch", source)
+	runGit(t, source, "rm", "--cached", includedPath)
+	runGit(t, source, "commit", "-m", "untrack linked include candidate")
+	if err := os.WriteFile(
+		filepath.Join(source, worktreeIncludeFile),
+		[]byte(includedPath+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write linked include manifest: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"linked-include-branch",
+		secondTestAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare from linked worktree: %v", err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, includedPath),
+		"linked local value\n",
+	)
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard linked include worktree: %v", err)
 	}
 }
 

@@ -29,12 +29,16 @@ func (m *Manager) capturePreparedWorktreeIdentity(
 			"workspace: prepared worktree has no Git registration",
 		)
 	}
-	gitDirectory, err := repository.preparedWorktreeGitDirectory(
-		ctx,
-		target.AgentID,
-	)
-	if err != nil {
-		return workspaceRecord{}, err
+	gitDirectory := record.GitDirectory
+	if gitDirectory == "" {
+		gitDirectory, err = repository.preparedWorktreeGitDirectory(
+			ctx,
+			target,
+			registered,
+		)
+		if err != nil {
+			return workspaceRecord{}, err
+		}
 	}
 	if err := repository.verifyPreparedWorktree(
 		ctx,

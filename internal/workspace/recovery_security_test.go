@@ -849,7 +849,8 @@ func TestPreparePreservesConcurrentlyCreatedBranch(t *testing.T) {
 	script := `#!/bin/sh
 case " $* " in
   *" update-ref "*" --stdin "*)
-    "$DROVE_TEST_REAL_GIT" -C "$DROVE_TEST_REPOSITORY" branch "$DROVE_TEST_BRANCH" HEAD
+    env -u GIT_DIR -u GIT_COMMON_DIR -u GIT_WORK_TREE \
+      "$DROVE_TEST_REAL_GIT" -C "$DROVE_TEST_REPOSITORY" branch "$DROVE_TEST_BRANCH" HEAD
     ;;
 esac
 exec "$DROVE_TEST_REAL_GIT" "$@"

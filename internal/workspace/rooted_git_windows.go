@@ -13,6 +13,8 @@ func rootedGitCommand(
 	git string,
 	path string,
 	root *os.Root,
+	commonPath string,
+	_ *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	guard, err := openRepositoryGuard(path, root)
@@ -27,5 +29,14 @@ func rootedGitCommand(
 			arguments...,
 		)...,
 	)
+	command.Env = rootedGitEnvironment(command.Environ())
+	if commonPath != "" {
+		command.Dir = commonPath
+		command.Env = boundGitEnvironment(
+			command.Env,
+			commonPath,
+			path,
+		)
+	}
 	return command, guard.Close, nil
 }

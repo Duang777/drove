@@ -8,13 +8,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 type repositoryCapability struct {
-	manager *Manager
-	path    string
-	root    *os.Root
+	manager    *Manager
+	path       string
+	root       *os.Root
+	gitPath    string
+	gitRoot    *os.Root
+	commonPath string
+	commonRoot *os.Root
+	startOID   string
 }
 
 func pathRepositoryCapability(
@@ -39,6 +45,21 @@ func rootedRepositoryCapability(
 	}
 }
 
+func (r repositoryCapability) withRepositoryBinding(
+	gitPath string,
+	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
+	startOID string,
+) repositoryCapability {
+	r.gitPath = gitPath
+	r.gitRoot = gitRoot
+	r.commonPath = commonPath
+	r.commonRoot = commonRoot
+	r.startOID = startOID
+	return r
+}
+
 func (r repositoryCapability) run(
 	ctx context.Context,
 	input string,
@@ -49,6 +70,8 @@ func (r repositoryCapability) run(
 			ctx,
 			r.path,
 			r.root,
+			r.commonPath,
+			r.commonRoot,
 			input,
 			arguments...,
 		)
@@ -66,11 +89,14 @@ func (r repositoryCapability) runForward(
 	arguments ...string,
 ) ([]byte, error) {
 	if r.root != nil {
-		return r.manager.runRootedGitInput(
+		return r.manager.runRootedGitInputWithPolicy(
 			ctx,
 			r.path,
 			r.root,
+			r.commonPath,
+			r.commonRoot,
 			input,
+			true,
 			arguments...,
 		)
 	}
@@ -109,6 +135,54 @@ func (r repositoryCapability) commonGitDirectory(
 	return path, nil
 }
 
+func (r repositoryCapability) gitDirectory(
+	ctx context.Context,
+) (string, error) {
+	output, err := r.runForward(
+		ctx,
+		"",
+		"rev-parse",
+		"--path-format=absolute",
+		"--absolute-git-dir",
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: inspect source Git directory: %w",
+			err,
+		)
+	}
+	path := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(path) {
+		return "", errors.New(
+			"workspace: source Git directory is not absolute",
+		)
+	}
+	path, err = resolvePath(path)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: resolve source Git directory: %w",
+			err,
+		)
+	}
+	return path, nil
+}
+
+func (r repositoryCapability) headOID(
+	ctx context.Context,
+) (string, error) {
+	output, err := r.runForward(ctx, "", "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return "", fmt.Errorf("workspace: resolve branch start: %w", err)
+	}
+	oid := strings.TrimSpace(string(output))
+	if oid == "" || strings.ContainsAny(oid, " \t\r\n") {
+		return "", errors.New(
+			"workspace: source HEAD returned an invalid object ID",
+		)
+	}
+	return oid, nil
+}
+
 func (r repositoryCapability) command(
 	ctx context.Context,
 	arguments ...string,
@@ -119,6 +193,8 @@ func (r repositoryCapability) command(
 			r.manager.git,
 			r.path,
 			r.root,
+			r.commonPath,
+			r.commonRoot,
 			arguments,
 		)
 	}
@@ -128,6 +204,74 @@ func (r repositoryCapability) command(
 		append([]string{"-C", r.path}, arguments...)...,
 	)
 	return command, func() error { return nil }, nil
+}
+
+func (r repositoryCapability) worktreeCommand(
+	ctx context.Context,
+	arguments ...string,
+) (*exec.Cmd, func() error, error) {
+	if r.root != nil && r.gitRoot != nil {
+		return rootedGitCommand(
+			ctx,
+			r.manager.git,
+			r.path,
+			r.root,
+			r.gitPath,
+			r.gitRoot,
+			arguments,
+		)
+	}
+	return r.command(ctx, arguments...)
+}
+
+func (r repositoryCapability) branchExists(
+	ctx context.Context,
+	branch string,
+) (bool, error) {
+	_, err := r.runForward(
+		ctx,
+		"",
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+branch,
+	)
+	if err == nil {
+		return true, nil
+	}
+	if isExitCode(err, 1) {
+		return false, nil
+	}
+	return false, fmt.Errorf("workspace: inspect branch %q: %w", branch, err)
+}
+
+func (r repositoryCapability) createOwnedBranch(
+	ctx context.Context,
+	branch string,
+	operationID string,
+) error {
+	if r.startOID == "" {
+		return errors.New("workspace: source branch start is unavailable")
+	}
+	input := fmt.Sprintf(
+		"start\ncreate refs/heads/%s %s\ncreate %s %s\nprepare\ncommit\n",
+		branch,
+		r.startOID,
+		branchOwnershipRef(operationID),
+		r.startOID,
+	)
+	if _, err := r.runForward(
+		ctx,
+		input,
+		"update-ref",
+		"--create-reflog",
+		"-m",
+		branchOwnershipLogMessage(operationID),
+		"--stdin",
+	); err != nil {
+		return fmt.Errorf("workspace: create owned branch transaction: %w", err)
+	}
+	return nil
 }
 
 func (r repositoryCapability) refOID(
@@ -219,36 +363,31 @@ func (r repositoryCapability) pruneWorktrees(
 
 func (r repositoryCapability) preparedWorktreeGitDirectory(
 	ctx context.Context,
-	agentID string,
+	target Workspace,
+	registered registeredWorktree,
 ) (string, error) {
-	output, err := r.run(
-		ctx,
-		"",
-		"rev-parse",
-		"--path-format=absolute",
-		"--git-path",
-		"worktrees/"+agentID,
+	worktrees, err := r.registeredWorktrees(ctx)
+	if err != nil {
+		return "", err
+	}
+	for index := 0; index <= len(worktrees)+1; index++ {
+		name := target.AgentID
+		if index != 0 {
+			name += strconv.Itoa(index)
+		}
+		path := filepath.Join(r.commonPath, "worktrees", name)
+		if err := r.verifyPreparedWorktree(
+			ctx,
+			target,
+			path,
+			registered,
+		); err == nil {
+			return path, nil
+		}
+	}
+	return "", errors.New(
+		"workspace: cannot resolve the prepared worktree Git directory",
 	)
-	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: resolve prepared worktree Git directory: %w",
-			err,
-		)
-	}
-	path := strings.TrimSpace(string(output))
-	if !filepath.IsAbs(path) {
-		return "", errors.New(
-			"workspace: prepared worktree Git directory is not absolute",
-		)
-	}
-	path, err = resolvePath(path)
-	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: resolve prepared worktree Git directory: %w",
-			err,
-		)
-	}
-	return path, nil
 }
 
 func (r repositoryCapability) verifyPreparedWorktree(
@@ -265,6 +404,13 @@ func (r repositoryCapability) verifyPreparedWorktree(
 		return errors.New(
 			"workspace: prepared worktree registration does not match intent",
 		)
+	}
+	gitDirectory, err := r.boundGitDirectory(
+		gitDirectory,
+		target.AgentID,
+	)
+	if err != nil {
+		return err
 	}
 	head, err := r.run(
 		ctx,
@@ -307,6 +453,34 @@ func (r repositoryCapability) verifyPreparedWorktree(
 	return nil
 }
 
+func (r repositoryCapability) boundGitDirectory(
+	path string,
+	agentID string,
+) (string, error) {
+	if r.commonRoot == nil {
+		return path, nil
+	}
+	worktreesPath := filepath.Join(r.commonPath, "worktrees")
+	name, err := filepath.Rel(worktreesPath, path)
+	if err != nil ||
+		!filepath.IsAbs(path) ||
+		filepath.Dir(name) != "." ||
+		!validWorktreeGitDirectoryName(name, agentID) {
+		return "", errors.New(
+			"workspace: prepared Git directory does not match the managed worktree",
+		)
+	}
+	return filepath.Join("worktrees", name), nil
+}
+
+func validWorktreeGitDirectoryName(name string, agentID string) bool {
+	if name == agentID {
+		return true
+	}
+	suffix := strings.TrimPrefix(name, agentID)
+	return suffix != "" && strings.Trim(suffix, "0123456789") == ""
+}
+
 func (r repositoryCapability) refLogSubject(
 	ctx context.Context,
 	ref string,
@@ -320,6 +494,7 @@ func (r repositoryCapability) refLogSubject(
 		"-n",
 		"1",
 		ref,
+		"--",
 	)
 	if err != nil {
 		return "", false, fmt.Errorf(
@@ -436,7 +611,7 @@ func (r repositoryCapability) runPreparedRefTransaction(
 	defer func() {
 		result = errors.Join(result, cleanup())
 	}()
-	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	command.Env = append(command.Environ(), "LC_ALL=C", "LANG=C")
 	stdin, err := command.StdinPipe()
 	if err != nil {
 		return false, err

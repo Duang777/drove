@@ -20,6 +20,8 @@ func (m *Manager) runRootedGit(
 		path,
 		root,
 		"",
+		nil,
+		"",
 		true,
 		arguments...,
 	)
@@ -36,6 +38,8 @@ func (m *Manager) runRootedGitInput(
 		ctx,
 		path,
 		root,
+		"",
+		nil,
 		input,
 		true,
 		arguments...,
@@ -46,6 +50,8 @@ func (m *Manager) runBoundGitInput(
 	ctx context.Context,
 	path string,
 	root *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	input string,
 	arguments ...string,
 ) ([]byte, error) {
@@ -53,6 +59,8 @@ func (m *Manager) runBoundGitInput(
 		ctx,
 		path,
 		root,
+		commonPath,
+		commonRoot,
 		input,
 		false,
 		arguments...,
@@ -63,6 +71,8 @@ func (m *Manager) runRootedGitInputWithPolicy(
 	ctx context.Context,
 	path string,
 	root *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	input string,
 	verifyPath bool,
 	arguments ...string,
@@ -77,6 +87,8 @@ func (m *Manager) runRootedGitInputWithPolicy(
 		m.git,
 		path,
 		root,
+		commonPath,
+		commonRoot,
 		arguments,
 	)
 	if err != nil {
@@ -92,7 +104,7 @@ func (m *Manager) runRootedGitInputWithPolicy(
 }
 
 func runGitCommand(command *exec.Cmd, input string) ([]byte, error) {
-	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	command.Env = append(command.Environ(), "LC_ALL=C", "LANG=C")
 	if input != "" {
 		command.Stdin = strings.NewReader(input)
 	}
@@ -111,4 +123,28 @@ func runGitCommand(command *exec.Cmd, input string) ([]byte, error) {
 		}
 	}
 	return nil, err
+}
+
+func rootedGitEnvironment(environment []string) []string {
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		if len(name) >= 4 && strings.EqualFold(name[:4], "GIT_") {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
+func boundGitEnvironment(
+	environment []string,
+	gitDirectory string,
+	worktree string,
+) []string {
+	return append(
+		rootedGitEnvironment(environment),
+		"GIT_DIR="+gitDirectory,
+		"GIT_WORK_TREE="+worktree,
+	)
 }

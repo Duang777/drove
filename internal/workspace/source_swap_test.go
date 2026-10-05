@@ -99,6 +99,75 @@ func TestPrepareRollsBackRootedWorktreeAfterPostSuccessSourceSwap(
 	assertPreparationRefsAbsent(t, source, branch)
 }
 
+func TestPrepareRollsBackSuffixedWorktreeAfterPostSuccessSourceSwap(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+	stalePath := filepath.Join(parent, "stale", testAgentID)
+	if err := os.MkdirAll(filepath.Dir(stalePath), 0o700); err != nil {
+		t.Fatalf("create stale worktree parent: %v", err)
+	}
+	runGit(
+		t,
+		source,
+		"worktree",
+		"add",
+		"--quiet",
+		"-b",
+		"stale-admin-entry",
+		stalePath,
+	)
+	if err := os.RemoveAll(stalePath); err != nil {
+		t.Fatalf("remove stale worktree path: %v", err)
+	}
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	canonicalSource, err := resolvePath(source)
+	if err != nil {
+		t.Fatalf("resolve source: %v", err)
+	}
+	targetPath := filepath.Join(
+		manager.root,
+		repositoryHash(canonicalSource),
+		testAgentID,
+	)
+	manager.git = postSuccessSwapGitWrapper(
+		t,
+		parent,
+		source,
+		replacement,
+		openedSource,
+		"worktree-add",
+	)
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare accepted a replaced source repository")
+	}
+
+	if _, err := os.Lstat(targetPath); !os.IsNotExist(err) {
+		t.Fatalf("prepared worktree remains or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(targetPath)); !os.IsNotExist(err) {
+		t.Fatalf("preparation record remains or inspect failed: %v", err)
+	}
+	assertWorktreeUnregistered(t, openedSource, targetPath)
+	branch := "drove/" + testAgentID
+	assertPreparationRefsAbsent(t, openedSource, branch)
+	assertPreparationRefsAbsent(t, source, branch)
+}
+
 func TestDiscardUsesRetainedRepositoryAfterPrepareSourceSwap(
 	t *testing.T,
 ) {
@@ -187,6 +256,208 @@ func TestAcknowledgeUsesRetainedRepositoryAfterPrepareSourceSwap(
 	}
 	if !exists || !record.PreparationCommitted {
 		t.Fatalf("acknowledged record = %+v, exists=%v", record, exists)
+	}
+}
+
+func TestAcknowledgeUsesRetainedCommonGitDirectoryAfterReplacement(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	openedGitDirectory := replaceCommonGitDirectoryWithCopy(t, source)
+	replacementGitDirectory := filepath.Join(source, ".git")
+	t.Setenv("GIT_COMMON_DIR", replacementGitDirectory)
+
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge through retained common Git directory: %v", err)
+	}
+
+	assertGitRefAbsent(
+		t,
+		openedGitDirectory,
+		branchOwnershipRef(prepared.branchOperationID),
+	)
+	assertGitRefExists(
+		t,
+		replacementGitDirectory,
+		branchOwnershipRef(prepared.branchOperationID),
+	)
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read acknowledged record: exists=%v err=%v", exists, err)
+	}
+	if !record.PreparationCommitted || record.BranchOperationID != "" {
+		t.Fatalf("acknowledged record = %+v", record)
+	}
+}
+
+func TestDiscardUsesRetainedCommonGitDirectoryAfterReplacement(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	openedGitDirectory := replaceCommonGitDirectoryWithCopy(t, source)
+	replacementGitDirectory := filepath.Join(source, ".git")
+	t.Setenv("GIT_COMMON_DIR", replacementGitDirectory)
+
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard through retained common Git directory: %v", err)
+	}
+
+	if _, err := os.Lstat(prepared.Path); !os.IsNotExist(err) {
+		t.Fatalf("prepared worktree remains or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(
+		workspaceRecordPath(prepared.Path),
+	); !os.IsNotExist(err) {
+		t.Fatalf("preparation record remains or inspect failed: %v", err)
+	}
+	assertGitWorktreeRegistration(t, openedGitDirectory, prepared.Path, false)
+	assertGitRefAbsent(t, openedGitDirectory, "refs/heads/"+prepared.Branch)
+	assertGitRefAbsent(
+		t,
+		openedGitDirectory,
+		branchOwnershipRef(prepared.branchOperationID),
+	)
+	assertGitWorktreeRegistration(
+		t,
+		replacementGitDirectory,
+		prepared.Path,
+		true,
+	)
+	assertGitRefExists(
+		t,
+		replacementGitDirectory,
+		"refs/heads/"+prepared.Branch,
+	)
+	assertGitRefExists(
+		t,
+		replacementGitDirectory,
+		branchOwnershipRef(prepared.branchOperationID),
+	)
+}
+
+func TestIncludedPathsUsesRetainedCommonGitDirectoryAfterReplacement(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	const includedPath = "included.txt"
+	if err := os.WriteFile(
+		filepath.Join(source, includedPath),
+		[]byte("source\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source include file: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(source, worktreeIncludeFile),
+		[]byte(includedPath+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source include manifest: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(replacement, includedPath),
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement tracked file: %v", err)
+	}
+	runGit(t, replacement, "add", includedPath)
+	runGit(t, replacement, "commit", "-m", "track replacement include file")
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	sourceRoot, err := openRealPathRoot(source)
+	if err != nil {
+		t.Fatalf("open source root: %v", err)
+	}
+	lease, err := newPreparationLease(
+		context.Background(),
+		manager,
+		source,
+		sourceRoot,
+	)
+	if err != nil {
+		_ = sourceRoot.Close()
+		t.Fatalf("retain source repository: %v", err)
+	}
+	defer lease.Close()
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" ls-files "*)
+    mv "$DROVE_TEST_SOURCE_GIT" "$DROVE_TEST_OPENED_GIT" || exit 91
+    mv "$DROVE_TEST_REPLACEMENT_GIT" "$DROVE_TEST_SOURCE_GIT" || exit 92
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_SOURCE_GIT", filepath.Join(source, ".git"))
+	t.Setenv("DROVE_TEST_OPENED_GIT", filepath.Join(parent, "source-git-opened"))
+	t.Setenv(
+		"DROVE_TEST_REPLACEMENT_GIT",
+		filepath.Join(replacement, ".git"),
+	)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	paths, err := manager.includedPaths(
+		context.Background(),
+		source,
+		sourceRoot,
+		lease.repository,
+	)
+	if err != nil {
+		t.Fatalf("evaluate include manifest through retained repository: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != includedPath {
+		t.Fatalf("included paths = %q, want [%s]", paths, includedPath)
 	}
 }
 
@@ -311,11 +582,15 @@ func TestReconcileRejectsReplacementCommonGitDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart manager: %v", err)
 	}
-	if err := restarted.ReconcilePreparations(
+	err = restarted.ReconcilePreparations(
 		context.Background(),
 		nil,
-	); err == nil {
-		t.Fatal("reconciliation accepted a replacement common Git directory")
+	)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"repository identity evidence changed after restart",
+	) {
+		t.Fatalf("reconcile replacement common Git directory error = %v", err)
 	}
 	if _, err := os.Lstat(prepared.Path); err != nil {
 		t.Fatalf("prepared worktree was changed: %v", err)
@@ -339,6 +614,95 @@ func TestReconcileRejectsReplacementCommonGitDirectory(t *testing.T) {
 		}
 	}
 	assertPreparationRefsAbsent(t, source, prepared.Branch)
+}
+
+func TestReconcileRejectsReplacementLinkedWorktreeGitPointer(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	dataDir := filepath.Join(parent, "data")
+	initSourceSwapRepository(t, repository)
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"-b",
+		"source",
+		source,
+	)
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"-b",
+		"replacement",
+		replacement,
+	)
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+	replacementPointer, err := os.ReadFile(filepath.Join(replacement, ".git"))
+	if err != nil {
+		t.Fatalf("read replacement Git pointer: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(source, ".git"),
+		replacementPointer,
+		0o600,
+	); err != nil {
+		t.Fatalf("replace source Git pointer: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	err = restarted.ReconcilePreparations(context.Background(), nil)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"repository identity evidence changed after restart",
+	) {
+		t.Fatalf("reconcile replacement Git pointer error = %v", err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("prepared worktree was changed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("preparation record was changed: %v", err)
+	}
+	runGit(
+		t,
+		repository,
+		"show-ref",
+		"--verify",
+		"refs/heads/"+prepared.Branch,
+	)
+	runGit(
+		t,
+		repository,
+		"show-ref",
+		"--verify",
+		branchOwnershipRef(prepared.branchOperationID),
+	)
 }
 
 func TestPrepareDoesNotRunCheckoutFromReplacementSource(t *testing.T) {
@@ -465,6 +829,90 @@ exit "$status"
 	t.Setenv("DROVE_TEST_SWAPPED", filepath.Join(parent, "swapped-"+mode))
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 	return wrapper
+}
+
+func replaceCommonGitDirectoryWithCopy(
+	t *testing.T,
+	source string,
+) string {
+	t.Helper()
+	commonGitDirectory := filepath.Join(source, ".git")
+	replacement := filepath.Join(t.TempDir(), "replacement-git")
+	if err := os.CopyFS(replacement, os.DirFS(commonGitDirectory)); err != nil {
+		t.Fatalf("copy common Git directory: %v", err)
+	}
+	opened := filepath.Join(source, ".git-opened")
+	if err := os.Rename(commonGitDirectory, opened); err != nil {
+		t.Fatalf("move common Git directory: %v", err)
+	}
+	if err := os.Rename(replacement, commonGitDirectory); err != nil {
+		t.Fatalf("install replacement common Git directory: %v", err)
+	}
+	return opened
+}
+
+func assertGitRefExists(t *testing.T, gitDirectory string, ref string) {
+	t.Helper()
+	command := exec.Command(
+		"git",
+		"--git-dir="+gitDirectory,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		ref,
+	)
+	command.Env = rootedGitEnvironment(command.Environ())
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("Git ref %q is missing: %v\n%s", ref, err, output)
+	}
+}
+
+func assertGitRefAbsent(t *testing.T, gitDirectory string, ref string) {
+	t.Helper()
+	command := exec.Command(
+		"git",
+		"--git-dir="+gitDirectory,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		ref,
+	)
+	command.Env = rootedGitEnvironment(command.Environ())
+	if output, err := command.CombinedOutput(); !isExitCode(err, 1) {
+		t.Fatalf("Git ref %q remains: %v\n%s", ref, err, output)
+	}
+}
+
+func assertGitWorktreeRegistration(
+	t *testing.T,
+	gitDirectory string,
+	path string,
+	want bool,
+) {
+	t.Helper()
+	command := exec.Command(
+		"git",
+		"--git-dir="+gitDirectory,
+		"worktree",
+		"list",
+		"--porcelain",
+		"-z",
+	)
+	command.Env = rootedGitEnvironment(command.Environ())
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("list Git worktrees in %q: %v", gitDirectory, err)
+	}
+	got := strings.Contains(string(output), "worktree "+path+"\x00")
+	if got != want {
+		t.Fatalf(
+			"Git worktree registration for %q in %q = %v, want %v",
+			path,
+			gitDirectory,
+			got,
+			want,
+		)
+	}
 }
 
 func assertPreparationRefsAbsent(

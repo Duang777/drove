@@ -13,6 +13,8 @@ type preparationLease struct {
 	evidence    repositoryEvidence
 	root        *os.Root
 	guard       *repositoryGuard
+	gitRoot     *os.Root
+	gitGuard    *repositoryGuard
 	commonRoot  *os.Root
 	commonGuard *repositoryGuard
 
@@ -38,9 +40,42 @@ func newPreparationLease(
 		return nil, err
 	}
 	repository := rootedRepositoryCapability(manager, path, root)
+	gitPath, err := repository.gitDirectory(ctx)
+	if err != nil {
+		return nil, errors.Join(err, guard.Close())
+	}
 	commonPath, err := repository.commonGitDirectory(ctx)
 	if err != nil {
 		return nil, errors.Join(err, guard.Close())
+	}
+	gitRoot, err := openRealPathRoot(gitPath)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf(
+				"workspace: open source Git directory: %w",
+				err,
+			),
+			guard.Close(),
+		)
+	}
+	gitIdentity, err := openedDirectoryIdentity(gitRoot)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf(
+				"workspace: inspect source Git directory identity: %w",
+				err,
+			),
+			gitRoot.Close(),
+			guard.Close(),
+		)
+	}
+	gitGuard, err := openRepositoryGuard(gitPath, gitRoot)
+	if err != nil {
+		return nil, errors.Join(
+			err,
+			gitRoot.Close(),
+			guard.Close(),
+		)
 	}
 	commonRoot, err := openRealPathRoot(commonPath)
 	if err != nil {
@@ -49,6 +84,8 @@ func newPreparationLease(
 				"workspace: open common Git directory: %w",
 				err,
 			),
+			gitGuard.Close(),
+			gitRoot.Close(),
 			guard.Close(),
 		)
 	}
@@ -60,6 +97,8 @@ func newPreparationLease(
 				err,
 			),
 			commonRoot.Close(),
+			gitGuard.Close(),
+			gitRoot.Close(),
 			guard.Close(),
 		)
 	}
@@ -68,6 +107,8 @@ func newPreparationLease(
 		return nil, errors.Join(
 			err,
 			commonRoot.Close(),
+			gitGuard.Close(),
+			gitRoot.Close(),
 			guard.Close(),
 		)
 	}
@@ -76,6 +117,8 @@ func newPreparationLease(
 			result,
 			commonGuard.Close(),
 			commonRoot.Close(),
+			gitGuard.Close(),
+			gitRoot.Close(),
 			guard.Close(),
 		)
 	}
@@ -84,9 +127,25 @@ func newPreparationLease(
 			fmt.Errorf("workspace: verify source repository: %w", err),
 		)
 	}
+	if err := verifyRealPathRoot(gitPath, gitRoot); err != nil {
+		return nil, cleanup(
+			fmt.Errorf("workspace: verify source Git directory: %w", err),
+		)
+	}
 	if err := verifyRealPathRoot(commonPath, commonRoot); err != nil {
 		return nil, cleanup(
 			fmt.Errorf("workspace: verify common Git directory: %w", err),
+		)
+	}
+	confirmedGitPath, err := repository.gitDirectory(ctx)
+	if err != nil {
+		return nil, cleanup(err)
+	}
+	if confirmedGitPath != gitPath {
+		return nil, cleanup(
+			errors.New(
+				"workspace: source Git directory changed while opening",
+			),
 		)
 	}
 	confirmedCommonPath, err := repository.commonGitDirectory(ctx)
@@ -100,6 +159,10 @@ func newPreparationLease(
 			),
 		)
 	}
+	startOID, err := repository.headOID(ctx)
+	if err != nil {
+		return nil, cleanup(err)
+	}
 	confirmedSourceIdentity, err := openedDirectoryIdentity(root)
 	if err != nil {
 		return nil, cleanup(err)
@@ -108,6 +171,17 @@ func newPreparationLease(
 		return nil, cleanup(
 			errors.New(
 				"workspace: source repository identity changed while opening",
+			),
+		)
+	}
+	confirmedGitIdentity, err := openedDirectoryIdentity(gitRoot)
+	if err != nil {
+		return nil, cleanup(err)
+	}
+	if confirmedGitIdentity != gitIdentity {
+		return nil, cleanup(
+			errors.New(
+				"workspace: source Git directory identity changed while opening",
 			),
 		)
 	}
@@ -122,16 +196,42 @@ func newPreparationLease(
 			),
 		)
 	}
+	if err := verifyRealPathRoot(path, root); err != nil {
+		return nil, cleanup(
+			fmt.Errorf("workspace: verify source repository: %w", err),
+		)
+	}
+	if err := verifyRealPathRoot(gitPath, gitRoot); err != nil {
+		return nil, cleanup(
+			fmt.Errorf("workspace: verify source Git directory: %w", err),
+		)
+	}
+	if err := verifyRealPathRoot(commonPath, commonRoot); err != nil {
+		return nil, cleanup(
+			fmt.Errorf("workspace: verify common Git directory: %w", err),
+		)
+	}
+	repository = repository.withRepositoryBinding(
+		gitPath,
+		gitRoot,
+		commonPath,
+		commonRoot,
+		startOID,
+	)
 	return &preparationLease{
 		repository: repository,
 		evidence: repositoryEvidence{
 			SourcePath:                 path,
 			SourceDirectoryIdentity:    sourceIdentity,
+			GitDirectory:               gitPath,
+			GitDirectoryIdentity:       gitIdentity,
 			CommonGitDirectory:         commonPath,
 			CommonGitDirectoryIdentity: commonIdentity,
 		},
 		root:        root,
 		guard:       guard,
+		gitRoot:     gitRoot,
+		gitGuard:    gitGuard,
 		commonRoot:  commonRoot,
 		commonGuard: commonGuard,
 	}, nil
@@ -222,6 +322,8 @@ func (l *preparationLease) Close() error {
 		l.closeErr = errors.Join(
 			l.commonGuard.Close(),
 			l.commonRoot.Close(),
+			l.gitGuard.Close(),
+			l.gitRoot.Close(),
 			l.guard.Close(),
 			l.root.Close(),
 		)

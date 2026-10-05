@@ -187,11 +187,22 @@ func TestIncludedPathsUsesOpenedManifestContents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open source root: %v", err)
 	}
-	defer source.Close()
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {
+		_ = source.Close()
 		t.Fatalf("new manager: %v", err)
 	}
+	lease, err := newPreparationLease(
+		context.Background(),
+		manager,
+		repository,
+		source,
+	)
+	if err != nil {
+		_ = source.Close()
+		t.Fatalf("retain source repository: %v", err)
+	}
+	defer lease.Close()
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatalf("find Git: %v", err)
@@ -218,6 +229,7 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 		context.Background(),
 		repository,
 		source,
+		lease.repository,
 	)
 	if err != nil {
 		t.Fatalf("evaluate pinned include manifest: %v", err)

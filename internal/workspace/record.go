@@ -18,7 +18,8 @@ const (
 	legacyWorkspaceRecordVersion      = 1
 	protectedWorkspaceRecordVersion   = 2
 	preparationWorkspaceRecordVersion = 3
-	workspaceRecordVersion            = 4
+	repositoryWorkspaceRecordVersion  = 4
+	workspaceRecordVersion            = 5
 	maxWorkspaceRecordSize            = 64 * 1024
 )
 
@@ -42,6 +43,8 @@ type workspaceRecord struct {
 type repositoryEvidence struct {
 	SourcePath                 string `json:"source_path"`
 	SourceDirectoryIdentity    string `json:"source_directory_identity"`
+	GitDirectory               string `json:"git_directory"`
+	GitDirectoryIdentity       string `json:"git_directory_identity"`
 	CommonGitDirectory         string `json:"common_git_directory"`
 	CommonGitDirectoryIdentity string `json:"common_git_directory_identity"`
 }
@@ -113,6 +116,17 @@ func cloneRepositoryEvidence(
 	}
 	cloned := *evidence
 	return &cloned
+}
+
+func upgradeWorkspaceRecord(record *workspaceRecord) {
+	if record.Version >= workspaceRecordVersion {
+		return
+	}
+	record.Version = workspaceRecordVersion
+	record.RepositoryEvidence = nil
+	if record.PreparationCommitted {
+		record.BranchOperationID = ""
+	}
 }
 
 func (m *Manager) writeWorkspaceRecord(
@@ -497,10 +511,17 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 				recordPath,
 			)
 		}
-	case workspaceRecordVersion:
+	case repositoryWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: version 4 record %q has no included paths",
+				recordPath,
+			)
+		}
+	case workspaceRecordVersion:
+		if record.IncludedPaths == nil {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: version 5 record %q has no included paths",
 				recordPath,
 			)
 		}
@@ -531,10 +552,11 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 	if record.Version != legacyWorkspaceRecordVersion &&
 		record.Version != protectedWorkspaceRecordVersion &&
 		record.Version != preparationWorkspaceRecordVersion &&
+		record.Version != repositoryWorkspaceRecordVersion &&
 		record.Version != workspaceRecordVersion {
 		return fmt.Errorf("workspace: unsupported record version %d", record.Version)
 	}
-	if record.Version < workspaceRecordVersion &&
+	if record.Version < repositoryWorkspaceRecordVersion &&
 		record.RepositoryEvidence != nil {
 		return errors.New(
 			"workspace: repository evidence requires record version 4",
@@ -616,14 +638,24 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 		)
 	}
 	if record.RepositoryEvidence != nil {
-		if err := validateRepositoryEvidence(*record.RepositoryEvidence); err != nil {
+		var err error
+		if record.Version == repositoryWorkspaceRecordVersion {
+			err = validateLegacyRepositoryEvidence(
+				*record.RepositoryEvidence,
+			)
+		} else {
+			err = validateRepositoryEvidence(*record.RepositoryEvidence)
+		}
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateRepositoryEvidence(evidence repositoryEvidence) error {
+func validateLegacyRepositoryEvidence(
+	evidence repositoryEvidence,
+) error {
 	if !cleanAbsolutePath(evidence.SourcePath) {
 		return errors.New(
 			"workspace: source repository path is not a clean absolute path",
@@ -634,6 +666,12 @@ func validateRepositoryEvidence(evidence repositoryEvidence) error {
 			"workspace: source repository identity is invalid",
 		)
 	}
+	if evidence.GitDirectory != "" ||
+		evidence.GitDirectoryIdentity != "" {
+		return errors.New(
+			"workspace: legacy repository evidence contains version 5 fields",
+		)
+	}
 	if !cleanAbsolutePath(evidence.CommonGitDirectory) {
 		return errors.New(
 			"workspace: common Git directory is not a clean absolute path",
@@ -642,6 +680,26 @@ func validateRepositoryEvidence(evidence repositoryEvidence) error {
 	if !validDirectoryIdentity(evidence.CommonGitDirectoryIdentity) {
 		return errors.New(
 			"workspace: common Git directory identity is invalid",
+		)
+	}
+	return nil
+}
+
+func validateRepositoryEvidence(evidence repositoryEvidence) error {
+	legacy := evidence
+	legacy.GitDirectory = ""
+	legacy.GitDirectoryIdentity = ""
+	if err := validateLegacyRepositoryEvidence(legacy); err != nil {
+		return err
+	}
+	if !cleanAbsolutePath(evidence.GitDirectory) {
+		return errors.New(
+			"workspace: source Git directory is not a clean absolute path",
+		)
+	}
+	if !validDirectoryIdentity(evidence.GitDirectoryIdentity) {
+		return errors.New(
+			"workspace: source Git directory identity is invalid",
 		)
 	}
 	return nil

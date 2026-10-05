@@ -265,12 +265,7 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 
-	exists, err := m.branchExistsAtRoot(
-		ctx,
-		sourcePath,
-		sourceRoot,
-		branch,
-	)
+	exists, err := sourceRepository.branchExists(ctx, branch)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -286,7 +281,12 @@ func (m *Manager) prepare(
 			&lease.evidence,
 		),
 	}
-	includedPaths, err := m.includedPaths(ctx, sourcePath, sourceRoot)
+	includedPaths, err := m.includedPaths(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		sourceRepository,
+	)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -311,10 +311,8 @@ func (m *Manager) prepare(
 		)
 	}
 	if createdBranch {
-		if err := m.createOwnedBranchAtRoot(
+		if err := sourceRepository.createOwnedBranch(
 			ctx,
-			sourcePath,
-			sourceRoot,
 			branch,
 			branchOperationID,
 		); err != nil {
@@ -1388,30 +1386,6 @@ func (m *Manager) branchExists(
 	return false, fmt.Errorf("workspace: inspect branch %q: %w", branch, err)
 }
 
-func (m *Manager) branchExistsAtRoot(
-	ctx context.Context,
-	path string,
-	root *os.Root,
-	branch string,
-) (bool, error) {
-	_, err := m.runRootedGit(
-		ctx,
-		path,
-		root,
-		"show-ref",
-		"--verify",
-		"--quiet",
-		"refs/heads/"+branch,
-	)
-	if err == nil {
-		return true, nil
-	}
-	if isExitCode(err, 1) {
-		return false, nil
-	}
-	return false, fmt.Errorf("workspace: inspect branch %q: %w", branch, err)
-}
-
 func (m *Manager) createOwnedBranch(
 	ctx context.Context,
 	repository string,
@@ -1435,41 +1409,6 @@ func (m *Manager) createOwnedBranch(
 		input,
 		"-C",
 		repository,
-		"update-ref",
-		"--create-reflog",
-		"-m",
-		branchOwnershipLogMessage(operationID),
-		"--stdin",
-	); err != nil {
-		return fmt.Errorf("workspace: create owned branch transaction: %w", err)
-	}
-	return nil
-}
-
-func (m *Manager) createOwnedBranchAtRoot(
-	ctx context.Context,
-	path string,
-	root *os.Root,
-	branch string,
-	operationID string,
-) error {
-	head, err := m.runRootedGit(ctx, path, root, "rev-parse", "HEAD")
-	if err != nil {
-		return fmt.Errorf("workspace: resolve branch start: %w", err)
-	}
-	commit := strings.TrimSpace(string(head))
-	input := fmt.Sprintf(
-		"start\ncreate refs/heads/%s %s\ncreate %s %s\nprepare\ncommit\n",
-		branch,
-		commit,
-		branchOwnershipRef(operationID),
-		commit,
-	)
-	if _, err := m.runRootedGitInput(
-		ctx,
-		path,
-		root,
-		input,
 		"update-ref",
 		"--create-reflog",
 		"-m",

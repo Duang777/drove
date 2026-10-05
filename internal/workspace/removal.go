@@ -84,7 +84,7 @@ func (m *Manager) remove(
 		if force && !record.Removal.Force {
 			upgraded := *record.Removal
 			upgraded.Force = true
-			record.Version = workspaceRecordVersion
+			upgradeWorkspaceRecord(&record)
 			record.Removal = &upgraded
 			if err := m.replaceWorkspaceRecord(record); err != nil {
 				pending := RemovalResult{
@@ -120,7 +120,7 @@ func (m *Manager) remove(
 		}
 	}
 
-	record.Version = workspaceRecordVersion
+	upgradeWorkspaceRecord(&record)
 	if record.IncludedPaths == nil {
 		record.IncludedPaths = []string{}
 	}
@@ -655,7 +655,7 @@ func (m *Manager) persistRemovalStart(
 	started := *record.Removal
 	started.Started = true
 	started.Quarantined = started.Quarantined || quarantined
-	record.Version = workspaceRecordVersion
+	upgradeWorkspaceRecord(&record)
 	record.Removal = &started
 	_, err := m.replaceWorkspaceRecordState(record)
 	if err != nil {

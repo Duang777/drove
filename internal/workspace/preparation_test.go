@@ -149,6 +149,84 @@ func TestReconcilePreparationsDiscardsPendingAfterRestart(t *testing.T) {
 	}
 }
 
+func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	stalePath := filepath.Join(t.TempDir(), testAgentID)
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"--quiet",
+		"-b",
+		"stale-admin-entry",
+		stalePath,
+	)
+	if err := os.RemoveAll(stalePath); err != nil {
+		t.Fatalf("remove stale worktree path: %v", err)
+	}
+
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	gitDirectoryName := filepath.Base(prepared.gitDirectory)
+	if gitDirectoryName == testAgentID ||
+		!validWorktreeGitDirectoryName(gitDirectoryName, testAgentID) {
+		t.Fatalf(
+			"prepared Git directory %q has no collision suffix",
+			prepared.gitDirectory,
+		)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile preparation after restart: %v", err)
+	}
+
+	if _, err := os.Lstat(prepared.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending workspace remains or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(
+		workspaceRecordPath(prepared.Path),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending record remains or inspect failed: %v", err)
+	}
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+prepared.Branch,
+	)
+	if err := command.Run(); !isExitCode(err, 1) {
+		t.Fatalf("pending branch remains after restart: %v", err)
+	}
+}
+
 func TestReconcilePreparationsRejectsPendingVersionThreeRecord(t *testing.T) {
 	repository := newTestRepository(t)
 	dataDir := filepath.Join(t.TempDir(), "data")
@@ -202,6 +280,197 @@ func TestReconcilePreparationsRejectsPendingVersionThreeRecord(t *testing.T) {
 		"--verify",
 		"refs/heads/"+prepared.Branch,
 	)
+}
+
+func TestReconcilePreparationsRejectsPendingVersionFourRecord(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	record.Version = repositoryWorkspaceRecordVersion
+	record.RepositoryEvidence.GitDirectory = ""
+	record.RepositoryEvidence.GitDirectoryIdentity = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("downgrade preparation record: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	err = restarted.ReconcilePreparations(context.Background(), nil)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"repository identity evidence",
+	) {
+		t.Fatalf("reconcile pending version 4 record error = %v", err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("pending workspace was changed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("pending record was changed: %v", err)
+	}
+	runGit(
+		t,
+		repository,
+		"show-ref",
+		"--verify",
+		"refs/heads/"+prepared.Branch,
+	)
+}
+
+func TestReconcilePreparationsAdoptsCommittedVersionThreeRecord(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if err := prepared.preparation.repository.removeOwnershipMarker(
+		context.Background(),
+		record.BranchOperationID,
+	); err != nil {
+		t.Fatalf("remove legacy ownership marker: %v", err)
+	}
+	record.Version = preparationWorkspaceRecordVersion
+	record.RepositoryEvidence = nil
+	record.PreparationCommitted = true
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write committed version 3 record: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	expected := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	); err != nil {
+		t.Fatalf("adopt committed version 3 preparation: %v", err)
+	}
+
+	adopted, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read adopted record: exists=%v err=%v", exists, err)
+	}
+	if adopted.Version != preparationWorkspaceRecordVersion ||
+		!adopted.PreparationCommitted ||
+		adopted.BranchOperationID != record.BranchOperationID {
+		t.Fatalf("adopted record = %+v", adopted)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("adopted workspace was changed: %v", err)
+	}
+}
+
+func TestReconcilePreparationsAdoptsCommittedVersionFourRecord(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if err := prepared.preparation.repository.removeOwnershipMarker(
+		context.Background(),
+		record.BranchOperationID,
+	); err != nil {
+		t.Fatalf("remove legacy ownership marker: %v", err)
+	}
+	record.Version = repositoryWorkspaceRecordVersion
+	record.RepositoryEvidence.GitDirectory = ""
+	record.RepositoryEvidence.GitDirectoryIdentity = ""
+	record.PreparationCommitted = true
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write committed version 4 record: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	expected := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	); err != nil {
+		t.Fatalf("adopt committed version 4 preparation: %v", err)
+	}
+
+	adopted, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read adopted record: exists=%v err=%v", exists, err)
+	}
+	if adopted.Version != repositoryWorkspaceRecordVersion ||
+		!adopted.PreparationCommitted ||
+		adopted.BranchOperationID != record.BranchOperationID {
+		t.Fatalf("adopted record = %+v", adopted)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("adopted workspace was changed: %v", err)
+	}
 }
 
 func TestAcknowledgePreparationClearsBranchOwnershipMarker(t *testing.T) {

@@ -31,6 +31,10 @@ func (m *Manager) acknowledgePreparation(
 			"workspace: preparation acknowledgement does not match record",
 		)
 	}
+	if record.PreparationCommitted &&
+		record.Version < workspaceRecordVersion {
+		return target.preparation.Close()
+	}
 	if record.PreparationCommitted && record.BranchOperationID == "" {
 		return target.preparation.Close()
 	}
