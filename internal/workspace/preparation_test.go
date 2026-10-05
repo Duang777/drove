@@ -183,8 +183,8 @@ func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 		t.Fatalf("prepare workspace: %v", err)
 	}
 	gitDirectoryName := filepath.Base(prepared.gitDirectory)
-	if gitDirectoryName == testAgentID ||
-		!validWorktreeGitDirectoryName(gitDirectoryName, testAgentID) {
+	suffix := strings.TrimPrefix(gitDirectoryName, testAgentID)
+	if suffix == "" || strings.Trim(suffix, "0123456789") != "" {
 		t.Fatalf(
 			"prepared Git directory %q has no collision suffix",
 			prepared.gitDirectory,

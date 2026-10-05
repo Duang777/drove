@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -361,48 +360,18 @@ func (r repositoryCapability) pruneWorktrees(
 	return nil
 }
 
-func (r repositoryCapability) preparedWorktreeGitDirectory(
-	ctx context.Context,
-	target Workspace,
-	registered registeredWorktree,
-) (string, error) {
-	for index := 0; ; index++ {
-		if err := ctx.Err(); err != nil {
-			return "", fmt.Errorf(
-				"workspace: resolve prepared worktree Git directory: %w",
-				err,
-			)
-		}
-		name := target.AgentID
-		if index != 0 {
-			name += strconv.Itoa(index)
-		}
-		path := filepath.Join(r.commonPath, "worktrees", name)
-		if err := r.verifyPreparedWorktree(
-			ctx,
-			target,
-			path,
-			registered,
-		); err == nil {
-			return path, nil
-		}
-	}
-}
-
 func (r repositoryCapability) verifyPreparedWorktree(
 	ctx context.Context,
 	target Workspace,
 	gitDirectory string,
 	registered registeredWorktree,
 ) error {
-	if registered.path != target.Path ||
-		registered.detached ||
-		registered.branch != "refs/heads/"+target.Branch ||
-		registered.head == "" ||
-		strings.ContainsAny(registered.head, " \t\r\n") {
-		return errors.New(
-			"workspace: prepared worktree registration does not match intent",
-		)
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		"",
+	); err != nil {
+		return err
 	}
 	gitDirectory, err := r.boundGitDirectory(
 		gitDirectory,
@@ -452,6 +421,28 @@ func (r repositoryCapability) verifyPreparedWorktree(
 	return nil
 }
 
+func (repositoryCapability) verifyPreparedWorktreeRegistration(
+	target Workspace,
+	registered registeredWorktree,
+	expectedHeadOID string,
+) error {
+	if registered.path != target.Path ||
+		registered.detached ||
+		registered.branch != "refs/heads/"+target.Branch ||
+		registered.head == "" ||
+		strings.ContainsAny(registered.head, " \t\r\n") {
+		return errors.New(
+			"workspace: prepared worktree registration does not match intent",
+		)
+	}
+	if expectedHeadOID != "" && registered.head != expectedHeadOID {
+		return errors.New(
+			"workspace: prepared worktree HEAD does not match intent",
+		)
+	}
+	return nil
+}
+
 func (r repositoryCapability) boundGitDirectory(
 	path string,
 	agentID string,
@@ -461,23 +452,19 @@ func (r repositoryCapability) boundGitDirectory(
 	}
 	worktreesPath := filepath.Join(r.commonPath, "worktrees")
 	name, err := filepath.Rel(worktreesPath, path)
+	validName := name == agentID
+	if strings.HasPrefix(name, agentID) && len(name) > len(agentID) {
+		validName = strings.Trim(name[len(agentID):], "0123456789") == ""
+	}
 	if err != nil ||
 		!filepath.IsAbs(path) ||
 		filepath.Dir(name) != "." ||
-		!validWorktreeGitDirectoryName(name, agentID) {
+		!validName {
 		return "", errors.New(
 			"workspace: prepared Git directory does not match the managed worktree",
 		)
 	}
 	return filepath.Join("worktrees", name), nil
-}
-
-func validWorktreeGitDirectoryName(name string, agentID string) bool {
-	if name == agentID {
-		return true
-	}
-	suffix := strings.TrimPrefix(name, agentID)
-	return suffix != "" && strings.Trim(suffix, "0123456789") == ""
 }
 
 func (r repositoryCapability) refLogSubject(

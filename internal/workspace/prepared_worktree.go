@@ -9,6 +9,133 @@ import (
 	"strings"
 )
 
+func (m *Manager) createPreparedWorktreeTarget(
+	target *Workspace,
+) (result error) {
+	bucket, err := m.openManagedBucketRoot(*target)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	if err := bucket.Mkdir(target.AgentID, 0o700); err != nil {
+		return fmt.Errorf("workspace: create prepared worktree target: %w", err)
+	}
+	opened, err := openRealRootFromRoot(bucket, target.AgentID)
+	if err != nil {
+		return fmt.Errorf("workspace: open prepared worktree target: %w", err)
+	}
+	removeOnFailure := true
+	defer func() {
+		if removeOnFailure {
+			result = errors.Join(
+				result,
+				removeOpenedDirectoryFromRoot(
+					bucket,
+					target.AgentID,
+					opened,
+				),
+			)
+			opened = nil
+		}
+		if opened != nil {
+			result = errors.Join(result, opened.Close())
+		}
+	}()
+
+	directoryIdentity, err := openedDirectoryIdentity(opened)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared worktree target identity: %w",
+			err,
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	); err != nil {
+		return err
+	}
+	directory, err := bucket.Open(".")
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open prepared worktree parent: %w",
+			err,
+		)
+	}
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf(
+			"workspace: sync prepared worktree parent: %w",
+			err,
+		)
+	}
+
+	target.directoryIdentity = directoryIdentity
+	record, exists, err := m.readWorkspaceRecordFromBucket(
+		bucket,
+		target.AgentID,
+		target.Path,
+	)
+	if err == nil && !exists {
+		err = errors.New("workspace: preparation record is missing")
+	}
+	if err != nil {
+		return err
+	}
+	if target.branchOperationID == "" ||
+		record.BranchOperationID != target.branchOperationID ||
+		!sameWorkspace(record.workspace(), *target) {
+		return errors.New(
+			"workspace: preparation record does not match prepared target",
+		)
+	}
+	record.DirectoryIdentity = directoryIdentity
+	if err := m.replaceWorkspaceRecord(record); err != nil {
+		return fmt.Errorf(
+			"workspace: persist prepared worktree target identity: %w",
+			err,
+		)
+	}
+	persisted, exists, err := m.readWorkspaceRecordFromBucket(
+		bucket,
+		target.AgentID,
+		target.Path,
+	)
+	if err != nil {
+		return err
+	}
+	if !exists ||
+		persisted.DirectoryIdentity != directoryIdentity ||
+		persisted.BranchOperationID != target.branchOperationID ||
+		!sameWorkspace(persisted.workspace(), *target) {
+		return errors.New(
+			"workspace: prepared worktree target identity was not persisted",
+		)
+	}
+	currentIdentity, err := openedDirectoryIdentity(opened)
+	if err != nil {
+		return err
+	}
+	if currentIdentity != directoryIdentity {
+		return errors.New(
+			"workspace: prepared worktree target identity changed after persistence",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	); err != nil {
+		return err
+	}
+	removeOnFailure = false
+	return nil
+}
+
 func (m *Manager) initializePreparedWorktree(
 	ctx context.Context,
 	target *Workspace,
@@ -28,6 +155,16 @@ func (m *Manager) initializePreparedWorktree(
 			err,
 		)
 	}
+	if target.directoryIdentity == "" {
+		return errors.New(
+			"workspace: prepared worktree target identity is unavailable",
+		)
+	}
+	if directoryIdentity != target.directoryIdentity {
+		return errors.New(
+			"workspace: prepared worktree target identity changed",
+		)
+	}
 	gitDirectory, err := m.worktreeGitDirectoryAtRoot(
 		ctx,
 		target.Path,
@@ -40,15 +177,20 @@ func (m *Manager) initializePreparedWorktree(
 		return err
 	}
 	target.gitDirectory = gitDirectory
-	target.directoryIdentity = directoryIdentity
 
 	record, exists, err := m.readWorkspaceRecord(target.Path)
 	if err == nil && !exists {
 		err = errors.New("workspace: worktree identity record is missing")
 	}
 	if err == nil {
+		if record.DirectoryIdentity != directoryIdentity {
+			err = errors.New(
+				"workspace: prepared worktree target identity record changed",
+			)
+		}
+	}
+	if err == nil {
 		record.GitDirectory = gitDirectory
-		record.DirectoryIdentity = directoryIdentity
 		err = m.replaceWorkspaceRecord(record)
 	}
 	if err != nil {

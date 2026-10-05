@@ -49,6 +49,7 @@ type Workspace struct {
 
 	createdBranch      bool
 	branchOperationID  string
+	expectedHeadOID    string
 	gitDirectory       string
 	directoryIdentity  string
 	protectionKnown    bool
@@ -265,11 +266,23 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 
-	exists, err := sourceRepository.branchExists(ctx, branch)
+	branchOID, exists, err := sourceRepository.refOID(
+		ctx,
+		"refs/heads/"+branch,
+	)
 	if err != nil {
 		return Workspace{}, err
 	}
 	createdBranch := !exists
+	expectedHeadOID := branchOID
+	if createdBranch {
+		expectedHeadOID = sourceRepository.startOID
+	}
+	if expectedHeadOID == "" {
+		return Workspace{}, errors.New(
+			"workspace: prepared branch start is unavailable",
+		)
+	}
 	branchOperationID := uuid.NewString()
 	result := Workspace{
 		AgentID:           agentID,
@@ -277,6 +290,7 @@ func (m *Manager) prepare(
 		Path:              path,
 		Branch:            branch,
 		branchOperationID: branchOperationID,
+		expectedHeadOID:   expectedHeadOID,
 		repositoryEvidence: cloneRepositoryEvidence(
 			&lease.evidence,
 		),
@@ -308,6 +322,22 @@ func (m *Manager) prepare(
 		return Workspace{}, errors.Join(
 			err,
 			m.discard(cleanupCtx, cleanupTarget),
+		)
+	}
+	if err := m.createPreparedWorktreeTarget(&result); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		return Workspace{}, errors.Join(
+			err,
+			m.discardWithRepository(
+				cleanupCtx,
+				result,
+				sourceRepository,
+				true,
+			),
 		)
 	}
 	if createdBranch {
@@ -723,19 +753,9 @@ func (m *Manager) discardWithRepository(
 			fmt.Errorf("workspace: inspect discarded worktree: %w", pathErr),
 		)
 	}
-	if pathExists && allowIdentityCapture {
-		record, err = m.capturePreparedWorktreeIdentity(
-			ctx,
-			target,
-			record,
-			repository,
-		)
-		if err != nil {
-			return errors.Join(result, err)
-		}
-	}
 	if pathExists &&
-		(record.GitDirectory == "" || record.DirectoryIdentity == "") {
+		(record.DirectoryIdentity == "" ||
+			(record.GitDirectory == "" && !allowIdentityCapture)) {
 		return errors.Join(
 			result,
 			errors.New(
@@ -760,6 +780,7 @@ func (m *Manager) discardWithRepository(
 					target,
 					record,
 					repository,
+					allowIdentityCapture,
 				)
 			} else {
 				removeErr = m.removeDiscardedPath(
