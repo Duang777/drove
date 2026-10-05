@@ -302,54 +302,61 @@ func ensureRemovalMarker(
 	_, err := root.Lstat(name)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
-		file, err := root.OpenFile(
-			name,
-			os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-			0o600,
-		)
-		if err != nil {
-			return fmt.Errorf(
-				"workspace: create removal marker: %w",
-				err,
-			)
-		}
-		if _, err := io.WriteString(
-			file,
-			record.Removal.DirectoryToken+"\n",
-		); err != nil {
-			_ = file.Close()
-			return fmt.Errorf(
-				"workspace: write removal marker: %w",
-				err,
-			)
-		}
-		syncErr := file.Sync()
-		closeErr := file.Close()
-		if err := errors.Join(syncErr, closeErr); err != nil {
-			return fmt.Errorf(
-				"workspace: sync removal marker: %w",
-				err,
-			)
-		}
-		directory, err := root.Open(".")
-		if err != nil {
-			return fmt.Errorf(
-				"workspace: open removal marker directory: %w",
-				err,
-			)
-		}
-		syncErr = syncRecordDirectory(directory)
-		closeErr = directory.Close()
-		if err := errors.Join(syncErr, closeErr); err != nil {
-			return fmt.Errorf(
-				"workspace: sync removal marker directory: %w",
-				err,
-			)
+		if err := installRemovalMarker(root, name, record.Removal.DirectoryToken); err != nil {
+			return err
 		}
 	case err != nil:
 		return fmt.Errorf("workspace: inspect removal marker: %w", err)
 	}
 	return verifyRemovalMarker(root, record)
+}
+
+func installRemovalMarker(
+	root *os.Root,
+	name string,
+	token string,
+) (result error) {
+	file, err := root.OpenFile(
+		name,
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		0o600,
+	)
+	if err != nil {
+		return fmt.Errorf("workspace: create removal marker: %w", err)
+	}
+	cleanupOnFailure := true
+	defer func() {
+		if cleanupOnFailure {
+			result = errors.Join(
+				result,
+				removeRecordPathIfSame(root, name, file),
+				syncRecordBucket(root, name),
+			)
+		}
+		result = errors.Join(result, file.Close())
+	}()
+	payload := token + "\n"
+	written, err := io.WriteString(file, payload)
+	if err != nil {
+		return fmt.Errorf("workspace: write removal marker: %w", err)
+	}
+	if written != len(payload) {
+		return fmt.Errorf("workspace: write removal marker: %w", io.ErrShortWrite)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("workspace: sync removal marker: %w", err)
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("workspace: open removal marker directory: %w", err)
+	}
+	syncErr := syncRecordDirectory(directory)
+	closeDirectoryErr := directory.Close()
+	if err := errors.Join(syncErr, closeDirectoryErr); err != nil {
+		return fmt.Errorf("workspace: sync removal marker directory: %w", err)
+	}
+	cleanupOnFailure = false
+	return nil
 }
 
 func verifyRemovalMarker(
@@ -553,12 +560,8 @@ func quarantineManagedPath(
 	if !current.IsDir() ||
 		current.Mode()&os.ModeSymlink != 0 ||
 		!os.SameFile(openedInfo, current) {
-		restoreErr := restoreManagedQuarantine(bucket, record, name)
-		return name, true, errors.Join(
-			errors.New(
-				"workspace: managed path changed while entering quarantine",
-			),
-			restoreErr,
+		return name, true, errors.New(
+			"workspace: managed path changed while entering quarantine",
 		)
 	}
 	return name, true, nil
@@ -706,61 +709,82 @@ func openOrCreateRealPathRoot(path string) (*os.Root, error) {
 	if !filepath.IsAbs(path) {
 		return nil, fmt.Errorf("%q is not an absolute path", path)
 	}
-	current := path
-	var missing []string
-	for {
-		info, err := os.Lstat(current)
-		switch {
-		case err == nil:
-			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-				return nil, fmt.Errorf("%q is not a real directory", current)
-			}
-			root, err := openRealPathRoot(current)
-			if err != nil {
-				return nil, err
-			}
-			for index := len(missing) - 1; index >= 0; index-- {
-				name := missing[index]
-				if err := root.Mkdir(name, 0o700); err != nil &&
-					!errors.Is(err, os.ErrExist) {
-					_ = root.Close()
-					return nil, fmt.Errorf(
-						"create directory %q: %w",
-						filepath.Join(current, name),
-						err,
-					)
-				}
-				child, err := openRealRootFromRoot(root, name)
-				if err != nil {
-					_ = root.Close()
-					return nil, fmt.Errorf(
-						"open created directory %q: %w",
-						filepath.Join(current, name),
-						err,
-					)
-				}
-				if err := root.Close(); err != nil {
-					_ = child.Close()
-					return nil, fmt.Errorf(
-						"close parent directory %q: %w",
-						current,
-						err,
-					)
-				}
-				current = filepath.Join(current, name)
-				root = child
-			}
-			return root, nil
-		case !errors.Is(err, os.ErrNotExist):
-			return nil, fmt.Errorf("inspect directory %q: %w", current, err)
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			return nil, fmt.Errorf("find existing ancestor for %q: %w", path, err)
-		}
-		missing = append(missing, filepath.Base(current))
-		current = parent
+	volumeRoot := filepath.VolumeName(path) + string(filepath.Separator)
+	relative, err := filepath.Rel(volumeRoot, path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve path below volume root: %w", err)
 	}
+	root, err := openRealPathRoot(volumeRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open volume root %q: %w", volumeRoot, err)
+	}
+	if relative == "." {
+		return root, nil
+	}
+	current := volumeRoot
+	for _, name := range strings.Split(relative, string(filepath.Separator)) {
+		if name == "" || name == "." || name == ".." {
+			_ = root.Close()
+			return nil, fmt.Errorf("invalid path component %q in %q", name, path)
+		}
+		info, inspectErr := root.Lstat(name)
+		if errors.Is(inspectErr, os.ErrNotExist) {
+			if err := root.Mkdir(name, 0o700); err != nil &&
+				!errors.Is(err, os.ErrExist) {
+				_ = root.Close()
+				return nil, fmt.Errorf(
+					"create directory %q: %w",
+					filepath.Join(current, name),
+					err,
+				)
+			}
+			info, inspectErr = root.Lstat(name)
+		}
+		if inspectErr != nil {
+			_ = root.Close()
+			return nil, fmt.Errorf(
+				"inspect directory %q: %w",
+				filepath.Join(current, name),
+				inspectErr,
+			)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			_ = root.Close()
+			return nil, fmt.Errorf(
+				"%q is not a real directory",
+				filepath.Join(current, name),
+			)
+		}
+		child, err := openRealRootFromRoot(root, name)
+		if err != nil {
+			_ = root.Close()
+			return nil, fmt.Errorf(
+				"open directory %q: %w",
+				filepath.Join(current, name),
+				err,
+			)
+		}
+		if err := verifyRootEntryUnchanged(root, name, child); err != nil {
+			_ = child.Close()
+			_ = root.Close()
+			return nil, err
+		}
+		if err := root.Close(); err != nil {
+			_ = child.Close()
+			return nil, fmt.Errorf(
+				"close parent directory %q: %w",
+				current,
+				err,
+			)
+		}
+		current = filepath.Join(current, name)
+		root = child
+	}
+	if err := verifyRealPathRoot(path, root); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	return root, nil
 }
 
 func verifyRealPathRoot(path string, opened *os.Root) error {

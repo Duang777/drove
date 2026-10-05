@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -56,6 +57,11 @@ type workspaceRemovalRecord struct {
 	Started        bool   `json:"started"`
 	Quarantined    bool   `json:"quarantined,omitempty"`
 	PathAbsent     bool   `json:"path_absent,omitempty"`
+}
+
+type recordAcknowledgement struct {
+	name        string
+	operationID string
 }
 
 func workspaceRecordPath(worktreePath string) string {
@@ -971,11 +977,7 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 			return err
 		}
 		normalRecords := make(map[string]struct{})
-		type acknowledgement struct {
-			name        string
-			operationID string
-		}
-		acknowledgements := make(map[string][]acknowledgement)
+		acknowledgements := make(map[string][]recordAcknowledgement)
 		for _, entry := range entries {
 			if agentID, ok := workspaceRecordAgentID(entry.Name()); ok {
 				normalRecords[agentID] = struct{}{}
@@ -989,7 +991,7 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 			}
 			acknowledgements[agentID] = append(
 				acknowledgements[agentID],
-				acknowledgement{
+				recordAcknowledgement{
 					name:        entry.Name(),
 					operationID: operationID,
 				},
@@ -999,15 +1001,18 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 			if _, exists := normalRecords[agentID]; exists {
 				continue
 			}
-			if len(candidates) != 1 {
+			candidate, err := coalesceRecordAcknowledgements(
+				bucketRoot,
+				candidates,
+			)
+			if err != nil {
 				_ = bucketRoot.Close()
 				return fmt.Errorf(
-					"workspace: agent %q has %d acknowledgement records",
+					"workspace: recover acknowledgement aliases for agent %q: %w",
 					agentID,
-					len(candidates),
+					err,
 				)
 			}
-			candidate := candidates[0]
 			name := agentID + workspaceRecordSuffix
 			if err := restoreRecordAcknowledgement(
 				bucketRoot,
@@ -1058,31 +1063,113 @@ func findRecordAcknowledgementQuarantine(
 		return "", false, err
 	}
 	prefix := recordAcknowledgementPrefix(agentID, operationID)
-	var matched string
+	var candidates []recordAcknowledgement
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		if matched != "" {
-			return "", false, fmt.Errorf(
-				"workspace: removal acknowledgement %q has multiple quarantined records",
-				operationID,
+		candidates = append(candidates, recordAcknowledgement{
+			name:        entry.Name(),
+			operationID: operationID,
+		})
+	}
+	if len(candidates) == 0 {
+		return "", false, nil
+	}
+	matched, err := coalesceRecordAcknowledgements(bucket, candidates)
+	if err != nil {
+		return "", false, err
+	}
+	return matched.name, true, nil
+}
+
+func coalesceRecordAcknowledgements(
+	bucket *os.Root,
+	candidates []recordAcknowledgement,
+) (_ recordAcknowledgement, result error) {
+	if len(candidates) == 0 {
+		return recordAcknowledgement{}, errors.New(
+			"workspace: acknowledgement candidate list is empty",
+		)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].name < candidates[j].name
+	})
+	operationID := candidates[0].operationID
+	var expected *os.File
+	for _, candidate := range candidates {
+		if candidate.operationID != operationID {
+			return recordAcknowledgement{}, errors.New(
+				"workspace: acknowledgement aliases have different operation IDs",
 			)
 		}
-		info, err := bucket.Lstat(entry.Name())
+		info, err := bucket.Lstat(candidate.name)
 		if err != nil {
-			return "", false, err
+			return recordAcknowledgement{}, err
 		}
 		if !info.Mode().IsRegular() ||
 			info.Mode()&os.ModeSymlink != 0 {
-			return "", false, fmt.Errorf(
+			return recordAcknowledgement{}, fmt.Errorf(
 				"workspace: acknowledgement quarantine %q is not a regular file",
-				entry.Name(),
+				candidate.name,
 			)
 		}
-		matched = entry.Name()
+		file, err := bucket.Open(candidate.name)
+		if err != nil {
+			return recordAcknowledgement{}, err
+		}
+		opened, statErr := file.Stat()
+		if statErr == nil &&
+			(!opened.Mode().IsRegular() || !os.SameFile(info, opened)) {
+			statErr = fmt.Errorf(
+				"workspace: acknowledgement quarantine %q changed while opening",
+				candidate.name,
+			)
+		}
+		if statErr == nil && expected != nil {
+			expectedInfo, expectedErr := expected.Stat()
+			if expectedErr != nil {
+				statErr = expectedErr
+			} else if !os.SameFile(expectedInfo, opened) {
+				statErr = errors.New(
+					"workspace: acknowledgement aliases refer to different records",
+				)
+			}
+		}
+		if statErr != nil {
+			_ = file.Close()
+			return recordAcknowledgement{}, statErr
+		}
+		if expected == nil {
+			expected = file
+			defer func() {
+				result = errors.Join(result, expected.Close())
+			}()
+			continue
+		}
+		if err := file.Close(); err != nil {
+			return recordAcknowledgement{}, err
+		}
 	}
-	return matched, matched != "", nil
+	for _, duplicate := range candidates[1:] {
+		if err := removeRecordPathIfSame(
+			bucket,
+			duplicate.name,
+			expected,
+		); err != nil {
+			return recordAcknowledgement{}, fmt.Errorf(
+				"workspace: remove acknowledgement alias %q: %w",
+				duplicate.name,
+				err,
+			)
+		}
+	}
+	if len(candidates) > 1 {
+		if err := syncRecordBucket(bucket, candidates[0].name); err != nil {
+			return recordAcknowledgement{}, err
+		}
+	}
+	return candidates[0], nil
 }
 
 func (m *Manager) removeRecordAcknowledgementQuarantine(

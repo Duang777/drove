@@ -748,6 +748,183 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
+func TestRemoveLegacyRecordRejectsReplacementSourceBeforeUpgrade(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Version = repositoryWorkspaceRecordVersion
+	record.RepositoryEvidence.GitDirectory = ""
+	record.RepositoryEvidence.GitDirectoryIdentity = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write version 4 workspace record: %v", err)
+	}
+	if err := os.Rename(source, openedSource); err != nil {
+		t.Fatalf("move source repository: %v", err)
+	}
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatalf("install replacement repository: %v", err)
+	}
+
+	if _, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"legacy removal repository identity evidence changed",
+	) {
+		t.Fatalf("remove replacement source error = %v", err)
+	}
+	current, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists ||
+		current.Version != repositoryWorkspaceRecordVersion ||
+		current.Removal != nil {
+		t.Fatalf(
+			"failed upgrade record = %+v, exists=%v err=%v",
+			current,
+			exists,
+			err,
+		)
+	}
+	if listing := runGit(
+		t,
+		openedSource,
+		"worktree",
+		"list",
+		"--porcelain",
+	); !strings.Contains(listing, prepared.Path) {
+		t.Fatal("original repository registration was unexpectedly changed")
+	}
+}
+
+func TestListRunsStatusFromOpenedWorktreeRoot(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge workspace: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "tracked.txt"),
+		[]byte("dirty\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("dirty worktree: %v", err)
+	}
+	replacement := filepath.Join(parent, "replacement-worktree")
+	if err := os.Mkdir(replacement, 0o700); err != nil {
+		t.Fatalf("create replacement worktree: %v", err)
+	}
+	gitPointer, err := os.ReadFile(filepath.Join(prepared.Path, ".git"))
+	if err != nil {
+		t.Fatalf("read worktree Git pointer: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(replacement, ".git"),
+		gitPointer,
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement Git pointer: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(replacement, "tracked.txt"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write clean replacement: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	opened := prepared.Path + "-opened"
+	swapped := filepath.Join(parent, "status-swapped")
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+matched=
+for argument in "$@"; do
+  [ "$argument" = "status" ] && matched=1
+done
+if [ -n "$matched" ] && [ ! -e "$DROVE_TEST_SWAPPED" ]; then
+  mv "$DROVE_TEST_TARGET" "$DROVE_TEST_OPENED" || exit 91
+  mv "$DROVE_TEST_REPLACEMENT" "$DROVE_TEST_TARGET" || exit 92
+  "$DROVE_TEST_REAL_GIT" "$@"
+  status=$?
+  mv "$DROVE_TEST_TARGET" "$DROVE_TEST_REPLACEMENT" || exit 93
+  mv "$DROVE_TEST_OPENED" "$DROVE_TEST_TARGET" || exit 94
+  : > "$DROVE_TEST_SWAPPED"
+  exit "$status"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_TARGET", prepared.Path)
+	t.Setenv("DROVE_TEST_OPENED", opened)
+	t.Setenv("DROVE_TEST_REPLACEMENT", replacement)
+	t.Setenv("DROVE_TEST_SWAPPED", swapped)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	listed, err := manager.List(context.Background())
+	if err != nil {
+		t.Fatalf("list workspaces: %v", err)
+	}
+	if len(listed) != 1 || !listed[0].Dirty {
+		t.Fatalf("listed workspaces = %+v, want dirty original", listed)
+	}
+	if _, err := os.Stat(swapped); err != nil {
+		t.Fatalf("status swap hook was not invoked: %v", err)
+	}
+	manager.git = realGit
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil {
+		t.Fatalf("remove workspace: %v", err)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
 func TestAcknowledgeRejectsReplacementCommonGitDirectory(
 	t *testing.T,
 ) {

@@ -120,6 +120,8 @@
 - 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
   只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。候选等待同 Agent
   cleanup completion，只有成功安装 resume reservation 后才消费；取消等待保留候选。
+  daemon 重启生成并持久化的 recovery `Stopped` 在真正尝试 resume 前仍保留该资格，
+  连续启动失败不能把候选静默降级为普通停止会话。
 - 信号与状态证据 reader 同时接受 v1、v2、typed screen v3 和 typed terminal v4；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。

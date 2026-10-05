@@ -2087,6 +2087,17 @@ func TestValidateBranchPreservesRuntimeGitFailure(t *testing.T) {
 	}
 }
 
+func TestValidateBranchRejectsHEAD(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	err = manager.validateBranch(context.Background(), "HEAD")
+	if !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf("validate HEAD error = %v, want ErrInvalidBranch", err)
+	}
+}
+
 func newTestRepository(t *testing.T) string {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {

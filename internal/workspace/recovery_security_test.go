@@ -38,6 +38,38 @@ func TestEnsureManagedRootRejectsLateParentSymlink(t *testing.T) {
 	}
 }
 
+func TestEnsureManagedRootRejectsLateAncestorSymlink(t *testing.T) {
+	parent := t.TempDir()
+	ancestor := filepath.Join(parent, "ancestor")
+	stable := filepath.Join(ancestor, "stable")
+	if err := os.MkdirAll(stable, 0o700); err != nil {
+		t.Fatalf("create stable ancestor: %v", err)
+	}
+	manager, err := New(filepath.Join(stable, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := os.Rename(ancestor, ancestor+"-opened"); err != nil {
+		t.Fatalf("move original ancestor: %v", err)
+	}
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(filepath.Join(outside, "stable"), 0o700); err != nil {
+		t.Fatalf("create redirect target: %v", err)
+	}
+	if err := os.Symlink(outside, ancestor); err != nil {
+		t.Skipf("create ancestor symlink: %v", err)
+	}
+
+	if err := manager.ensureManagedRoot(); err == nil {
+		t.Fatal("managed root creation followed a symlink in an earlier ancestor")
+	}
+	if _, err := os.Lstat(
+		filepath.Join(outside, "stable", "data"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("managed root creation changed the symlink target: %v", err)
+	}
+}
+
 func TestDiscardRejectsReplacedDataDirectory(t *testing.T) {
 	repository := newTestRepository(t)
 	parent := t.TempDir()
@@ -1577,6 +1609,67 @@ func TestAcknowledgeRemovalRecoversQuarantinedRecord(t *testing.T) {
 	}
 	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("acknowledgement quarantine remains or inspect failed: %v", err)
+	}
+}
+
+func TestReconcileRemovalCoalescesAcknowledgementHardLinks(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	recordPath := workspaceRecordPath(prepared.Path)
+	prefix := recordAcknowledgementPrefix(
+		prepared.AgentID,
+		result.Removal.operationID,
+	)
+	firstPath := filepath.Join(
+		filepath.Dir(recordPath),
+		prefix+"71717171-7171-4717-8717-717171717171",
+	)
+	secondPath := filepath.Join(
+		filepath.Dir(recordPath),
+		prefix+"72727272-7272-4727-8727-727272727272",
+	)
+	if err := os.Rename(recordPath, firstPath); err != nil {
+		t.Fatalf("quarantine removal record: %v", err)
+	}
+	if err := os.Link(firstPath, secondPath); err != nil {
+		t.Skipf("create acknowledgement hard link: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	removals, err := restarted.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile acknowledgement aliases: %v", err)
+	}
+	if len(removals) != 1 {
+		t.Fatalf("reconciled removals = %+v, want one", removals)
+	}
+	if err := restarted.AcknowledgeRemoval(removals[0]); err != nil {
+		t.Fatalf("acknowledge reconciled removal: %v", err)
+	}
+	for _, path := range []string{recordPath, firstPath, secondPath} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("acknowledgement path %q remains: %v", path, err)
+		}
 	}
 }
 

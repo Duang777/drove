@@ -98,12 +98,13 @@
   sidecar repository evidence 重开的 capability；拒绝未开始的 removal 时必须先验证并
   持久删除目录 marker，再清除 intent。ack sidecar 隔离名在正式记录缺失时必须按
   Agent ID 恢复并回读 operation ID，使 session 重试和重启 reconciliation 能继续；
+  同 operation 且 `os.SameFile` 的多个 ack 名必须折叠，任一不同身份仍 fail-stop；
   正式记录已存在时不得恢复旧 ack。对 version 1-4 记录发起新删除时，必须在写 intent
   前取得并持久化完整的 version 5 repository evidence；已经存在但缺少该证据的 removal
   intent 只能 fail-stop，禁止在恢复时重新信任记录中的公开仓库路径。清理始终保留分支。
 - Manager 创建不预先查找 Git，也不创建目录；只有实际查询或变更 worktree 时才解析并
   执行 `git`，因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。缺失的
-  DataDir 必须从已打开的最近现存祖先通过 `os.Root` 逐级创建，禁止 `MkdirAll` 沿可替换
+  DataDir 必须从已打开的卷根通过 `os.Root` 逐级创建，禁止 `MkdirAll` 沿可替换
   的公开路径创建。
 - Manager 初始化时固定既有 data directory、worktrees root 和 repository bucket 的
   文件身份，新建目录则在首次打开时固定。后续通过 `os.Root` 逐级打开并持续复核；

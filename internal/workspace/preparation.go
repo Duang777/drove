@@ -41,6 +41,11 @@ func (m *Manager) acknowledgePreparation(
 		record.RepositoryEvidence == nil {
 		return target.preparation.Close()
 	}
+	if record.PreparationCommitted &&
+		record.BranchOperationID == "" &&
+		target.preparation.isClosed() {
+		return target.preparation.Close()
+	}
 	lease := target.preparation
 	temporaryLease := false
 	if lease == nil {

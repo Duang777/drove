@@ -745,7 +745,7 @@ func copyIncludedPath(
 	output, err := destinationParent.OpenFile(
 		temporaryName,
 		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-		sourceInfo.Mode().Perm(),
+		openedInfo.Mode().Perm(),
 	)
 	if err != nil {
 		return fmt.Errorf("create staged destination: %w", err)

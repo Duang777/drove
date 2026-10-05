@@ -172,18 +172,18 @@ func (m *Manager) createPreparedWorktreeTarget(
 	); err != nil {
 		return nil, err
 	}
-	removeOnFailure = false
-	if err := bucket.Close(); err != nil {
-		bucket = nil
-		return nil, err
-	}
-	bucket = nil
 	openedResult := &preparedWorktreeTarget{
 		root: opened,
 		name: name,
 		path: path,
 	}
 	opened = nil
+	removeOnFailure = false
+	if err := bucket.Close(); err != nil {
+		bucket = nil
+		return openedResult, err
+	}
+	bucket = nil
 	return openedResult, nil
 }
 

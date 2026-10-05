@@ -59,6 +59,7 @@ type sessionDraft struct {
 	workingDir             string
 	workspace              *workspaceMetadata
 	workspaceRemoved       bool
+	restartStopped         bool
 	hasCreated             bool
 	hasState               bool
 }
@@ -354,6 +355,8 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		p.report.PartialHistory++
 	}
 	draft.state = to
+	draft.restartStopped =
+		to == agent.StateStopped && row.Reason == restartStopReason
 	if known {
 		draft.lastTransition = evidence
 	}
@@ -678,8 +681,9 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			plan.VendorSessionRefs[draft.id] = draft.vendorSessionRef
 			plan.ResumeOnStart[draft.id] =
 				!draft.workspaceRemoved &&
-					state != agent.StateDone &&
-					state != agent.StateStopped
+					(state != agent.StateDone &&
+						state != agent.StateStopped ||
+						draft.restartStopped)
 		}
 		workingDir := draft.workingDir
 		if draft.workspaceRemoved {

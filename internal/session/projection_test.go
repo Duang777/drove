@@ -322,6 +322,84 @@ func TestRecoveryProjectorRestoresLatestVendorSessionReference(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorPreservesResumeAfterPersistedRestartStop(
+	t *testing.T,
+) {
+	base := time.Date(2026, time.October, 5, 12, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "starting",
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "starting",
+			To:        "working",
+		},
+		{
+			Seq:       4,
+			Timestamp: base.Add(3 * time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "hook",
+			Payload: `{"version":1,"source":"hook","kind":"observed","vendor":"claude",` +
+				`"vendor_event":"Notification","scope":"root","vendor_session_ref":"resume-ref",` +
+				`"confidence":1,"received_at":"2026-10-05T12:00:02Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440001","outcome":"observed"}`,
+		},
+	}
+	first := newRecoveryProjector()
+	for _, row := range rows {
+		if err := first.Apply(row); err != nil {
+			t.Fatalf("apply initial seq %d: %v", row.Seq, err)
+		}
+	}
+	firstPlan, err := first.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish initial projection: %v", err)
+	}
+	rows = append(rows, firstPlan.Reconciliation...)
+
+	restarted := newRecoveryProjector()
+	for _, row := range rows {
+		if err := restarted.Apply(row); err != nil {
+			t.Fatalf("apply restarted seq %d: %v", row.Seq, err)
+		}
+	}
+	restartedPlan, err := restarted.Finish(base.Add(2 * time.Hour))
+	if err != nil {
+		t.Fatalf("finish restarted projection: %v", err)
+	}
+	if !restartedPlan.ResumeOnStart["agent-1"] {
+		t.Fatal("persisted daemon restart stop lost automatic resume intent")
+	}
+	if len(restartedPlan.Reconciliation) != 0 {
+		t.Fatalf(
+			"restarted reconciliation = %+v, want no duplicate stop",
+			restartedPlan.Reconciliation,
+		)
+	}
+}
+
 func TestRecoveryProjectorReadsVersionTwoMetadataAndEvidence(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	projector := newRecoveryProjector()

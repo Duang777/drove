@@ -317,6 +317,7 @@ func (m *Manager) prepare(
 		defer cancel()
 		return Workspace{}, errors.Join(
 			err,
+			m.cleanupPreparedWorktreeTarget(result, preparedTarget),
 			m.discardWithRepository(
 				cleanupCtx,
 				result,
@@ -725,7 +726,12 @@ func (m *Manager) listRepositoryBucket(
 		if hasRecord {
 			recorded = &record
 		}
-		current, inspectErr := m.inspect(ctx, path, recorded)
+		current, inspectErr := m.inspectAtRoot(
+			ctx,
+			path,
+			workspaceRoot,
+			recorded,
+		)
 		verifyErr := verifyRootEntryUnchanged(
 			bucket,
 			agentID,
@@ -897,6 +903,16 @@ func (m *Manager) discardWithRepository(
 					),
 				)
 			} else {
+				if !registered {
+					registered, removeErr =
+						repository.worktreeRegistered(
+							ctx,
+							activePath,
+						)
+					if removeErr != nil {
+						result = errors.Join(result, removeErr)
+					}
+				}
 				pathRemoved = true
 			}
 		}
@@ -970,7 +986,12 @@ func (m *Manager) removeDiscardedPath(
 			result = errors.Join(result, opened.Close())
 		}
 	}()
-	current, inspectErr := m.inspect(ctx, target.Path, &record)
+	current, inspectErr := m.inspectAtRoot(
+		ctx,
+		target.Path,
+		opened,
+		&record,
+	)
 	verifyErr := verifyRootEntryUnchanged(
 		bucket,
 		target.AgentID,
@@ -1020,9 +1041,27 @@ func (m *Manager) inspect(
 	ctx context.Context,
 	path string,
 	recorded *workspaceRecord,
+) (_ Workspace, result error) {
+	root, err := openRealPathRoot(path)
+	if err != nil {
+		return Workspace{}, err
+	}
+	defer func() {
+		result = errors.Join(result, root.Close())
+	}()
+	current, err := m.inspectAtRoot(ctx, path, root, recorded)
+	verifyErr := verifyRealPathRoot(path, root)
+	return current, errors.Join(err, verifyErr)
+}
+
+func (m *Manager) inspectAtRoot(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	recorded *workspaceRecord,
 ) (Workspace, error) {
 	agentID := filepath.Base(path)
-	directoryIdentity, err := worktreeDirectoryIdentity(path)
+	directoryIdentity, err := openedDirectoryIdentity(root)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -1034,7 +1073,7 @@ func (m *Manager) inspect(
 			path,
 		)
 	}
-	repository, err := m.repositoryRoot(ctx, path)
+	repository, err := m.repositoryRootAtRoot(ctx, path, root)
 	if err != nil {
 		return Workspace{}, fmt.Errorf("workspace: inspect repository for %q: %w", path, err)
 	}
@@ -1044,7 +1083,7 @@ func (m *Manager) inspect(
 			path,
 		)
 	}
-	gitDirectory, err := m.worktreeGitDirectory(ctx, path)
+	gitDirectory, err := m.worktreeGitDirectoryAtRoot(ctx, path, root)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -1057,7 +1096,15 @@ func (m *Manager) inspect(
 		)
 	}
 
-	branchOutput, err := m.run(ctx, "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	branchOutput, err := m.runRootedGit(
+		ctx,
+		path,
+		root,
+		"symbolic-ref",
+		"--quiet",
+		"--short",
+		"HEAD",
+	)
 	detached := false
 	branch := strings.TrimSpace(string(branchOutput))
 	if isExitCode(err, 1) {
@@ -1065,7 +1112,14 @@ func (m *Manager) inspect(
 		if recorded != nil {
 			branch = recorded.Branch
 		} else {
-			head, headErr := m.run(ctx, "-C", path, "rev-parse", "--short", "HEAD")
+			head, headErr := m.runRootedGit(
+				ctx,
+				path,
+				root,
+				"rev-parse",
+				"--short",
+				"HEAD",
+			)
 			if headErr != nil {
 				return Workspace{}, fmt.Errorf(
 					"workspace: inspect detached HEAD for %q: %w",
@@ -1078,10 +1132,10 @@ func (m *Manager) inspect(
 	} else if err != nil {
 		return Workspace{}, fmt.Errorf("workspace: inspect branch for %q: %w", path, err)
 	}
-	status, err := m.run(
+	status, err := m.runRootedGit(
 		ctx,
-		"-C",
 		path,
+		root,
 		"status",
 		"--porcelain=v1",
 		"--untracked-files=all",
@@ -1095,7 +1149,7 @@ func (m *Manager) inspect(
 	if recorded != nil {
 		includedPaths = append([]string(nil), recorded.IncludedPaths...)
 		for _, relative := range includedPaths {
-			_, pathErr := os.Lstat(filepath.Join(path, relative))
+			_, pathErr := root.Lstat(relative)
 			switch {
 			case pathErr == nil:
 				includedDirty = true
@@ -1274,8 +1328,8 @@ func (m *Manager) validateBranch(ctx context.Context, branch string) error {
 		strings.ContainsRune(branch, '\x00') {
 		return fmt.Errorf("%w: %q", ErrInvalidBranch, branch)
 	}
-	if _, err := m.run(ctx, "check-ref-format", "refs/heads/"+branch); err != nil {
-		if isExitCode(err, 1) {
+	if _, err := m.run(ctx, "check-ref-format", "--branch", branch); err != nil {
+		if isExitCode(err, 1) || isExitCode(err, 128) {
 			return errors.Join(
 				fmt.Errorf("%w: %q", ErrInvalidBranch, branch),
 				err,
@@ -1459,7 +1513,7 @@ func (m *Manager) worktreeRegistration(
 	}
 	path = filepath.Clean(path)
 	for _, registered := range worktrees {
-		if registered.path == path {
+		if sameRegisteredWorktreePath(registered.path, path) {
 			return registered, true, nil
 		}
 	}

@@ -429,7 +429,7 @@ func (r repositoryCapability) worktreeRegistration(
 	}
 	path = filepath.Clean(path)
 	for _, registered := range worktrees {
-		if registered.path == path {
+		if sameRegisteredWorktreePath(registered.path, path) {
 			return registered, true, nil
 		}
 	}
@@ -518,7 +518,7 @@ func (repositoryCapability) verifyPreparedWorktreeRegistration(
 	registered registeredWorktree,
 	expectedHeadOID string,
 ) error {
-	if registered.path != target.Path ||
+	if !sameRegisteredWorktreePath(registered.path, target.Path) ||
 		registered.detached ||
 		registered.branch != "refs/heads/"+target.Branch ||
 		registered.head == "" ||
@@ -533,6 +533,17 @@ func (repositoryCapability) verifyPreparedWorktreeRegistration(
 		)
 	}
 	return nil
+}
+
+func sameRegisteredWorktreePath(left string, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if left == right {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 func (r repositoryCapability) boundGitDirectory(

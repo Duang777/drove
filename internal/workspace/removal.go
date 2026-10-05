@@ -216,13 +216,6 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 		Started:     true,
 		Quarantined: true,
 	}
-	bucketAbsent, err := m.removalBucketAbsent(removal.Workspace)
-	if err != nil {
-		return err
-	}
-	if bucketAbsent {
-		return nil
-	}
 	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	facts, err := m.removalFacts(inspectCtx, record)
@@ -238,30 +231,6 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 		return err
 	}
 	return nil
-}
-
-func (m *Manager) removalBucketAbsent(
-	target Workspace,
-) (_ bool, result error) {
-	root, err := m.openWorktreeRoot()
-	if errors.Is(err, os.ErrNotExist) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		result = errors.Join(result, root.Close())
-	}()
-	_, err = root.Lstat(repositoryHash(target.Repository))
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return true, nil
-	case err != nil:
-		return false, fmt.Errorf("workspace: inspect repository bucket: %w", err)
-	default:
-		return false, nil
-	}
 }
 
 type removalFacts struct {
@@ -301,7 +270,17 @@ func (m *Manager) ensureRemovalRepositoryEvidence(
 			"workspace: pending removal has no repository identity evidence",
 		)
 	}
-	root, err := openRealPathRoot(record.Repository)
+	sourcePath := record.Repository
+	var legacyEvidence *repositoryEvidence
+	if record.Version == repositoryWorkspaceRecordVersion &&
+		record.RepositoryEvidence != nil {
+		legacyEvidence = cloneRepositoryEvidence(record.RepositoryEvidence)
+		if err := validateLegacyRepositoryEvidence(*legacyEvidence); err != nil {
+			return workspaceRecord{}, err
+		}
+		sourcePath = legacyEvidence.SourcePath
+	}
+	root, err := openRealPathRoot(sourcePath)
 	if err != nil {
 		return workspaceRecord{}, fmt.Errorf(
 			"workspace: open removal repository: %w",
@@ -316,7 +295,7 @@ func (m *Manager) ensureRemovalRepositoryEvidence(
 	}()
 	repository, err := m.repositoryRootAtRoot(
 		ctx,
-		record.Repository,
+		sourcePath,
 		root,
 	)
 	if err != nil {
@@ -330,7 +309,7 @@ func (m *Manager) ensureRemovalRepositoryEvidence(
 	lease, err := newPreparationLease(
 		ctx,
 		m,
-		record.Repository,
+		sourcePath,
 		root,
 	)
 	if err != nil {
@@ -343,6 +322,18 @@ func (m *Manager) ensureRemovalRepositoryEvidence(
 	defer func() {
 		result = errors.Join(result, lease.Close())
 	}()
+	if legacyEvidence != nil &&
+		(legacyEvidence.SourcePath != lease.evidence.SourcePath ||
+			legacyEvidence.SourceDirectoryIdentity !=
+				lease.evidence.SourceDirectoryIdentity ||
+			legacyEvidence.CommonGitDirectory !=
+				lease.evidence.CommonGitDirectory ||
+			legacyEvidence.CommonGitDirectoryIdentity !=
+				lease.evidence.CommonGitDirectoryIdentity) {
+		return workspaceRecord{}, errors.New(
+			"workspace: legacy removal repository identity evidence changed",
+		)
+	}
 
 	upgradeWorkspaceRecord(&record)
 	record.RepositoryEvidence = cloneRepositoryEvidence(&lease.evidence)

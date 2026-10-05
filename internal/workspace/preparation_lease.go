@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 type preparationLease struct {
@@ -20,6 +21,7 @@ type preparationLease struct {
 
 	closeOnce sync.Once
 	closeErr  error
+	closed    atomic.Bool
 }
 
 func newPreparationLease(
@@ -327,6 +329,11 @@ func (l *preparationLease) Close() error {
 			l.guard.Close(),
 			l.root.Close(),
 		)
+		l.closed.Store(true)
 	})
 	return l.closeErr
+}
+
+func (l *preparationLease) isClosed() bool {
+	return l != nil && l.closed.Load()
 }
