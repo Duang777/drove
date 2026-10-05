@@ -34,14 +34,18 @@
   Git registration 的四种组合。非强制 intent 每次继续前都重新检查；路径存在但
   registration 丢失，或路径丢失但 registration 为 detached 时保留 intent 并
   fail-stop。显式 force 会原子升级已有的非强制 intent 并保留 operation ID；调用任何
-  物理删除前必须原子持久化 `started`，之后失败必须保留 intent 并在重启后继续，不能再因
-  dirty 状态回滚。version 2 的历史 removal intent 兼容视为已开始。清理始终保留分支。
+  物理删除前先把已检查的 workspace 原子移动到 operation ID 隔离名，再持久化
+  `quarantined + started`；之后只删除隔离名，失败必须保留 intent 并在重启后继续，
+  不能再因 dirty 状态回滚。version 2 的历史 removal intent 兼容视为已开始。清理始终
+  保留分支。
 - Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
   因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。
 - Manager 初始化时固定既有 data directory、worktrees root 和 repository bucket 的
   文件身份，新建目录则在首次打开时固定。后续通过 `os.Root` 逐级打开并持续复核；
   任一中间实目录或 symlink 被替换时必须 fail-stop。List 与 record scan 全程持有固定
   root/bucket 句柄。sidecar 的原子写、确认读取和删除必须在受约束 bucket 句柄内完成。
+  初次 sidecar 安装必须使用 no-replace 原语；removal acknowledgement 先把匹配 token 的
+  sidecar 原子移动到 operation ID 隔离名，再校验并删除，崩溃后从隔离名恢复。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。未注册残留目录通过已验证的 `os.Root` 相对操作删除，任一中间
   symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理

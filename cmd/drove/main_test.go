@@ -246,6 +246,16 @@ func TestTerminalStreamInternalErrorUsesRuntimeExitCode(t *testing.T) {
 	}
 }
 
+func TestTerminalStreamBackpressureUsesRuntimeExitCode(t *testing.T) {
+	err := &client.TerminalStreamError{
+		Code:    "input_backpressure",
+		Message: "terminal input is temporarily busy",
+	}
+	if got := commandExitCode(err); got != exitErr {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitErr, err)
+	}
+}
+
 func TestRuntimeFailureUsesRuntimeExitCode(t *testing.T) {
 	err := errors.New("daemon unavailable")
 	if got := commandExitCode(err); got != exitErr {

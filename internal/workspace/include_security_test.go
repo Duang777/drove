@@ -29,7 +29,15 @@ func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 		t.Fatalf("open source root: %v", err)
 	}
 	defer source.Close()
-	destination, err := openRealPathRoot(destinationPath)
+	destinationBucket, err := openRealPathRoot(filepath.Dir(destinationPath))
+	if err != nil {
+		t.Fatalf("open destination bucket: %v", err)
+	}
+	defer destinationBucket.Close()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		filepath.Base(destinationPath),
+	)
 	if err != nil {
 		t.Fatalf("open destination root: %v", err)
 	}
@@ -50,7 +58,13 @@ func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 		t.Fatalf("write replacement source: %v", err)
 	}
 
-	if err := copyIncludedPath(source, destination, "secret"); err != nil {
+	if err := copyIncludedPath(
+		source,
+		destinationBucket,
+		destination,
+		filepath.Base(destinationPath),
+		"secret",
+	); err != nil {
 		t.Fatalf("copy included path: %v", err)
 	}
 	assertFileContents(
@@ -82,13 +96,27 @@ func TestCopyIncludedPathRejectsSymlinkedParent(t *testing.T) {
 		t.Fatalf("open source root: %v", err)
 	}
 	defer source.Close()
-	destination, err := openRealPathRoot(destinationPath)
+	destinationBucket, err := openRealPathRoot(filepath.Dir(destinationPath))
+	if err != nil {
+		t.Fatalf("open destination bucket: %v", err)
+	}
+	defer destinationBucket.Close()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		filepath.Base(destinationPath),
+	)
 	if err != nil {
 		t.Fatalf("open destination root: %v", err)
 	}
 	defer destination.Close()
 
-	err = copyIncludedPath(source, destination, "linked/secret")
+	err = copyIncludedPath(
+		source,
+		destinationBucket,
+		destination,
+		filepath.Base(destinationPath),
+		"linked/secret",
+	)
 	if err == nil || !strings.Contains(err.Error(), "not a real directory") {
 		t.Fatalf("copy through source symlink error = %v", err)
 	}
@@ -124,7 +152,15 @@ func TestCopyIncludedPathRejectsSymlinkedDestinationParent(t *testing.T) {
 		t.Fatalf("open source root: %v", err)
 	}
 	defer source.Close()
-	destination, err := openRealPathRoot(destinationPath)
+	destinationBucket, err := openRealPathRoot(filepath.Dir(destinationPath))
+	if err != nil {
+		t.Fatalf("open destination bucket: %v", err)
+	}
+	defer destinationBucket.Close()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		filepath.Base(destinationPath),
+	)
 	if err != nil {
 		t.Fatalf("open destination root: %v", err)
 	}
@@ -132,7 +168,9 @@ func TestCopyIncludedPathRejectsSymlinkedDestinationParent(t *testing.T) {
 
 	if err := copyIncludedPath(
 		source,
+		destinationBucket,
 		destination,
+		filepath.Base(destinationPath),
 		"nested/secret",
 	); err == nil {
 		t.Fatal("copy accepted a symlinked destination parent")
@@ -141,5 +179,61 @@ func TestCopyIncludedPathRejectsSymlinkedDestinationParent(t *testing.T) {
 		filepath.Join(outsideDestination, "secret"),
 	); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("copy escaped destination root or inspect failed: %v", err)
+	}
+}
+
+func TestCopyIncludedPathDoesNotFollowMovedDestinationRoot(t *testing.T) {
+	sourcePath := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(sourcePath, "secret"),
+		[]byte("inside\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	bucketPath := t.TempDir()
+	destinationName := "workspace"
+	destinationPath := filepath.Join(bucketPath, destinationName)
+	if err := os.Mkdir(destinationPath, 0o700); err != nil {
+		t.Fatalf("create destination: %v", err)
+	}
+	source, err := openRealPathRoot(sourcePath)
+	if err != nil {
+		t.Fatalf("open source root: %v", err)
+	}
+	defer source.Close()
+	destinationBucket, err := openRealPathRoot(bucketPath)
+	if err != nil {
+		t.Fatalf("open destination bucket: %v", err)
+	}
+	defer destinationBucket.Close()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		destinationName,
+	)
+	if err != nil {
+		t.Fatalf("open destination root: %v", err)
+	}
+	defer destination.Close()
+
+	outsidePath := filepath.Join(t.TempDir(), "moved-workspace")
+	if err := os.Rename(destinationPath, outsidePath); err != nil {
+		t.Fatalf("move destination outside bucket: %v", err)
+	}
+	err = copyIncludedPath(
+		source,
+		destinationBucket,
+		destination,
+		destinationName,
+		"secret",
+	)
+	if err == nil {
+		t.Fatal("copy accepted a moved destination workspace")
+	}
+	if _, err := os.Lstat(filepath.Join(outsidePath, "secret")); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("copy wrote into moved destination: %v", err)
 	}
 }

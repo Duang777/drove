@@ -23,49 +23,93 @@ func renameRecordFile(
 	temporary *os.File,
 	temporaryName string,
 	recordName string,
-) (result error) {
+	replace bool,
+) (installed bool, result error) {
 	renaming, err := openRecordForRename(directory, temporaryName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() {
 		result = errors.Join(result, renaming.Close())
 	}()
 	writtenInfo, err := temporary.Stat()
 	if err != nil {
-		return fmt.Errorf("inspect written temporary record: %w", err)
+		return false, fmt.Errorf("inspect written temporary record: %w", err)
 	}
 	renamingInfo, err := renaming.Stat()
 	if err != nil {
-		return fmt.Errorf("inspect rename temporary record: %w", err)
+		return false, fmt.Errorf("inspect rename temporary record: %w", err)
 	}
 	if !os.SameFile(writtenInfo, renamingInfo) {
-		return errors.New("temporary record changed before rename")
+		return false, errors.New("temporary record changed before rename")
 	}
 
+	installed, err = renameWindowsHandle(
+		directory,
+		renaming,
+		recordName,
+		replace,
+	)
+	if err != nil {
+		return installed, err
+	}
+	if err := windows.FlushFileBuffers(
+		windows.Handle(renaming.Fd()),
+	); err != nil {
+		return true, fmt.Errorf("flush renamed record: %w", err)
+	}
+	return true, nil
+}
+
+func moveRecordFile(
+	directory *os.File,
+	source *os.File,
+	sourceName string,
+	targetName string,
+) (bool, error) {
+	return renameRecordFile(
+		directory,
+		source,
+		sourceName,
+		targetName,
+		false,
+	)
+}
+
+func renameWindowsHandle(
+	directory *os.File,
+	renaming *os.File,
+	recordName string,
+	replace bool,
+) (bool, error) {
 	name, err := windows.UTF16FromString(recordName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	nameLength := (len(name) - 1) * 2
 	var header recordRenameInformation
 	size := int(unsafe.Offsetof(header.FileName)) + nameLength
 	buffer := make([]byte, size)
 	information := (*recordRenameInformation)(unsafe.Pointer(&buffer[0]))
-	information.ReplaceIfExists = windows.FILE_RENAME_REPLACE_IF_EXISTS |
-		windows.FILE_RENAME_POSIX_SEMANTICS
+	information.ReplaceIfExists = windows.FILE_RENAME_POSIX_SEMANTICS
+	if replace {
+		information.ReplaceIfExists |= windows.FILE_RENAME_REPLACE_IF_EXISTS
+	}
 	information.RootDirectory = windows.Handle(directory.Fd())
 	information.FileNameLength = uint32(nameLength)
 	target := unsafe.Slice(&information.FileName[0], nameLength/2)
 	copy(target, name)
 	var status windows.IO_STATUS_BLOCK
-	return windows.NtSetInformationFile(
+	if err := windows.NtSetInformationFile(
 		windows.Handle(renaming.Fd()),
 		&status,
 		&buffer[0],
 		uint32(size),
 		windows.FileRenameInformation,
-	)
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func openRecordForRename(directory *os.File, name string) (*os.File, error) {

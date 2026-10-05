@@ -584,7 +584,7 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 	}
 	recordRemoved := false
 	if worktreeRemoved && branchCleaned {
-		if err := m.removeWorkspaceRecord(target.Path, ""); err != nil {
+		if err := m.removeWorkspaceRecord(target.Path); err != nil {
 			result = errors.Join(result, err)
 		} else {
 			recordRemoved = true

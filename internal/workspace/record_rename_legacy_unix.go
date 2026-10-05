@@ -1,8 +1,9 @@
-//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd
+//go:build aix || illumos || solaris
 
 package workspace
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -15,18 +16,14 @@ func renameRecordFile(
 	recordName string,
 	replace bool,
 ) (bool, error) {
+	if !replace {
+		return false, errors.New(
+			"atomic no-replace record installation is unsupported",
+		)
+	}
 	fd := int(directory.Fd())
-	if replace {
-		if err := unix.Renameat(fd, temporaryName, fd, recordName); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-	if err := unix.Linkat(fd, temporaryName, fd, recordName, 0); err != nil {
+	if err := unix.Renameat(fd, temporaryName, fd, recordName); err != nil {
 		return false, err
-	}
-	if err := unix.Unlinkat(fd, temporaryName, 0); err != nil {
-		return true, err
 	}
 	return true, nil
 }

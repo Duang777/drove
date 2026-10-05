@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/google/uuid"
 )
 
 func (m *Manager) ensureManagedRoot() (result error) {
@@ -251,6 +253,177 @@ func (m *Manager) removeManagedPath(target Workspace) (result error) {
 	return nil
 }
 
+func removalQuarantinePrefix(record workspaceRecord) string {
+	return "." + record.AgentID + ".removal-" +
+		record.Removal.OperationID + "-"
+}
+
+func findRemovalQuarantine(
+	bucket *os.Root,
+	record workspaceRecord,
+) (string, bool, error) {
+	entries, err := readRootDirectory(bucket)
+	if err != nil {
+		return "", false, err
+	}
+	prefix := removalQuarantinePrefix(record)
+	var matched string
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		if matched != "" {
+			return "", false, fmt.Errorf(
+				"workspace: removal %q has multiple quarantined paths",
+				record.Removal.OperationID,
+			)
+		}
+		info, err := bucket.Lstat(entry.Name())
+		if err != nil {
+			return "", false, err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return "", false, fmt.Errorf(
+				"workspace: removal quarantine %q is not a real directory",
+				entry.Name(),
+			)
+		}
+		matched = entry.Name()
+	}
+	return matched, matched != "", nil
+}
+
+func quarantineManagedPath(
+	bucket *os.Root,
+	record workspaceRecord,
+	opened *os.Root,
+) (name string, moved bool, result error) {
+	if record.Removal == nil {
+		return "", false, errors.New(
+			"workspace: removal intent is missing",
+		)
+	}
+	existing, exists, err := findRemovalQuarantine(bucket, record)
+	if err != nil {
+		return "", false, err
+	}
+	if exists {
+		if opened != nil {
+			if err := verifyRootEntryUnchanged(
+				bucket,
+				existing,
+				opened,
+			); err != nil {
+				return "", false, fmt.Errorf(
+					"workspace: verify removal quarantine: %w",
+					err,
+				)
+			}
+		}
+		return existing, false, nil
+	}
+	if record.Removal.Quarantined {
+		return "", false, nil
+	}
+
+	var owned bool
+	if opened == nil {
+		opened, err = openRealRootFromRoot(bucket, record.AgentID)
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		owned = true
+		defer func() {
+			if owned {
+				result = errors.Join(result, opened.Close())
+			}
+		}()
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		record.AgentID,
+		opened,
+	); err != nil {
+		return "", false, err
+	}
+	openedInfo, err := opened.Stat(".")
+	if err != nil {
+		return "", false, err
+	}
+	name = removalQuarantinePrefix(record) + uuid.NewString()
+	directory, err := bucket.Open(".")
+	if err != nil {
+		return "", false, err
+	}
+	moved, renameErr := renameDirectoryNoReplace(
+		directory,
+		openedInfo,
+		record.AgentID,
+		name,
+	)
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	if err := errors.Join(renameErr, syncErr, closeErr); err != nil {
+		return name, moved, err
+	}
+	current, err := bucket.Lstat(name)
+	if err != nil {
+		return name, true, err
+	}
+	if !current.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(openedInfo, current) {
+		restoreErr := restoreManagedQuarantine(bucket, record, name)
+		return name, true, errors.Join(
+			errors.New(
+				"workspace: managed path changed while entering quarantine",
+			),
+			restoreErr,
+		)
+	}
+	return name, true, nil
+}
+
+func restoreManagedQuarantine(
+	bucket *os.Root,
+	record workspaceRecord,
+	name string,
+) (result error) {
+	opened, err := openRealRootFromRoot(bucket, name)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, opened.Close())
+	}()
+	openedInfo, err := opened.Stat(".")
+	if err != nil {
+		return err
+	}
+	directory, err := bucket.Open(".")
+	if err != nil {
+		return err
+	}
+	restored, renameErr := renameDirectoryNoReplace(
+		directory,
+		openedInfo,
+		name,
+		record.AgentID,
+	)
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	if err := errors.Join(renameErr, syncErr, closeErr); err != nil {
+		return err
+	}
+	if !restored {
+		return errors.New("workspace: removal quarantine was not restored")
+	}
+	return verifyRootEntryUnchanged(bucket, record.AgentID, opened)
+}
+
 func (m *Manager) removeManagedBucketIfEmpty(
 	target Workspace,
 ) (result error) {
@@ -432,10 +605,11 @@ func removeAllFromRoot(root *os.Root, name string) (result error) {
 	if err := errors.Join(readErr, closeErr); err != nil {
 		return err
 	}
-	for _, entry := range entries {
-		if err := removeAllFromRoot(child, entry.Name()); err != nil {
-			return err
-		}
+	if err := verifyRootEntryUnchanged(root, name, child); err != nil {
+		return err
+	}
+	if err := removeRootEntries(root, name, entries); err != nil {
+		return err
 	}
 	closeErr = child.Close()
 	child = nil
@@ -443,4 +617,18 @@ func removeAllFromRoot(root *os.Root, name string) (result error) {
 		return closeErr
 	}
 	return root.Remove(name)
+}
+
+func removeRootEntries(
+	root *os.Root,
+	name string,
+	entries []os.DirEntry,
+) error {
+	for _, entry := range entries {
+		childName := filepath.Join(name, entry.Name())
+		if err := removeAllFromRoot(root, childName); err != nil {
+			return err
+		}
+	}
+	return nil
 }

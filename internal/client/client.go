@@ -70,7 +70,6 @@ func IsUserError(err error) bool {
 		"empty_input",
 		"input_too_large",
 		"invalid_utf8",
-		"input_backpressure",
 		"not_subscribed",
 		"duplicate_subscription",
 		"request_limit":

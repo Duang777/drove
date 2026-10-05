@@ -101,12 +101,12 @@ func (m *Manager) remove(
 		return RemovalResult{Removal: removal, State: state}, removalErr
 	}
 
-	before, err := m.removalFacts(ctx, record)
+	facts, err := m.removalFacts(ctx, record)
 	if err != nil {
 		return RemovalResult{}, err
 	}
 	if !force {
-		if err := m.validateRemovalSafety(ctx, record, before); err != nil {
+		if err := m.validateRemovalSafety(ctx, record, facts); err != nil {
 			return RemovalResult{}, err
 		}
 	}
@@ -119,33 +119,17 @@ func (m *Manager) remove(
 		OperationID: uuid.NewString(),
 		Force:       force,
 	}
-	if err := m.replaceWorkspaceRecord(record); err != nil {
-		return RemovalResult{}, err
-	}
 	removal.operationID = record.Removal.OperationID
-
-	if !force {
-		current, safetyErr := m.removalFacts(ctx, record)
-		if safetyErr == nil {
-			safetyErr = m.validateRemovalSafety(ctx, record, current)
-		}
-		if safetyErr != nil {
-			state, rollbackErr := m.rollbackRemovalIntent(ctx, record, before)
-			return RemovalResult{Removal: removal, State: state}, errors.Join(
-				safetyErr,
-				rollbackErr,
-			)
-		}
-	}
-
-	record, err = m.startRemoval(record)
+	installed, err := m.replaceWorkspaceRecordState(record)
 	if err != nil {
-		return RemovalResult{
-			Removal: removal,
-			State:   RemovalPending,
-		}, err
+		state := RemovalUnchanged
+		if installed {
+			state = RemovalPending
+		}
+		return RemovalResult{Removal: removal, State: state}, err
 	}
-	state, removalErr := m.completeRemoval(ctx, record)
+
+	state, removalErr := m.resumePendingRemoval(ctx, record)
 	return RemovalResult{Removal: removal, State: state}, removalErr
 }
 
@@ -189,67 +173,63 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	record, exists, err := m.readWorkspaceRecord(removal.Workspace.Path)
-	if err != nil {
+	if err := m.validateManagedPath(removal.Workspace); err != nil {
 		return err
 	}
-	if !exists {
-		return nil
+	operationID, err := uuid.Parse(removal.operationID)
+	if err != nil || operationID.String() != removal.operationID {
+		return errors.New(
+			"workspace: removal acknowledgement token is invalid",
+		)
 	}
-	if record.AgentID != removal.Workspace.AgentID ||
-		record.Repository != removal.Workspace.Repository ||
-		record.Path != removal.Workspace.Path ||
-		record.Branch != removal.Workspace.Branch {
-		return errors.New("workspace: removal acknowledgement does not match record")
-	}
-	if record.Removal == nil ||
-		record.Removal.OperationID != removal.operationID {
-		return errors.New("workspace: removal acknowledgement token does not match")
+	record := newWorkspaceRecord(removal.Workspace, nil)
+	record.Removal = &workspaceRemovalRecord{
+		OperationID: removal.operationID,
+		Started:     true,
+		Quarantined: true,
 	}
 	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	facts, err := m.removalFacts(inspectCtx, record)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if facts.pathExists || facts.registered {
+	if facts.pathExists ||
+		facts.quarantineName != "" ||
+		facts.registered {
 		return errors.New("workspace: cannot acknowledge an incomplete removal")
 	}
-	current, exists, err := m.readWorkspaceRecord(record.Path)
-	if err != nil {
+	if err := m.removeAcknowledgedWorkspaceRecord(removal); err != nil {
 		return err
 	}
-	if !exists ||
-		current.AgentID != record.AgentID ||
-		current.Repository != record.Repository ||
-		current.Path != record.Path ||
-		current.Branch != record.Branch ||
-		current.Removal == nil ||
-		current.Removal.OperationID != removal.operationID {
-		return errors.New(
-			"workspace: removal record changed before acknowledgement",
-		)
-	}
-	if err := m.removeWorkspaceRecord(record.Path, removal.operationID); err != nil {
-		return err
-	}
-	if err := m.removeManagedBucketIfEmpty(record.workspace()); err != nil {
+	if err := m.removeManagedBucketIfEmpty(removal.Workspace); err != nil {
 		return err
 	}
 	return nil
 }
 
 type removalFacts struct {
-	pathExists   bool
-	registered   bool
-	registration registeredWorktree
+	pathExists     bool
+	quarantineName string
+	registered     bool
+	registration   registeredWorktree
 }
 
 func (m *Manager) removalFacts(
 	ctx context.Context,
 	record workspaceRecord,
-) (removalFacts, error) {
-	info, err := os.Lstat(record.Path)
+) (_ removalFacts, result error) {
+	bucket, err := m.openManagedBucketRoot(record.workspace())
+	if err != nil {
+		return removalFacts{}, err
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	info, err := bucket.Lstat(record.AgentID)
 	pathExists := err == nil
 	switch {
 	case errors.Is(err, os.ErrNotExist):
@@ -265,6 +245,16 @@ func (m *Manager) removalFacts(
 			record.Path,
 		)
 	}
+	var quarantineName string
+	if record.Removal != nil {
+		quarantineName, _, err = findRemovalQuarantine(bucket, record)
+		if err != nil {
+			return removalFacts{}, fmt.Errorf(
+				"workspace: inspect removal quarantine: %w",
+				err,
+			)
+		}
+	}
 	registration, registered, err := m.worktreeRegistration(
 		ctx,
 		record.Repository,
@@ -274,9 +264,10 @@ func (m *Manager) removalFacts(
 		return removalFacts{}, err
 	}
 	return removalFacts{
-		pathExists:   pathExists,
-		registered:   registered,
-		registration: registration,
+		pathExists:     pathExists,
+		quarantineName: quarantineName,
+		registered:     registered,
+		registration:   registration,
 	}, nil
 }
 
@@ -285,7 +276,21 @@ func (m *Manager) validateRemovalSafety(
 	record workspaceRecord,
 	facts removalFacts,
 ) error {
-	if !facts.pathExists && !facts.registered {
+	path := ""
+	if facts.pathExists {
+		path = record.Path
+	}
+	return m.validateRemovalSafetyAt(ctx, record, facts, path)
+}
+
+func (m *Manager) validateRemovalSafetyAt(
+	ctx context.Context,
+	record workspaceRecord,
+	facts removalFacts,
+	path string,
+) error {
+	pathExists := path != ""
+	if !pathExists && !facts.registered {
 		return nil
 	}
 	if !record.ProtectionKnown {
@@ -294,7 +299,7 @@ func (m *Manager) validateRemovalSafety(
 			ErrDirty,
 		)
 	}
-	if facts.pathExists && !facts.registered {
+	if pathExists && !facts.registered {
 		return fmt.Errorf(
 			"%w: workspace path is no longer registered",
 			ErrDirty,
@@ -307,10 +312,10 @@ func (m *Manager) validateRemovalSafety(
 			record.Path,
 		)
 	}
-	if !facts.pathExists {
+	if !pathExists {
 		return nil
 	}
-	current, err := m.inspect(ctx, record.Path, &record)
+	current, err := m.inspect(ctx, path, &record)
 	if err != nil {
 		return err
 	}
@@ -322,7 +327,7 @@ func (m *Manager) validateRemovalSafety(
 		)
 	}
 	if current.Dirty {
-		return fmt.Errorf("%w: %s", ErrDirty, record.Path)
+		return fmt.Errorf("%w: %s", ErrDirty, path)
 	}
 	return nil
 }
@@ -340,14 +345,25 @@ func (m *Manager) completeRemoval(
 	if err != nil {
 		return RemovalPending, err
 	}
-	if !facts.pathExists && !facts.registered {
+	if !facts.pathExists &&
+		facts.quarantineName == "" &&
+		!facts.registered {
 		return RemovalComplete, nil
 	}
-	if facts.pathExists {
-		if err := m.removeManagedPath(record.workspace()); err != nil {
+	if facts.quarantineName != "" {
+		bucket, openErr := m.openManagedBucketRoot(record.workspace())
+		if openErr != nil {
+			return RemovalPending, openErr
+		}
+		removeErr := removeAllFromRoot(bucket, facts.quarantineName)
+		closeErr := bucket.Close()
+		if err := errors.Join(removeErr, closeErr); err != nil {
 			return m.classifyRemovalFailure(
 				record,
-				fmt.Errorf("workspace: remove managed worktree: %w", err),
+				fmt.Errorf(
+					"workspace: remove quarantined worktree: %w",
+					err,
+				),
 			)
 		}
 	}
@@ -374,9 +390,11 @@ func (m *Manager) completeRemoval(
 	if err != nil {
 		return RemovalPending, err
 	}
-	if after.pathExists || after.registered {
+	if after.pathExists ||
+		after.quarantineName != "" ||
+		after.registered {
 		return RemovalPending, errors.New(
-			"workspace: removal left a path or Git registration",
+			"workspace: removal left a path, quarantine, or Git registration",
 		)
 	}
 	return RemovalComplete, nil
@@ -386,53 +404,223 @@ func (m *Manager) resumePendingRemoval(
 	ctx context.Context,
 	record workspaceRecord,
 ) (RemovalState, error) {
+	if record.Removal == nil {
+		return RemovalPending, errors.New(
+			"workspace: removal intent is missing",
+		)
+	}
 	facts, err := m.removalFacts(ctx, record)
 	if err != nil {
 		return RemovalPending, err
 	}
-	if !record.Removal.Force && !record.Removal.Started {
-		if safetyErr := m.validateRemovalSafety(ctx, record, facts); safetyErr != nil {
-			return m.rejectPendingRemoval(record, facts, safetyErr)
+
+	if facts.quarantineName != "" {
+		if !record.Removal.Started {
+			bucket, openErr := m.openManagedBucketRoot(record.workspace())
+			if openErr != nil {
+				return RemovalPending, openErr
+			}
+			quarantined, openErr := openRealRootFromRoot(
+				bucket,
+				facts.quarantineName,
+			)
+			if openErr != nil {
+				_ = bucket.Close()
+				return RemovalPending, openErr
+			}
+			quarantinePath := filepath.Join(
+				filepath.Dir(record.Path),
+				facts.quarantineName,
+			)
+			var safetyErr error
+			if record.Removal.Force {
+				safetyErr = m.validateRemovalIdentity(
+					ctx,
+					record,
+					quarantinePath,
+				)
+			} else {
+				safetyErr = m.validateRemovalSafetyAt(
+					ctx,
+					record,
+					facts,
+					quarantinePath,
+				)
+			}
+			verifyErr := verifyRootEntryUnchanged(
+				bucket,
+				facts.quarantineName,
+				quarantined,
+			)
+			closeErr := errors.Join(
+				quarantined.Close(),
+				bucket.Close(),
+			)
+			if err := errors.Join(safetyErr, verifyErr, closeErr); err != nil {
+				if safetyErr != nil &&
+					errors.Is(safetyErr, ErrDirty) &&
+					verifyErr == nil &&
+					closeErr == nil {
+					return m.rejectQuarantinedRemoval(
+						ctx,
+						record,
+						facts.quarantineName,
+						safetyErr,
+					)
+				}
+				return RemovalPending, err
+			}
 		}
+		record, err = m.persistRemovalStart(record, true)
+		if err != nil {
+			return RemovalPending, err
+		}
+		return m.completeRemoval(ctx, record)
 	}
-	record, err = m.startRemoval(record)
+
+	if !facts.pathExists {
+		if !record.Removal.Force && !record.Removal.Started {
+			if safetyErr := m.validateRemovalSafety(
+				ctx,
+				record,
+				facts,
+			); safetyErr != nil {
+				return m.rejectPendingRemoval(record, facts, safetyErr)
+			}
+		}
+		record, err = m.persistRemovalStart(record, false)
+		if err != nil {
+			return RemovalPending, err
+		}
+		return m.completeRemoval(ctx, record)
+	}
+
+	bucket, err := m.openManagedBucketRoot(record.workspace())
 	if err != nil {
 		return RemovalPending, err
 	}
-	state, removalErr := m.completeRemoval(ctx, record)
-	if state != RemovalPending || !errors.Is(removalErr, ErrDirty) {
-		return state, removalErr
+	opened, err := openRealRootFromRoot(bucket, record.AgentID)
+	if err != nil {
+		_ = bucket.Close()
+		return RemovalPending, err
 	}
-	current, factsErr := m.removalFacts(ctx, record)
-	if factsErr != nil {
-		return RemovalPending, errors.Join(removalErr, factsErr)
+	if !record.Removal.Force && !record.Removal.Started {
+		safetyErr := m.validateRemovalSafetyAt(
+			ctx,
+			record,
+			facts,
+			record.Path,
+		)
+		verifyErr := verifyRootEntryUnchanged(
+			bucket,
+			record.AgentID,
+			opened,
+		)
+		if err := errors.Join(safetyErr, verifyErr); err != nil {
+			_ = opened.Close()
+			_ = bucket.Close()
+			if safetyErr != nil &&
+				errors.Is(safetyErr, ErrDirty) &&
+				verifyErr == nil {
+				return m.rejectPendingRemoval(record, facts, safetyErr)
+			}
+			return RemovalPending, err
+		}
 	}
-	state, safetyErr := m.rejectPendingRemoval(record, current, removalErr)
-	return state, safetyErr
+	quarantineName, _, quarantineErr := quarantineManagedPath(
+		bucket,
+		record,
+		opened,
+	)
+	closeErr := errors.Join(opened.Close(), bucket.Close())
+	if err := errors.Join(quarantineErr, closeErr); err != nil {
+		return RemovalPending, fmt.Errorf(
+			"workspace: quarantine managed worktree: %w",
+			err,
+		)
+	}
+	if quarantineName == "" {
+		return RemovalPending, errors.New(
+			"workspace: managed worktree was not quarantined",
+		)
+	}
+	record, err = m.persistRemovalStart(record, true)
+	if err != nil {
+		return RemovalPending, err
+	}
+	return m.completeRemoval(ctx, record)
 }
 
-func (m *Manager) startRemoval(
+func (m *Manager) persistRemovalStart(
 	record workspaceRecord,
+	quarantined bool,
 ) (workspaceRecord, error) {
 	if record.Removal == nil {
 		return workspaceRecord{}, errors.New(
 			"workspace: removal intent is missing",
 		)
 	}
-	if record.Removal.Started {
+	if record.Removal.Started &&
+		(!quarantined || record.Removal.Quarantined) {
 		return record, nil
 	}
 	started := *record.Removal
 	started.Started = true
+	started.Quarantined = started.Quarantined || quarantined
 	record.Version = workspaceRecordVersion
 	record.Removal = &started
-	if err := m.replaceWorkspaceRecord(record); err != nil {
+	_, err := m.replaceWorkspaceRecordState(record)
+	if err != nil {
 		return workspaceRecord{}, fmt.Errorf(
-			"workspace: mark physical removal started: %w",
+			"workspace: persist physical removal phase: %w",
 			err,
 		)
 	}
 	return record, nil
+}
+
+func (m *Manager) validateRemovalIdentity(
+	ctx context.Context,
+	record workspaceRecord,
+	path string,
+) error {
+	repository, err := m.repositoryRoot(ctx, path)
+	if err != nil {
+		return err
+	}
+	if repository != record.Repository {
+		return fmt.Errorf(
+			"workspace: repository mismatch for quarantined path %q",
+			path,
+		)
+	}
+	return nil
+}
+
+func (m *Manager) rejectQuarantinedRemoval(
+	ctx context.Context,
+	record workspaceRecord,
+	quarantineName string,
+	safetyErr error,
+) (RemovalState, error) {
+	bucket, err := m.openManagedBucketRoot(record.workspace())
+	if err != nil {
+		return RemovalPending, errors.Join(safetyErr, err)
+	}
+	restoreErr := restoreManagedQuarantine(
+		bucket,
+		record,
+		quarantineName,
+	)
+	closeErr := bucket.Close()
+	if err := errors.Join(restoreErr, closeErr); err != nil {
+		return RemovalPending, errors.Join(safetyErr, err)
+	}
+	facts, err := m.removalFacts(ctx, record)
+	if err != nil {
+		return RemovalPending, errors.Join(safetyErr, err)
+	}
+	return m.rejectPendingRemoval(record, facts, safetyErr)
 }
 
 func (m *Manager) rejectPendingRemoval(
@@ -470,32 +658,12 @@ func (m *Manager) classifyRemovalFailure(
 	if err != nil {
 		return RemovalPending, errors.Join(cause, err)
 	}
-	if !facts.pathExists && !facts.registered {
+	if !facts.pathExists &&
+		facts.quarantineName == "" &&
+		!facts.registered {
 		return RemovalComplete, cause
 	}
 	return RemovalPending, cause
-}
-
-func (m *Manager) rollbackRemovalIntent(
-	ctx context.Context,
-	record workspaceRecord,
-	before removalFacts,
-) (RemovalState, error) {
-	if record.Removal != nil && record.Removal.Started {
-		return RemovalPending, nil
-	}
-	after, err := m.removalFacts(ctx, record)
-	if err != nil {
-		return RemovalPending, err
-	}
-	if after != before {
-		return RemovalPending, nil
-	}
-	record.Removal = nil
-	if err := m.replaceWorkspaceRecord(record); err != nil {
-		return RemovalPending, err
-	}
-	return RemovalUnchanged, nil
 }
 
 func (m *Manager) findWorkspaceRecord(

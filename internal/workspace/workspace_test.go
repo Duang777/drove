@@ -48,6 +48,83 @@ func TestInstallWorkspaceRecordRejectsOversizedEncoding(t *testing.T) {
 	}
 }
 
+func TestInstallWorkspaceRecordRequireAbsentIsAtomic(t *testing.T) {
+	dataDir := filepath.Join(t.TempDir(), "data")
+	firstManager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new first manager: %v", err)
+	}
+	secondManager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new second manager: %v", err)
+	}
+	repository := filepath.Join(t.TempDir(), "repository")
+	for index, manager := range []*Manager{firstManager, secondManager} {
+		if err := manager.ensureManagedRoot(); err != nil {
+			t.Fatalf("ensure managed root %d: %v", index, err)
+		}
+		if err := manager.ensureManagedBucket(repository); err != nil {
+			t.Fatalf("ensure managed bucket %d: %v", index, err)
+		}
+	}
+	target := Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path: filepath.Join(
+			firstManager.root,
+			repositoryHash(repository),
+			testAgentID,
+		),
+	}
+	records := []workspaceRecord{
+		newWorkspaceRecord(target, nil),
+		newWorkspaceRecord(target, nil),
+	}
+	records[0].Branch = "first"
+	records[1].Branch = "second"
+	type installResult struct {
+		installed bool
+		err       error
+	}
+	start := make(chan struct{})
+	results := make(chan installResult, 2)
+	for index, manager := range []*Manager{firstManager, secondManager} {
+		go func(manager *Manager, record workspaceRecord) {
+			<-start
+			installed, err := manager.installWorkspaceRecordState(
+				record,
+				true,
+			)
+			results <- installResult{installed: installed, err: err}
+		}(manager, records[index])
+	}
+	close(start)
+	var succeeded int
+	for range 2 {
+		result := <-results
+		if result.err == nil {
+			if !result.installed {
+				t.Fatal("successful installation did not report installed")
+			}
+			succeeded++
+			continue
+		}
+		if result.installed {
+			t.Fatalf("failed no-replace installation reported installed: %v", result.err)
+		}
+	}
+	if succeeded != 1 {
+		t.Fatalf("successful installations = %d, want 1", succeeded)
+	}
+	record, exists, err := firstManager.readWorkspaceRecord(target.Path)
+	if err != nil || !exists {
+		t.Fatalf("read installed record: exists=%v err=%v", exists, err)
+	}
+	if record.Branch != "first" && record.Branch != "second" {
+		t.Fatalf("installed branch = %q", record.Branch)
+	}
+}
+
 func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	repository := newTestRepository(t)
 	if err := os.WriteFile(

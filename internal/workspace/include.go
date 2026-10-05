@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/google/uuid"
 )
 
 const worktreeIncludeFile = ".worktreeinclude"
@@ -28,7 +30,17 @@ func (m *Manager) copyIncludedFiles(
 	defer func() {
 		result = errors.Join(result, source.Close())
 	}()
-	destination, err := m.openManagedWorkspaceRoot(target)
+	destinationBucket, err := m.openManagedBucketRoot(target)
+	if err != nil {
+		return fmt.Errorf("workspace: open include destination bucket: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, destinationBucket.Close())
+	}()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		target.AgentID,
+	)
 	if err != nil {
 		return fmt.Errorf("workspace: open include destination root: %w", err)
 	}
@@ -37,7 +49,13 @@ func (m *Manager) copyIncludedFiles(
 	}()
 
 	for _, relative := range paths {
-		if err := copyIncludedPath(source, destination, relative); err != nil {
+		if err := copyIncludedPath(
+			source,
+			destinationBucket,
+			destination,
+			target.AgentID,
+			relative,
+		); err != nil {
 			return fmt.Errorf("workspace: copy included path %q: %w", relative, err)
 		}
 	}
@@ -120,12 +138,21 @@ func validateIncludedPath(path string) (string, error) {
 
 func copyIncludedPath(
 	sourceRoot *os.Root,
+	destinationBucket *os.Root,
 	destinationRoot *os.Root,
+	destinationName string,
 	relative string,
 ) (result error) {
 	relative, err := validateIncludedPath(relative)
 	if err != nil {
 		return err
+	}
+	if filepath.Base(destinationName) != destinationName ||
+		destinationName == "." {
+		return fmt.Errorf(
+			"destination workspace name %q is invalid",
+			destinationName,
+		)
 	}
 	directory := filepath.Dir(relative)
 	name := filepath.Base(relative)
@@ -169,34 +196,157 @@ func copyIncludedPath(
 		return errors.New("source changed while opening")
 	}
 
-	destinationParent, destinationOwned, err := openIncludedParent(
-		destinationRoot,
-		directory,
-		true,
-	)
-	if err != nil {
-		return err
-	}
-	if destinationOwned {
-		defer func() {
-			result = errors.Join(result, destinationParent.Close())
-		}()
-	}
-	output, err := destinationParent.OpenFile(
-		name,
+	temporaryName := "." + destinationName + ".include-" + uuid.NewString()
+	output, err := destinationBucket.OpenFile(
+		temporaryName,
 		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
 		sourceInfo.Mode().Perm(),
 	)
 	if err != nil {
-		return fmt.Errorf("create destination: %w", err)
+		return fmt.Errorf("create staged destination: %w", err)
 	}
+	outputOpen := true
 	defer func() {
-		result = errors.Join(result, output.Close())
+		if outputOpen {
+			result = errors.Join(result, output.Close())
+		}
+		if temporaryName != "" {
+			if err := destinationBucket.Remove(temporaryName); !errors.Is(
+				err,
+				os.ErrNotExist,
+			) {
+				result = errors.Join(result, err)
+			}
+		}
 	}()
 	if _, err := io.Copy(output, input); err != nil {
-		return fmt.Errorf("copy contents: %w", err)
+		return fmt.Errorf("copy staged contents: %w", err)
+	}
+	if err := output.Sync(); err != nil {
+		return fmt.Errorf("sync staged destination: %w", err)
+	}
+
+	parentName, err := ensureIncludedParent(
+		destinationBucket,
+		destinationName,
+		directory,
+	)
+	if err != nil {
+		return err
+	}
+	destinationParent, err := openRealRootFromRoot(
+		destinationBucket,
+		parentName,
+	)
+	if err != nil {
+		return fmt.Errorf("open destination parent: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, destinationParent.Close())
+	}()
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		destinationName,
+		destinationRoot,
+	); err != nil {
+		return fmt.Errorf("verify destination workspace: %w", err)
+	}
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		parentName,
+		destinationParent,
+	); err != nil {
+		return fmt.Errorf("verify destination parent: %w", err)
+	}
+
+	directoryFile, err := destinationBucket.Open(".")
+	if err != nil {
+		return fmt.Errorf("open destination bucket for install: %w", err)
+	}
+	targetName := filepath.Join(parentName, name)
+	_, renameErr := renameRecordFile(
+		directoryFile,
+		output,
+		temporaryName,
+		targetName,
+		false,
+	)
+	if renameErr != nil {
+		_ = directoryFile.Close()
+		return fmt.Errorf("install destination: %w", renameErr)
+	}
+	closeErr := output.Close()
+	outputOpen = false
+	syncErr := syncRecordDirectory(directoryFile)
+	directoryCloseErr := directoryFile.Close()
+	if err := errors.Join(closeErr, syncErr, directoryCloseErr); err != nil {
+		return fmt.Errorf("sync installed destination: %w", err)
+	}
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		destinationName,
+		destinationRoot,
+	); err != nil {
+		return fmt.Errorf("reverify destination workspace: %w", err)
+	}
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		parentName,
+		destinationParent,
+	); err != nil {
+		return fmt.Errorf("reverify destination parent: %w", err)
 	}
 	return nil
+}
+
+func ensureIncludedParent(
+	root *os.Root,
+	destinationName string,
+	directory string,
+) (string, error) {
+	current := destinationName
+	for _, component := range strings.Split(
+		directory,
+		string(filepath.Separator),
+	) {
+		if component == "." || component == "" {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := root.Lstat(current)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if err := root.Mkdir(current, 0o700); err != nil &&
+				!errors.Is(err, os.ErrExist) {
+				return "", fmt.Errorf(
+					"create destination directory %q: %w",
+					current,
+					err,
+				)
+			}
+			info, err = root.Lstat(current)
+			if err != nil {
+				return "", fmt.Errorf(
+					"inspect created destination directory %q: %w",
+					current,
+					err,
+				)
+			}
+		case err != nil:
+			return "", fmt.Errorf(
+				"inspect destination directory %q: %w",
+				current,
+				err,
+			)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf(
+				"destination parent %q is not a real directory",
+				current,
+			)
+		}
+	}
+	return current, nil
 }
 
 func openIncludedParent(
