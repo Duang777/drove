@@ -1861,6 +1861,92 @@ func TestNaturalFailurePersistsErrorAndDetaches(t *testing.T) {
 	}
 }
 
+func TestProcessGroupCleanupFailurePersistsErrorAndStopsOneshot(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		code       int
+		processErr error
+	}{
+		{name: "successful leader", code: 0},
+		{
+			name:       "failed leader",
+			code:       7,
+			processErr: errors.New("process exit failed"),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, _ := newTestManager(t)
+			id := agent.ID("cleanup-failure")
+			a := agent.New(
+				id,
+				agent.WithName(string(id)),
+				agent.WithVendor("generic"),
+				agent.WithRunMode(agent.RunModeOneshot),
+				agent.WithHookPolicy(agent.HooksOff),
+			)
+			manager.mu.Lock()
+			manager.agents[id] = newManagedAgent(a)
+			manager.mu.Unlock()
+			commitTestState(t, manager, a, agent.StateStarting, "test start")
+			commitTestState(t, manager, a, agent.StateWorking, "test working")
+			running := attachTestRuntime(t, manager, a, manager.reg.For("generic"))
+
+			cleanupErr := errors.New("process group remains after permission error")
+			manager.onExit(id, running, pty.ExitInfo{
+				Code:       test.code,
+				Err:        test.processErr,
+				CleanupErr: cleanupErr,
+			})
+
+			status, err := manager.Status(id)
+			if err != nil {
+				t.Fatalf("status: %v", err)
+			}
+			if status.State != agent.StateStopped ||
+				!strings.Contains(status.LastError, cleanupErr.Error()) {
+				t.Fatalf(
+					"status = %+v, want stopped with cleanup error %q",
+					status,
+					cleanupErr,
+				)
+			}
+			if test.processErr != nil &&
+				!strings.Contains(status.LastError, test.processErr.Error()) {
+				t.Fatalf(
+					"last error = %q, want process error %q",
+					status.LastError,
+					test.processErr,
+				)
+			}
+
+			rows, err := manager.Replay(string(id))
+			if err != nil {
+				t.Fatalf("replay: %v", err)
+			}
+			errorIndex := -1
+			stoppedIndex := -1
+			for index, row := range rows {
+				if row.Type == string(event.TypeError) &&
+					strings.Contains(row.Payload, cleanupErr.Error()) {
+					errorIndex = index
+				}
+				if row.Type == string(event.TypeStateChanged) &&
+					row.To == string(agent.StateStopped) {
+					stoppedIndex = index
+				}
+			}
+			if errorIndex < 0 || stoppedIndex < 0 || errorIndex >= stoppedIndex {
+				t.Fatalf(
+					"error index = %d, stopped index = %d, rows = %+v",
+					errorIndex,
+					stoppedIndex,
+					rows,
+				)
+			}
+		})
+	}
+}
+
 func TestUserStopOneshotEndsStoppedWithoutProcessError(t *testing.T) {
 	manager, _ := newTestManager(t)
 

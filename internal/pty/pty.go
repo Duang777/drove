@@ -16,10 +16,11 @@ import (
 )
 
 const (
-	maxTerminalDimension     = 1<<16 - 1
-	defaultTerminationGrace  = 5 * time.Second
-	processGroupPollInterval = 10 * time.Millisecond
-	writeTimeout             = time.Second
+	maxTerminalDimension              = 1<<16 - 1
+	defaultTerminationGrace           = 5 * time.Second
+	processGroupKillConfirmationGrace = 250 * time.Millisecond
+	processGroupPollInterval          = 10 * time.Millisecond
+	writeTimeout                      = time.Second
 )
 
 // ExitInfo 描述进程退出信息。
@@ -27,6 +28,8 @@ type ExitInfo struct {
 	PID  int
 	Code int
 	Err  error
+	// CleanupErr reports a process-group cleanup failure.
+	CleanupErr error
 }
 
 // Size 是经过校验的 PTY 行列尺寸。
@@ -105,12 +108,14 @@ type Session struct {
 	masterCloseOnce sync.Once
 	groupCloseOnce  sync.Once
 	closeErr        error
+	groupCloseErr   error
 
 	cmd         *exec.Cmd
 	ptmx        *os.File
 	closed      bool
 	writeActive bool
 	grace       time.Duration
+	groupSignal processGroupSignalFunc
 
 	onOutput      func(chunk []byte, offset uint64)
 	onOutputEnd   func(offset uint64)
@@ -134,6 +139,13 @@ var (
 
 // Start 创建 PTY 并启动命令。返回会话，或错误。
 func Start(cfg Config) (*Session, error) {
+	return startWithProcessGroupSignal(cfg, unixProcessGroupSignal)
+}
+
+func startWithProcessGroupSignal(
+	cfg Config,
+	groupSignal processGroupSignalFunc,
+) (*Session, error) {
 	windowSize, err := cfg.Size.windowSize()
 	if err != nil {
 		return nil, fmt.Errorf("pty: invalid initial size: %w", err)
@@ -166,6 +178,7 @@ func Start(cfg Config) (*Session, error) {
 		cmd:           cmd,
 		ptmx:          ptmx,
 		grace:         grace,
+		groupSignal:   groupSignal,
 		onOutput:      cfg.OnOutput,
 		onOutputEnd:   cfg.OnOutputEnd,
 		onExit:        cfg.OnExit,
@@ -282,6 +295,9 @@ func (s *Session) waitLoop() {
 	} else {
 		info.Code = 0
 	}
+	s.mu.Lock()
+	info.CleanupErr = s.groupCloseErr
+	s.mu.Unlock()
 	if s.onExit != nil {
 		s.onExit(info)
 	}
@@ -333,20 +349,71 @@ func (s *Session) joinWriter() {
 func (s *Session) closeProcessGroup() {
 	s.groupCloseOnce.Do(func() {
 		var closeErrors []error
-		alive, err := processGroupAlive(s.cmd.Process.Pid)
+		alive, err := processGroupAliveWith(
+			s.groupSignal,
+			s.cmd.Process.Pid,
+		)
 		if err != nil {
 			closeErrors = append(
 				closeErrors,
 				fmt.Errorf("pty: inspect process group: %w", err),
 			)
 		} else if alive {
-			terminateErr := terminateProcessGroup(s.cmd.Process.Pid)
+			terminateErr := terminateProcessGroupWith(
+				s.groupSignal,
+				s.cmd.Process.Pid,
+			)
 			exited, waitErr := waitForProcessGroupExit(
+				s.groupSignal,
 				s.cmd.Process.Pid,
 				s.grace,
 			)
+			if waitErr != nil {
+				closeErrors = append(
+					closeErrors,
+					fmt.Errorf("pty: wait for process group: %w", waitErr),
+				)
+			}
+			groupGone := exited
+			if !exited {
+				killFoundExited, killErr := killProcessGroupWith(
+					s.groupSignal,
+					s.cmd.Process.Pid,
+				)
+				groupGone = killFoundExited
+				if killErr != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf("pty: kill process group: %w", killErr),
+					)
+				} else if !killFoundExited {
+					killExited, killWaitErr := waitForProcessGroupExit(
+						s.groupSignal,
+						s.cmd.Process.Pid,
+						processGroupKillConfirmationGrace,
+					)
+					groupGone = killExited
+					if killWaitErr != nil {
+						closeErrors = append(
+							closeErrors,
+							fmt.Errorf(
+								"pty: confirm process group exit: %w",
+								killWaitErr,
+							),
+						)
+					} else if !groupGone {
+						closeErrors = append(
+							closeErrors,
+							fmt.Errorf(
+								"pty: process group %d remains after SIGKILL",
+								s.cmd.Process.Pid,
+							),
+						)
+					}
+				}
+			}
 			if terminateErr != nil &&
-				!(exited && errors.Is(terminateErr, syscall.EPERM)) {
+				!(groupGone && errors.Is(terminateErr, syscall.EPERM)) {
 				closeErrors = append(
 					closeErrors,
 					fmt.Errorf(
@@ -355,23 +422,11 @@ func (s *Session) closeProcessGroup() {
 					),
 				)
 			}
-			if waitErr != nil {
-				closeErrors = append(
-					closeErrors,
-					fmt.Errorf("pty: wait for process group: %w", waitErr),
-				)
-			}
-			if !exited {
-				if err := killProcessGroup(s.cmd.Process.Pid); err != nil {
-					closeErrors = append(
-						closeErrors,
-						fmt.Errorf("pty: kill process group: %w", err),
-					)
-				}
-			}
 		}
+		groupCloseErr := errors.Join(closeErrors...)
 		s.mu.Lock()
-		s.closeErr = errors.Join(s.closeErr, errors.Join(closeErrors...))
+		s.groupCloseErr = groupCloseErr
+		s.closeErr = errors.Join(s.closeErr, groupCloseErr)
 		s.mu.Unlock()
 	})
 }
@@ -476,14 +531,18 @@ func (s *Session) Close() error {
 	return s.closeErr
 }
 
-func waitForProcessGroupExit(pid int, grace time.Duration) (bool, error) {
+func waitForProcessGroupExit(
+	signal processGroupSignalFunc,
+	pid int,
+	grace time.Duration,
+) (bool, error) {
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	ticker := time.NewTicker(processGroupPollInterval)
 	defer ticker.Stop()
 
 	for {
-		alive, err := processGroupAlive(pid)
+		alive, err := processGroupAliveWith(signal, pid)
 		if err != nil {
 			return false, err
 		}
@@ -492,7 +551,11 @@ func waitForProcessGroupExit(pid int, grace time.Duration) (bool, error) {
 		}
 		select {
 		case <-timer.C:
-			return false, nil
+			alive, err := processGroupAliveWith(signal, pid)
+			if err != nil {
+				return false, err
+			}
+			return !alive, nil
 		case <-ticker.C:
 		}
 	}

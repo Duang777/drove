@@ -74,6 +74,8 @@
   可等待 `starting -> working`，同时防止短进程先提交错误终态。
 - 运行中会话记录停止原因和退出认领状态；`Stop`、`Close` 与自然退出通过同一个锁确定唯一终态。
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
+- PTY 进程组清理失败优先于自然成功或主动停止原因，必须持久化 error 并进入
+  `stopped`，不得把仍有不可控后代的会话记录为 `done`。
 - `Close()`：拒绝新 Start → 等待进行中的 Start 和 workspace cleanup → 关闭全部 PTY 并等待回调 →
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
 - Manager 把同一 `terminationGrace` 传给新建和恢复的 PTY；关闭顺序仍按 Agent ID
