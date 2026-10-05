@@ -698,6 +698,194 @@ func TestAcknowledgeRejectsReplacementCommonGitDirectory(
 	}
 }
 
+func TestAcknowledgeRejectsReplacementSourceGitPointer(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	initSourceSwapRepository(t, repository)
+	runGit(t, repository, "worktree", "add", "-b", "source", source)
+	runGit(t, repository, "worktree", "add", "-b", "replacement", replacement)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	sourcePointer := filepath.Join(source, ".git")
+	originalPointer, err := os.ReadFile(sourcePointer)
+	if err != nil {
+		t.Fatalf("read source Git pointer: %v", err)
+	}
+	replacementPointer, err := os.ReadFile(filepath.Join(replacement, ".git"))
+	if err != nil {
+		t.Fatalf("read replacement Git pointer: %v", err)
+	}
+	if err := os.WriteFile(sourcePointer, replacementPointer, 0o600); err != nil {
+		t.Fatalf("replace source Git pointer: %v", err)
+	}
+
+	if err := manager.AcknowledgePreparation(prepared); err == nil {
+		t.Fatal("acknowledgement accepted a replacement source Git pointer")
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read failed acknowledgement: exists=%v err=%v", exists, err)
+	}
+	if record.PreparationCommitted || record.BranchOperationID == "" {
+		t.Fatalf("failed acknowledgement record = %+v", record)
+	}
+
+	if err := os.WriteFile(sourcePointer, originalPointer, 0o600); err != nil {
+		t.Fatalf("restore source Git pointer: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard restored preparation: %v", err)
+	}
+}
+
+func TestAcknowledgeRejectsSourceGitPointerSwapDuringOwnershipCleanup(
+	t *testing.T,
+) {
+	for _, phase := range []string{"before", "after"} {
+		t.Run(phase, func(t *testing.T) {
+			parent := t.TempDir()
+			repository := filepath.Join(parent, "repository")
+			source := filepath.Join(parent, "source")
+			replacement := filepath.Join(parent, "replacement")
+			initSourceSwapRepository(t, repository)
+			runGit(
+				t,
+				repository,
+				"worktree",
+				"add",
+				"-b",
+				"source",
+				source,
+			)
+			runGit(
+				t,
+				repository,
+				"worktree",
+				"add",
+				"-b",
+				"replacement",
+				replacement,
+			)
+
+			manager, err := New(filepath.Join(parent, "data"))
+			if err != nil {
+				t.Fatalf("new manager: %v", err)
+			}
+			prepared, err := manager.Prepare(
+				context.Background(),
+				source,
+				"",
+				testAgentID,
+			)
+			if err != nil {
+				t.Fatalf("prepare workspace: %v", err)
+			}
+			sourcePointer := filepath.Join(source, ".git")
+			originalPointer, err := os.ReadFile(sourcePointer)
+			if err != nil {
+				t.Fatalf("read source Git pointer: %v", err)
+			}
+			realGit, err := exec.LookPath("git")
+			if err != nil {
+				t.Fatalf("find Git: %v", err)
+			}
+			swapped := filepath.Join(parent, "swapped")
+			wrapper := filepath.Join(parent, "git-wrapper")
+			script := `#!/bin/sh
+matched=
+case " $* " in
+  *" update-ref -d refs/drove/preparations/"*) matched=1 ;;
+esac
+swap_source_pointer() {
+  cp "$DROVE_TEST_REPLACEMENT_POINTER" "$DROVE_TEST_SOURCE_POINTER" || exit 91
+  : > "$DROVE_TEST_SWAPPED"
+}
+if [ -n "$matched" ] && [ "$DROVE_TEST_SWAP_PHASE" = "before" ] &&
+   [ ! -e "$DROVE_TEST_SWAPPED" ]; then
+  swap_source_pointer
+fi
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$matched" ] &&
+   [ "$DROVE_TEST_SWAP_PHASE" = "after" ] &&
+   [ ! -e "$DROVE_TEST_SWAPPED" ]; then
+  swap_source_pointer
+fi
+exit "$status"
+`
+			if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+				t.Fatalf("write Git wrapper: %v", err)
+			}
+			t.Setenv("DROVE_TEST_SOURCE_POINTER", sourcePointer)
+			t.Setenv(
+				"DROVE_TEST_REPLACEMENT_POINTER",
+				filepath.Join(replacement, ".git"),
+			)
+			t.Setenv("DROVE_TEST_SWAPPED", swapped)
+			t.Setenv("DROVE_TEST_SWAP_PHASE", phase)
+			t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+			manager.git = wrapper
+
+			err = manager.AcknowledgePreparation(prepared)
+			if err == nil || !strings.Contains(
+				err.Error(),
+				"verify repository after ownership cleanup",
+			) {
+				t.Fatalf("acknowledgement replacement error = %v", err)
+			}
+			record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+			if err != nil || !exists {
+				t.Fatalf(
+					"read failed acknowledgement: exists=%v err=%v",
+					exists,
+					err,
+				)
+			}
+			if !record.PreparationCommitted ||
+				record.BranchOperationID != prepared.branchOperationID {
+				t.Fatalf("retry state = %+v", record)
+			}
+
+			if err := os.WriteFile(
+				sourcePointer,
+				originalPointer,
+				0o600,
+			); err != nil {
+				t.Fatalf("restore source Git pointer: %v", err)
+			}
+			manager.git = realGit
+			if err := manager.AcknowledgePreparation(prepared); err != nil {
+				t.Fatalf("retry acknowledgement: %v", err)
+			}
+			record, exists, err = manager.readWorkspaceRecord(prepared.Path)
+			if err != nil || !exists {
+				t.Fatalf(
+					"read retried acknowledgement: exists=%v err=%v",
+					exists,
+					err,
+				)
+			}
+			if !record.PreparationCommitted || record.BranchOperationID != "" {
+				t.Fatalf("retried acknowledgement state = %+v", record)
+			}
+		})
+	}
+}
+
 func TestDiscardUsesRetainedCommonGitDirectoryAfterReplacement(
 	t *testing.T,
 ) {

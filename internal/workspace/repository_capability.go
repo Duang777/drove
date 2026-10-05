@@ -59,7 +59,7 @@ func (r repositoryCapability) withRepositoryBinding(
 	return r
 }
 
-func (r repositoryCapability) verifyBinding() error {
+func (r repositoryCapability) verifyBinding(ctx context.Context) error {
 	if r.root == nil ||
 		r.gitRoot == nil ||
 		r.commonRoot == nil ||
@@ -68,25 +68,53 @@ func (r repositoryCapability) verifyBinding() error {
 		r.commonPath == "" {
 		return errors.New("workspace: repository binding is incomplete")
 	}
-	if err := verifyRealPathRoot(r.path, r.root); err != nil {
-		return fmt.Errorf(
-			"workspace: verify source repository binding: %w",
-			err,
+	verifyPaths := func() error {
+		if err := verifyRealPathRoot(r.path, r.root); err != nil {
+			return fmt.Errorf(
+				"workspace: verify source repository binding: %w",
+				err,
+			)
+		}
+		if err := verifyRealPathRoot(r.gitPath, r.gitRoot); err != nil {
+			return fmt.Errorf(
+				"workspace: verify source Git directory binding: %w",
+				err,
+			)
+		}
+		if err := verifyRealPathRoot(
+			r.commonPath,
+			r.commonRoot,
+		); err != nil {
+			return fmt.Errorf(
+				"workspace: verify common Git directory binding: %w",
+				err,
+			)
+		}
+		return nil
+	}
+	if err := verifyPaths(); err != nil {
+		return err
+	}
+	unbound := rootedRepositoryCapability(r.manager, r.path, r.root)
+	currentGitPath, err := unbound.gitDirectory(ctx)
+	if err != nil {
+		return err
+	}
+	if currentGitPath != r.gitPath {
+		return errors.New(
+			"workspace: source Git directory binding changed",
 		)
 	}
-	if err := verifyRealPathRoot(r.gitPath, r.gitRoot); err != nil {
-		return fmt.Errorf(
-			"workspace: verify source Git directory binding: %w",
-			err,
+	currentCommonPath, err := unbound.commonGitDirectory(ctx)
+	if err != nil {
+		return err
+	}
+	if currentCommonPath != r.commonPath {
+		return errors.New(
+			"workspace: common Git directory binding changed",
 		)
 	}
-	if err := verifyRealPathRoot(r.commonPath, r.commonRoot); err != nil {
-		return fmt.Errorf(
-			"workspace: verify common Git directory binding: %w",
-			err,
-		)
-	}
-	return nil
+	return verifyPaths()
 }
 
 func (r repositoryCapability) run(

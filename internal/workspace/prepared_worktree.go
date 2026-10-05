@@ -219,7 +219,7 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 			"workspace: prepared worktree identity is incomplete",
 		)
 	}
-	if err := repository.verifyBinding(); err != nil {
+	if err := repository.verifyBinding(ctx); err != nil {
 		return err
 	}
 	bucket, err := m.openManagedBucketRoot(target)
@@ -301,7 +301,7 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 	); err != nil {
 		return err
 	}
-	return repository.verifyBinding()
+	return repository.verifyBinding(ctx)
 }
 
 func (m *Manager) worktreeGitDirectoryAtRoot(

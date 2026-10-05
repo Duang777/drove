@@ -54,6 +54,21 @@ func (m *Manager) acknowledgePreparation(
 			result = errors.Join(result, lease.Close())
 		}()
 	}
+	verifyRepository := func(stage string) error {
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		if err := lease.repository.verifyBinding(ctx); err != nil {
+			return fmt.Errorf(
+				"workspace: verify repository %s: %w",
+				stage,
+				err,
+			)
+		}
+		return nil
+	}
 	verifyCtx, cancelVerify := context.WithTimeout(
 		context.Background(),
 		10*time.Second,
@@ -76,19 +91,13 @@ func (m *Manager) acknowledgePreparation(
 		if err := m.replaceWorkspaceRecord(record); err != nil {
 			return fmt.Errorf("workspace: commit preparation record: %w", err)
 		}
-		if err := lease.repository.verifyBinding(); err != nil {
-			return fmt.Errorf(
-				"workspace: verify repository after committing preparation: %w",
-				err,
-			)
+		if err := verifyRepository("after committing preparation"); err != nil {
+			return err
 		}
 	}
 	if record.BranchOperationID != "" {
-		if err := lease.repository.verifyBinding(); err != nil {
-			return fmt.Errorf(
-				"workspace: verify repository before ownership cleanup: %w",
-				err,
-			)
+		if err := verifyRepository("before ownership cleanup"); err != nil {
+			return err
 		}
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(),
@@ -101,11 +110,8 @@ func (m *Manager) acknowledgePreparation(
 		); err != nil {
 			return err
 		}
-		if err := lease.repository.verifyBinding(); err != nil {
-			return fmt.Errorf(
-				"workspace: verify repository after ownership cleanup: %w",
-				err,
-			)
+		if err := verifyRepository("after ownership cleanup"); err != nil {
+			return err
 		}
 		record.BranchOperationID = ""
 		if err := m.replaceWorkspaceRecord(record); err != nil {
