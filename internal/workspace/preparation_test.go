@@ -955,3 +955,54 @@ func TestVersionTwoRecordLoadsAsCommittedWithStartedRemoval(t *testing.T) {
 		t.Fatalf("migrated version 2 record = %+v", record)
 	}
 }
+
+func TestReconcilePreparationsRejectsReplacedCommittedWorkspace(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move committed workspace: %v", err)
+	}
+	if err := os.Mkdir(prepared.Path, 0o700); err != nil {
+		t.Fatalf("create replacement workspace: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	expected := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	); err == nil {
+		t.Fatal("reconciliation accepted a replaced committed workspace")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+}

@@ -35,7 +35,9 @@ func (m *Manager) acknowledgePreparation(
 		record.Version < workspaceRecordVersion {
 		return target.preparation.Close()
 	}
-	if record.PreparationCommitted && record.BranchOperationID == "" {
+	if record.PreparationCommitted &&
+		record.BranchOperationID == "" &&
+		target.preparation != nil {
 		return target.preparation.Close()
 	}
 	lease := target.preparation

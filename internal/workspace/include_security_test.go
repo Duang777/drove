@@ -497,3 +497,55 @@ func TestCopyIncludedPathDoesNotFollowMovedDestinationRoot(t *testing.T) {
 		t.Fatalf("copy wrote into moved destination: %v", err)
 	}
 }
+
+func TestPrepareCopiesIncludedLiteralPathspecName(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows filenames cannot contain a colon")
+	}
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, "other.txt"),
+		[]byte("other\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write other tracked file: %v", err)
+	}
+	runGit(t, repository, "add", "other.txt")
+	runGit(t, repository, "commit", "-m", "add other tracked file")
+
+	const includedPath = ":(exclude)tracked.txt"
+	if err := os.WriteFile(
+		filepath.Join(repository, includedPath),
+		[]byte("local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include candidate: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte(includedPath+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = manager.Discard(context.Background(), prepared)
+	})
+	if _, err := os.Stat(filepath.Join(prepared.Path, includedPath)); err != nil {
+		t.Fatalf("included literal path was not copied: %v", err)
+	}
+}

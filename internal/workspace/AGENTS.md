@@ -42,7 +42,8 @@
   环境变量，再显式设置受约束的 `GIT_DIR` 与 `GIT_WORK_TREE`。include 规则的
   `ls-files` 必须先从已打开的私有 Git directory 读取 linked-worktree index，再在
   私有 Git 路径身份仍匹配时从已打开的源 worktree root 复核；两次输出必须一致，并用
-  top-level pathspec 覆盖整个 worktree。
+  top-level pathspec 覆盖整个 worktree。Git 返回的候选文件名再次用于 tracked 检查时
+  必须禁用 pathspec 解释。
   version 4 只有源 worktree 与 common Git directory 证据；pending version 3/4 记录可
   读取但不能授权基于路径的回滚或 ownership marker 清理；已提交的 version 1-4 记录可
   直接兼容采纳，不执行缺少完整 identity evidence 的 Git 清理。
@@ -53,6 +54,8 @@
   创建事件 durable 后必须调用 `AcknowledgePreparation`；
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
+  已提交的 version 5 sidecar 在重启采纳时仍必须重开 repository lease 并复核目标
+  worktree 身份；只有仍持有进程内 preparation lease 的幂等确认允许快速返回。
   `AcknowledgePreparation` 在提交 sidecar 或清理 ownership ref 前必须重新验证当前目标
   目录身份、Git registration、私有 Git directory，以及源 worktree、源私有 Git
   directory 和 common Git directory 的公开路径仍绑定 preparation lease 固定的目录

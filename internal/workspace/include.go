@@ -186,6 +186,7 @@ func (m *Manager) worktreePathTracked(
 		ctx,
 		path,
 		root,
+		"--literal-pathspecs",
 		"ls-files",
 		"--error-unmatch",
 		"--",
