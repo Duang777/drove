@@ -94,29 +94,41 @@ func rootedWorktreeGitCommand(
 	root *os.Root,
 	_ string,
 	gitRoot *os.Root,
+	_ string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
-	gitDirectory, err := gitRoot.Open(".")
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"workspace: open rooted private Git directory: %w",
-			err,
-		)
-	}
 	worktree, err := root.Open(".")
 	if err != nil {
-		_ = gitDirectory.Close()
 		return nil, nil, fmt.Errorf(
 			"workspace: open rooted Git worktree: %w",
 			err,
 		)
 	}
+	gitDirectory, err := gitRoot.Open(".")
+	if err != nil {
+		_ = worktree.Close()
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted private Git directory: %w",
+			err,
+		)
+	}
+	commonDirectory, err := commonRoot.Open(".")
+	if err != nil {
+		_ = worktree.Close()
+		_ = gitDirectory.Close()
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted common Git directory: %w",
+			err,
+		)
+	}
 	command := exec.CommandContext(ctx, git)
-	command.ExtraFiles = []*os.File{gitDirectory, worktree}
-	command.Env = boundGitEnvironment(
+	command.ExtraFiles = []*os.File{worktree, gitDirectory, commonDirectory}
+	command.Env = boundGitEnvironmentWithCommon(
 		command.Environ(),
-		".",
 		"/proc/self/fd/4",
+		"/proc/self/fd/3",
+		"/proc/self/fd/5",
 	)
 	command.Args = append(
 		command.Args,
@@ -127,7 +139,11 @@ func rootedWorktreeGitCommand(
 	)
 	command.Args = append(command.Args, arguments...)
 	cleanup := func() error {
-		return errors.Join(worktree.Close(), gitDirectory.Close())
+		return errors.Join(
+			commonDirectory.Close(),
+			gitDirectory.Close(),
+			worktree.Close(),
+		)
 	}
 	return command, cleanup, nil
 }
@@ -136,6 +152,7 @@ func rootedPreparedWorktreeGitCommand(
 	ctx context.Context,
 	git string,
 	repositoryPath string,
+	repositoryRoot *os.Root,
 	commonPath string,
 	commonRoot *os.Root,
 	_ string,
@@ -149,17 +166,29 @@ func rootedPreparedWorktreeGitCommand(
 			err,
 		)
 	}
-	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
+	commonDirectory, err := commonRoot.Open(".")
 	if err != nil {
 		_ = worktree.Close()
-		return nil, nil, err
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted common Git directory: %w",
+			err,
+		)
+	}
+	repository, err := repositoryRoot.Open(".")
+	if err != nil {
+		_ = commonDirectory.Close()
+		_ = worktree.Close()
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted source repository: %w",
+			err,
+		)
 	}
 	command := exec.CommandContext(ctx, git)
-	command.ExtraFiles = []*os.File{worktree}
+	command.ExtraFiles = []*os.File{worktree, commonDirectory, repository}
 	command.Env = boundGitEnvironment(
 		command.Environ(),
-		commonPath,
-		repositoryPath,
+		"/proc/self/fd/4",
+		"/proc/self/fd/5",
 	)
 	command.Args = append(
 		command.Args,
@@ -170,7 +199,13 @@ func rootedPreparedWorktreeGitCommand(
 	)
 	command.Args = append(command.Args, arguments...)
 	cleanup := func() error {
-		return errors.Join(commonGuard.Close(), worktree.Close())
+		return errors.Join(
+			verifyRealPathRoot(repositoryPath, repositoryRoot),
+			verifyRealPathRoot(commonPath, commonRoot),
+			repository.Close(),
+			commonDirectory.Close(),
+			worktree.Close(),
+		)
 	}
 	return command, cleanup, nil
 }

@@ -133,6 +133,7 @@ func TestNoReplaceRenamesPreserveWindowsTargets(t *testing.T) {
 		directory,
 		sourceInfo,
 		"source-dir",
+		"source-dir-isolated",
 		"target-dir",
 	)
 	closeErr = directory.Close()

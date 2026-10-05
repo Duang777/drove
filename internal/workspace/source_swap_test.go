@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -2278,6 +2279,61 @@ exit "$status"
 	}
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("replacement worktree checkout filter ran: %v", err)
+	}
+}
+
+func TestPrepareRejectsCheckoutThroughTransientPrivateGitReplacement(
+	t *testing.T,
+) {
+	if runtime.GOOS == "linux" {
+		t.Skip("Linux binds the private Git directory through /proc/self/fd")
+	}
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	marker := filepath.Join(parent, "swapped-private-git")
+	wrapper := filepath.Join(parent, "git-wrapper-transient-private-git")
+	script := `#!/bin/sh
+matched=
+for argument in "$@"; do
+  [ "$argument" = "read-tree" ] && matched=1
+done
+if [ -n "$matched" ] && [ ! -e "$DROVE_TEST_MARKER" ]; then
+  original="$GIT_DIR.drove-original"
+  mv "$GIT_DIR" "$original" || exit 91
+  cp -R "$original" "$GIT_DIR" || exit 92
+  "$DROVE_TEST_REAL_GIT" "$@"
+  status=$?
+  rm -rf "$GIT_DIR" || exit 93
+  mv "$original" "$GIT_DIR" || exit 94
+  : > "$DROVE_TEST_MARKER"
+  exit "$status"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_MARKER", marker)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil ||
+		!strings.Contains(err.Error(), "prepared index does not match") {
+		t.Fatalf("prepare through transient private Git replacement error = %v", err)
 	}
 }
 

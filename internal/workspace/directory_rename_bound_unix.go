@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,11 +20,18 @@ func renameBoundDirectoryNoReplace(
 	directory *os.File,
 	expected os.FileInfo,
 	sourceName string,
+	isolatedName string,
 	targetName string,
 	rename directoryRenameNoReplace,
 ) (bool, error) {
+	if sourceName == isolatedName ||
+		sourceName == targetName ||
+		isolatedName == targetName {
+		return false, errors.New(
+			"directory rename source, isolation, and target names must differ",
+		)
+	}
 	fd := int(directory.Fd())
-	isolatedName := ".drove-directory-" + uuid.NewString()
 	if err := rename(fd, sourceName, isolatedName); err != nil {
 		return false, err
 	}
@@ -37,7 +43,17 @@ func renameBoundDirectoryNoReplace(
 				err,
 			)
 		}
-		return nil
+		return syncRecordDirectory(directory)
+	}
+	if err := syncRecordDirectory(directory); err != nil {
+		return false, errors.Join(
+			fmt.Errorf(
+				"sync isolated directory %q: %w",
+				sourceName,
+				err,
+			),
+			restore(),
+		)
 	}
 	isolated, err := statDirectoryAt(directory, isolatedName)
 	if err != nil {
@@ -58,6 +74,13 @@ func renameBoundDirectoryNoReplace(
 	}
 	if err := rename(fd, isolatedName, targetName); err != nil {
 		return false, errors.Join(err, restore())
+	}
+	if err := syncRecordDirectory(directory); err != nil {
+		return true, fmt.Errorf(
+			"sync renamed directory %q: %w",
+			targetName,
+			err,
+		)
 	}
 	target, err := statDirectoryAt(directory, targetName)
 	if err != nil {

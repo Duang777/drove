@@ -171,15 +171,29 @@ func (r repositoryCapability) addPreparedWorktree(
 	ctx context.Context,
 	path string,
 	root *os.Root,
+	branch string,
 	expectedHeadOID string,
 ) ([]byte, error) {
-	if err := r.verifyBinding(ctx); err != nil {
+	verifyBranch := func() error {
+		oid, exists, err := r.refOID(ctx, "refs/heads/"+branch)
+		if err != nil {
+			return err
+		}
+		if !exists || oid != expectedHeadOID {
+			return errors.New(
+				"workspace: prepared branch moved from its expected HEAD",
+			)
+		}
+		return nil
+	}
+	if err := errors.Join(r.verifyBinding(ctx), verifyBranch()); err != nil {
 		return nil, err
 	}
 	command, cleanup, err := rootedPreparedWorktreeGitCommand(
 		ctx,
 		r.manager.git,
 		r.path,
+		r.root,
 		r.commonPath,
 		r.commonRoot,
 		path,
@@ -188,10 +202,9 @@ func (r repositoryCapability) addPreparedWorktree(
 			"worktree",
 			"add",
 			"--quiet",
-			"--detach",
 			"--no-checkout",
 			".",
-			expectedHeadOID,
+			branch,
 		},
 	)
 	if err != nil {
@@ -201,6 +214,7 @@ func (r repositoryCapability) addPreparedWorktree(
 	verifyErr := errors.Join(
 		r.verifyBinding(ctx),
 		verifyRealPathRoot(path, root),
+		verifyBranch(),
 	)
 	return output, errors.Join(commandErr, verifyErr, cleanup())
 }
@@ -368,6 +382,8 @@ func (r repositoryCapability) worktreeCommandAt(
 			worktreeRoot,
 			r.gitPath,
 			r.gitRoot,
+			r.commonPath,
+			r.commonRoot,
 			arguments,
 		)
 	}

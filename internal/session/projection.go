@@ -722,8 +722,8 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			plan.VendorSessionRefs[draft.id] = draft.vendorSessionRef
 			plan.ResumeOnStart[draft.id] =
 				!draft.workspaceRemoved &&
-					(state != agent.StateDone &&
-						state != agent.StateStopped ||
+					state != agent.StateDone &&
+					(state != agent.StateStopped ||
 						draft.restartStopped)
 		}
 		workingDir := draft.workingDir

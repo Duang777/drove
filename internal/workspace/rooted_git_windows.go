@@ -78,6 +78,8 @@ func rootedWorktreeGitCommand(
 	root *os.Root,
 	gitPath string,
 	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	command, closeWorktree, err := rootedGitCommand(
@@ -96,8 +98,20 @@ func rootedWorktreeGitCommand(
 	if err != nil {
 		return nil, nil, errors.Join(err, closeWorktree())
 	}
+	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
+	if err != nil {
+		return nil, nil, errors.Join(
+			err,
+			gitGuard.Close(),
+			closeWorktree(),
+		)
+	}
 	cleanup := func() error {
-		return errors.Join(gitGuard.Close(), closeWorktree())
+		return errors.Join(
+			commonGuard.Close(),
+			gitGuard.Close(),
+			closeWorktree(),
+		)
 	}
 	return command, cleanup, nil
 }
@@ -106,6 +120,7 @@ func rootedPreparedWorktreeGitCommand(
 	ctx context.Context,
 	git string,
 	repositoryPath string,
+	repositoryRoot *os.Root,
 	commonPath string,
 	commonRoot *os.Root,
 	worktreePath string,
@@ -119,6 +134,17 @@ func rootedPreparedWorktreeGitCommand(
 	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
 	if err != nil {
 		return nil, nil, errors.Join(err, worktreeGuard.Close())
+	}
+	repositoryGuard, err := openRepositoryGuard(
+		repositoryPath,
+		repositoryRoot,
+	)
+	if err != nil {
+		return nil, nil, errors.Join(
+			err,
+			commonGuard.Close(),
+			worktreeGuard.Close(),
+		)
 	}
 	command := exec.CommandContext(
 		ctx,
@@ -135,7 +161,11 @@ func rootedPreparedWorktreeGitCommand(
 		repositoryPath,
 	)
 	cleanup := func() error {
-		return errors.Join(commonGuard.Close(), worktreeGuard.Close())
+		return errors.Join(
+			repositoryGuard.Close(),
+			commonGuard.Close(),
+			worktreeGuard.Close(),
+		)
 	}
 	return command, cleanup, nil
 }

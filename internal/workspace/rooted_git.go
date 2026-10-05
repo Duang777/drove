@@ -148,3 +148,15 @@ func boundGitEnvironment(
 		"GIT_WORK_TREE="+worktree,
 	)
 }
+
+func boundGitEnvironmentWithCommon(
+	environment []string,
+	gitDirectory string,
+	worktree string,
+	commonDirectory string,
+) []string {
+	return append(
+		boundGitEnvironment(environment, gitDirectory, worktree),
+		"GIT_COMMON_DIR="+commonDirectory,
+	)
+}

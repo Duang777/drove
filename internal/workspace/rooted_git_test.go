@@ -36,3 +36,23 @@ func TestBoundGitEnvironmentRemovesInheritedGitConfiguration(t *testing.T) {
 		}
 	}
 }
+
+func TestBoundGitEnvironmentWithCommonSetsExplicitCommonDirectory(
+	t *testing.T,
+) {
+	environment := boundGitEnvironmentWithCommon(
+		[]string{"GIT_COMMON_DIR=/replacement"},
+		"/git",
+		"/worktree",
+		"/common",
+	)
+	for _, want := range []string{
+		"GIT_DIR=/git",
+		"GIT_WORK_TREE=/worktree",
+		"GIT_COMMON_DIR=/common",
+	} {
+		if !slices.Contains(environment, want) {
+			t.Fatalf("bound environment %q does not contain %q", environment, want)
+		}
+	}
+}

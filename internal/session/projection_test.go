@@ -448,6 +448,68 @@ func TestRecoveryProjectorPreservesResumeAfterPersistedRestartStop(
 	}
 }
 
+func TestRecoveryProjectorDoesNotResumeDoneStartupResume(t *testing.T) {
+	base := time.Date(2026, time.October, 6, 1, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "created",
+			Payload: `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq: 2, Timestamp: base.Add(time.Second), Type: string(event.TypeAgentSignal),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "hook",
+			Payload: `{"version":1,"source":"hook","kind":"observed","vendor":"claude",` +
+				`"vendor_event":"Notification","scope":"root","vendor_session_ref":"resume-ref",` +
+				`"confidence":1,"received_at":"2026-10-06T01:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440001","outcome":"observed"}`,
+		},
+		{
+			Seq: 3, Timestamp: base.Add(2 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "pending", To: "starting",
+		},
+		{
+			Seq: 4, Timestamp: base.Add(3 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "starting", To: "working",
+		},
+		{
+			Seq: 5, Timestamp: base.Add(4 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "working", To: "stopped",
+			Reason: restartStopReason,
+		},
+		{
+			Seq: 6, Timestamp: base.Add(5 * time.Second), Type: string(event.TypeAgentResumed),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "requested",
+			Payload: `{"version":1,"vendor_session_ref":"resume-ref"}`,
+		},
+		{
+			Seq: 7, Timestamp: base.Add(6 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "stopped", To: "starting",
+		},
+		{
+			Seq: 8, Timestamp: base.Add(7 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "starting", To: "working",
+		},
+		{
+			Seq: 9, Timestamp: base.Add(8 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "working", To: "done",
+		},
+	}
+	projector := newRecoveryProjector()
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if plan.ResumeOnStart["agent-1"] {
+		t.Fatal("completed startup resume remained eligible without completion marker")
+	}
+}
+
 func TestRecoveryProjectorRequiresDurableCompletionToConsumeStartupResume(
 	t *testing.T,
 ) {

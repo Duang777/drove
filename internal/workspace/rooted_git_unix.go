@@ -139,11 +139,19 @@ func rootedWorktreeGitCommand(
 	root *os.Root,
 	gitPath string,
 	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	if err := verifyRealPathRoot(gitPath, gitRoot); err != nil {
 		return nil, nil, fmt.Errorf(
 			"workspace: verify rooted private Git directory: %w",
+			err,
+		)
+	}
+	if err := verifyRealPathRoot(commonPath, commonRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify rooted common Git directory: %w",
 			err,
 		)
 	}
@@ -184,6 +192,7 @@ func rootedWorktreeGitCommand(
 	cleanup := func() error {
 		return errors.Join(
 			verifyRealPathRoot(gitPath, gitRoot),
+			verifyRealPathRoot(commonPath, commonRoot),
 			directory.Close(),
 		)
 	}
@@ -194,12 +203,19 @@ func rootedPreparedWorktreeGitCommand(
 	ctx context.Context,
 	git string,
 	repositoryPath string,
+	repositoryRoot *os.Root,
 	commonPath string,
 	commonRoot *os.Root,
 	_ string,
 	worktreeRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
+	if err := verifyRealPathRoot(repositoryPath, repositoryRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify rooted source repository: %w",
+			err,
+		)
+	}
 	directory, err := worktreeRoot.Open(".")
 	if err != nil {
 		return nil, nil, fmt.Errorf(
@@ -242,7 +258,12 @@ func rootedPreparedWorktreeGitCommand(
 		repositoryPath,
 	)
 	cleanup := func() error {
-		return errors.Join(commonGuard.Close(), directory.Close())
+		return errors.Join(
+			verifyRealPathRoot(repositoryPath, repositoryRoot),
+			verifyRealPathRoot(commonPath, commonRoot),
+			commonGuard.Close(),
+			directory.Close(),
+		)
 	}
 	return command, cleanup, nil
 }

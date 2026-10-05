@@ -1560,6 +1560,35 @@ func TestPrepareUsesExistingBranchAndDiscardPreservesIt(t *testing.T) {
 	runGit(t, repository, "show-ref", "--verify", "refs/heads/existing")
 }
 
+func TestPrepareRejectsBranchCheckedOutInSourceWorktree(t *testing.T) {
+	repository := newTestRepository(t)
+	branch := strings.TrimSpace(
+		runGit(t, repository, "symbolic-ref", "--short", "HEAD"),
+	)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		branch,
+		testAgentID,
+	); err == nil {
+		_ = manager.Discard(context.Background(), prepared)
+		t.Fatal("prepare reused the source worktree branch")
+	}
+	if got := strings.TrimSpace(
+		runGit(t, repository, "symbolic-ref", "--short", "HEAD"),
+	); got != branch {
+		t.Fatalf("source branch = %q, want %q", got, branch)
+	}
+	if status := runGit(t, repository, "status", "--porcelain"); status != "" {
+		t.Fatalf("source worktree changed after rejected prepare:\n%s", status)
+	}
+}
+
 func TestPrepareSkipsIncludeTrackedByTargetBranch(t *testing.T) {
 	repository := newTestRepository(t)
 	if err := os.WriteFile(

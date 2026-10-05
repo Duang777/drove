@@ -14,7 +14,12 @@ func TestConfigureIncludeManifestCommandLocksManifestIdentity(t *testing.T) {
 	if err := os.WriteFile(path, []byte("allowed.txt\n"), 0o600); err != nil {
 		t.Fatalf("write manifest: %v", err)
 	}
-	manifest, err := os.Open(path)
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("open manifest parent: %v", err)
+	}
+	defer root.Close()
+	manifest, err := root.Open(filepath.Base(path))
 	if err != nil {
 		t.Fatalf("open manifest: %v", err)
 	}

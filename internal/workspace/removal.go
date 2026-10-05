@@ -590,10 +590,11 @@ func (m *Manager) resumePendingRemoval(
 			filepath.Dir(record.Path),
 			facts.quarantineName,
 		)
-		identityErr := m.validateRemovalIdentity(
+		identityErr := m.validateRemovalQuarantineIdentity(
 			ctx,
 			record,
 			quarantinePath,
+			quarantined,
 		)
 		var markerErr error
 		if identityErr == nil {
@@ -804,6 +805,33 @@ func (m *Manager) persistRemovalStart(
 	return record, nil
 }
 
+func (m *Manager) persistRemovalContentsCleared(
+	record workspaceRecord,
+) (workspaceRecord, error) {
+	if record.Removal == nil ||
+		!record.Removal.Started ||
+		!record.Removal.Quarantined {
+		return workspaceRecord{}, errors.New(
+			"workspace: removal quarantine is not ready to clear contents",
+		)
+	}
+	if record.Removal.ContentsCleared {
+		return record, nil
+	}
+	cleared := *record.Removal
+	cleared.ContentsCleared = true
+	upgradeWorkspaceRecord(&record)
+	record.Removal = &cleared
+	_, err := m.replaceWorkspaceRecordState(record)
+	if err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: persist cleared removal contents: %w",
+			err,
+		)
+	}
+	return record, nil
+}
+
 func (m *Manager) validateRemovalIdentity(
 	ctx context.Context,
 	record workspaceRecord,
@@ -868,6 +896,38 @@ func validateRemovalMarkerPath(
 	return verifyRemovalMarker(root, record)
 }
 
+func (m *Manager) validateRemovalQuarantineIdentity(
+	ctx context.Context,
+	record workspaceRecord,
+	path string,
+	root *os.Root,
+) error {
+	identity, err := openedDirectoryIdentity(root)
+	if err != nil {
+		return err
+	}
+	if record.DirectoryIdentity == "" ||
+		identity != record.DirectoryIdentity {
+		return errors.New(
+			"workspace: removal quarantine directory identity changed",
+		)
+	}
+	if record.Removal != nil && record.Removal.ContentsCleared {
+		return validateClearedRemovalDirectory(root, record, false)
+	}
+	onlyMarker, err := removalDirectoryContainsOnlyMarker(root, record)
+	if err != nil {
+		return err
+	}
+	if onlyMarker &&
+		record.Removal != nil &&
+		record.Removal.Started &&
+		record.Removal.Quarantined {
+		return nil
+	}
+	return m.validateRemovalIdentity(ctx, record, path)
+}
+
 func (m *Manager) removeRemovalQuarantine(
 	ctx context.Context,
 	record workspaceRecord,
@@ -892,14 +952,71 @@ func (m *Manager) removeRemovalQuarantine(
 	}()
 	path := filepath.Join(filepath.Dir(record.Path), name)
 	if err := errors.Join(
-		m.validateRemovalIdentity(ctx, record, path),
-		verifyRemovalMarker(opened, record),
+		m.validateRemovalQuarantineIdentity(ctx, record, path, opened),
+		validateRemovalMarkerPhase(opened, record),
 		verifyRootEntryUnchanged(bucket, name, opened),
 	); err != nil {
 		return err
 	}
+	if !record.Removal.ContentsCleared {
+		onlyMarker, err := removalDirectoryContainsOnlyMarker(opened, record)
+		if err != nil {
+			return err
+		}
+		if !onlyMarker {
+			entries, err := readRootDirectory(opened)
+			if err != nil {
+				return err
+			}
+			if err := removeRootEntriesExcept(
+				opened,
+				entries,
+				removalMarkerName(record),
+			); err != nil {
+				return err
+			}
+			if err := validateClearedRemovalDirectory(
+				opened,
+				record,
+				true,
+			); err != nil {
+				return err
+			}
+		}
+		record, err = m.persistRemovalContentsCleared(record)
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateClearedRemovalDirectory(
+		opened,
+		record,
+		false,
+	); err != nil {
+		return err
+	}
+	if err := removeRemovalMarkerIfPresent(opened, record); err != nil {
+		return err
+	}
+	if err := validateClearedRemovalDirectory(
+		opened,
+		record,
+		false,
+	); err != nil {
+		return err
+	}
+	if err := verifyRootEntryUnchanged(bucket, name, opened); err != nil {
+		return err
+	}
+	closeErr := opened.Close()
 	openedOwned = false
-	return removeOpenedDirectoryFromRoot(bucket, name, opened)
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := bucket.Remove(name); err != nil {
+		return err
+	}
+	return syncRecordBucket(bucket, name)
 }
 
 func (m *Manager) rejectQuarantinedRemoval(

@@ -34,6 +34,10 @@ func preparedWorktreeStagingName(
 	return name, nil
 }
 
+func preparedWorktreeIsolationName(stagingName string) string {
+	return stagingName + ".rename"
+}
+
 func (m *Manager) createPreparedWorktreeTarget(
 	target *Workspace,
 ) (_ *preparedWorktreeTarget, result error) {
@@ -219,13 +223,19 @@ func (m *Manager) initializePreparedWorktree(
 	if err != nil {
 		return err
 	}
-	if !exists ||
-		!sameRegisteredWorktreePath(registered.path, prepared.path) ||
-		!registered.detached ||
-		registered.head != target.expectedHeadOID {
+	preparedIntent := *target
+	preparedIntent.Path = prepared.path
+	if !exists {
 		return errors.New(
-			"workspace: detached worktree registration does not match intent",
+			"workspace: prepared worktree registration is missing",
 		)
+	}
+	if err := repository.verifyPreparedWorktreeRegistration(
+		preparedIntent,
+		registered,
+		target.expectedHeadOID,
+	); err != nil {
+		return err
 	}
 	gitDirectory, err := m.worktreeGitDirectoryAtRoot(
 		ctx,
@@ -291,23 +301,42 @@ func (m *Manager) initializePreparedWorktree(
 		prepared.path,
 		root,
 		"",
-		"symbolic-ref",
-		"HEAD",
-		"refs/heads/"+target.Branch,
-	); err != nil {
-		return fmt.Errorf("workspace: attach prepared worktree branch: %w", err)
-	}
-	if _, err := privateRepository.runWorktreeAt(
-		ctx,
-		prepared.path,
-		root,
-		"",
 		"read-tree",
 		"--reset",
 		"-u",
 		target.expectedHeadOID,
 	); err != nil {
 		return fmt.Errorf("workspace: checkout prepared worktree: %w", err)
+	}
+	expectedTree, err := privateRepository.runPrivateGit(
+		ctx,
+		"",
+		"rev-parse",
+		"--verify",
+		target.expectedHeadOID+"^{tree}",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared expected tree: %w",
+			err,
+		)
+	}
+	indexTree, err := privateRepository.runPrivateGit(
+		ctx,
+		"",
+		"write-tree",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared index tree: %w",
+			err,
+		)
+	}
+	if strings.TrimSpace(string(indexTree)) !=
+		strings.TrimSpace(string(expectedTree)) {
+		return errors.New(
+			"workspace: prepared index does not match expected tree",
+		)
 	}
 	if err := repository.verifyPreparationRefs(ctx, *target, true); err != nil {
 		return err
@@ -324,8 +353,6 @@ func (m *Manager) initializePreparedWorktree(
 			"workspace: prepared worktree registration disappeared",
 		)
 	}
-	preparedIntent := *target
-	preparedIntent.Path = prepared.path
 	if err := privateRepository.verifyBoundPreparedWorktree(
 		ctx,
 		preparedIntent,
@@ -417,6 +444,7 @@ func (m *Manager) promotePreparedWorktreeTarget(
 		directory,
 		opened,
 		prepared.name,
+		preparedWorktreeIsolationName(prepared.name),
 		target.AgentID,
 	)
 	if moved {
@@ -489,38 +517,51 @@ func (prepared *preparedWorktreeTarget) Close() error {
 	return err
 }
 
-func (m *Manager) preparedWorktreeStagingPath(
+func (m *Manager) preparedWorktreeStagingPaths(
 	target Workspace,
 	record workspaceRecord,
-) (_ string, _ bool, result error) {
+) (_ string, _ string, _ bool, result error) {
 	name, err := preparedWorktreeStagingName(
 		target.AgentID,
 		record.BranchOperationID,
 	)
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	bucket, err := m.openManagedBucketRoot(target)
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	defer func() {
 		result = errors.Join(result, bucket.Close())
 	}()
-	info, err := bucket.Lstat(name)
-	path := filepath.Join(filepath.Dir(target.Path), name)
-	switch {
-	case errors.Is(err, os.ErrNotExist):
-		return path, false, nil
-	case err != nil:
-		return "", false, err
-	case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
-		return "", false, errors.New(
-			"workspace: prepared worktree staging path is not a real directory",
-		)
-	default:
-		return path, true, nil
+	names := []string{name, preparedWorktreeIsolationName(name)}
+	active := ""
+	for _, candidate := range names {
+		info, err := bucket.Lstat(candidate)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			continue
+		case err != nil:
+			return "", "", false, err
+		case !info.IsDir() || info.Mode()&os.ModeSymlink != 0:
+			return "", "", false, errors.New(
+				"workspace: prepared worktree staging path is not a real directory",
+			)
+		case active != "":
+			return "", "", false, errors.New(
+				"workspace: preparation has multiple staging worktree paths",
+			)
+		default:
+			active = candidate
+		}
 	}
+	parent := filepath.Dir(target.Path)
+	registrationPath := filepath.Join(parent, name)
+	if active == "" {
+		return registrationPath, registrationPath, false, nil
+	}
+	return filepath.Join(parent, active), registrationPath, true, nil
 }
 
 func (m *Manager) removeStagedPreparedWorktree(
@@ -528,6 +569,8 @@ func (m *Manager) removeStagedPreparedWorktree(
 	target Workspace,
 	record workspaceRecord,
 	path string,
+	registrationPath string,
+	repository repositoryCapability,
 ) (result error) {
 	bucket, err := m.openManagedBucketRoot(target)
 	if err != nil {
@@ -557,24 +600,32 @@ func (m *Manager) removeStagedPreparedWorktree(
 			"workspace: prepared worktree staging identity changed",
 		)
 	}
-	repository, err := m.repositoryRootAtRoot(ctx, path, opened)
+	registered, exists, err := repository.worktreeRegistration(
+		ctx,
+		registrationPath,
+	)
 	if err != nil {
 		return err
 	}
-	if repository != record.Repository {
+	if !exists {
 		return errors.New(
-			"workspace: prepared worktree staging repository changed",
+			"workspace: prepared worktree staging registration disappeared",
 		)
 	}
-	gitDirectory, err := m.worktreeGitDirectoryAtRoot(ctx, path, opened)
-	if err != nil {
+	if record.GitDirectory == "" {
+		return errors.New(
+			"workspace: prepared worktree staging Git identity is incomplete",
+		)
+	}
+	stagingTarget := target
+	stagingTarget.Path = registrationPath
+	if err := repository.verifyPreparedWorktree(
+		ctx,
+		stagingTarget,
+		record.GitDirectory,
+		registered,
+	); err != nil {
 		return err
-	}
-	if record.GitDirectory == "" ||
-		gitDirectory != record.GitDirectory {
-		return errors.New(
-			"workspace: prepared worktree staging Git directory changed",
-		)
 	}
 	if err := verifyRootEntryUnchanged(bucket, name, opened); err != nil {
 		return err

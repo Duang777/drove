@@ -418,6 +418,7 @@ func (m *Manager) prepare(
 		ctx,
 		preparedTarget.path,
 		preparedTarget.root,
+		result.Branch,
 		expectedHeadOID,
 	); err != nil {
 		return Workspace{}, fmt.Errorf("workspace: create worktree: %w", err)
@@ -734,8 +735,8 @@ func (m *Manager) discardWithRepository(
 			"workspace: preparation record does not match discard request",
 		)
 	}
-	stagingPath, stagingExists, err :=
-		m.preparedWorktreeStagingPath(target, record)
+	stagingPath, stagingRegistrationPath, stagingExists, err :=
+		m.preparedWorktreeStagingPaths(target, record)
 	if err != nil {
 		return err
 	}
@@ -765,8 +766,11 @@ func (m *Manager) discardWithRepository(
 		)
 	}
 	registrationPaths := []string{target.Path}
-	if stagingPath != target.Path {
-		registrationPaths = append(registrationPaths, stagingPath)
+	if stagingRegistrationPath != target.Path {
+		registrationPaths = append(
+			registrationPaths,
+			stagingRegistrationPath,
+		)
 	}
 	anyRegistered := func() (bool, error) {
 		for _, path := range registrationPaths {
@@ -795,6 +799,8 @@ func (m *Manager) discardWithRepository(
 					target,
 					record,
 					activePath,
+					stagingRegistrationPath,
+					repository,
 				)
 			} else if repository.root != nil {
 				removeErr = m.removePreparedWorktreeAtRoot(

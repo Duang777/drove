@@ -280,10 +280,21 @@ func removalMarkerName(record workspaceRecord) string {
 	return ".drove-removal-" + record.Removal.OperationID
 }
 
+func removalQuarantineIsolationName(name string) string {
+	const suffix = ".rename"
+	if strings.HasSuffix(name, suffix) {
+		return strings.TrimSuffix(name, suffix)
+	}
+	return name + suffix
+}
+
 func validateRemovalMarkerPhase(
 	root *os.Root,
 	record workspaceRecord,
 ) error {
+	if record.Removal != nil && record.Removal.ContentsCleared {
+		return validateClearedRemovalDirectory(root, record, false)
+	}
 	if record.Removal != nil && record.Removal.Started {
 		return verifyRemovalMarker(root, record)
 	}
@@ -404,6 +415,80 @@ func verifyRemovalMarker(
 		return errors.New("workspace: removal marker changed while reading")
 	}
 	return nil
+}
+
+func removalDirectoryContainsOnlyMarker(
+	root *os.Root,
+	record workspaceRecord,
+) (bool, error) {
+	entries, err := readRootDirectory(root)
+	if err != nil {
+		return false, err
+	}
+	if len(entries) != 1 || entries[0].Name() != removalMarkerName(record) {
+		return false, nil
+	}
+	if err := verifyRemovalMarker(root, record); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func validateClearedRemovalDirectory(
+	root *os.Root,
+	record workspaceRecord,
+	requireMarker bool,
+) error {
+	entries, err := readRootDirectory(root)
+	if err != nil {
+		return err
+	}
+	markerPresent := false
+	for _, entry := range entries {
+		if entry.Name() != removalMarkerName(record) {
+			return fmt.Errorf(
+				"workspace: cleared removal quarantine contains unexpected entry %q",
+				entry.Name(),
+			)
+		}
+		if markerPresent {
+			return errors.New(
+				"workspace: cleared removal quarantine contains duplicate markers",
+			)
+		}
+		markerPresent = true
+	}
+	if !markerPresent {
+		if requireMarker {
+			return errors.New(
+				"workspace: cleared removal quarantine marker is missing",
+			)
+		}
+		return nil
+	}
+	return verifyRemovalMarker(root, record)
+}
+
+func removeRootEntriesExcept(
+	root *os.Root,
+	entries []os.DirEntry,
+	preserved string,
+) error {
+	for _, entry := range entries {
+		if entry.Name() == preserved {
+			continue
+		}
+		if err := removeAllFromRoot(root, entry.Name()); err != nil {
+			return err
+		}
+	}
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		return err
+	}
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
 }
 
 func removeRemovalMarkerIfPresent(
@@ -546,6 +631,7 @@ func quarantineManagedPath(
 		directory,
 		openedInfo,
 		record.AgentID,
+		removalQuarantineIsolationName(name),
 		name,
 	)
 	syncErr := syncRecordDirectory(directory)
@@ -591,6 +677,7 @@ func restoreManagedQuarantine(
 		directory,
 		openedInfo,
 		name,
+		removalQuarantineIsolationName(name),
 		record.AgentID,
 	)
 	syncErr := syncRecordDirectory(directory)

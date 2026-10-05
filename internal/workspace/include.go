@@ -123,18 +123,20 @@ func (m *Manager) copyIncludedFiles(
 		)
 	}
 
-	copiedPaths := make([]string, 0, len(paths))
-	for _, relative := range paths {
-		tracked, err := m.worktreePathTracked(
+	trackedPaths := map[string]struct{}{}
+	if len(paths) > 0 {
+		trackedPaths, err = m.worktreeTrackedPaths(
 			ctx,
 			target.Path,
 			destination,
-			relative,
 		)
 		if err != nil {
 			return nil, err
 		}
-		if tracked {
+	}
+	copiedPaths := make([]string, 0, len(paths))
+	for _, relative := range paths {
+		if _, tracked := trackedPaths[filepath.ToSlash(relative)]; tracked {
 			continue
 		}
 		if err := copyIncludedPath(
@@ -177,34 +179,34 @@ func (m *Manager) copyIncludedFiles(
 	return copiedPaths, nil
 }
 
-func (m *Manager) worktreePathTracked(
+func (m *Manager) worktreeTrackedPaths(
 	ctx context.Context,
 	path string,
 	root *os.Root,
-	relative string,
-) (bool, error) {
-	_, err := m.runRootedGit(
+) (map[string]struct{}, error) {
+	output, err := m.runRootedGit(
 		ctx,
 		path,
 		root,
 		"--literal-pathspecs",
 		"ls-files",
-		"--error-unmatch",
-		"--",
-		filepath.ToSlash(relative),
+		"--cached",
+		"--full-name",
+		"-z",
 	)
-	switch {
-	case err == nil:
-		return true, nil
-	case isExitCode(err, 1):
-		return false, nil
-	default:
-		return false, fmt.Errorf(
-			"workspace: inspect target include path %q: %w",
-			relative,
+	if err != nil {
+		return nil, fmt.Errorf(
+			"workspace: inspect target tracked paths: %w",
 			err,
 		)
 	}
+	tracked := make(map[string]struct{})
+	for _, rawPath := range strings.Split(string(output), "\x00") {
+		if rawPath != "" {
+			tracked[rawPath] = struct{}{}
+		}
+	}
+	return tracked, nil
 }
 
 func (m *Manager) includedPaths(

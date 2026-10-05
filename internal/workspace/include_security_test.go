@@ -616,3 +616,92 @@ func TestPrepareCopiesIncludedLiteralPathspecName(t *testing.T) {
 		t.Fatalf("included literal path was not copied: %v", err)
 	}
 }
+
+func TestPrepareReadsTargetTrackedPathsOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local files")
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	for _, name := range []string{"first.local", "second.local", "third.local"} {
+		if err := os.WriteFile(
+			filepath.Join(repository, name),
+			[]byte(name+"\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write include candidate %q: %v", name, err)
+		}
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	countPath := filepath.Join(t.TempDir(), "tracked-count")
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+saw_ls=
+saw_cached=
+for argument in "$@"; do
+  [ "$argument" = "ls-files" ] && saw_ls=1
+  [ "$argument" = "--cached" ] && saw_cached=1
+  [ "$argument" = "--error-unmatch" ] && exit 97
+done
+if [ -n "$saw_ls" ] && [ -n "$saw_cached" ]; then
+  printf 'x\n' >> "$DROVE_TEST_COUNT"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_COUNT", countPath)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = manager.Discard(context.Background(), prepared)
+	})
+	count, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("read tracked-path query count: %v", err)
+	}
+	if string(count) != "x\n" {
+		t.Fatalf("target tracked-path queries = %q, want one", count)
+	}
+	for _, name := range []string{"first.local", "second.local", "third.local"} {
+		assertFileContents(
+			t,
+			filepath.Join(prepared.Path, name),
+			name+"\n",
+		)
+	}
+}

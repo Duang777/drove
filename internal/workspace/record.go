@@ -52,12 +52,13 @@ type repositoryEvidence struct {
 }
 
 type workspaceRemovalRecord struct {
-	OperationID    string `json:"operation_id"`
-	DirectoryToken string `json:"directory_token,omitempty"`
-	Force          bool   `json:"force"`
-	Started        bool   `json:"started"`
-	Quarantined    bool   `json:"quarantined,omitempty"`
-	PathAbsent     bool   `json:"path_absent,omitempty"`
+	OperationID     string `json:"operation_id"`
+	DirectoryToken  string `json:"directory_token,omitempty"`
+	Force           bool   `json:"force"`
+	Started         bool   `json:"started"`
+	Quarantined     bool   `json:"quarantined,omitempty"`
+	ContentsCleared bool   `json:"contents_cleared,omitempty"`
+	PathAbsent      bool   `json:"path_absent,omitempty"`
 }
 
 type recordAcknowledgement struct {
@@ -643,6 +644,12 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 		if record.Removal.Quarantined && !record.Removal.Started {
 			return errors.New(
 				"workspace: quarantined removal has not been started",
+			)
+		}
+		if record.Removal.ContentsCleared &&
+			(!record.Removal.Started || !record.Removal.Quarantined) {
+			return errors.New(
+				"workspace: cleared removal contents require a started quarantine",
 			)
 		}
 		if record.Removal.PathAbsent && record.Removal.Quarantined {

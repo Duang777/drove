@@ -1689,6 +1689,122 @@ func TestReconcileStartedRemovalDoesNotRecreateMissingMarker(t *testing.T) {
 	}
 }
 
+func TestReconcileContentsClearedRemovalAcceptsMissingMarker(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID:     "53535353-5353-4353-8353-535353535353",
+		DirectoryToken:  "54545454-5454-4454-8454-545454545454",
+		Force:           true,
+		Started:         true,
+		Quarantined:     true,
+		ContentsCleared: true,
+	}
+	quarantineName := removalQuarantinePrefix(record) +
+		"55555555-5555-4555-8555-555555555555"
+	quarantinePath := filepath.Join(filepath.Dir(prepared.Path), quarantineName)
+	if err := os.Rename(prepared.Path, quarantinePath); err != nil {
+		t.Fatalf("quarantine workspace: %v", err)
+	}
+	entries, err := os.ReadDir(quarantinePath)
+	if err != nil {
+		t.Fatalf("read quarantine: %v", err)
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(quarantinePath, entry.Name())); err != nil {
+			t.Fatalf("clear quarantine entry %q: %v", entry.Name(), err)
+		}
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("persist cleared removal: %v", err)
+	}
+
+	removals, err := manager.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile cleared removal: %v", err)
+	}
+	if len(removals) != 1 || removals[0].Workspace.Path != prepared.Path {
+		t.Fatalf("reconciled removals = %+v", removals)
+	}
+	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cleared quarantine remains or inspect failed: %v", err)
+	}
+}
+
+func TestReconcileContentsClearedRemovalRejectsUnexpectedEntry(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID:     "56565656-5656-4656-8656-565656565656",
+		DirectoryToken:  "57575757-5757-4757-8757-575757575757",
+		Force:           true,
+		Started:         true,
+		Quarantined:     true,
+		ContentsCleared: true,
+	}
+	quarantineName := removalQuarantinePrefix(record) +
+		"58585858-5858-4858-8858-585858585858"
+	quarantinePath := filepath.Join(filepath.Dir(prepared.Path), quarantineName)
+	if err := os.Rename(prepared.Path, quarantinePath); err != nil {
+		t.Fatalf("quarantine workspace: %v", err)
+	}
+	entries, err := os.ReadDir(quarantinePath)
+	if err != nil {
+		t.Fatalf("read quarantine: %v", err)
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(quarantinePath, entry.Name())); err != nil {
+			t.Fatalf("clear quarantine entry %q: %v", entry.Name(), err)
+		}
+	}
+	unexpected := filepath.Join(quarantinePath, "unexpected")
+	if err := os.WriteFile(unexpected, []byte("preserve\n"), 0o600); err != nil {
+		t.Fatalf("write unexpected entry: %v", err)
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("persist cleared removal: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(
+		context.Background(),
+	); err == nil || !strings.Contains(err.Error(), "unexpected entry") {
+		t.Fatalf("reconcile unexpected cleared entry error = %v", err)
+	}
+	assertFileContents(t, unexpected, "preserve\n")
+}
+
 func TestReconcileAbsentPathRemovalPreservesReplacementPath(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

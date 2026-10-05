@@ -14,6 +14,7 @@ func renameDirectoryNoReplace(
 	directory *os.File,
 	expected os.FileInfo,
 	sourceName string,
+	_ string,
 	targetName string,
 ) (moved bool, result error) {
 	renaming, err := openDirectoryForRename(directory, sourceName)

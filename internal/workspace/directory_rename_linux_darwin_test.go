@@ -40,6 +40,7 @@ func TestRenameDirectoryNoReplaceRejectsReplacementSource(t *testing.T) {
 		directory,
 		expected,
 		"source",
+		"source-isolated",
 		"target",
 	)
 	if err == nil || moved {
