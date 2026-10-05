@@ -19,6 +19,9 @@
   `git worktree add` 都必须从该根句柄执行，并禁用 Git hooks。Linux 使用
   `/proc/self/fd`，其他 Unix 通过继承目录描述符后 `fchdir`，Windows 持有不允许
   share-delete 的目录句柄并复核目录身份；不能提供等价约束的平台必须 fail-stop。
+  macOS/BSD 上只依赖私有 Git directory 的查询必须从该目录句柄执行，禁止经由使用
+  公开私有 Git 路径的 worktree helper；同时依赖 index 与 worktree 的查询必须由两个
+  各自固定一侧的视角交叉验证。
   `git worktree add` 使用 `--no-checkout`，新 worktree 打开后先核对预先持久化的
   文件系统目录身份，再持久化 Git 私有目录，最后从固定目标根执行 `git reset --hard`。仓库根目录的
   `.worktreeinclude` 使用 gitignore 语义，并从已打开文件读取一次。Unix 通过继承的

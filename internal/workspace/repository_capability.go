@@ -158,12 +158,12 @@ func (r repositoryCapability) runForward(
 	return r.run(ctx, input, arguments...)
 }
 
-func (r repositoryCapability) runWorktree(
+func (r repositoryCapability) runPrivateGit(
 	ctx context.Context,
 	input string,
 	arguments ...string,
 ) ([]byte, error) {
-	command, cleanup, err := r.worktreeCommand(ctx, arguments...)
+	command, cleanup, err := r.privateGitCommand(ctx, arguments...)
 	if err != nil {
 		return nil, err
 	}
@@ -226,7 +226,7 @@ func (r repositoryCapability) repositoryDirectories(
 func (r repositoryCapability) headOID(
 	ctx context.Context,
 ) (string, error) {
-	output, err := r.runWorktree(ctx, "", "rev-parse", "--verify", "HEAD")
+	output, err := r.runPrivateGit(ctx, "", "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve branch start: %w", err)
 	}

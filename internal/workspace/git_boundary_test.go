@@ -179,6 +179,114 @@ exit "$status"
 	}
 }
 
+func TestPreparePinsLinkedWorktreePrivateGitDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	sourceOID := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	source := filepath.Join(t.TempDir(), "source")
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"-b",
+		"source-private-git",
+		source,
+		sourceOID,
+	)
+	if err := os.WriteFile(
+		filepath.Join(repository, "second.txt"),
+		[]byte("second\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write second commit: %v", err)
+	}
+	runGit(t, repository, "add", "second.txt")
+	runGit(t, repository, "commit", "-m", "second")
+	replacementOID := strings.TrimSpace(
+		runGit(t, repository, "rev-parse", "HEAD"),
+	)
+	sibling := filepath.Join(t.TempDir(), "sibling")
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"-b",
+		"sibling-private-git",
+		sibling,
+		"main",
+	)
+	sourceGit := strings.TrimSpace(
+		runGit(t, source, "rev-parse", "--absolute-git-dir"),
+	)
+	siblingGit := strings.TrimSpace(
+		runGit(t, sibling, "rev-parse", "--absolute-git-dir"),
+	)
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+matched=
+case " $* " in
+  *" rev-parse --verify HEAD "*) matched=1 ;;
+esac
+if [ -n "$matched" ]; then
+  mv "$DROVE_TEST_SOURCE_GIT" "$DROVE_TEST_OPENED_GIT" || exit 91
+  mv "$DROVE_TEST_SIBLING_GIT" "$DROVE_TEST_SOURCE_GIT" || exit 92
+fi
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ -n "$matched" ]; then
+  mv "$DROVE_TEST_SOURCE_GIT" "$DROVE_TEST_SIBLING_GIT" || exit 93
+  mv "$DROVE_TEST_OPENED_GIT" "$DROVE_TEST_SOURCE_GIT" || exit 94
+fi
+exit "$status"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_SOURCE_GIT", sourceGit)
+	t.Setenv("DROVE_TEST_SIBLING_GIT", siblingGit)
+	t.Setenv("DROVE_TEST_OPENED_GIT", sourceGit+".opened")
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"prepared-from-pinned-private-git",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare linked worktree: %v", err)
+	}
+	gotOID := strings.TrimSpace(
+		runGit(t, prepared.Path, "rev-parse", "HEAD"),
+	)
+	if gotOID != sourceOID {
+		t.Fatalf(
+			"prepared HEAD = %q, want source %q, replacement was %q",
+			gotOID,
+			sourceOID,
+			replacementOID,
+		)
+	}
+	manager.git = realGit
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard prepared workspace: %v", err)
+	}
+}
+
 func TestIncludeEnumerationUsesPinnedSourceRoot(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires a POSIX shell")
