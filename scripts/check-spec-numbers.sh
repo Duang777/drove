@@ -6,7 +6,11 @@ repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 specs_dir="$repo_root/specs"
 
 invalid_names=0
-for spec_dir in "$specs_dir"/*; do
+for spec_dir in \
+	"$specs_dir"/* \
+	"$specs_dir"/.[!.]* \
+	"$specs_dir"/..?*
+do
 	[ -d "$spec_dir" ] || continue
 	spec_name=${spec_dir##*/}
 	case "$spec_name" in
