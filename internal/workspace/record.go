@@ -35,6 +35,7 @@ type workspaceRecord struct {
 	PreparationCommitted bool                    `json:"preparation_committed"`
 	CreatedBranch        bool                    `json:"created_branch"`
 	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
+	ExpectedHeadOID      string                  `json:"expected_head_oid,omitempty"`
 	GitDirectory         string                  `json:"git_directory,omitempty"`
 	DirectoryIdentity    string                  `json:"directory_identity,omitempty"`
 	RepositoryEvidence   *repositoryEvidence     `json:"repository_evidence,omitempty"`
@@ -90,6 +91,7 @@ func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecor
 		IncludedPaths:     append([]string{}, includedPaths...),
 		CreatedBranch:     target.createdBranch,
 		BranchOperationID: target.branchOperationID,
+		ExpectedHeadOID:   target.expectedHeadOID,
 		GitDirectory:      target.gitDirectory,
 		DirectoryIdentity: target.directoryIdentity,
 		RepositoryEvidence: cloneRepositoryEvidence(
@@ -106,6 +108,7 @@ func (r workspaceRecord) workspace() Workspace {
 		Branch:            r.Branch,
 		createdBranch:     r.CreatedBranch,
 		branchOperationID: r.BranchOperationID,
+		expectedHeadOID:   r.ExpectedHeadOID,
 		gitDirectory:      r.GitDirectory,
 		directoryIdentity: r.DirectoryIdentity,
 		repositoryEvidence: cloneRepositoryEvidence(
@@ -130,6 +133,7 @@ func upgradeWorkspaceRecord(record *workspaceRecord) {
 	}
 	record.Version = workspaceRecordVersion
 	record.RepositoryEvidence = nil
+	record.ExpectedHeadOID = ""
 	if record.PreparationCommitted {
 		record.BranchOperationID = ""
 	}
@@ -505,6 +509,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.PreparationCommitted ||
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
+			record.ExpectedHeadOID != "" ||
 			record.GitDirectory != "" ||
 			record.DirectoryIdentity != "" ||
 			record.RepositoryEvidence != nil ||
@@ -525,6 +530,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		if record.PreparationCommitted ||
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
+			record.ExpectedHeadOID != "" ||
 			record.GitDirectory != "" ||
 			record.DirectoryIdentity != "" ||
 			record.RepositoryEvidence != nil {
@@ -661,6 +667,13 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 				"workspace: branch operation ID is not a canonical UUID",
 			)
 		}
+	}
+	if record.ExpectedHeadOID != "" &&
+		(len(record.ExpectedHeadOID) > 128 ||
+			strings.ContainsAny(record.ExpectedHeadOID, " \t\r\n")) {
+		return errors.New(
+			"workspace: expected HEAD object ID is invalid",
+		)
 	}
 	if record.GitDirectory != "" &&
 		(!filepath.IsAbs(record.GitDirectory) ||

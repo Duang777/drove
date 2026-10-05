@@ -59,6 +59,15 @@ func (r repositoryCapability) withRepositoryBinding(
 	return r
 }
 
+func (r repositoryCapability) withPrivateGitBinding(
+	gitPath string,
+	gitRoot *os.Root,
+) repositoryCapability {
+	r.gitPath = gitPath
+	r.gitRoot = gitRoot
+	return r
+}
+
 func (r repositoryCapability) verifyBinding(ctx context.Context) error {
 	if r.root == nil ||
 		r.gitRoot == nil ||
@@ -158,12 +167,70 @@ func (r repositoryCapability) runForward(
 	return r.run(ctx, input, arguments...)
 }
 
+func (r repositoryCapability) addPreparedWorktree(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	expectedHeadOID string,
+) ([]byte, error) {
+	if err := r.verifyBinding(ctx); err != nil {
+		return nil, err
+	}
+	command, cleanup, err := rootedPreparedWorktreeGitCommand(
+		ctx,
+		r.manager.git,
+		r.path,
+		r.commonPath,
+		r.commonRoot,
+		path,
+		root,
+		[]string{
+			"worktree",
+			"add",
+			"--quiet",
+			"--detach",
+			"--no-checkout",
+			".",
+			expectedHeadOID,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	output, commandErr := runGitCommand(command, "")
+	verifyErr := errors.Join(
+		r.verifyBinding(ctx),
+		verifyRealPathRoot(path, root),
+	)
+	return output, errors.Join(commandErr, verifyErr, cleanup())
+}
+
 func (r repositoryCapability) runPrivateGit(
 	ctx context.Context,
 	input string,
 	arguments ...string,
 ) ([]byte, error) {
 	command, cleanup, err := r.privateGitCommand(ctx, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	output, commandErr := runGitCommand(command, input)
+	return output, errors.Join(commandErr, cleanup())
+}
+
+func (r repositoryCapability) runWorktreeAt(
+	ctx context.Context,
+	worktreePath string,
+	worktreeRoot *os.Root,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	command, cleanup, err := r.worktreeCommandAt(
+		ctx,
+		worktreePath,
+		worktreeRoot,
+		arguments...,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -284,12 +351,21 @@ func (r repositoryCapability) worktreeCommand(
 	ctx context.Context,
 	arguments ...string,
 ) (*exec.Cmd, func() error, error) {
+	return r.worktreeCommandAt(ctx, r.path, r.root, arguments...)
+}
+
+func (r repositoryCapability) worktreeCommandAt(
+	ctx context.Context,
+	worktreePath string,
+	worktreeRoot *os.Root,
+	arguments ...string,
+) (*exec.Cmd, func() error, error) {
 	if r.root != nil && r.gitRoot != nil {
 		return rootedWorktreeGitCommand(
 			ctx,
 			r.manager.git,
-			r.path,
-			r.root,
+			worktreePath,
+			worktreeRoot,
 			r.gitPath,
 			r.gitRoot,
 			arguments,
@@ -458,18 +534,18 @@ func (r repositoryCapability) verifyPreparedWorktree(
 	gitDirectory string,
 	registered registeredWorktree,
 ) error {
-	if err := r.verifyPreparedWorktreeRegistration(
-		target,
-		registered,
-		"",
-	); err != nil {
-		return err
-	}
 	gitDirectory, err := r.boundGitDirectory(
 		gitDirectory,
 		target.AgentID,
 	)
 	if err != nil {
+		return err
+	}
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		target.expectedHeadOID,
+	); err != nil {
 		return err
 	}
 	head, err := r.run(
@@ -508,6 +584,91 @@ func (r repositoryCapability) verifyPreparedWorktree(
 	if strings.TrimSpace(string(branch)) != registered.branch {
 		return errors.New(
 			"workspace: prepared worktree branch does not match registration",
+		)
+	}
+	return nil
+}
+
+func (r repositoryCapability) verifyBoundPreparedWorktree(
+	ctx context.Context,
+	target Workspace,
+	registered registeredWorktree,
+) error {
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		target.expectedHeadOID,
+	); err != nil {
+		return err
+	}
+	head, err := r.runPrivateGit(ctx, "", "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared worktree HEAD: %w",
+			err,
+		)
+	}
+	if strings.TrimSpace(string(head)) != registered.head {
+		return errors.New(
+			"workspace: prepared worktree HEAD does not match registration",
+		)
+	}
+	branch, err := r.runPrivateGit(
+		ctx,
+		"",
+		"symbolic-ref",
+		"--quiet",
+		"HEAD",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared worktree branch: %w",
+			err,
+		)
+	}
+	if strings.TrimSpace(string(branch)) != registered.branch {
+		return errors.New(
+			"workspace: prepared worktree branch does not match registration",
+		)
+	}
+	return nil
+}
+
+func (r repositoryCapability) verifyPreparationRefs(
+	ctx context.Context,
+	target Workspace,
+	requireOwnershipMarker bool,
+) error {
+	if target.expectedHeadOID == "" {
+		return errors.New(
+			"workspace: prepared worktree expected HEAD is unavailable",
+		)
+	}
+	branchOID, exists, err := r.refOID(
+		ctx,
+		"refs/heads/"+target.Branch,
+	)
+	if err != nil {
+		return err
+	}
+	if !exists || branchOID != target.expectedHeadOID {
+		return errors.New(
+			"workspace: prepared branch moved from its expected HEAD",
+		)
+	}
+	if !target.createdBranch || !requireOwnershipMarker {
+		return nil
+	}
+	markerOID, exists, err := r.refOID(
+		ctx,
+		branchOwnershipRef(target.branchOperationID),
+	)
+	if err != nil {
+		return err
+	}
+	if !exists || markerOID != target.expectedHeadOID {
+		return errors.New(
+			"workspace: prepared branch ownership marker changed",
 		)
 	}
 	return nil
@@ -559,12 +720,19 @@ func (r repositoryCapability) boundGitDirectory(
 	if strings.HasPrefix(name, agentID) && len(name) > len(agentID) {
 		validName = strings.Trim(name[len(agentID):], "0123456789") == ""
 	}
+	if name == "-" ||
+		(strings.HasPrefix(name, "-") &&
+			strings.Trim(name[1:], "0123456789") == "") {
+		validName = true
+	}
 	if err != nil ||
 		!filepath.IsAbs(path) ||
 		filepath.Dir(name) != "." ||
 		!validName {
-		return "", errors.New(
-			"workspace: prepared Git directory does not match the managed worktree",
+		return "", fmt.Errorf(
+			"workspace: prepared Git directory %q does not match agent %q",
+			path,
+			agentID,
 		)
 	}
 	return filepath.Join("worktrees", name), nil

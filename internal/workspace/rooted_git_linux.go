@@ -131,3 +131,46 @@ func rootedWorktreeGitCommand(
 	}
 	return command, cleanup, nil
 }
+
+func rootedPreparedWorktreeGitCommand(
+	ctx context.Context,
+	git string,
+	repositoryPath string,
+	commonPath string,
+	commonRoot *os.Root,
+	_ string,
+	worktreeRoot *os.Root,
+	arguments []string,
+) (*exec.Cmd, func() error, error) {
+	worktree, err := worktreeRoot.Open(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: open prepared worktree target: %w",
+			err,
+		)
+	}
+	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
+	if err != nil {
+		_ = worktree.Close()
+		return nil, nil, err
+	}
+	command := exec.CommandContext(ctx, git)
+	command.ExtraFiles = []*os.File{worktree}
+	command.Env = boundGitEnvironment(
+		command.Environ(),
+		commonPath,
+		repositoryPath,
+	)
+	command.Args = append(
+		command.Args,
+		"-c",
+		"core.hooksPath=/dev/null",
+		"-C",
+		"/proc/self/fd/3",
+	)
+	command.Args = append(command.Args, arguments...)
+	cleanup := func() error {
+		return errors.Join(commonGuard.Close(), worktree.Close())
+	}
+	return command, cleanup, nil
+}

@@ -277,6 +277,11 @@ func sameWorkspace(left Workspace, right Workspace) bool {
 		left.directoryIdentity != right.directoryIdentity {
 		return false
 	}
+	if left.expectedHeadOID != "" &&
+		right.expectedHeadOID != "" &&
+		left.expectedHeadOID != right.expectedHeadOID {
+		return false
+	}
 	return left.AgentID == right.AgentID &&
 		left.Repository == right.Repository &&
 		left.Path == right.Path &&

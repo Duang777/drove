@@ -665,6 +665,9 @@ func TestDiscardPreservesWorkspaceWhenRegistrationCheckFails(t *testing.T) {
 	if err := manager.Discard(ctx, prepared); err == nil {
 		t.Fatal("discard succeeded with a canceled registration check")
 	}
+	if !prepared.preparation.isClosed() {
+		t.Fatal("failed discard retained its preparation lease")
+	}
 	if _, err := os.Lstat(prepared.Path); err != nil {
 		t.Fatalf("failed discard removed worktree: %v", err)
 	}

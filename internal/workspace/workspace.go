@@ -49,6 +49,7 @@ type Workspace struct {
 
 	createdBranch      bool
 	branchOperationID  string
+	expectedHeadOID    string
 	gitDirectory       string
 	directoryIdentity  string
 	protectionKnown    bool
@@ -277,6 +278,22 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 	createdBranch := !exists
+	expectedHeadOID := sourceRepository.startOID
+	if exists {
+		var branchExists bool
+		expectedHeadOID, branchExists, err = sourceRepository.refOID(
+			ctx,
+			"refs/heads/"+branch,
+		)
+		if err != nil {
+			return Workspace{}, err
+		}
+		if !branchExists {
+			return Workspace{}, errors.New(
+				"workspace: branch disappeared while preparing",
+			)
+		}
+	}
 	branchOperationID := uuid.NewString()
 	result := Workspace{
 		AgentID:           agentID,
@@ -284,6 +301,7 @@ func (m *Manager) prepare(
 		Path:              path,
 		Branch:            branch,
 		branchOperationID: branchOperationID,
+		expectedHeadOID:   expectedHeadOID,
 		repositoryEvidence: cloneRepositoryEvidence(
 			&lease.evidence,
 		),
@@ -396,18 +414,11 @@ func (m *Manager) prepare(
 			)
 		}
 	}
-	arguments := []string{
-		"worktree",
-		"add",
-		"--quiet",
-		"--no-checkout",
-		preparedTarget.path,
-		branch,
-	}
-	if _, err := sourceRepository.runForward(
+	if _, err := sourceRepository.addPreparedWorktree(
 		ctx,
-		"",
-		arguments...,
+		preparedTarget.path,
+		preparedTarget.root,
+		expectedHeadOID,
 	); err != nil {
 		return Workspace{}, fmt.Errorf("workspace: create worktree: %w", err)
 	}
@@ -416,6 +427,7 @@ func (m *Manager) prepare(
 		ctx,
 		&result,
 		preparedTarget,
+		sourceRepository,
 	); err != nil {
 		return Workspace{}, err
 	}
@@ -661,8 +673,8 @@ func (m *Manager) discard(
 	target Workspace,
 ) (result error) {
 	lease := target.preparation
-	temporaryLease := false
-	if lease == nil {
+	liveLease := lease != nil && !lease.isClosed()
+	if !liveLease {
 		record, exists, err := m.readWorkspaceRecord(target.Path)
 		if err != nil {
 			return err
@@ -681,23 +693,19 @@ func (m *Manager) discard(
 		if err != nil {
 			return err
 		}
-		temporaryLease = true
-		defer func() {
-			result = errors.Join(result, lease.Close())
-		}()
 	}
+	defer func() {
+		result = errors.Join(result, lease.Close())
+	}()
 	if err := m.discardWithRepository(
 		ctx,
 		target,
 		lease.repository,
-		target.preparation != nil,
+		liveLease,
 	); err != nil {
 		return err
 	}
-	if temporaryLease {
-		return nil
-	}
-	return lease.Close()
+	return nil
 }
 
 func (m *Manager) discardWithRepository(

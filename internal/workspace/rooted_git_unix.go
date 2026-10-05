@@ -189,3 +189,60 @@ func rootedWorktreeGitCommand(
 	}
 	return command, cleanup, nil
 }
+
+func rootedPreparedWorktreeGitCommand(
+	ctx context.Context,
+	git string,
+	repositoryPath string,
+	commonPath string,
+	commonRoot *os.Root,
+	_ string,
+	worktreeRoot *os.Root,
+	arguments []string,
+) (*exec.Cmd, func() error, error) {
+	directory, err := worktreeRoot.Open(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: open prepared worktree target: %w",
+			err,
+		)
+	}
+	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
+	if err != nil {
+		_ = directory.Close()
+		return nil, nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		_ = commonGuard.Close()
+		_ = directory.Close()
+		return nil, nil, fmt.Errorf(
+			"workspace: locate rooted Git helper: %w",
+			err,
+		)
+	}
+	git, err = exec.LookPath(git)
+	if err != nil {
+		_ = commonGuard.Close()
+		_ = directory.Close()
+		return nil, nil, err
+	}
+	helperArguments := []string{
+		rootedGitHelperArgument,
+		git,
+		"-c",
+		"core.hooksPath=/dev/null",
+	}
+	helperArguments = append(helperArguments, arguments...)
+	command := exec.CommandContext(ctx, executable, helperArguments...)
+	command.ExtraFiles = []*os.File{directory}
+	command.Env = boundGitEnvironment(
+		command.Environ(),
+		commonPath,
+		repositoryPath,
+	)
+	cleanup := func() error {
+		return errors.Join(commonGuard.Close(), directory.Close())
+	}
+	return command, cleanup, nil
+}

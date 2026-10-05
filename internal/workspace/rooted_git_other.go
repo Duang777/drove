@@ -49,3 +49,18 @@ func rootedWorktreeGitCommand(
 		"workspace: rooted worktree Git commands are unsupported on this platform",
 	)
 }
+
+func rootedPreparedWorktreeGitCommand(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ string,
+	_ *os.Root,
+	_ string,
+	_ *os.Root,
+	_ []string,
+) (*exec.Cmd, func() error, error) {
+	return nil, nil, errors.New(
+		"workspace: rooted prepared worktree Git commands are unsupported on this platform",
+	)
+}

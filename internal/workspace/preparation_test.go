@@ -341,7 +341,7 @@ func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 	t *testing.T,
 ) {
 	repository := newTestRepository(t)
-	stalePath := filepath.Join(t.TempDir(), testAgentID)
+	stalePath := filepath.Join(t.TempDir(), "-")
 	runGit(
 		t,
 		repository,
@@ -371,7 +371,7 @@ func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 		t.Fatalf("prepare workspace: %v", err)
 	}
 	gitDirectoryName := filepath.Base(prepared.gitDirectory)
-	suffix := strings.TrimPrefix(gitDirectoryName, testAgentID)
+	suffix := strings.TrimPrefix(gitDirectoryName, "-")
 	if suffix == "" || strings.Trim(suffix, "0123456789") != "" {
 		t.Fatalf(
 			"prepared Git directory %q has no collision suffix",

@@ -259,7 +259,7 @@ next_target=
 for argument in "$@"; do
   if [ -n "$next_target" ]; then
     test -d "$argument" || exit 98
-    printf '%s' "$argument" > "$DROVE_TEST_INVOKED"
+    printf '%s' "$PWD" > "$DROVE_TEST_INVOKED"
     exit 97
   fi
   [ "$argument" = "--no-checkout" ] && next_target=1
@@ -329,7 +329,7 @@ target=
 next_target=
 for argument in "$@"; do
   if [ -n "$next_target" ]; then
-    target=$argument
+    target=$PWD
     next_target=
   fi
   [ "$argument" = "--no-checkout" ] && next_target=1
@@ -408,6 +408,64 @@ exit "$status"
 	}
 	runGit(t, stagingPath, "status", "--porcelain")
 	assertFileContents(t, sentinel, "replacement\n")
+}
+
+func TestPrepareDoesNotWriteThroughReplacedStagingPath(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(outside, 0o700); err != nil {
+		t.Fatalf("create outside target: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper-replace-staging")
+	script := `#!/bin/sh
+target=
+next_target=
+for argument in "$@"; do
+  if [ -n "$next_target" ]; then
+    target=$argument
+    next_target=
+  fi
+  [ "$argument" = "--no-checkout" ] && next_target=1
+done
+if [ -n "$target" ]; then
+  target=$PWD
+  mv "$target" "$target-opened" || exit 91
+  ln -s "$DROVE_TEST_OUTSIDE" "$target" || exit 92
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_OUTSIDE", outside)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare accepted a replaced staging path")
+	}
+	if _, err := os.Lstat(filepath.Join(outside, ".git")); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("Git wrote through the replaced staging path: %v", err)
+	}
 }
 
 func TestPreparePruneFailurePreservesRecoveryRecord(t *testing.T) {
@@ -612,6 +670,87 @@ exit "$status"
 		"refs/heads/existing",
 	)); branchOID != newOID {
 		t.Fatalf("existing branch OID = %q, want %q", branchOID, newOID)
+	}
+}
+
+func TestPrepareRejectsCreatedBranchMovedBeforeWorktreeAdd(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	startOID := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+	if err := os.WriteFile(
+		filepath.Join(source, "replacement.txt"),
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement commit: %v", err)
+	}
+	runGit(t, source, "add", "replacement.txt")
+	runGit(t, source, "commit", "-m", "replacement")
+	replacementOID := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+	runGit(t, source, "reset", "--hard", startOID)
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper-move-created-branch")
+	script := `#!/bin/sh
+matched=
+saw_worktree=
+for argument in "$@"; do
+  if [ "$saw_worktree" = "1" ] && [ "$argument" = "add" ]; then
+    matched=1
+    break
+  fi
+  [ "$argument" = "worktree" ] && saw_worktree=1
+done
+if [ -n "$matched" ]; then
+  "$DROVE_TEST_REAL_GIT" --git-dir="$DROVE_TEST_GIT_DIR" update-ref \
+    "$DROVE_TEST_BRANCH_REF" "$DROVE_TEST_REPLACEMENT_OID" \
+    "$DROVE_TEST_START_OID" || exit 96
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	branch := "drove/" + testAgentID
+	t.Setenv("DROVE_TEST_GIT_DIR", filepath.Join(source, ".git"))
+	t.Setenv("DROVE_TEST_BRANCH_REF", "refs/heads/"+branch)
+	t.Setenv("DROVE_TEST_REPLACEMENT_OID", replacementOID)
+	t.Setenv("DROVE_TEST_START_OID", startOID)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare accepted a moved created branch")
+	}
+	if got := strings.TrimSpace(runGit(
+		t,
+		source,
+		"rev-parse",
+		"refs/heads/"+branch,
+	)); got != replacementOID {
+		t.Fatalf("moved branch OID = %q, want %q", got, replacementOID)
+	}
+	if markers := strings.TrimSpace(runGit(
+		t,
+		source,
+		"for-each-ref",
+		"--format=%(refname)",
+		branchOwnershipRefPrefix,
+	)); markers != "" {
+		t.Fatalf("branch ownership marker remains: %q", markers)
 	}
 }
 
@@ -2048,6 +2187,97 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
 		t.Fatalf("replacement checkout filter ran: %v", err)
+	}
+}
+
+func TestPrepareDoesNotCheckoutThroughReplacedWorktreeGitPointer(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	replacement := filepath.Join(parent, "replacement-worktree")
+	runGit(
+		t,
+		source,
+		"worktree",
+		"add",
+		"-b",
+		"replacement-worktree",
+		replacement,
+	)
+
+	sentinel := filepath.Join(parent, "filter-ran")
+	filter := filepath.Join(parent, "filter")
+	script := "#!/bin/sh\nprintf ran > \"$DROVE_TEST_SENTINEL\"\ncat\n"
+	if err := os.WriteFile(filter, []byte(script), 0o700); err != nil {
+		t.Fatalf("write filter: %v", err)
+	}
+	runGit(t, source, "config", "filter.review.smudge", filter)
+	runGit(t, source, "config", "filter.review.clean", "cat")
+	runGit(t, source, "config", "filter.review.required", "true")
+	if err := os.WriteFile(
+		filepath.Join(replacement, ".gitattributes"),
+		[]byte("replacement.txt filter=review\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement attributes: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(replacement, "replacement.txt"),
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement file: %v", err)
+	}
+	runGit(t, replacement, "add", ".gitattributes", "replacement.txt")
+	runGit(t, replacement, "commit", "-m", "replacement worktree")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper-swap-worktree-pointer")
+	wrapperScript := `#!/bin/sh
+target=
+next_target=
+for argument in "$@"; do
+  if [ -n "$next_target" ]; then
+    target=$argument
+    next_target=
+  fi
+  [ "$argument" = "--no-checkout" ] && next_target=1
+done
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$target" ]; then
+  mv "$target/.git" "$target/.git-original" || exit 91
+  cp "$DROVE_TEST_REPLACEMENT/.git" "$target/.git" || exit 92
+fi
+exit "$status"
+`
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_REPLACEMENT", replacement)
+	t.Setenv("DROVE_TEST_SENTINEL", sentinel)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare accepted a replaced worktree Git pointer")
+	}
+	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement worktree checkout filter ran: %v", err)
 	}
 }
 

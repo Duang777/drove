@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 )
@@ -191,6 +192,7 @@ func (m *Manager) initializePreparedWorktree(
 	ctx context.Context,
 	target *Workspace,
 	prepared *preparedWorktreeTarget,
+	repository repositoryCapability,
 ) (result error) {
 	root := prepared.root
 	directoryIdentity, err := openedDirectoryIdentity(root)
@@ -210,6 +212,21 @@ func (m *Manager) initializePreparedWorktree(
 			"workspace: prepared worktree target identity changed",
 		)
 	}
+	registered, exists, err := repository.worktreeRegistration(
+		ctx,
+		prepared.path,
+	)
+	if err != nil {
+		return err
+	}
+	if !exists ||
+		!sameRegisteredWorktreePath(registered.path, prepared.path) ||
+		!registered.detached ||
+		registered.head != target.expectedHeadOID {
+		return errors.New(
+			"workspace: detached worktree registration does not match intent",
+		)
+	}
 	gitDirectory, err := m.worktreeGitDirectoryAtRoot(
 		ctx,
 		prepared.path,
@@ -219,6 +236,117 @@ func (m *Manager) initializePreparedWorktree(
 		return err
 	}
 	if err := verifyRealPathRoot(prepared.path, root); err != nil {
+		return err
+	}
+	if _, err := repository.boundGitDirectory(
+		gitDirectory,
+		target.AgentID,
+	); err != nil {
+		return err
+	}
+	gitRoot, err := openRealPathRoot(gitDirectory)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open prepared private Git directory: %w",
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, gitRoot.Close())
+	}()
+	gitGuard, err := openRepositoryGuard(gitDirectory, gitRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, gitGuard.Close())
+	}()
+	privateRepository := repository.withPrivateGitBinding(
+		gitDirectory,
+		gitRoot,
+	)
+	privateHead, err := privateRepository.runPrivateGit(
+		ctx,
+		"",
+		"rev-parse",
+		"--verify",
+		"HEAD",
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared private HEAD: %w",
+			err,
+		)
+	}
+	if strings.TrimSpace(string(privateHead)) != target.expectedHeadOID {
+		return errors.New(
+			"workspace: prepared private HEAD does not match intent",
+		)
+	}
+	if err := repository.verifyPreparationRefs(ctx, *target, true); err != nil {
+		return err
+	}
+	if _, err := privateRepository.runWorktreeAt(
+		ctx,
+		prepared.path,
+		root,
+		"",
+		"symbolic-ref",
+		"HEAD",
+		"refs/heads/"+target.Branch,
+	); err != nil {
+		return fmt.Errorf("workspace: attach prepared worktree branch: %w", err)
+	}
+	if _, err := privateRepository.runWorktreeAt(
+		ctx,
+		prepared.path,
+		root,
+		"",
+		"read-tree",
+		"--reset",
+		"-u",
+		target.expectedHeadOID,
+	); err != nil {
+		return fmt.Errorf("workspace: checkout prepared worktree: %w", err)
+	}
+	if err := repository.verifyPreparationRefs(ctx, *target, true); err != nil {
+		return err
+	}
+	registered, exists, err = repository.worktreeRegistration(
+		ctx,
+		prepared.path,
+	)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New(
+			"workspace: prepared worktree registration disappeared",
+		)
+	}
+	preparedIntent := *target
+	preparedIntent.Path = prepared.path
+	if err := privateRepository.verifyBoundPreparedWorktree(
+		ctx,
+		preparedIntent,
+		registered,
+	); err != nil {
+		return err
+	}
+	confirmedGitDirectory, err := m.worktreeGitDirectoryAtRoot(
+		ctx,
+		prepared.path,
+		root,
+	)
+	if err != nil {
+		return err
+	}
+	if confirmedGitDirectory != gitDirectory {
+		return errors.New(
+			"workspace: prepared worktree Git pointer changed",
+		)
+	}
+	if err := verifyRealPathRoot(gitDirectory, gitRoot); err != nil {
 		return err
 	}
 	target.gitDirectory = gitDirectory
@@ -240,15 +368,6 @@ func (m *Manager) initializePreparedWorktree(
 	}
 	if err != nil {
 		return fmt.Errorf("workspace: persist worktree identity: %w", err)
-	}
-	if _, err := m.runRootedGit(
-		ctx,
-		prepared.path,
-		root,
-		"reset",
-		"--hard",
-	); err != nil {
-		return fmt.Errorf("workspace: checkout prepared worktree: %w", err)
 	}
 	return nil
 }
@@ -521,6 +640,42 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 			"workspace: prepared worktree Git directory changed",
 		)
 	}
+	if target.expectedHeadOID == "" ||
+		target.expectedHeadOID != record.ExpectedHeadOID {
+		return errors.New(
+			"workspace: prepared worktree expected HEAD changed",
+		)
+	}
+	if _, err := repository.boundGitDirectory(
+		record.GitDirectory,
+		target.AgentID,
+	); err != nil {
+		return err
+	}
+	gitRoot, err := openRealPathRoot(record.GitDirectory)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open prepared private Git directory: %w",
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, gitRoot.Close())
+	}()
+	gitGuard, err := openRepositoryGuard(record.GitDirectory, gitRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, gitGuard.Close())
+	}()
+	if err := repository.verifyPreparationRefs(
+		ctx,
+		target,
+		!record.PreparationCommitted,
+	); err != nil {
+		return err
+	}
 	registered, exists, err := repository.worktreeRegistration(
 		ctx,
 		target.Path,
@@ -533,10 +688,13 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 			"workspace: prepared worktree registration disappeared",
 		)
 	}
-	if err := repository.verifyPreparedWorktree(
+	privateRepository := repository.withPrivateGitBinding(
+		record.GitDirectory,
+		gitRoot,
+	)
+	if err := privateRepository.verifyBoundPreparedWorktree(
 		ctx,
 		target,
-		record.GitDirectory,
 		registered,
 	); err != nil {
 		return err
@@ -554,6 +712,16 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 		bucket,
 		target.AgentID,
 		opened,
+	); err != nil {
+		return err
+	}
+	if err := verifyRealPathRoot(record.GitDirectory, gitRoot); err != nil {
+		return err
+	}
+	if err := repository.verifyPreparationRefs(
+		ctx,
+		target,
+		!record.PreparationCommitted,
 	); err != nil {
 		return err
 	}
