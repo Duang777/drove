@@ -178,6 +178,9 @@ func (m *Manager) ReconcilePreparations(
 				)
 			}
 			matched[record.AgentID] = struct{}{}
+			if record.Removal != nil {
+				continue
+			}
 			if err := m.acknowledgePreparation(target); err != nil {
 				return fmt.Errorf(
 					"workspace: adopt preparation for agent %q: %w",

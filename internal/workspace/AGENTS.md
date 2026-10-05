@@ -56,7 +56,8 @@
   reflog 世代同时匹配才提交删除，避免外部分支删除后同 OID 重建形成 ABA。session
   创建事件 durable 后必须调用 `AcknowledgePreparation`；
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
-  preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
+  preparation，其余工作区及本次新建分支全部回滚；匹配但已带 removal intent 的记录只
+  标记存在，交给后续 `ReconcileRemovals` 收敛。version 1/2 sidecar 兼容视为已提交。
   已提交的 version 5 sidecar 在重启采纳时仍必须重开 repository lease 并复核目标
   worktree 身份；只有仍持有进程内 preparation lease 的幂等确认允许快速返回。
   `AcknowledgePreparation` 在提交 sidecar 或清理 ownership ref 前必须重新验证当前目标

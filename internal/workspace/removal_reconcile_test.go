@@ -127,6 +127,72 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
+func TestReconcilePreparationsDefersExpectedRemoval(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	expected := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{expected},
+	); err != nil {
+		t.Fatalf("reconcile preparation with pending removal: %v", err)
+	}
+	record, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal == nil {
+		t.Fatalf(
+			"pending removal record = %+v, exists=%v err=%v",
+			record.Removal,
+			exists,
+			err,
+		)
+	}
+	removals, err := restarted.ReconcileRemovals(context.Background())
+	if err != nil {
+		t.Fatalf("reconcile removal: %v", err)
+	}
+	if len(removals) != 1 ||
+		removals[0].Workspace.AgentID != prepared.AgentID {
+		t.Fatalf("reconciled removals = %+v", removals)
+	}
+	if err := restarted.AcknowledgeRemoval(removals[0]); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
 func TestRemoveRechecksDirtyAfterQuarantine(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires a POSIX shell")
