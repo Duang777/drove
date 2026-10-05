@@ -365,8 +365,28 @@ func (s *Session) closeProcessGroup() {
 				s.cmd.Process.Pid,
 				s.grace,
 			)
+			if waitErr != nil {
+				closeErrors = append(
+					closeErrors,
+					fmt.Errorf("pty: wait for process group: %w", waitErr),
+				)
+			}
+			groupGone := exited
+			if !exited {
+				killFoundExited, killErr := killProcessGroupWith(
+					s.groupSignal,
+					s.cmd.Process.Pid,
+				)
+				groupGone = killFoundExited
+				if killErr != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf("pty: kill process group: %w", killErr),
+					)
+				}
+			}
 			if terminateErr != nil &&
-				!(exited && errors.Is(terminateErr, syscall.EPERM)) {
+				!(groupGone && errors.Is(terminateErr, syscall.EPERM)) {
 				closeErrors = append(
 					closeErrors,
 					fmt.Errorf(
@@ -374,23 +394,6 @@ func (s *Session) closeProcessGroup() {
 						terminateErr,
 					),
 				)
-			}
-			if waitErr != nil {
-				closeErrors = append(
-					closeErrors,
-					fmt.Errorf("pty: wait for process group: %w", waitErr),
-				)
-			}
-			if !exited {
-				if err := killProcessGroupWith(
-					s.groupSignal,
-					s.cmd.Process.Pid,
-				); err != nil {
-					closeErrors = append(
-						closeErrors,
-						fmt.Errorf("pty: kill process group: %w", err),
-					)
-				}
 			}
 		}
 		s.mu.Lock()

@@ -26,15 +26,19 @@ func terminateProcessGroupWith(signal processGroupSignalFunc, pid int) error {
 }
 
 func killProcessGroup(pid int) error {
-	return killProcessGroupWith(unixProcessGroupSignal, pid)
+	_, err := killProcessGroupWith(unixProcessGroupSignal, pid)
+	return err
 }
 
-func killProcessGroupWith(signal processGroupSignalFunc, pid int) error {
+func killProcessGroupWith(
+	signal processGroupSignalFunc,
+	pid int,
+) (bool, error) {
 	err := signal(pid, syscall.SIGKILL)
 	if errors.Is(err, syscall.ESRCH) {
-		return nil
+		return true, nil
 	}
-	return err
+	return false, err
 }
 
 func processGroupAlive(pid int) (bool, error) {

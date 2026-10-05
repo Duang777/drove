@@ -623,6 +623,48 @@ func TestCloseSuppressesTermPermissionErrorAfterProcessGroupExits(t *testing.T) 
 	}
 }
 
+func TestCloseSuppressesTermPermissionErrorWhenKillFindsExitedGroup(t *testing.T) {
+	const grace = time.Millisecond
+	var signalsMu sync.Mutex
+	var signals []syscall.Signal
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+		},
+		func(_ int, signal syscall.Signal) error {
+			signalsMu.Lock()
+			signals = append(signals, signal)
+			signalsMu.Unlock()
+			if signal == syscall.SIGKILL {
+				return syscall.ESRCH
+			}
+			return syscall.EPERM
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process group exit")
+	}
+	if closeErr := sess.Close(); closeErr != nil {
+		t.Fatalf("close after kill found exited group: %v", closeErr)
+	}
+
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	if len(signals) == 0 || signals[len(signals)-1] != syscall.SIGKILL {
+		t.Fatalf("signals = %v, want final SIGKILL probe", signals)
+	}
+}
+
 func TestCloseKillsRemainingProcessGroupChildren(t *testing.T) {
 	const grace = 75 * time.Millisecond
 	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
