@@ -1260,7 +1260,7 @@ func coalesceRecordAcknowledgementsAfterValidation(
 		)
 	}
 	for _, duplicate := range candidates[1:] {
-		directory, err := bucket.Open(".")
+		directory, err := openRecordDirectory(bucket)
 		if err != nil {
 			return recordAcknowledgement{}, err
 		}
