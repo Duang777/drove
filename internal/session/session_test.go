@@ -1164,6 +1164,46 @@ func TestResumeOnStartRunsEligibleAgentsInCreationOrderOnce(t *testing.T) {
 	}
 }
 
+func TestResumeOnStartRetriesFailedCandidate(t *testing.T) {
+	manager, _ := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	attempts := 0
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, errors.New("exec unavailable")
+		}
+		return &fakeProcessSession{}, nil
+	}
+
+	first := manager.ResumeOnStart(context.Background())
+	if len(first) != 1 ||
+		first[0].AgentID != managed.agent.ID() ||
+		first[0].Err == nil {
+		t.Fatalf("first startup resume results = %+v", first)
+	}
+	if !managed.shouldResumeOnStart() {
+		t.Fatal("failed startup resume consumed candidate")
+	}
+
+	second := manager.ResumeOnStart(context.Background())
+	if len(second) != 1 ||
+		second[0].AgentID != managed.agent.ID() ||
+		second[0].Err != nil {
+		t.Fatalf("second startup resume results = %+v", second)
+	}
+	if managed.shouldResumeOnStart() {
+		t.Fatal("successful startup resume retained candidate")
+	}
+	if third := manager.ResumeOnStart(context.Background()); len(third) != 0 {
+		t.Fatalf("third startup resume results = %+v, want none", third)
+	}
+}
+
 func TestNormalizeRunMode(t *testing.T) {
 	tests := []struct {
 		name    string

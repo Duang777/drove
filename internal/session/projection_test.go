@@ -398,6 +398,54 @@ func TestRecoveryProjectorPreservesResumeAfterPersistedRestartStop(
 			restartedPlan.Reconciliation,
 		)
 	}
+
+	nextSeq := uint64(len(rows) + 1)
+	rows = append(
+		rows,
+		store.EventRow{
+			Seq:       nextSeq,
+			Timestamp: base.Add(3 * time.Hour),
+			Type:      string(event.TypeAgentResumed),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "requested",
+			Payload:   `{"version":1,"vendor_session_ref":"resume-ref"}`,
+		},
+		store.EventRow{
+			Seq:       nextSeq + 1,
+			Timestamp: base.Add(3*time.Hour + time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "stopped",
+			To:        "starting",
+		},
+		store.EventRow{
+			Seq:       nextSeq + 2,
+			Timestamp: base.Add(3*time.Hour + 2*time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "starting",
+			To:        "stopped",
+			Reason:    "startup failed",
+			Payload: `{"version":1,"source":"process","event":"process_start_failed",` +
+				`"confidence":1}`,
+		},
+	)
+	failedResume := newRecoveryProjector()
+	for _, row := range rows {
+		if err := failedResume.Apply(row); err != nil {
+			t.Fatalf("apply failed resume seq %d: %v", row.Seq, err)
+		}
+	}
+	failedPlan, err := failedResume.Finish(base.Add(4 * time.Hour))
+	if err != nil {
+		t.Fatalf("finish failed resume projection: %v", err)
+	}
+	if !failedPlan.ResumeOnStart["agent-1"] {
+		t.Fatal("failed startup resume lost automatic resume intent")
+	}
 }
 
 func TestRecoveryProjectorDoesNotResumeCompletedSessionAfterRestartStop(

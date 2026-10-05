@@ -1187,9 +1187,6 @@ func (m *Manager) resumeOnStart(
 			}
 		}
 		managed, entry, ref, err := m.reserveResumeLocked(id)
-		if err == nil {
-			managed.consumeResumeOnStart()
-		}
 		m.mu.Unlock()
 		if err != nil {
 			m.endStart()
@@ -1197,6 +1194,9 @@ func (m *Manager) resumeOnStart(
 		}
 
 		_, err = m.resumeReserved(ctx, id, managed, entry, ref)
+		if err == nil {
+			managed.consumeResumeOnStart()
+		}
 		m.endStart()
 		return true, err
 	}

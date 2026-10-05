@@ -301,6 +301,7 @@ func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 		)
 	}
 	draft.workspaceRemoved = true
+	draft.restartStopped = false
 	return nil
 }
 
@@ -355,11 +356,18 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		p.report.PartialHistory++
 	}
 	draft.state = to
+	isRestartStop := to == agent.StateStopped &&
+		from != agent.StateDone &&
+		from != agent.StateStopped &&
+		row.Reason == restartStopReason
+	isFailedRestartResume := draft.restartStopped &&
+		from == agent.StateStarting &&
+		to == agent.StateStopped
+	isRestartResumeStarting := draft.restartStopped &&
+		from == agent.StateStopped &&
+		to == agent.StateStarting
 	draft.restartStopped =
-		to == agent.StateStopped &&
-			from != agent.StateDone &&
-			from != agent.StateStopped &&
-			row.Reason == restartStopReason
+		isRestartStop || isFailedRestartResume || isRestartResumeStarting
 	if known {
 		draft.lastTransition = evidence
 	}
