@@ -208,6 +208,83 @@ func (m *Manager) initializePreparedWorktree(
 	return nil
 }
 
+func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
+	ctx context.Context,
+	target Workspace,
+	record workspaceRecord,
+	repository repositoryCapability,
+) (result error) {
+	if record.GitDirectory == "" || record.DirectoryIdentity == "" {
+		return errors.New(
+			"workspace: prepared worktree identity is incomplete",
+		)
+	}
+	bucket, err := m.openManagedBucketRoot(target)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	opened, err := openRealRootFromRoot(bucket, target.AgentID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, opened.Close())
+	}()
+	directoryIdentity, err := openedDirectoryIdentity(opened)
+	if err != nil {
+		return err
+	}
+	if directoryIdentity != record.DirectoryIdentity {
+		return errors.New(
+			"workspace: prepared worktree directory identity changed",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	); err != nil {
+		return err
+	}
+	registered, exists, err := repository.worktreeRegistration(
+		ctx,
+		target.Path,
+	)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New(
+			"workspace: prepared worktree registration disappeared",
+		)
+	}
+	if err := repository.verifyPreparedWorktree(
+		ctx,
+		target,
+		record.GitDirectory,
+		registered,
+	); err != nil {
+		return err
+	}
+	currentIdentity, err := openedDirectoryIdentity(opened)
+	if err != nil {
+		return err
+	}
+	if currentIdentity != record.DirectoryIdentity {
+		return errors.New(
+			"workspace: prepared worktree directory identity changed while acknowledging",
+		)
+	}
+	return verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	)
+}
+
 func (m *Manager) worktreeGitDirectoryAtRoot(
 	ctx context.Context,
 	path string,

@@ -119,6 +119,7 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	if err := os.Mkdir(target.Path, 0o700); err != nil {
 		t.Fatalf("create destination: %v", err)
 	}
+	runGit(t, target.Path, "init")
 	destination, err := openRealPathRoot(target.Path)
 	if err != nil {
 		t.Fatalf("open destination: %v", err)
@@ -146,7 +147,8 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 		t.Fatalf("write replacement source: %v", err)
 	}
 
-	if err := manager.copyIncludedFiles(
+	if _, err := manager.copyIncludedFiles(
+		context.Background(),
 		source,
 		target,
 		[]string{"secret"},
@@ -216,7 +218,8 @@ func TestCopyIncludedFilesRejectsReplacementTargetIdentity(t *testing.T) {
 		t.Fatalf("create replacement destination: %v", err)
 	}
 
-	if err := manager.copyIncludedFiles(
+	if _, err := manager.copyIncludedFiles(
+		context.Background(),
 		source,
 		target,
 		[]string{"secret"},
@@ -431,8 +434,11 @@ func TestCopyIncludedPathRejectsSymlinkedDestinationParent(t *testing.T) {
 
 func TestCopyIncludedPathDoesNotFollowMovedDestinationRoot(t *testing.T) {
 	sourcePath := t.TempDir()
+	if err := os.Mkdir(filepath.Join(sourcePath, "nested"), 0o700); err != nil {
+		t.Fatalf("create source parent: %v", err)
+	}
 	if err := os.WriteFile(
-		filepath.Join(sourcePath, "secret"),
+		filepath.Join(sourcePath, "nested", "secret"),
 		[]byte("inside\n"),
 		0o600,
 	); err != nil {
@@ -472,12 +478,19 @@ func TestCopyIncludedPathDoesNotFollowMovedDestinationRoot(t *testing.T) {
 		destinationBucket,
 		destination,
 		destinationName,
-		"secret",
+		"nested/secret",
 	)
 	if err == nil {
 		t.Fatal("copy accepted a moved destination workspace")
 	}
-	if _, err := os.Lstat(filepath.Join(outsidePath, "secret")); !errors.Is(
+	if _, err := os.Lstat(
+		filepath.Join(destinationPath, "nested"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("copy created a replacement destination parent: %v", err)
+	}
+	if _, err := os.Lstat(
+		filepath.Join(outsidePath, "nested", "secret"),
+	); !errors.Is(
 		err,
 		os.ErrNotExist,
 	) {

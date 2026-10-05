@@ -54,6 +54,23 @@ func (m *Manager) acknowledgePreparation(
 			result = errors.Join(result, lease.Close())
 		}()
 	}
+	verifyCtx, cancelVerify := context.WithTimeout(
+		context.Background(),
+		10*time.Second,
+	)
+	verifyErr := m.verifyPreparedWorktreeForAcknowledgement(
+		verifyCtx,
+		record.workspace(),
+		record,
+		lease.repository,
+	)
+	cancelVerify()
+	if verifyErr != nil {
+		return fmt.Errorf(
+			"workspace: verify preparation acknowledgement: %w",
+			verifyErr,
+		)
+	}
 	if !record.PreparationCommitted {
 		record.PreparationCommitted = true
 		if err := m.replaceWorkspaceRecord(record); err != nil {

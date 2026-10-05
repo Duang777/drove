@@ -578,6 +578,64 @@ func TestAcknowledgePreparationClearsBranchOwnershipMarker(t *testing.T) {
 	}
 }
 
+func TestAcknowledgePreparationRejectsReplacementTarget(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move prepared target: %v", err)
+	}
+	if err := os.Mkdir(prepared.Path, 0o700); err != nil {
+		t.Fatalf("create replacement target: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if err := manager.AcknowledgePreparation(prepared); err == nil {
+		t.Fatal("acknowledgement accepted a replacement target")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if record.PreparationCommitted || record.BranchOperationID == "" {
+		t.Fatalf("failed acknowledgement changed record: %+v", record)
+	}
+	marker, err := manager.branchOwnershipMarkerExists(
+		context.Background(),
+		repository,
+		prepared.branchOperationID,
+	)
+	if err != nil || !marker {
+		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+
+	if err := os.RemoveAll(prepared.Path); err != nil {
+		t.Fatalf("remove replacement target: %v", err)
+	}
+	if err := os.Rename(originalPath, prepared.Path); err != nil {
+		t.Fatalf("restore prepared target: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge restored target: %v", err)
+	}
+}
+
 func TestAcknowledgePreparationDoesNotOverwriteConcurrentRemoval(
 	t *testing.T,
 ) {

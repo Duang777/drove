@@ -381,6 +381,42 @@ func verifyRemovalMarker(
 	return nil
 }
 
+func removeRemovalMarkerIfPresent(
+	root *os.Root,
+	record workspaceRecord,
+) error {
+	name := removalMarkerName(record)
+	_, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("workspace: inspect removal marker: %w", err)
+	}
+	if err := verifyRemovalMarker(root, record); err != nil {
+		return err
+	}
+	if err := root.Remove(name); err != nil {
+		return fmt.Errorf("workspace: remove removal marker: %w", err)
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open removal marker directory: %w",
+			err,
+		)
+	}
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf(
+			"workspace: sync removal marker deletion: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 func findRemovalQuarantine(
 	bucket *os.Root,
 	record workspaceRecord,

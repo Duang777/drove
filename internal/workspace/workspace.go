@@ -449,7 +449,13 @@ func (m *Manager) prepare(
 			),
 		)
 	}
-	if err := m.copyIncludedFiles(sourceRoot, result, includedPaths); err != nil {
+	copiedPaths, err := m.copyIncludedFiles(
+		ctx,
+		sourceRoot,
+		result,
+		includedPaths,
+	)
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return Workspace{}, errors.Join(
@@ -461,6 +467,35 @@ func (m *Manager) prepare(
 				true,
 			),
 		)
+	}
+	if len(copiedPaths) != len(includedPaths) {
+		record, exists, err := m.readWorkspaceRecord(result.Path)
+		if err == nil && !exists {
+			err = errors.New("workspace: preparation record is missing")
+		}
+		if err == nil {
+			record.IncludedPaths = append([]string{}, copiedPaths...)
+			err = m.replaceWorkspaceRecord(record)
+		}
+		if err != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			return Workspace{}, errors.Join(
+				fmt.Errorf(
+					"workspace: persist copied include paths: %w",
+					err,
+				),
+				m.discardWithRepository(
+					cleanupCtx,
+					result,
+					sourceRepository,
+					true,
+				),
+			)
+		}
 	}
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -476,7 +511,7 @@ func (m *Manager) prepare(
 		)
 	}
 	result.protectionKnown = true
-	result.includedPaths = append([]string(nil), includedPaths...)
+	result.includedPaths = append([]string(nil), copiedPaths...)
 	result.preparation = lease
 	leaseReturned = true
 	return result, nil

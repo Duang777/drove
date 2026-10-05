@@ -1493,6 +1493,58 @@ func TestAcknowledgeRemovalRecoversQuarantinedRecord(t *testing.T) {
 	}
 }
 
+func TestRemoveRecoversQuarantinedAcknowledgementRecord(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	recordPath := workspaceRecordPath(prepared.Path)
+	quarantineName := recordAcknowledgementPrefix(
+		prepared.AgentID,
+		result.Removal.operationID,
+	) + "68686868-6868-4868-8868-686868686868"
+	quarantinePath := filepath.Join(filepath.Dir(recordPath), quarantineName)
+	if err := os.Rename(recordPath, quarantinePath); err != nil {
+		t.Fatalf("quarantine removal record: %v", err)
+	}
+
+	retried, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || retried.State != RemovalComplete {
+		t.Fatalf("retry removal = %+v, %v", retried, err)
+	}
+	if retried.Removal.operationID != result.Removal.operationID {
+		t.Fatalf(
+			"retried operation ID = %q, want %q",
+			retried.Removal.operationID,
+			result.Removal.operationID,
+		)
+	}
+	if err := manager.AcknowledgeRemoval(retried.Removal); err != nil {
+		t.Fatalf("acknowledge retried removal: %v", err)
+	}
+	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("acknowledgement quarantine remains or inspect failed: %v", err)
+	}
+}
+
 func TestStaleAcknowledgementPreservesNewWorkspaceRecord(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

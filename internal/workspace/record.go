@@ -906,6 +906,148 @@ func recordAcknowledgementPrefix(
 		operationID + "-"
 }
 
+func recordAcknowledgementIdentity(
+	name string,
+) (agentID string, operationID string, ok bool) {
+	const acknowledgementMarker = workspaceRecordSuffix + ".ack-"
+	if !strings.HasPrefix(name, ".") {
+		return "", "", false
+	}
+	raw := strings.TrimPrefix(name, ".")
+	index := strings.Index(raw, acknowledgementMarker)
+	if index < 0 {
+		return "", "", false
+	}
+	agentID = raw[:index]
+	if validateAgentID(agentID) != nil {
+		return "", "", false
+	}
+	suffix := raw[index+len(acknowledgementMarker):]
+	if len(suffix) != 73 || suffix[36] != '-' {
+		return "", "", false
+	}
+	operationID = suffix[:36]
+	operation, err := uuid.Parse(operationID)
+	if err != nil || operation.String() != operationID {
+		return "", "", false
+	}
+	nonce, err := uuid.Parse(suffix[37:])
+	if err != nil || nonce.String() != suffix[37:] {
+		return "", "", false
+	}
+	return agentID, operationID, true
+}
+
+func (m *Manager) recoverRecordAcknowledgements() (result error) {
+	root, err := m.openWorktreeRoot()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, root.Close())
+	}()
+	buckets, err := readRootDirectory(root)
+	if err != nil {
+		return fmt.Errorf("workspace: read worktree root: %w", err)
+	}
+	for _, bucket := range buckets {
+		if !validRepositoryHash(bucket.Name()) {
+			continue
+		}
+		bucketRoot, err := openRealRootFromRoot(root, bucket.Name())
+		if err != nil {
+			return err
+		}
+		if err := m.verifyRepositoryBucket(bucket.Name(), bucketRoot); err != nil {
+			_ = bucketRoot.Close()
+			return err
+		}
+		entries, err := readRootDirectory(bucketRoot)
+		if err != nil {
+			_ = bucketRoot.Close()
+			return err
+		}
+		normalRecords := make(map[string]struct{})
+		type acknowledgement struct {
+			name        string
+			operationID string
+		}
+		acknowledgements := make(map[string][]acknowledgement)
+		for _, entry := range entries {
+			if agentID, ok := workspaceRecordAgentID(entry.Name()); ok {
+				normalRecords[agentID] = struct{}{}
+				continue
+			}
+			agentID, operationID, ok := recordAcknowledgementIdentity(
+				entry.Name(),
+			)
+			if !ok {
+				continue
+			}
+			acknowledgements[agentID] = append(
+				acknowledgements[agentID],
+				acknowledgement{
+					name:        entry.Name(),
+					operationID: operationID,
+				},
+			)
+		}
+		for agentID, candidates := range acknowledgements {
+			if _, exists := normalRecords[agentID]; exists {
+				continue
+			}
+			if len(candidates) != 1 {
+				_ = bucketRoot.Close()
+				return fmt.Errorf(
+					"workspace: agent %q has %d acknowledgement records",
+					agentID,
+					len(candidates),
+				)
+			}
+			candidate := candidates[0]
+			name := agentID + workspaceRecordSuffix
+			if err := restoreRecordAcknowledgement(
+				bucketRoot,
+				candidate.name,
+				name,
+			); err != nil {
+				_ = bucketRoot.Close()
+				return fmt.Errorf(
+					"workspace: recover acknowledgement for agent %q: %w",
+					agentID,
+					err,
+				)
+			}
+			path := filepath.Join(m.root, bucket.Name(), agentID)
+			record, exists, err := m.readWorkspaceRecordFromBucket(
+				bucketRoot,
+				agentID,
+				path,
+			)
+			if err != nil {
+				_ = bucketRoot.Close()
+				return err
+			}
+			if !exists ||
+				record.Removal == nil ||
+				record.Removal.OperationID != candidate.operationID {
+				_ = bucketRoot.Close()
+				return fmt.Errorf(
+					"workspace: recovered acknowledgement for agent %q does not match its record",
+					agentID,
+				)
+			}
+		}
+		if err := bucketRoot.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func findRecordAcknowledgementQuarantine(
 	bucket *os.Root,
 	agentID string,

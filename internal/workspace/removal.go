@@ -37,6 +37,14 @@ type RemovalResult struct {
 	State   RemovalState
 }
 
+func workspaceForRemoval(record workspaceRecord) Workspace {
+	target := record.workspace()
+	if record.Version < workspaceRecordVersion {
+		target.repositoryEvidence = nil
+	}
+	return target
+}
+
 // Remove removes one managed worktree and preserves its branch.
 func (m *Manager) Remove(
 	ctx context.Context,
@@ -78,7 +86,7 @@ func (m *Manager) remove(
 		}
 	}
 
-	removal := Removal{Workspace: record.workspace()}
+	removal := Removal{Workspace: workspaceForRemoval(record)}
 	if record.Removal != nil {
 		removal.operationID = record.Removal.OperationID
 		if force && !record.Removal.Force {
@@ -149,6 +157,9 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if err := m.recoverRecordAcknowledgements(); err != nil {
+		return nil, err
+	}
 	records, err := m.workspaceRecords()
 	if err != nil {
 		return nil, err
@@ -172,7 +183,7 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 			)
 		}
 		completed = append(completed, Removal{
-			Workspace:   record.workspace(),
+			Workspace:   workspaceForRemoval(record),
 			operationID: record.Removal.OperationID,
 		})
 	}
@@ -229,10 +240,34 @@ type removalFacts struct {
 	registration   registeredWorktree
 }
 
+func (m *Manager) removalRepository(
+	ctx context.Context,
+	record workspaceRecord,
+) (repositoryCapability, func() error, error) {
+	if record.Version < workspaceRecordVersion ||
+		record.RepositoryEvidence == nil {
+		return pathRepositoryCapability(m, record.Repository),
+			func() error { return nil },
+			nil
+	}
+	lease, err := openRecordedPreparationLease(ctx, m, record)
+	if err != nil {
+		return repositoryCapability{}, nil, err
+	}
+	return lease.repository, lease.Close, nil
+}
+
 func (m *Manager) removalFacts(
 	ctx context.Context,
 	record workspaceRecord,
 ) (_ removalFacts, result error) {
+	repository, closeRepository, err := m.removalRepository(ctx, record)
+	if err != nil {
+		return removalFacts{}, err
+	}
+	defer func() {
+		result = errors.Join(result, closeRepository())
+	}()
 	bucket, err := m.openManagedBucketRoot(record.workspace())
 	if err != nil {
 		return removalFacts{}, err
@@ -266,9 +301,8 @@ func (m *Manager) removalFacts(
 			)
 		}
 	}
-	registration, registered, err := m.worktreeRegistration(
+	registration, registered, err := repository.worktreeRegistration(
 		ctx,
-		record.Repository,
 		record.Path,
 	)
 	if err != nil {
@@ -383,15 +417,13 @@ func (m *Manager) completeRemoval(
 		}
 	}
 	if facts.registered {
-		if _, err := m.run(
-			ctx,
-			"-C",
-			record.Repository,
-			"worktree",
-			"prune",
-			"--expire",
-			"now",
-		); err != nil {
+		repository, closeRepository, err := m.removalRepository(ctx, record)
+		if err != nil {
+			return RemovalPending, err
+		}
+		pruneErr := repository.pruneWorktrees(ctx)
+		closeErr := closeRepository()
+		if err := errors.Join(pruneErr, closeErr); err != nil {
 			return m.classifyRemovalFailure(
 				record,
 				fmt.Errorf(
@@ -791,6 +823,53 @@ func (m *Manager) rejectQuarantinedRemoval(
 	return m.rejectPendingRemoval(record, facts, safetyErr)
 }
 
+func (m *Manager) clearPendingRemovalMarker(
+	record workspaceRecord,
+) (result error) {
+	if record.Removal == nil {
+		return errors.New("workspace: removal intent is missing")
+	}
+	bucket, err := m.openManagedBucketRoot(record.workspace())
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	opened, err := openRealRootFromRoot(bucket, record.AgentID)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, opened.Close())
+	}()
+	directoryIdentity, err := openedDirectoryIdentity(opened)
+	if err != nil {
+		return err
+	}
+	if record.DirectoryIdentity == "" ||
+		directoryIdentity != record.DirectoryIdentity {
+		return errors.New(
+			"workspace: pending removal directory identity changed",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		record.AgentID,
+		opened,
+	); err != nil {
+		return err
+	}
+	if err := removeRemovalMarkerIfPresent(opened, record); err != nil {
+		return err
+	}
+	return verifyRootEntryUnchanged(
+		bucket,
+		record.AgentID,
+		opened,
+	)
+}
+
 func (m *Manager) rejectPendingRemoval(
 	record workspaceRecord,
 	facts removalFacts,
@@ -808,6 +887,9 @@ func (m *Manager) rejectPendingRemoval(
 		!facts.pathExists ||
 		!facts.registered {
 		return RemovalPending, wrapped
+	}
+	if err := m.clearPendingRemovalMarker(record); err != nil {
+		return RemovalPending, errors.Join(wrapped, err)
 	}
 	record.Removal = nil
 	if err := m.replaceWorkspaceRecord(record); err != nil {
@@ -837,6 +919,9 @@ func (m *Manager) classifyRemovalFailure(
 func (m *Manager) findWorkspaceRecord(
 	agentID string,
 ) (workspaceRecord, bool, error) {
+	if err := m.recoverRecordAcknowledgements(); err != nil {
+		return workspaceRecord{}, false, err
+	}
 	records, err := m.workspaceRecords()
 	if err != nil {
 		return workspaceRecord{}, false, err

@@ -20,13 +20,17 @@ const (
 )
 
 func (m *Manager) copyIncludedFiles(
+	ctx context.Context,
 	source *os.Root,
 	target Workspace,
 	paths []string,
-) (result error) {
+) (_ []string, result error) {
 	destinationBucket, err := m.openManagedBucketRoot(target)
 	if err != nil {
-		return fmt.Errorf("workspace: open include destination bucket: %w", err)
+		return nil, fmt.Errorf(
+			"workspace: open include destination bucket: %w",
+			err,
+		)
 	}
 	defer func() {
 		result = errors.Join(result, destinationBucket.Close())
@@ -36,25 +40,28 @@ func (m *Manager) copyIncludedFiles(
 		target.AgentID,
 	)
 	if err != nil {
-		return fmt.Errorf("workspace: open include destination root: %w", err)
+		return nil, fmt.Errorf(
+			"workspace: open include destination root: %w",
+			err,
+		)
 	}
 	defer func() {
 		result = errors.Join(result, destination.Close())
 	}()
 	if target.directoryIdentity == "" {
-		return errors.New(
+		return nil, errors.New(
 			"workspace: include destination identity is unavailable",
 		)
 	}
 	destinationIdentity, err := openedDirectoryIdentity(destination)
 	if err != nil {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"workspace: inspect include destination identity: %w",
 			err,
 		)
 	}
 	if destinationIdentity != target.directoryIdentity {
-		return errors.New(
+		return nil, errors.New(
 			"workspace: include destination identity changed",
 		)
 	}
@@ -63,10 +70,26 @@ func (m *Manager) copyIncludedFiles(
 		target.AgentID,
 		destination,
 	); err != nil {
-		return fmt.Errorf("workspace: verify include destination: %w", err)
+		return nil, fmt.Errorf(
+			"workspace: verify include destination: %w",
+			err,
+		)
 	}
 
+	copiedPaths := make([]string, 0, len(paths))
 	for _, relative := range paths {
+		tracked, err := m.worktreePathTracked(
+			ctx,
+			target.Path,
+			destination,
+			relative,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if tracked {
+			continue
+		}
 		if err := copyIncludedPath(
 			source,
 			destinationBucket,
@@ -74,18 +97,23 @@ func (m *Manager) copyIncludedFiles(
 			target.AgentID,
 			relative,
 		); err != nil {
-			return fmt.Errorf("workspace: copy included path %q: %w", relative, err)
+			return nil, fmt.Errorf(
+				"workspace: copy included path %q: %w",
+				relative,
+				err,
+			)
 		}
+		copiedPaths = append(copiedPaths, relative)
 	}
 	destinationIdentity, err = openedDirectoryIdentity(destination)
 	if err != nil {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"workspace: reinspect include destination identity: %w",
 			err,
 		)
 	}
 	if destinationIdentity != target.directoryIdentity {
-		return errors.New(
+		return nil, errors.New(
 			"workspace: include destination identity changed while copying",
 		)
 	}
@@ -94,9 +122,41 @@ func (m *Manager) copyIncludedFiles(
 		target.AgentID,
 		destination,
 	); err != nil {
-		return fmt.Errorf("workspace: reverify include destination: %w", err)
+		return nil, fmt.Errorf(
+			"workspace: reverify include destination: %w",
+			err,
+		)
 	}
-	return nil
+	return copiedPaths, nil
+}
+
+func (m *Manager) worktreePathTracked(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	relative string,
+) (bool, error) {
+	_, err := m.runRootedGit(
+		ctx,
+		path,
+		root,
+		"ls-files",
+		"--error-unmatch",
+		"--",
+		filepath.ToSlash(relative),
+	)
+	switch {
+	case err == nil:
+		return true, nil
+	case isExitCode(err, 1):
+		return false, nil
+	default:
+		return false, fmt.Errorf(
+			"workspace: inspect target include path %q: %w",
+			relative,
+			err,
+		)
+	}
 }
 
 func (m *Manager) includedPaths(
@@ -503,10 +563,9 @@ func copyIncludedPath(
 		return errors.New("source changed while opening")
 	}
 
-	parentName := filepath.Clean(filepath.Join(destinationName, directory))
 	destinationParent, destinationOwned, err := openIncludedParent(
-		destinationBucket,
-		parentName,
+		destinationRoot,
+		directory,
 		true,
 	)
 	if err != nil {
@@ -525,8 +584,8 @@ func copyIncludedPath(
 		return fmt.Errorf("verify destination workspace: %w", err)
 	}
 	if err := verifyRootEntryUnchanged(
-		destinationBucket,
-		parentName,
+		destinationRoot,
+		directory,
 		destinationParent,
 	); err != nil {
 		return fmt.Errorf("verify destination parent: %w", err)
@@ -583,8 +642,8 @@ func copyIncludedPath(
 		return fmt.Errorf("verify destination workspace: %w", err)
 	}
 	if err := verifyRootEntryUnchanged(
-		destinationBucket,
-		parentName,
+		destinationRoot,
+		directory,
 		destinationParent,
 	); err != nil {
 		return fmt.Errorf("verify destination parent: %w", err)
@@ -628,8 +687,8 @@ func copyIncludedPath(
 		return fmt.Errorf("reverify destination workspace: %w", err)
 	}
 	if err := verifyRootEntryUnchanged(
-		destinationBucket,
-		parentName,
+		destinationRoot,
+		directory,
 		destinationParent,
 	); err != nil {
 		return fmt.Errorf("reverify destination parent: %w", err)

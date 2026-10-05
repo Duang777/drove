@@ -1056,8 +1056,18 @@ func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
 		OperationID:    "99999999-9999-4999-8999-999999999999",
 		DirectoryToken: "98989898-9898-4898-8989-989898989898",
 	}
+	markerName := removalMarkerName(record)
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
+	}
+	root, err := openRealPathRoot(prepared.Path)
+	if err != nil {
+		t.Fatalf("open worktree for removal marker: %v", err)
+	}
+	markerErr := ensureRemovalMarker(root, record)
+	closeErr := root.Close()
+	if err := errors.Join(markerErr, closeErr); err != nil {
+		t.Fatalf("install removal marker: %v", err)
 	}
 	if err := os.WriteFile(
 		filepath.Join(prepared.Path, "tracked.txt"),
@@ -1080,6 +1090,11 @@ func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
 		filepath.Join(prepared.Path, "tracked.txt"),
 		"changed after intent\n",
 	)
+	if _, err := os.Lstat(
+		filepath.Join(prepared.Path, markerName),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected removal marker remains: %v", err)
+	}
 }
 
 func TestRemoveUpgradesExistingIntentToForce(t *testing.T) {
@@ -1540,6 +1555,69 @@ func TestPrepareUsesExistingBranchAndDiscardPreservesIt(t *testing.T) {
 		t.Fatalf("discard existing branch worktree: %v", err)
 	}
 	runGit(t, repository, "show-ref", "--verify", "refs/heads/existing")
+}
+
+func TestPrepareSkipsIncludeTrackedByTargetBranch(t *testing.T) {
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, "local.env"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write tracked target file: %v", err)
+	}
+	runGit(t, repository, "add", "local.env")
+	runGit(t, repository, "commit", "-m", "track target local file")
+	runGit(t, repository, "branch", "target-with-local-file")
+	runGit(t, repository, "rm", "local.env")
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("local.env\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local file on source")
+	if err := os.WriteFile(
+		filepath.Join(repository, ".worktreeinclude"),
+		[]byte("local.env\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, "local.env"),
+		[]byte("source-local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source local file: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"target-with-local-file",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare target branch: %v", err)
+	}
+	assertFileContents(t, filepath.Join(prepared.Path, "local.env"), "tracked\n")
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if len(record.IncludedPaths) != 0 {
+		t.Fatalf("protected include paths = %q, want none", record.IncludedPaths)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard target branch worktree: %v", err)
+	}
 }
 
 func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {

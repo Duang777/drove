@@ -27,7 +27,9 @@
   只有该文件匹配的未跟踪文件会复制到新 worktree，普通未跟踪文件不会复制；匹配项
   必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 4+
   sidecar 中；复制入口和出口都必须把重新打开的目标目录与 sidecar 目录身份比对，
-  后续 dirty 检查不得重新解释目标 worktree 的 manifest。
+  目标分支已跟踪的候选项不复制，sidecar 最终只保留实际复制路径；后续 dirty 检查
+  不得重新解释目标 worktree 的 manifest。目标父目录必须从已固定 worktree root
+  向下创建，不能从 repository bucket 重新解析可替换的公开路径。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
   sidecar，并在受约束 repository bucket 内预创建空目标目录、固定目录身份、同步父目录
   后把身份写回 sidecar。每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager
@@ -49,6 +51,8 @@
   创建事件 durable 后必须调用 `AcknowledgePreparation`；
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
+  `AcknowledgePreparation` 在提交 sidecar 或清理 ownership ref 前必须重新验证当前目标
+  目录身份、Git registration 与私有 Git directory；不能只信 session 携带的历史值。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
   dirty 状态。每个成功创建的 worktree 都有同目录私有记录，用于识别 detached HEAD
   和修复目录已丢失但 Git 注册仍存在的情况。路径存在时必须同时匹配记录中的 Git
@@ -70,7 +74,11 @@
   token 与已打开句柄；`Started` 不代表隔离路径永久可信，且 Started 状态只允许验证
   既有 token，禁止为当前路径重新创建 marker。新 intent 会记录创建时原路径是否已缺失；此后同名路径出现
   时必须 fail-stop，禁止把替代目录当成旧 workspace 删除。version 2 的历史 removal
-  intent 兼容视为已开始。清理始终保留分支。
+  intent 兼容视为已开始。version 5 removal 的 registration 查询与 prune 必须通过
+  sidecar repository evidence 重开的 capability；拒绝未开始的 removal 时必须先验证并
+  持久删除目录 marker，再清除 intent。ack sidecar 隔离名在正式记录缺失时必须按
+  Agent ID 恢复并回读 operation ID，使 session 重试和重启 reconciliation 能继续；
+  正式记录已存在时不得恢复旧 ack。清理始终保留分支。
 - Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
   因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。
 - Manager 初始化时固定既有 data directory、worktrees root 和 repository bucket 的

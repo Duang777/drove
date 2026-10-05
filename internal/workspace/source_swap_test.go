@@ -549,6 +549,82 @@ func TestAcknowledgeUsesRetainedRepositoryAfterPrepareSourceSwap(
 	}
 }
 
+func TestReconcileRemovalRejectsReplacementSourceRepository(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge workspace: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper-prune-failure")
+	script := `#!/bin/sh
+saw_worktree=
+for argument in "$@"; do
+  if [ "$saw_worktree" = "1" ] && [ "$argument" = "prune" ]; then
+    exit 97
+  fi
+  [ "$argument" = "worktree" ] && saw_worktree=1
+done
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err == nil || result.State != RemovalPending {
+		t.Fatalf("removal with prune failure = %+v, err=%v", result, err)
+	}
+	manager.git = realGit
+	if err := os.Rename(source, openedSource); err != nil {
+		t.Fatalf("move source repository: %v", err)
+	}
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatalf("install replacement repository: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(context.Background()); err == nil {
+		t.Fatal("removal reconciliation accepted a replacement repository")
+	}
+	if listing := runGit(
+		t,
+		openedSource,
+		"worktree",
+		"list",
+		"--porcelain",
+	); !strings.Contains(listing, prepared.Path) {
+		t.Fatal("original repository registration was unexpectedly pruned")
+	}
+	assertPreparationRefsAbsent(t, source, prepared.Branch)
+}
+
 func TestAcknowledgeUsesRetainedCommonGitDirectoryAfterReplacement(
 	t *testing.T,
 ) {
