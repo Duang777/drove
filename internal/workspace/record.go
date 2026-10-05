@@ -771,6 +771,13 @@ func validDirectoryIdentity(identity string) bool {
 
 func (m *Manager) removeWorkspaceRecord(
 	worktreePath string,
+) error {
+	return m.removeWorkspaceRecordAfterValidation(worktreePath, nil)
+}
+
+func (m *Manager) removeWorkspaceRecordAfterValidation(
+	worktreePath string,
+	afterValidation func(),
 ) (result error) {
 	recordPath := workspaceRecordPath(worktreePath)
 	bucket, agentID, err := m.openRecordBucket(worktreePath)
@@ -801,8 +808,75 @@ func (m *Manager) removeWorkspaceRecord(
 			recordPath,
 		)
 	}
-	if err := bucket.Remove(name); err != nil {
-		return fmt.Errorf("workspace: remove record %q: %w", recordPath, err)
+	opened, err := bucket.Open(name)
+	if err != nil {
+		return fmt.Errorf("workspace: open record %q: %w", recordPath, err)
+	}
+	defer func() {
+		result = errors.Join(result, opened.Close())
+	}()
+	openedInfo, err := opened.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect opened record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return fmt.Errorf(
+			"workspace: record %q changed while opening",
+			recordPath,
+		)
+	}
+	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
+		return err
+	}
+	directory, err := openRecordDirectory(bucket)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open record directory %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	isolatedName := ".drove-record-remove-" + uuid.NewString()
+	isolated, isolateErr := isolateRecordPathIfSame(
+		bucket,
+		directory,
+		name,
+		isolatedName,
+		opened,
+		afterValidation,
+	)
+	syncErr := syncRecordDirectory(directory)
+	closeErr := directory.Close()
+	if err := errors.Join(isolateErr, syncErr, closeErr); err != nil {
+		return fmt.Errorf(
+			"workspace: isolate record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	if !isolated {
+		return fmt.Errorf(
+			"workspace: record %q was not isolated",
+			recordPath,
+		)
+	}
+	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
+		return err
+	}
+	if err := removeRecordPathIfSame(
+		bucket,
+		isolatedName,
+		opened,
+	); err != nil {
+		return fmt.Errorf(
+			"workspace: remove isolated record %q: %w",
+			recordPath,
+			err,
+		)
 	}
 	return syncRecordBucket(bucket, recordPath)
 }

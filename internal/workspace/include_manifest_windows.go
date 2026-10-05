@@ -3,14 +3,69 @@
 package workspace
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+
+	"golang.org/x/sys/windows"
 )
 
 func configureIncludeManifestCommand(
 	_ *exec.Cmd,
-	_ *os.File,
+	manifest *os.File,
 	path string,
-) (string, bool, error) {
-	return path, false, nil
+) (string, bool, func() error, error) {
+	expected, err := manifest.Stat()
+	if err != nil {
+		return "", false, nil, fmt.Errorf(
+			"workspace: inspect opened include manifest: %w",
+			err,
+		)
+	}
+	name, err := windows.UTF16PtrFromString(filepath.Clean(path))
+	if err != nil {
+		return "", false, nil, fmt.Errorf(
+			"workspace: encode include manifest path: %w",
+			err,
+		)
+	}
+	handle, err := windows.CreateFile(
+		name,
+		windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return "", false, nil, fmt.Errorf(
+			"workspace: lock include manifest: %w",
+			err,
+		)
+	}
+	guard := os.NewFile(uintptr(handle), path)
+	if guard == nil {
+		_ = windows.CloseHandle(handle)
+		return "", false, nil, errors.New(
+			"workspace: wrap include manifest guard",
+		)
+	}
+	locked, err := guard.Stat()
+	if err != nil {
+		_ = guard.Close()
+		return "", false, nil, fmt.Errorf(
+			"workspace: inspect locked include manifest: %w",
+			err,
+		)
+	}
+	if !locked.Mode().IsRegular() || !os.SameFile(expected, locked) {
+		_ = guard.Close()
+		return "", false, nil, errors.New(
+			"workspace: include manifest changed while locking",
+		)
+	}
+	return path, false, guard.Close, nil
 }

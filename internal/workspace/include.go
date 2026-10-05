@@ -425,14 +425,18 @@ func (m *Manager) runIncludeManifest(
 		defer func() {
 			commandResult = errors.Join(commandResult, cleanup())
 		}()
-		excludePath, unlinkBeforeRun, err := configureIncludeManifestCommand(
-			command,
-			reader,
-			manifestPath,
-		)
+		excludePath, unlinkBeforeRun, cleanupManifest, err :=
+			configureIncludeManifestCommand(
+				command,
+				reader,
+				manifestPath,
+			)
 		if err != nil {
 			return nil, err
 		}
+		defer func() {
+			commandResult = errors.Join(commandResult, cleanupManifest())
+		}()
 		if unlinkBeforeRun && name != "" {
 			if err := root.Remove(name); err != nil {
 				return nil, fmt.Errorf(
