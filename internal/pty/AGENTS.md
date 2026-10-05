@@ -22,6 +22,8 @@
   SIGTERM，等待 `Config.TerminationGrace`，超时再发送 SIGKILL。默认宽限 5 秒。
 - 直接子进程自然退出后也通过同一个幂等步骤清理仍存活的进程组后代，避免遗留
   继承 PTY 的 helper；主动关闭与自然退出不得重复或交叉执行信号升级。
+- Unix 进程组在存活探测与发送信号之间消失时，`ESRCH` 与 Darwin 返回的 `EPERM`
+  都按幂等完成处理；禁止继续操作可能已复用的外部进程组。
 - PTY master 只在直接子进程已回收后关闭；`Close` 幂等，并等待读取、进程退出和
   全部回调及 writer 完成。自然退出仍在读取结束后关闭 master，并与主动关闭共享
   唯一的 master close。
