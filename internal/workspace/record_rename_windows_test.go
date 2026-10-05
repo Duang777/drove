@@ -197,7 +197,7 @@ func TestRenameWindowsHandleAcceptsReadOnlyFile(t *testing.T) {
 	assertFileContents(t, filepath.Join(rootPath, "target"), "source\n")
 }
 
-func TestMoveRecordFileFlushesThroughRenameHandle(t *testing.T) {
+func TestMoveRecordFileAcceptsReadOnlySourceHandle(t *testing.T) {
 	rootPath := t.TempDir()
 	if err := os.WriteFile(
 		filepath.Join(rootPath, "source"),
