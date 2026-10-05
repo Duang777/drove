@@ -937,6 +937,47 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 	)
 }
 
+func (m *Manager) removalAcknowledgementPending(
+	removal Removal,
+) (_ bool, result error) {
+	recordPath := workspaceRecordPath(removal.Workspace.Path)
+	bucket, agentID, err := m.openRecordBucket(removal.Workspace.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: open record directory %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	_, exists, err := findRecordAcknowledgementQuarantine(
+		bucket,
+		agentID,
+		removal.operationID,
+	)
+	if err != nil || exists {
+		return exists, err
+	}
+	_, err = bucket.Lstat(agentID + workspaceRecordSuffix)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf(
+			"workspace: inspect record %q: %w",
+			recordPath,
+			err,
+		)
+	default:
+		return true, nil
+	}
+}
+
 func recordAcknowledgementPrefix(
 	agentID string,
 	operationID string,

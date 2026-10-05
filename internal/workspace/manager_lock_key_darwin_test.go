@@ -43,6 +43,29 @@ func TestNewFoldsDarwinUnicodePathAliases(t *testing.T) {
 	}
 }
 
+func TestNewFoldsDarwinUnicodeCaseAliases(t *testing.T) {
+	parent := t.TempDir()
+	lower := filepath.Join(parent, "\u00df")
+	upper := filepath.Join(parent, "\u1e9e")
+	if err := os.Mkdir(lower, 0o700); err != nil {
+		t.Fatalf("create lowercase data directory: %v", err)
+	}
+	if _, err := os.Stat(upper); err != nil {
+		t.Skip("test volume does not fold Unicode path case")
+	}
+	first, err := New(lower)
+	if err != nil {
+		t.Fatalf("new lowercase manager: %v", err)
+	}
+	second, err := New(upper)
+	if err != nil {
+		t.Fatalf("new uppercase manager: %v", err)
+	}
+	if first.mu != second.mu {
+		t.Fatal("Unicode case aliases received different manager locks")
+	}
+}
+
 func TestRegisteredWorktreePathAcceptsDarwinCaseAlias(t *testing.T) {
 	root := t.TempDir()
 	actual := filepath.Join(root, "Worktree")

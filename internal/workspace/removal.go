@@ -210,6 +210,13 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 			"workspace: removal acknowledgement token is invalid",
 		)
 	}
+	pending, err := m.removalAcknowledgementPending(removal)
+	if err != nil {
+		return err
+	}
+	if !pending {
+		return nil
+	}
 	record := newWorkspaceRecord(removal.Workspace, nil)
 	record.Removal = &workspaceRemovalRecord{
 		OperationID: removal.operationID,

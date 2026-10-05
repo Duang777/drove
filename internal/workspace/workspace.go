@@ -337,13 +337,16 @@ func (m *Manager) prepare(
 				result,
 				preparedTarget,
 			)
-			pruneErr := sourceRepository.pruneWorktrees(cleanupCtx)
-			discardErr := m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			)
+			var pruneErr, discardErr error
+			if cleanupErr == nil {
+				pruneErr = sourceRepository.pruneWorktrees(cleanupCtx)
+				discardErr = m.discardWithRepository(
+					cleanupCtx,
+					result,
+					sourceRepository,
+					true,
+				)
+			}
 			resultErr = errors.Join(
 				resultErr,
 				cleanupErr,
@@ -359,23 +362,10 @@ func (m *Manager) prepare(
 			branch,
 			branchOperationID,
 		); err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: create branch %q: %w",
-					branch,
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: create branch %q: %w",
+				branch,
+				err,
 			)
 		}
 		result.createdBranch = true
@@ -384,42 +374,16 @@ func (m *Manager) prepare(
 			err = errors.New("workspace: branch ownership record is missing")
 		}
 		if err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: read branch ownership record: %w",
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: read branch ownership record: %w",
+				err,
 			)
 		}
 		record.CreatedBranch = true
 		if err := m.replaceWorkspaceRecord(record); err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: confirm branch ownership: %w",
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: confirm branch ownership: %w",
+				err,
 			)
 		}
 	}
@@ -436,20 +400,7 @@ func (m *Manager) prepare(
 		"",
 		arguments...,
 	); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: create worktree: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+		return Workspace{}, fmt.Errorf("workspace: create worktree: %w", err)
 	}
 
 	if err := m.initializePreparedWorktree(
@@ -457,53 +408,20 @@ func (m *Manager) prepare(
 		&result,
 		preparedTarget,
 	); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			err,
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+		return Workspace{}, err
 	}
 	if err := m.promotePreparedWorktreeTarget(
 		ctx,
 		result,
 		preparedTarget,
 	); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			err,
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+		return Workspace{}, err
 	}
 
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: source repository changed: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
+		return Workspace{}, fmt.Errorf(
+			"workspace: source repository changed: %w",
+			err,
 		)
 	}
 	copiedPaths, err := m.copyIncludedSelection(
@@ -515,17 +433,7 @@ func (m *Manager) prepare(
 		includeSelection,
 	)
 	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			err,
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+		return Workspace{}, err
 	}
 	if len(copiedPaths) != len(includedPaths) {
 		record, exists, err := m.readWorkspaceRecord(result.Path)
@@ -537,36 +445,16 @@ func (m *Manager) prepare(
 			err = m.replaceWorkspaceRecord(record)
 		}
 		if err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: persist copied include paths: %w",
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: persist copied include paths: %w",
+				err,
 			)
 		}
 	}
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: source repository changed: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
+		return Workspace{}, fmt.Errorf(
+			"workspace: source repository changed: %w",
+			err,
 		)
 	}
 	result.protectionKnown = true

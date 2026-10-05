@@ -407,6 +407,50 @@ func TestAcknowledgeRemovalPreservesRecordWhenRepositoryDisappears(
 	}
 }
 
+func TestAcknowledgeRemovalRetryDoesNotRequireDeletedRepository(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+	movedRepository := repository + "-moved"
+	if err := os.Rename(repository, movedRepository); err != nil {
+		t.Fatalf("move acknowledged source repository: %v", err)
+	}
+	defer func() {
+		_ = os.Rename(movedRepository, repository)
+	}()
+
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("retry acknowledgement without source repository: %v", err)
+	}
+}
+
 func TestDiscardRejectsReplacementRepositoryBucket(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

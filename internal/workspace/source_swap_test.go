@@ -368,6 +368,46 @@ exit "$status"
 		filepath.Join(string(rawPath), "must-remain"),
 		"replacement\n",
 	)
+	manager.git = realGit
+	stagingPath := string(rawPath)
+	registered, err := manager.worktreeRegistered(
+		context.Background(),
+		source,
+		stagingPath,
+	)
+	if err != nil || !registered {
+		t.Fatalf("original staging registration = %v, err=%v", registered, err)
+	}
+	if err := os.Rename(stagingPath, replacementPath); err != nil {
+		t.Fatalf("restore replacement target: %v", err)
+	}
+	if err := os.Rename(stagingPath+"-opened", stagingPath); err != nil {
+		t.Fatalf("restore original staging target: %v", err)
+	}
+	_, repository, err := manager.repositoryPaths(
+		context.Background(),
+		source,
+	)
+	if err != nil {
+		t.Fatalf("resolve restored source repository: %v", err)
+	}
+	registered, err = manager.worktreeRegistered(
+		context.Background(),
+		repository,
+		stagingPath,
+	)
+	if err != nil || !registered {
+		t.Fatalf("restored staging registration = %v, err=%v", registered, err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(filepath.Join(
+		manager.root,
+		repositoryHash(repository),
+		testAgentID,
+	))); err != nil {
+		t.Fatalf("preparation record was removed: %v", err)
+	}
+	runGit(t, stagingPath, "status", "--porcelain")
+	assertFileContents(t, sentinel, "replacement\n")
 }
 
 func TestPrepareRollsBackExistingBranchMovedBeforeWorktreeAdd(t *testing.T) {
