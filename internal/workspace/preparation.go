@@ -37,7 +37,9 @@ func (m *Manager) acknowledgePreparation(
 	}
 	if record.PreparationCommitted &&
 		record.BranchOperationID == "" &&
-		target.preparation != nil {
+		(target.preparation != nil ||
+			(record.Removal != nil &&
+				record.RepositoryEvidence == nil)) {
 		return target.preparation.Close()
 	}
 	lease := target.preparation
