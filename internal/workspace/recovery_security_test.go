@@ -11,6 +11,33 @@ import (
 	"testing"
 )
 
+func TestEnsureManagedRootRejectsLateParentSymlink(t *testing.T) {
+	parent := t.TempDir()
+	redirect := filepath.Join(parent, "redirect")
+	dataDir := filepath.Join(redirect, "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if _, err := os.Lstat(redirect); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("new manager changed the filesystem: %v", err)
+	}
+
+	outside := t.TempDir()
+	if err := os.Symlink(outside, redirect); err != nil {
+		t.Skipf("create late parent symlink: %v", err)
+	}
+	if err := manager.ensureManagedRoot(); err == nil {
+		t.Fatal("managed root creation followed a late parent symlink")
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "data")); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("managed root creation changed the symlink target: %v", err)
+	}
+}
+
 func TestDiscardRejectsReplacedDataDirectory(t *testing.T) {
 	repository := newTestRepository(t)
 	parent := t.TempDir()
@@ -291,6 +318,58 @@ func TestAcknowledgeRemovalRejectsReplacedRepositoryBucket(t *testing.T) {
 	if err := os.Rename(original, bucket); err != nil {
 		t.Fatalf("restore repository bucket: %v", err)
 	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge restored removal: %v", err)
+	}
+}
+
+func TestAcknowledgeRemovalPreservesRecordWhenRepositoryDisappears(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+
+	movedRepository := repository + "-moved"
+	if err := os.Rename(repository, movedRepository); err != nil {
+		t.Fatalf("move source repository: %v", err)
+	}
+	repositoryMoved := true
+	t.Cleanup(func() {
+		if repositoryMoved {
+			_ = os.Rename(movedRepository, repository)
+		}
+	})
+	if err := manager.AcknowledgeRemoval(result.Removal); err == nil {
+		t.Fatal("acknowledgement ignored a missing source repository")
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("failed acknowledgement removed the sidecar: %v", err)
+	}
+
+	if err := os.Rename(movedRepository, repository); err != nil {
+		t.Fatalf("restore source repository: %v", err)
+	}
+	repositoryMoved = false
 	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
 		t.Fatalf("acknowledge restored removal: %v", err)
 	}
@@ -1169,7 +1248,7 @@ func TestPreparedRefTransactionLocksBranchDuringValidation(t *testing.T) {
 	}
 }
 
-func TestManagerRecreatesAcknowledgedRepositoryBucket(t *testing.T) {
+func TestManagerRetainsAcknowledgedRepositoryBucket(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {
@@ -1190,6 +1269,14 @@ func TestManagerRecreatesAcknowledgedRepositoryBucket(t *testing.T) {
 	}
 	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
 		t.Fatalf("acknowledge first removal: %v", err)
+	}
+	bucket := filepath.Dir(first.Path)
+	info, err := os.Lstat(bucket)
+	if err != nil {
+		t.Fatalf("inspect retained repository bucket: %v", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("retained repository bucket mode = %v", info.Mode())
 	}
 	second, err := manager.Prepare(
 		context.Background(),

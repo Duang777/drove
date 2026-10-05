@@ -188,14 +188,13 @@ func (r repositoryCapability) repositoryDirectories(
 			err,
 		)
 	}
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	lines := strings.Split(trimGitLineTerminator(output), "\n")
 	if len(lines) != 2 {
 		return "", "", errors.New(
 			"workspace: Git directory query returned an invalid response",
 		)
 	}
 	resolve := func(kind string, path string) (string, error) {
-		path = strings.TrimSpace(path)
 		if !filepath.IsAbs(path) {
 			return "", fmt.Errorf(
 				"workspace: %s Git directory is not absolute",

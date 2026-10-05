@@ -1974,6 +1974,42 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
+func TestPreparePreservesTrailingSpaceInRepositoryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows paths cannot end in a space")
+	}
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve repository parent: %v", err)
+	}
+	repository := filepath.Join(parent, "repository ")
+	initTestRepositoryAt(t, repository)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare trailing-space repository: %v", err)
+	}
+	if prepared.Repository != repository {
+		t.Fatalf(
+			"prepared repository = %q, want %q",
+			prepared.Repository,
+			repository,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard trailing-space repository: %v", err)
+	}
+}
+
 func TestPrepareRejectsMissingRepositoryWithoutRunningGit(t *testing.T) {
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {

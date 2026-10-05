@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 func (m *Manager) createPreparedWorktreeTarget(
@@ -323,7 +322,7 @@ func (m *Manager) worktreeGitDirectoryAtRoot(
 			err,
 		)
 	}
-	gitDirectory := strings.TrimSpace(string(output))
+	gitDirectory := trimGitLineTerminator(output)
 	if !filepath.IsAbs(gitDirectory) {
 		return "", fmt.Errorf(
 			"workspace: Git directory for %q is not absolute",

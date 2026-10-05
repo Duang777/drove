@@ -210,12 +210,16 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 		Started:     true,
 		Quarantined: true,
 	}
+	bucketAbsent, err := m.removalBucketAbsent(removal.Workspace)
+	if err != nil {
+		return err
+	}
+	if bucketAbsent {
+		return nil
+	}
 	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	facts, err := m.removalFacts(inspectCtx, record)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
 	if err != nil {
 		return err
 	}
@@ -227,10 +231,31 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 	if err := m.removeAcknowledgedWorkspaceRecord(removal); err != nil {
 		return err
 	}
-	if err := m.removeManagedBucketIfEmpty(removal.Workspace); err != nil {
-		return err
-	}
 	return nil
+}
+
+func (m *Manager) removalBucketAbsent(
+	target Workspace,
+) (_ bool, result error) {
+	root, err := m.openWorktreeRoot()
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		result = errors.Join(result, root.Close())
+	}()
+	_, err = root.Lstat(repositoryHash(target.Repository))
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("workspace: inspect repository bucket: %w", err)
+	default:
+		return false, nil
+	}
 }
 
 type removalFacts struct {

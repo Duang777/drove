@@ -299,6 +299,16 @@ func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
 			args:       []string{"completion", "bash"},
 			wantOutput: "__start_drove",
 		},
+		{
+			name:       "completion request",
+			args:       []string{"__complete", "workt"},
+			wantOutput: "worktree",
+		},
+		{
+			name:       "completion request without descriptions",
+			args:       []string{"__completeNoDesc", "workt"},
+			wantOutput: "worktree",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

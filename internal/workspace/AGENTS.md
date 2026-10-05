@@ -94,8 +94,10 @@
   持久删除目录 marker，再清除 intent。ack sidecar 隔离名在正式记录缺失时必须按
   Agent ID 恢复并回读 operation ID，使 session 重试和重启 reconciliation 能继续；
   正式记录已存在时不得恢复旧 ack。清理始终保留分支。
-- Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
-  因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。
+- Manager 创建不预先查找 Git，也不创建目录；只有实际查询或变更 worktree 时才解析并
+  执行 `git`，因此没有受管 workspace 的 daemon 可在未安装 Git 时启动。缺失的
+  DataDir 必须从已打开的最近现存祖先通过 `os.Root` 逐级创建，禁止 `MkdirAll` 沿可替换
+  的公开路径创建。
 - Manager 初始化时固定既有 data directory、worktrees root 和 repository bucket 的
   文件身份，新建目录则在首次打开时固定。后续通过 `os.Root` 逐级打开并持续复核；
   任一中间实目录或 symlink 被替换时必须 fail-stop。List 与 record scan 全程持有固定
@@ -105,7 +107,8 @@
   sidecar 安装在原子改名前后都要确认已打开的 repository bucket 仍位于规范 hash 路径，
   文件改名先把已校验源链接到内部随机别名，再从别名安装最终目标；公开临时路径被替换
   只能导致失败，不得覆盖最终记录。清理临时名时也必须确认它仍指向已打开文件。缺少
-  对应原子原语的平台必须返回错误。
+  对应原子原语的平台必须返回错误。空 repository bucket 在创建后永久保留，禁止按公开
+  名称删除并清除已固定的目录身份。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。普通或重启后的 Discard 遇到路径存在但 preparation sidecar 尚未持久化
   完整 Git 身份时必须 fail-stop；同一次 Prepare 仍持有原始仓库根句柄时，如果 sidecar

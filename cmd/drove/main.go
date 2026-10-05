@@ -71,25 +71,32 @@ func main() {
 func executeRoot(root *cobra.Command, args []string) error {
 	root.InitDefaultHelpCmd()
 	root.InitDefaultCompletionCmd()
-	command, remaining, err := root.Find(args)
-	if err != nil {
-		return markUsageError(err)
-	}
-	if len(remaining) > 0 && remaining[0] == "--" {
-		remaining = remaining[1:]
-	}
-	if command.HasSubCommands() &&
-		!command.Runnable() &&
-		len(remaining) > 0 &&
-		!strings.HasPrefix(remaining[0], "-") {
-		return markUsageError(fmt.Errorf(
-			"unknown command %q for %q",
-			remaining[0],
-			command.CommandPath(),
-		))
+	if !isCompletionRequest(args) {
+		command, remaining, err := root.Find(args)
+		if err != nil {
+			return markUsageError(err)
+		}
+		if len(remaining) > 0 && remaining[0] == "--" {
+			remaining = remaining[1:]
+		}
+		if command.HasSubCommands() &&
+			!command.Runnable() &&
+			len(remaining) > 0 &&
+			!strings.HasPrefix(remaining[0], "-") {
+			return markUsageError(fmt.Errorf(
+				"unknown command %q for %q",
+				remaining[0],
+				command.CommandPath(),
+			))
+		}
 	}
 	root.SetArgs(args)
 	return root.Execute()
+}
+
+func isCompletionRequest(args []string) bool {
+	return len(args) > 0 &&
+		(args[0] == "__complete" || args[0] == "__completeNoDesc")
 }
 
 func commandExitCode(err error) int {

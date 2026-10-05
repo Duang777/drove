@@ -299,10 +299,7 @@ func (m *Manager) prepare(
 		)
 		defer cancel()
 		if !recordInstalled {
-			return Workspace{}, errors.Join(
-				err,
-				m.removeManagedBucketIfEmpty(result),
-			)
+			return Workspace{}, err
 		}
 		cleanupTarget := result
 		cleanupTarget.createdBranch = false
@@ -865,16 +862,8 @@ func (m *Manager) discardWithRepository(
 			branchCleaned = true
 		}
 	}
-	recordRemoved := false
 	if worktreeRemoved && branchCleaned {
 		if err := m.removeWorkspaceRecord(target.Path); err != nil {
-			result = errors.Join(result, err)
-		} else {
-			recordRemoved = true
-		}
-	}
-	if recordRemoved {
-		if err := m.removeManagedBucketIfEmpty(target); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
@@ -1097,7 +1086,7 @@ func (m *Manager) worktreeGitDirectory(
 			err,
 		)
 	}
-	gitDirectory := strings.TrimSpace(string(output))
+	gitDirectory := trimGitLineTerminator(output)
 	if !filepath.IsAbs(gitDirectory) {
 		return "", fmt.Errorf(
 			"workspace: Git directory for %q is not absolute",
@@ -1183,7 +1172,7 @@ func (m *Manager) repositoryPaths(
 			err,
 		)
 	}
-	sourcePath := strings.TrimSpace(string(output))
+	sourcePath := trimGitLineTerminator(output)
 	sourcePath, err = filepath.EvalSymlinks(sourcePath)
 	if err != nil {
 		return "", "", fmt.Errorf(
@@ -1277,7 +1266,7 @@ func (m *Manager) repositoryRootWith(
 	if err != nil {
 		return "", fmt.Errorf("workspace: inspect common Git directory: %w", err)
 	}
-	commonPath := strings.TrimSpace(string(commonOutput))
+	commonPath := trimGitLineTerminator(commonOutput)
 	if !filepath.IsAbs(commonPath) {
 		commonPath = filepath.Join(worktreePath, commonPath)
 	}
@@ -1296,7 +1285,7 @@ func (m *Manager) repositoryRootWith(
 		"core.worktree",
 	)
 	if err == nil {
-		configured := strings.TrimSpace(string(worktreeOutput))
+		configured := trimGitLineTerminator(worktreeOutput)
 		if !filepath.IsAbs(configured) {
 			configured = filepath.Join(commonPath, configured)
 		}
@@ -1571,6 +1560,10 @@ func isExitCode(err error, code int) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
 }
 
+func trimGitLineTerminator(output []byte) string {
+	return strings.TrimSuffix(string(output), "\n")
+}
+
 func resolvePath(path string) (string, error) {
 	path = filepath.Clean(path)
 	var suffix []string
@@ -1618,20 +1611,6 @@ func validRepositoryHash(value string) bool {
 		}
 	}
 	return true
-}
-
-func ensureDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("workspace: create directory %q: %w", path, err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("workspace: inspect directory %q: %w", path, err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("workspace: path %q is not a real directory", path)
-	}
-	return nil
 }
 
 func ensureAbsent(path string) error {

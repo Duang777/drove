@@ -15,11 +15,7 @@ func (m *Manager) ensureManagedRoot() (result error) {
 	if m.rootErr != nil {
 		return m.rootErr
 	}
-	dataDir := filepath.Dir(m.root)
-	if err := ensureDirectory(dataDir); err != nil {
-		return err
-	}
-	root, err := m.openDataDirectoryRoot()
+	root, err := m.openOrCreateDataDirectoryRoot()
 	if err != nil {
 		return err
 	}
@@ -54,6 +50,28 @@ func (m *Manager) ensureManagedRoot() (result error) {
 		return err
 	}
 	return opened.Close()
+}
+
+func (m *Manager) openOrCreateDataDirectoryRoot() (*os.Root, error) {
+	if m.dataDirInfo != nil {
+		return m.openDataDirectoryRoot()
+	}
+	path := filepath.Dir(m.root)
+	root, err := openOrCreateRealPathRoot(path)
+	if err != nil {
+		return nil, fmt.Errorf("workspace: create data directory: %w", err)
+	}
+	opened, err := root.Stat(".")
+	if err != nil {
+		_ = root.Close()
+		return nil, fmt.Errorf("workspace: inspect created data directory: %w", err)
+	}
+	if err := verifyRealPathRoot(path, root); err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+	m.dataDirInfo = opened
+	return root, nil
 }
 
 func (m *Manager) pinDataDirectory() error {
@@ -583,34 +601,6 @@ func restoreManagedQuarantine(
 	return verifyRootEntryUnchanged(bucket, record.AgentID, opened)
 }
 
-func (m *Manager) removeManagedBucketIfEmpty(
-	target Workspace,
-) (result error) {
-	if err := m.validateManagedPath(target); err != nil {
-		return err
-	}
-	root, err := m.openWorktreeRoot()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		result = errors.Join(result, root.Close())
-	}()
-	name := repositoryHash(target.Repository)
-	err = root.Remove(name)
-	switch {
-	case err == nil:
-		delete(m.bucketInfo, name)
-		return nil
-	case errors.Is(err, os.ErrNotExist):
-		return nil
-	case isDirectoryNotEmptyError(err):
-		return nil
-	default:
-		return fmt.Errorf("remove repository bucket: %w", err)
-	}
-}
-
 func (m *Manager) openRecordBucket(
 	worktreePath string,
 ) (*os.Root, string, error) {
@@ -709,6 +699,68 @@ func openRealPathRoot(path string) (*os.Root, error) {
 		return nil, fmt.Errorf("%q changed while opening", path)
 	}
 	return root, nil
+}
+
+func openOrCreateRealPathRoot(path string) (*os.Root, error) {
+	path = filepath.Clean(path)
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("%q is not an absolute path", path)
+	}
+	current := path
+	var missing []string
+	for {
+		info, err := os.Lstat(current)
+		switch {
+		case err == nil:
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return nil, fmt.Errorf("%q is not a real directory", current)
+			}
+			root, err := openRealPathRoot(current)
+			if err != nil {
+				return nil, err
+			}
+			for index := len(missing) - 1; index >= 0; index-- {
+				name := missing[index]
+				if err := root.Mkdir(name, 0o700); err != nil &&
+					!errors.Is(err, os.ErrExist) {
+					_ = root.Close()
+					return nil, fmt.Errorf(
+						"create directory %q: %w",
+						filepath.Join(current, name),
+						err,
+					)
+				}
+				child, err := openRealRootFromRoot(root, name)
+				if err != nil {
+					_ = root.Close()
+					return nil, fmt.Errorf(
+						"open created directory %q: %w",
+						filepath.Join(current, name),
+						err,
+					)
+				}
+				if err := root.Close(); err != nil {
+					_ = child.Close()
+					return nil, fmt.Errorf(
+						"close parent directory %q: %w",
+						current,
+						err,
+					)
+				}
+				current = filepath.Join(current, name)
+				root = child
+			}
+			return root, nil
+		case !errors.Is(err, os.ErrNotExist):
+			return nil, fmt.Errorf("inspect directory %q: %w", current, err)
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil, fmt.Errorf("find existing ancestor for %q: %w", path, err)
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
 }
 
 func verifyRealPathRoot(path string, opened *os.Root) error {
