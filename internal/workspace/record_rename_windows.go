@@ -54,7 +54,7 @@ func renameRecordFile(
 		return installed, err
 	}
 	if err := windows.FlushFileBuffers(
-		windows.Handle(renaming.Fd()),
+		windows.Handle(temporary.Fd()),
 	); err != nil {
 		return true, fmt.Errorf("flush renamed record: %w", err)
 	}
@@ -127,7 +127,7 @@ func openRecordForRename(directory *os.File, name string) (*os.File, error) {
 	)
 	err = windows.NtCreateFile(
 		&handle,
-		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE|windows.DELETE,
+		windows.FILE_READ_ATTRIBUTES|windows.DELETE|windows.SYNCHRONIZE,
 		attributes,
 		&status,
 		nil,

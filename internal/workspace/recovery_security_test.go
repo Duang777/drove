@@ -377,6 +377,68 @@ func TestDiscardRejectsReplacementWorkspacePath(t *testing.T) {
 	}
 }
 
+func TestRemoveRejectsReplacementGitWorktree(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	replacementPath := filepath.Join(t.TempDir(), "replacement-worktree")
+	runGit(t, repository, "branch", "replacement-remove", "HEAD")
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"--quiet",
+		replacementPath,
+		"replacement-remove",
+	)
+	if err := os.WriteFile(
+		filepath.Join(replacementPath, "must-remain"),
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move original workspace: %v", err)
+	}
+	if err := os.Rename(replacementPath, prepared.Path); err != nil {
+		t.Fatalf("install replacement workspace: %v", err)
+	}
+	defer func() {
+		_ = os.Rename(prepared.Path, replacementPath)
+		_ = os.Rename(originalPath, prepared.Path)
+	}()
+
+	if _, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	); err == nil {
+		t.Fatal("remove accepted a replacement Git worktree")
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, "must-remain"),
+		"replacement\n",
+	)
+}
+
 func TestListRejectsReplacementDataDirectory(t *testing.T) {
 	repository := newTestRepository(t)
 	parent := t.TempDir()
@@ -812,6 +874,63 @@ func TestReconcilePreparationPreservesSameCommitRecreatedBranch(
 	}
 }
 
+func TestPreparedRefTransactionLocksBranchDuringValidation(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	oldOID := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	if err := os.WriteFile(
+		filepath.Join(repository, "second.txt"),
+		[]byte("second\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write second commit: %v", err)
+	}
+	runGit(t, repository, "add", "second.txt")
+	runGit(t, repository, "commit", "-m", "second")
+	newOID := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	const branch = "refs/heads/prepared-lock"
+	runGit(t, repository, "update-ref", branch, oldOID)
+
+	var externalErr error
+	committed, err := manager.runPreparedRefTransaction(
+		context.Background(),
+		repository,
+		[]string{"delete " + branch + " " + oldOID},
+		func() (bool, error) {
+			command := exec.Command(
+				"git",
+				"-C",
+				repository,
+				"-c",
+				"core.filesRefLockTimeout=50",
+				"update-ref",
+				branch,
+				newOID,
+				oldOID,
+			)
+			externalErr = command.Run()
+			return false, nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("abort prepared transaction: %v", err)
+	}
+	if committed {
+		t.Fatal("prepared transaction committed after validation rejected it")
+	}
+	if externalErr == nil {
+		t.Fatal("external branch update succeeded while ref lock was held")
+	}
+	runGit(t, repository, "update-ref", branch, newOID, oldOID)
+	current := strings.TrimSpace(runGit(t, repository, "rev-parse", branch))
+	if current != newOID {
+		t.Fatalf("branch object ID = %q, want %q", current, newOID)
+	}
+}
+
 func TestManagerRecreatesAcknowledgedRepositoryBucket(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
@@ -906,6 +1025,76 @@ func TestReconcileQuarantinedRemovalPreservesReplacementPath(t *testing.T) {
 			exists,
 			err,
 		)
+	}
+}
+
+func TestReconcileStartedRemovalRejectsReplacementQuarantine(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID:    "47474747-4747-4747-8747-474747474747",
+		DirectoryToken: "48484848-4848-4848-8848-484848484848",
+		Force:          true,
+		Started:        true,
+		Quarantined:    true,
+	}
+	workspaceRoot, err := openRealPathRoot(prepared.Path)
+	if err != nil {
+		t.Fatalf("open workspace root: %v", err)
+	}
+	if err := ensureRemovalMarker(workspaceRoot, record); err != nil {
+		_ = workspaceRoot.Close()
+		t.Fatalf("install removal marker: %v", err)
+	}
+	if err := workspaceRoot.Close(); err != nil {
+		t.Fatalf("close workspace root: %v", err)
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("persist started removal: %v", err)
+	}
+	quarantineName := removalQuarantinePrefix(record) +
+		"49494949-4949-4949-8949-494949494949"
+	quarantinePath := filepath.Join(filepath.Dir(prepared.Path), quarantineName)
+	if err := os.Rename(prepared.Path, quarantinePath); err != nil {
+		t.Fatalf("quarantine workspace: %v", err)
+	}
+	originalQuarantine := quarantinePath + "-original"
+	if err := os.Rename(quarantinePath, originalQuarantine); err != nil {
+		t.Fatalf("move original quarantine: %v", err)
+	}
+	if err := os.Mkdir(quarantinePath, 0o700); err != nil {
+		t.Fatalf("create replacement quarantine: %v", err)
+	}
+	sentinel := filepath.Join(quarantinePath, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(context.Background()); err == nil {
+		t.Fatal("reconciliation accepted a replacement quarantine")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+	if _, err := os.Stat(originalQuarantine); err != nil {
+		t.Fatalf("original quarantine changed: %v", err)
 	}
 }
 

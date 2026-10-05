@@ -11,18 +11,22 @@
   派生，Agent ID 必须是规范 UUID。
 - `Prepare` 使用 `git worktree add` 创建或复用本地分支。未指定分支时使用
   `drove/<agent-id>`。
-- 同一 Manager 的 Prepare、List、Remove、ReconcilePreparations、
-  AcknowledgePreparation、ReconcileRemovals 和 Discard 串行执行。workspace 记录先写入
-  同目录临时文件并 fsync，原子安装最终文件后再 fsync 父目录。
-- 仓库根目录的 `.worktreeinclude` 使用 gitignore 语义；只有该文件匹配的未跟踪文件会
+- 指向同一规范 DataDir 的所有进程内 Manager 共享互斥锁；Prepare、List、Remove、
+  ReconcilePreparations、AcknowledgePreparation、ReconcileRemovals 和 Discard 串行
+  执行。workspace 记录先写入同目录临时文件并 fsync，原子安装最终文件后再 fsync
+  父目录。
+- Prepare 全程固定已打开的源仓库根目录；仓库根目录的 `.worktreeinclude` 使用
+  gitignore 语义，并从已打开文件读取一次后经 stdin 交给 Git，禁止 Git 再按 manifest
+  路径打开。只有该文件匹配的未跟踪文件会
   复制到新 worktree，普通未跟踪文件不会复制；匹配项必须是普通文件，symlink 一律
   拒绝。创建时选中的规范相对路径保存在 version 3 sidecar 中，后续 dirty 检查不得
   重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
   sidecar，每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager 的冲突清理。
   新分支与私有 ownership ref 通过同一 `git update-ref --stdin` transaction 创建，并用
-  含 operation ID 的 reflog subject 标记 ref 世代；只有 marker、OID 和最新 reflog
-  subject 同时匹配才允许回滚删除分支，避免外部分支删除后同 OID 重建形成 ABA。session
+  含 operation ID 的 reflog subject 标记 ref 世代；回滚先让 `git update-ref` prepare
+  并锁定 branch/marker refs，再在锁内校验最新 reflog subject，只有 marker、OID 和
+  reflog 世代同时匹配才提交删除，避免外部分支删除后同 OID 重建形成 ABA。session
   创建事件 durable 后必须调用 `AcknowledgePreparation`；
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
@@ -35,10 +39,13 @@
   `AcknowledgeRemoval` 校验 token 并删除。`ReconcileRemovals` 在重启时收敛 path 与
   Git registration 的四种组合。非强制 intent 每次继续前都重新检查；路径存在但
   registration 丢失，或路径丢失但 registration 为 detached 时保留 intent 并
-  fail-stop。显式 force 会原子升级已有的非强制 intent 并保留 operation ID；调用任何
+  fail-stop。显式 force 会原子升级已有的非强制 intent 并保留 operation ID；每个新
+  worktree 记录持久化 Git worktree 私有目录身份，每个 removal intent 另有随机目录
+  token，隔离前写入 worktree 并随原目录移动。调用任何
   物理删除前先把已检查的 workspace 原子移动到 operation ID 隔离名，再持久化
   `quarantined + started`；之后只删除隔离名，失败必须保留 intent 并在重启后继续，
-  不能再因 dirty 状态回滚。新 intent 会记录创建时原路径是否已缺失；此后同名路径出现
+  不能再因 dirty 状态回滚。每次恢复和递归删除隔离目录前都必须复核 Git 身份、目录
+  token 与已打开句柄；`Started` 不代表隔离路径永久可信。新 intent 会记录创建时原路径是否已缺失；此后同名路径出现
   时必须 fail-stop，禁止把替代目录当成旧 workspace 删除。version 2 的历史 removal
   intent 兼容视为已开始。清理始终保留分支。
 - Manager 创建不预先查找 Git；只有实际查询或变更 worktree 时才解析并执行 `git`，
@@ -50,7 +57,9 @@
   初次 sidecar 安装必须使用 no-replace 原语；removal acknowledgement 先把匹配 token 的
   sidecar 原子移动到 operation ID 隔离名，再校验并删除，崩溃后从隔离名恢复。
   sidecar 安装在原子改名前后都要确认已打开的 repository bucket 仍位于规范 hash 路径，
-  文件改名必须确认路径仍指向已写入的临时文件。缺少对应原子原语的平台必须返回错误。
+  文件改名先把已校验源链接到内部随机别名，再从别名安装最终目标；公开临时路径被替换
+  只能导致失败，不得覆盖最终记录。清理临时名时也必须确认它仍指向已打开文件。缺少
+  对应原子原语的平台必须返回错误。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。未注册残留目录通过已验证的 `os.Root` 相对操作删除，任一中间
   symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理

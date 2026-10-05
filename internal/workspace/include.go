@@ -13,23 +13,16 @@ import (
 	"github.com/google/uuid"
 )
 
-const worktreeIncludeFile = ".worktreeinclude"
+const (
+	worktreeIncludeFile    = ".worktreeinclude"
+	maxWorktreeIncludeSize = 1024 * 1024
+)
 
 func (m *Manager) copyIncludedFiles(
+	source *os.Root,
 	target Workspace,
 	paths []string,
 ) (result error) {
-	sourceRoot := target.sourcePath
-	if sourceRoot == "" {
-		sourceRoot = target.Repository
-	}
-	source, err := openRealPathRoot(sourceRoot)
-	if err != nil {
-		return fmt.Errorf("workspace: open include source root: %w", err)
-	}
-	defer func() {
-		result = errors.Join(result, source.Close())
-	}()
 	destinationBucket, err := m.openManagedBucketRoot(target)
 	if err != nil {
 		return fmt.Errorf("workspace: open include destination bucket: %w", err)
@@ -64,37 +57,28 @@ func (m *Manager) copyIncludedFiles(
 
 func (m *Manager) includedPaths(
 	ctx context.Context,
-	sourceRoot string,
+	sourcePath string,
+	sourceRoot *os.Root,
 ) ([]string, error) {
-	includePath := filepath.Join(sourceRoot, worktreeIncludeFile)
-	info, err := os.Lstat(includePath)
-	if errors.Is(err, os.ErrNotExist) {
+	manifest, exists, err := readWorktreeInclude(sourceRoot)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
 		return nil, nil
 	}
-	if err != nil {
-		return nil, fmt.Errorf(
-			"workspace: inspect %s: %w",
-			worktreeIncludeFile,
-			err,
-		)
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf(
-			"workspace: %s must be a regular file",
-			worktreeIncludeFile,
-		)
-	}
 
-	output, err := m.run(
+	output, err := m.runInput(
 		ctx,
+		string(manifest),
 		"-C",
-		sourceRoot,
+		sourcePath,
 		"ls-files",
 		"--others",
 		"--ignored",
 		"--full-name",
 		"-z",
-		"--exclude-from="+worktreeIncludeFile,
+		"--exclude-from=/dev/stdin",
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -122,6 +106,102 @@ func (m *Manager) includedPaths(
 		}
 	}
 	return unique, nil
+}
+
+func readWorktreeInclude(
+	sourceRoot *os.Root,
+) (_ []byte, _ bool, result error) {
+	info, err := sourceRoot.Lstat(worktreeIncludeFile)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: inspect %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, false, fmt.Errorf(
+			"workspace: %s must be a regular file",
+			worktreeIncludeFile,
+		)
+	}
+	if info.Size() > maxWorktreeIncludeSize {
+		return nil, false, fmt.Errorf(
+			"workspace: %s exceeds %d bytes",
+			worktreeIncludeFile,
+			maxWorktreeIncludeSize,
+		)
+	}
+	file, err := sourceRoot.Open(worktreeIncludeFile)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: open %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: inspect opened %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		return nil, false, fmt.Errorf(
+			"workspace: %s changed while opening",
+			worktreeIncludeFile,
+		)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, maxWorktreeIncludeSize+1))
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: read %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
+	}
+	if len(raw) > maxWorktreeIncludeSize {
+		return nil, false, fmt.Errorf(
+			"workspace: %s exceeds %d bytes",
+			worktreeIncludeFile,
+			maxWorktreeIncludeSize,
+		)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: reinspect %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
+	}
+	current, err := sourceRoot.Lstat(worktreeIncludeFile)
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: recheck %s: %w",
+			worktreeIncludeFile,
+			err,
+		)
+	}
+	if !os.SameFile(opened, after) ||
+		!os.SameFile(opened, current) ||
+		after.Size() != opened.Size() ||
+		after.Mode() != opened.Mode() ||
+		!after.ModTime().Equal(opened.ModTime()) {
+		return nil, false, fmt.Errorf(
+			"workspace: %s changed while reading",
+			worktreeIncludeFile,
+		)
+	}
+	return raw, true, nil
 }
 
 func validateIncludedPath(path string) (string, error) {
@@ -236,16 +316,18 @@ func copyIncludedPath(
 	}
 	outputOpen := true
 	defer func() {
+		if temporaryName != "" {
+			result = errors.Join(
+				result,
+				removeRecordPathIfSame(
+					destinationParent,
+					temporaryName,
+					output,
+				),
+			)
+		}
 		if outputOpen {
 			result = errors.Join(result, output.Close())
-		}
-		if temporaryName != "" {
-			if err := destinationParent.Remove(temporaryName); !errors.Is(
-				err,
-				os.ErrNotExist,
-			) {
-				result = errors.Join(result, err)
-			}
 		}
 	}()
 	copied, err := io.Copy(output, input)

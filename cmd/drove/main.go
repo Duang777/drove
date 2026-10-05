@@ -256,7 +256,7 @@ func newPSCmd() *cobra.Command {
 		Use:   "ps",
 		Short: "列出全部 Agent 会话",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -342,7 +342,7 @@ func newLogCmd() *cobra.Command {
 		Short: "回放某 Agent 的事件流",
 		Args:  usageArgs(cobra.ExactArgs(1)),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -631,8 +631,8 @@ func newStopCmd() *cobra.Command {
 		Use:   "stop <agent-id>",
 		Short: "停止一个 Agent 会话",
 		Args:  usageArgs(cobra.ExactArgs(1)),
-		RunE: func(_ *cobra.Command, args []string) error {
-			ctx := context.Background()
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -887,7 +887,12 @@ func newSendCmd() *cobra.Command {
 			return nil
 		}),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			data, err := readSendInput(args, fromStdin, cmd.InOrStdin())
+			data, err := readSendInput(
+				cmd.Context(),
+				args,
+				fromStdin,
+				cmd.InOrStdin(),
+			)
 			if err != nil {
 				if errors.Is(err, session.ErrInputEmpty) ||
 					errors.Is(err, session.ErrInputTooLarge) ||
@@ -896,7 +901,7 @@ func newSendCmd() *cobra.Command {
 				}
 				return err
 			}
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err
@@ -1015,10 +1020,11 @@ func forwardHook(
 	if payloadArgv {
 		payload = []byte(args[0])
 	} else {
-		payload, err = io.ReadAll(io.LimitReader(
+		payload, err = readAllWithContext(
+			cmd.Context(),
 			cmd.InOrStdin(),
 			client.MaxHookPayloadBytes+1,
-		))
+		)
 		if err != nil {
 			return fmt.Errorf("read hook payload: %w", err)
 		}
@@ -1032,14 +1038,19 @@ func forwardHook(
 	return relay.Forward(cmd.Context(), vendor, payload)
 }
 
-func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, error) {
+func readSendInput(
+	ctx context.Context,
+	args []string,
+	fromStdin bool,
+	stdin io.Reader,
+) ([]byte, error) {
 	var data []byte
 	if fromStdin {
 		if len(args) != 1 {
 			return nil, errors.New("send with --stdin requires exactly one agent ID")
 		}
 		var err error
-		data, err = io.ReadAll(io.LimitReader(stdin, session.MaxInputBytes+1))
+		data, err = readAllWithContext(ctx, stdin, session.MaxInputBytes+1)
 		if err != nil {
 			return nil, fmt.Errorf("read input: %w", err)
 		}
@@ -1060,6 +1071,28 @@ func readSendInput(args []string, fromStdin bool, stdin io.Reader) ([]byte, erro
 	default:
 		return data, nil
 	}
+}
+
+func readAllWithContext(
+	ctx context.Context,
+	reader io.Reader,
+	limit int64,
+) ([]byte, error) {
+	stopClose := func() bool {
+		return false
+	}
+	if closer, ok := reader.(io.Closer); ok {
+		stopClose = context.AfterFunc(ctx, func() {
+			_ = closer.Close()
+		})
+	}
+	defer stopClose()
+
+	data, err := io.ReadAll(io.LimitReader(reader, limit))
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	return data, err
 }
 
 func newVersionCmd() *cobra.Command {

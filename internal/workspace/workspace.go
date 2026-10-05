@@ -2,6 +2,7 @@
 package workspace
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -33,6 +34,8 @@ var (
 	ErrDirty = errors.New("workspace: worktree has uncommitted changes")
 	// ErrNotFound means no managed worktree matches the requested Agent ID.
 	ErrNotFound = errors.New("workspace: managed worktree not found")
+
+	managerLocks sync.Map
 )
 
 // Workspace describes one Drove-managed Git worktree.
@@ -47,7 +50,7 @@ type Workspace struct {
 
 	createdBranch     bool
 	branchOperationID string
-	sourcePath        string
+	gitDirectory      string
 	protectionKnown   bool
 	includedPaths     []string
 }
@@ -60,7 +63,7 @@ type Manager struct {
 	worktreeInfo os.FileInfo
 	bucketInfo   map[string]os.FileInfo
 	rootErr      error
-	mu           sync.Mutex
+	mu           *sync.Mutex
 }
 
 // New creates a worktree manager without changing the filesystem.
@@ -121,6 +124,7 @@ func New(dataDir string) (*Manager, error) {
 		worktreeInfo: worktreeInfo,
 		bucketInfo:   bucketInfo,
 		rootErr:      rootErr,
+		mu:           workspaceManagerLock(rootPath),
 	}
 	if worktreeInfo == nil || rootErr != nil {
 		return manager, nil
@@ -189,7 +193,7 @@ func (m *Manager) prepare(
 	repository string,
 	branch string,
 	agentID string,
-) (Workspace, error) {
+) (_ Workspace, resultErr error) {
 	if err := validateAgentID(agentID); err != nil {
 		return Workspace{}, err
 	}
@@ -197,6 +201,16 @@ func (m *Manager) prepare(
 	if err != nil {
 		return Workspace{}, err
 	}
+	sourceRoot, err := openRealPathRoot(sourcePath)
+	if err != nil {
+		return Workspace{}, fmt.Errorf(
+			"workspace: open source repository: %w",
+			err,
+		)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, sourceRoot.Close())
+	}()
 	if branch == "" {
 		branch = "drove/" + agentID
 	}
@@ -230,9 +244,8 @@ func (m *Manager) prepare(
 		Path:              path,
 		Branch:            branch,
 		branchOperationID: branchOperationID,
-		sourcePath:        sourcePath,
 	}
-	includedPaths, err := m.includedPaths(ctx, sourcePath)
+	includedPaths, err := m.includedPaths(ctx, sourcePath, sourceRoot)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -326,14 +339,51 @@ func (m *Manager) prepare(
 		)
 	}
 
-	if err := m.copyIncludedFiles(result, includedPaths); err != nil {
+	gitDirectory, err := m.worktreeGitDirectory(ctx, result.Path)
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
+	result.gitDirectory = gitDirectory
+	record, exists, err := m.readWorkspaceRecord(result.Path)
+	if err == nil && !exists {
+		err = errors.New("workspace: worktree identity record is missing")
+	}
+	if err == nil {
+		record.GitDirectory = gitDirectory
+		err = m.replaceWorkspaceRecord(record)
+	}
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return Workspace{}, errors.Join(
+			fmt.Errorf("workspace: persist worktree identity: %w", err),
+			m.discard(cleanupCtx, result),
+		)
+	}
+
+	if err := m.copyIncludedFiles(sourceRoot, result, includedPaths); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
+	}
+	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return Workspace{}, errors.Join(
+			fmt.Errorf("workspace: source repository changed: %w", err),
+			m.discard(cleanupCtx, result),
+		)
+	}
 	result.protectionKnown = true
 	result.includedPaths = append([]string(nil), includedPaths...)
 	return result, nil
+}
+
+func workspaceManagerLock(root string) *sync.Mutex {
+	lock, _ := managerLocks.LoadOrStore(root, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 // List returns all valid worktrees below this manager's root.
@@ -692,38 +742,39 @@ func (m *Manager) cleanupPreparedBranch(
 	if err != nil {
 		return err
 	}
-	branchOwned := false
 	if branchExists && branchOID == markerOID {
-		subject, exists, err := m.refLogSubject(
+		committed, err := m.runPreparedRefTransaction(
 			ctx,
 			target.Repository,
-			branchRef,
+			[]string{
+				fmt.Sprintf("delete %s %s", branchRef, branchOID),
+				fmt.Sprintf("delete %s %s", markerRef, markerOID),
+			},
+			func() (bool, error) {
+				subject, exists, err := m.refLogSubject(
+					ctx,
+					target.Repository,
+					branchRef,
+				)
+				if err != nil {
+					return false, err
+				}
+				return exists &&
+					subject == branchOwnershipLogMessage(
+						target.branchOperationID,
+					), nil
+			},
 		)
 		if err != nil {
 			return err
 		}
-		branchOwned = exists &&
-			subject == branchOwnershipLogMessage(target.branchOperationID)
-	}
-	var input string
-	if branchOwned {
-		input = fmt.Sprintf(
-			"start\ndelete %s %s\ndelete %s %s\nprepare\ncommit\n",
-			branchRef,
-			branchOID,
-			markerRef,
-			markerOID,
-		)
-	} else {
-		input = fmt.Sprintf(
-			"start\ndelete %s %s\nprepare\ncommit\n",
-			markerRef,
-			markerOID,
-		)
+		if committed {
+			return nil
+		}
 	}
 	if _, err := m.runInput(
 		ctx,
-		input,
+		fmt.Sprintf("delete %s %s\n", markerRef, markerOID),
 		"-C",
 		target.Repository,
 		"update-ref",
@@ -732,6 +783,123 @@ func (m *Manager) cleanupPreparedBranch(
 		return fmt.Errorf("workspace: discard owned branch transaction: %w", err)
 	}
 	return nil
+}
+
+func (m *Manager) runPreparedRefTransaction(
+	ctx context.Context,
+	repository string,
+	commands []string,
+	validate func() (bool, error),
+) (_ bool, result error) {
+	command := exec.CommandContext(
+		ctx,
+		m.git,
+		"-C",
+		repository,
+		"update-ref",
+		"--stdin",
+	)
+	command.Env = append(os.Environ(), "LC_ALL=C", "LANG=C")
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		return false, err
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		return false, err
+	}
+	var stderr strings.Builder
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		return false, err
+	}
+	finished := false
+	defer func() {
+		if finished {
+			return
+		}
+		_ = stdin.Close()
+		if command.Process != nil {
+			_ = command.Process.Kill()
+		}
+		result = errors.Join(result, command.Wait())
+	}()
+
+	writer := bufio.NewWriter(stdin)
+	reader := bufio.NewReader(stdout)
+	send := func(input string) error {
+		if _, err := writer.WriteString(input + "\n"); err != nil {
+			return err
+		}
+		return writer.Flush()
+	}
+	expect := func(want string) error {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+		if line != want+"\n" {
+			return fmt.Errorf(
+				"workspace: unexpected update-ref response %q, want %q",
+				strings.TrimSpace(line),
+				want,
+			)
+		}
+		return nil
+	}
+	if err := send("start"); err != nil {
+		return false, err
+	}
+	if err := expect("start: ok"); err != nil {
+		return false, err
+	}
+	for _, update := range commands {
+		if err := send(update); err != nil {
+			return false, err
+		}
+	}
+	if err := send("prepare"); err != nil {
+		return false, err
+	}
+	if err := expect("prepare: ok"); err != nil {
+		return false, err
+	}
+
+	commit, validationErr := validate()
+	action := "abort"
+	if validationErr == nil && commit {
+		action = "commit"
+	}
+	actionErr := send(action)
+	if actionErr == nil {
+		actionErr = expect(action + ": ok")
+	}
+	closeErr := stdin.Close()
+	waitErr := command.Wait()
+	finished = true
+	if err := errors.Join(
+		validationErr,
+		actionErr,
+		closeErr,
+		updateRefError(waitErr, stderr.String()),
+	); err != nil {
+		return false, err
+	}
+	return commit, nil
+}
+
+func updateRefError(err error, stderr string) error {
+	if err == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(stderr)
+	if len(detail) > 4096 {
+		detail = detail[:4096]
+	}
+	if detail == "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", detail, err)
 }
 
 func (m *Manager) rollbackFailedAdd(
@@ -756,6 +924,10 @@ func (m *Manager) inspect(
 			"workspace: repository mismatch for %q",
 			path,
 		)
+	}
+	gitDirectory, err := m.worktreeGitDirectory(ctx, path)
+	if err != nil {
+		return Workspace{}, err
 	}
 
 	branchOutput, err := m.run(ctx, "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
@@ -815,11 +987,71 @@ func (m *Manager) inspect(
 		Repository:      repository,
 		Path:            path,
 		Branch:          branch,
-		Dirty:           len(status) != 0 || includedDirty,
+		Dirty:           workspaceStatusDirty(status, recorded) || includedDirty,
 		Detached:        detached,
+		gitDirectory:    gitDirectory,
 		protectionKnown: protectionKnown,
 		includedPaths:   includedPaths,
 	}, nil
+}
+
+func workspaceStatusDirty(
+	status []byte,
+	recorded *workspaceRecord,
+) bool {
+	ignored := ""
+	if recorded != nil &&
+		recorded.Removal != nil &&
+		recorded.Removal.DirectoryToken != "" {
+		ignored = "?? " + removalMarkerName(*recorded)
+	}
+	for _, line := range strings.Split(
+		strings.TrimSpace(string(status)),
+		"\n",
+	) {
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" || line == ignored {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func (m *Manager) worktreeGitDirectory(
+	ctx context.Context,
+	path string,
+) (string, error) {
+	output, err := m.run(
+		ctx,
+		"-C",
+		path,
+		"rev-parse",
+		"--absolute-git-dir",
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: inspect Git directory for %q: %w",
+			path,
+			err,
+		)
+	}
+	gitDirectory := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(gitDirectory) {
+		return "", fmt.Errorf(
+			"workspace: Git directory for %q is not absolute",
+			path,
+		)
+	}
+	gitDirectory, err = resolvePath(gitDirectory)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: resolve Git directory for %q: %w",
+			path,
+			err,
+		)
+	}
+	return gitDirectory, nil
 }
 
 func (m *Manager) repositoryPaths(

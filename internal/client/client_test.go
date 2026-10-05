@@ -131,6 +131,55 @@ func TestCleanupWorktreeUsesAuthenticatedDelete(t *testing.T) {
 	}
 }
 
+func TestCleanupWorktreeReportsOldDaemonRoute(t *testing.T) {
+	server := httptest.NewServer(http.NewServeMux())
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := c.CleanupWorktree(
+		context.Background(),
+		"11111111-1111-4111-8111-111111111111",
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "restart the daemon") {
+		t.Fatalf("cleanup error = %v, want daemon restart guidance", err)
+	}
+	if IsUserError(err) {
+		t.Fatalf("old daemon cleanup error was classified as user error: %v", err)
+	}
+}
+
+func TestCleanupWorktreeKeepsCurrentDaemonNotFoundAsUserError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		_ *http.Request,
+	) {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(
+			w,
+			`{"error":"session: workspace not found"}`,
+			http.StatusNotFound,
+		)
+	}))
+	defer server.Close()
+
+	c := New(strings.TrimPrefix(server.URL, "http://"))
+	_, err := c.CleanupWorktree(
+		context.Background(),
+		"11111111-1111-4111-8111-111111111111",
+		false,
+	)
+	if err == nil {
+		t.Fatal("cleanup succeeded for an unknown workspace")
+	}
+	if !IsUserError(err) {
+		t.Fatalf("current daemon not-found error was not a user error: %v", err)
+	}
+	if strings.Contains(err.Error(), "restart the daemon") {
+		t.Fatalf("current daemon not-found error requested a restart: %v", err)
+	}
+}
+
 func TestStartUsesDedicatedWorktreeEndpointWithoutClientTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(
 		w http.ResponseWriter,
@@ -632,6 +681,20 @@ func TestEnsureDaemonDoesNotAutoStartAfterUnauthorized(t *testing.T) {
 	}
 	if errors.Is(err, ErrDaemonUnreachable) {
 		t.Fatalf("unauthorized error was treated as unreachable: %v", err)
+	}
+}
+
+func TestEnsureDaemonPreservesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c := New("127.0.0.1:1")
+	err := c.EnsureDaemon(ctx, "/tmp/config.json")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ensure daemon error = %v, want context canceled", err)
+	}
+	if errors.Is(err, ErrDaemonUnreachable) {
+		t.Fatalf("cancellation was classified as daemon unreachable: %v", err)
 	}
 }
 

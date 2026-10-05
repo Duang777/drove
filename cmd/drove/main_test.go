@@ -771,7 +771,12 @@ func TestReadSendInput(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := readSendInput(test.args, test.fromStdin, bytes.NewReader(test.stdin))
+			got, err := readSendInput(
+				context.Background(),
+				test.args,
+				test.fromStdin,
+				bytes.NewReader(test.stdin),
+			)
 			if test.wantErr != nil || test.wantAnyErr {
 				if err == nil {
 					t.Fatalf("read input succeeded, want error")
@@ -791,6 +796,31 @@ func TestReadSendInput(t *testing.T) {
 				t.Fatalf("input = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestReadAllWithContextCancelsBlockingInput(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create input pipe: %v", err)
+	}
+	defer writer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := readAllWithContext(ctx, reader, session.MaxInputBytes+1)
+		result <- err
+	}()
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocking input error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocking input did not stop after cancellation")
 	}
 }
 

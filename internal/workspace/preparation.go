@@ -48,10 +48,6 @@ func (m *Manager) acknowledgePreparation(target Workspace) error {
 	); err != nil {
 		return err
 	}
-	record.BranchOperationID = ""
-	if err := m.replaceWorkspaceRecord(record); err != nil {
-		return fmt.Errorf("workspace: clear branch ownership marker: %w", err)
-	}
 	return nil
 }
 
@@ -145,6 +141,11 @@ func (m *Manager) ReconcilePreparations(
 }
 
 func sameWorkspace(left Workspace, right Workspace) bool {
+	if left.gitDirectory != "" &&
+		right.gitDirectory != "" &&
+		left.gitDirectory != right.gitDirectory {
+		return false
+	}
 	return left.AgentID == right.AgentID &&
 		left.Repository == right.Repository &&
 		left.Path == right.Path &&

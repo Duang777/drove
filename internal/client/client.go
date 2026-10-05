@@ -41,6 +41,12 @@ type responseError struct {
 	body       string
 }
 
+func (e *responseError) missingWorktreeRoute() bool {
+	return e.statusCode == http.StatusNotFound &&
+		strings.HasPrefix(e.path, worktreeStartPath) &&
+		strings.TrimSpace(e.body) == "404 page not found"
+}
+
 func (e *responseError) Error() string {
 	return fmt.Sprintf("client: %s %s: %s", e.status, e.path, e.body)
 }
@@ -55,7 +61,7 @@ func IsUserError(err error) bool {
 			http.StatusRequestEntityTooLarge:
 			return true
 		case http.StatusNotFound:
-			return responseErr.path != worktreeStartPath
+			return !responseErr.missingWorktreeRoute()
 		}
 	}
 
@@ -140,7 +146,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return ErrDaemonUnreachable
+		return requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, "/api/v1/agents"); err != nil {
@@ -177,7 +183,7 @@ func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.
 		var responseErr *responseError
 		if req.Worktree != nil &&
 			errors.As(err, &responseErr) &&
-			responseErr.statusCode == http.StatusNotFound {
+			responseErr.missingWorktreeRoute() {
 			return nil, fmt.Errorf(
 				"client: daemon does not support worktree startup; restart the daemon: %w",
 				err,
@@ -237,10 +243,18 @@ func (c *Client) CleanupWorktree(
 	}
 	resp, err := c.longRunningHTTPClient().Do(req)
 	if err != nil {
-		return nil, ErrDaemonUnreachable
+		return nil, requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, path); err != nil {
+		var responseErr *responseError
+		if errors.As(err, &responseErr) &&
+			responseErr.missingWorktreeRoute() {
+			return nil, fmt.Errorf(
+				"client: daemon does not support worktree cleanup; restart the daemon: %w",
+				err,
+			)
+		}
 		return nil, err
 	}
 	var removed RemovedWorktree
@@ -266,7 +280,7 @@ func (c *Client) RotateToken(ctx context.Context) error {
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return ErrDaemonUnreachable
+		return requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, "/api/v1/auth/token/rotate"); err != nil {
@@ -291,7 +305,7 @@ func (c *Client) IssueLoginCode(ctx context.Context) (string, error) {
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return "", ErrDaemonUnreachable
+		return "", requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, "/api/v1/auth/login-code"); err != nil {
@@ -430,6 +444,12 @@ func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	err := c.Ping(probeCtx)
 	cancel()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		err = ErrDaemonUnreachable
+	}
 	if err == nil {
 		return nil
 	}
@@ -461,15 +481,33 @@ func (c *Client) EnsureDaemon(ctx context.Context, configPath string) error {
 	for time.Now().Before(deadline) {
 		pctx, pcancel := context.WithTimeout(ctx, 300*time.Millisecond)
 		pingErr := c.Ping(pctx)
+		ctxErr := ctx.Err()
 		if pingErr == nil {
 			pcancel()
 			return nil
 		}
 		pcancel()
+		if ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(pingErr, context.DeadlineExceeded) {
+			pingErr = ErrDaemonUnreachable
+		}
 		if !errors.Is(pingErr, ErrDaemonUnreachable) {
 			return pingErr
 		}
-		time.Sleep(200 * time.Millisecond)
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
 	return fmt.Errorf("%w: daemon did not become ready (see %s)", ErrDaemonUnreachable, logPath)
 }
@@ -512,7 +550,7 @@ func (c *Client) getJSON(ctx context.Context, path string, out any) error {
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return ErrDaemonUnreachable
+		return requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, path); err != nil {
@@ -546,7 +584,7 @@ func (c *Client) postJSONWithClient(
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return ErrDaemonUnreachable
+		return requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, path); err != nil {
@@ -576,7 +614,7 @@ func (c *Client) delete(ctx context.Context, path string) error {
 	}
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return ErrDaemonUnreachable
+		return requestError(ctx)
 	}
 	defer resp.Body.Close()
 	if err := c.responseError(resp, path); err != nil {
@@ -627,6 +665,13 @@ func (c *Client) responseError(resp *http.Response, path string) error {
 		path:       path,
 		body:       string(msg),
 	}
+}
+
+func requestError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ErrDaemonUnreachable
 }
 
 // findDaemonBin 优先使用 CLI 同目录的 droved，其次 PATH。

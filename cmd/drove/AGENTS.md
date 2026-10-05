@@ -40,8 +40,9 @@ log / timeline / explain / attach / stop / worktree / token rotate / web / versi
   signal 或 cleanup 逻辑。
 - 每次命令经 DataDir 下的 Unix socket 调用 daemon，并从同一目录读取控制令牌后调用
   `client.EnsureDaemon`；仅 socket 不可达时后台拉起 `droved`，认证失败直接返回。
-- 根命令使用进程 interrupt context；长耗时 worktree 创建和清理必须传递
-  `cmd.Context()`，不得使用不可取消的后台 context。
+- 根命令使用进程 interrupt context；所有 daemon 请求必须传递 `cmd.Context()`，
+  不得使用不可取消的后台 context。读取 stdin 的命令在 context 取消时关闭可关闭的
+  reader，使 Ctrl+C 不会卡在本地输入。
 - `drove token rotate` 经 Unix socket 请求 daemon 原子轮换令牌；命令本身不读取或
   输出令牌值。
 - `drove web` 经 Unix socket 签发一次性 code，把 code 放在 `/login` URL fragment

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -48,6 +49,24 @@ func renameRecordPath(
 	targetName string,
 	replace bool,
 ) (bool, error) {
+	return renameRecordPathAfterValidation(
+		directory,
+		expected,
+		sourceName,
+		targetName,
+		replace,
+		nil,
+	)
+}
+
+func renameRecordPathAfterValidation(
+	directory *os.File,
+	expected *os.File,
+	sourceName string,
+	targetName string,
+	replace bool,
+	afterValidation func(),
+) (bool, error) {
 	if err := verifyRecordPathIdentity(
 		directory,
 		expected,
@@ -55,11 +74,41 @@ func renameRecordPath(
 	); err != nil {
 		return false, err
 	}
+	if afterValidation != nil {
+		afterValidation()
+	}
 	fd := int(directory.Fd())
+	alias := ".drove-install-" + uuid.NewString()
+	if err := unix.Linkat(fd, sourceName, fd, alias, 0); err != nil {
+		return false, err
+	}
+	aliasPresent := true
+	defer func() {
+		if aliasPresent {
+			if verifyRecordPathIdentity(
+				directory,
+				expected,
+				alias,
+			) == nil {
+				_ = unix.Unlinkat(fd, alias, 0)
+			}
+		}
+	}()
+	if err := verifyRecordPathIdentity(
+		directory,
+		expected,
+		alias,
+	); err != nil {
+		return false, fmt.Errorf(
+			"verify staged record identity: %w",
+			err,
+		)
+	}
 	if replace {
-		if err := unix.Renameat(fd, sourceName, fd, targetName); err != nil {
+		if err := unix.Renameat(fd, alias, fd, targetName); err != nil {
 			return false, err
 		}
+		aliasPresent = false
 		if err := verifyRecordPathIdentity(
 			directory,
 			expected,
@@ -70,9 +119,19 @@ func renameRecordPath(
 				err,
 			)
 		}
+		if err := unlinkRecordPath(
+			directory,
+			expected,
+			sourceName,
+		); err != nil {
+			return true, fmt.Errorf(
+				"remove installed record source: %w",
+				err,
+			)
+		}
 		return true, nil
 	}
-	if err := unix.Linkat(fd, sourceName, fd, targetName, 0); err != nil {
+	if err := unix.Linkat(fd, alias, fd, targetName, 0); err != nil {
 		return false, err
 	}
 	if err := verifyRecordPathIdentity(
@@ -85,19 +144,10 @@ func renameRecordPath(
 			err,
 		)
 	}
-	if err := verifyRecordPathIdentity(
-		directory,
-		expected,
-		sourceName,
-	); err != nil {
-		return true, fmt.Errorf(
-			"reverify source record identity: %w",
-			err,
-		)
-	}
-	if err := unix.Unlinkat(fd, sourceName, 0); err != nil {
+	if err := unix.Unlinkat(fd, alias, 0); err != nil {
 		return true, err
 	}
+	aliasPresent = false
 	if err := verifyRecordPathIdentity(
 		directory,
 		expected,
@@ -108,7 +158,32 @@ func renameRecordPath(
 			err,
 		)
 	}
+	if err := unlinkRecordPath(
+		directory,
+		expected,
+		sourceName,
+	); err != nil {
+		return true, fmt.Errorf(
+			"remove installed record source: %w",
+			err,
+		)
+	}
 	return true, nil
+}
+
+func unlinkRecordPath(
+	directory *os.File,
+	expected *os.File,
+	name string,
+) error {
+	if err := verifyRecordPathIdentity(
+		directory,
+		expected,
+		name,
+	); err != nil {
+		return err
+	}
+	return unix.Unlinkat(int(directory.Fd()), name, 0)
 }
 
 func verifyRecordPathIdentity(

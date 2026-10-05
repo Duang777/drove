@@ -3,6 +3,7 @@ package workspace
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,6 +256,119 @@ func (m *Manager) removeManagedPath(target Workspace) (result error) {
 func removalQuarantinePrefix(record workspaceRecord) string {
 	return "." + record.AgentID + ".removal-" +
 		record.Removal.OperationID + "-"
+}
+
+func removalMarkerName(record workspaceRecord) string {
+	return ".drove-removal-" + record.Removal.OperationID
+}
+
+func ensureRemovalMarker(
+	root *os.Root,
+	record workspaceRecord,
+) (result error) {
+	if record.Removal == nil ||
+		record.Removal.DirectoryToken == "" {
+		return nil
+	}
+	name := removalMarkerName(record)
+	_, err := root.Lstat(name)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		file, err := root.OpenFile(
+			name,
+			os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+			0o600,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"workspace: create removal marker: %w",
+				err,
+			)
+		}
+		if _, err := io.WriteString(
+			file,
+			record.Removal.DirectoryToken+"\n",
+		); err != nil {
+			_ = file.Close()
+			return fmt.Errorf(
+				"workspace: write removal marker: %w",
+				err,
+			)
+		}
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			return fmt.Errorf(
+				"workspace: sync removal marker: %w",
+				err,
+			)
+		}
+		directory, err := root.Open(".")
+		if err != nil {
+			return fmt.Errorf(
+				"workspace: open removal marker directory: %w",
+				err,
+			)
+		}
+		syncErr = syncRecordDirectory(directory)
+		closeErr = directory.Close()
+		if err := errors.Join(syncErr, closeErr); err != nil {
+			return fmt.Errorf(
+				"workspace: sync removal marker directory: %w",
+				err,
+			)
+		}
+	case err != nil:
+		return fmt.Errorf("workspace: inspect removal marker: %w", err)
+	}
+	return verifyRemovalMarker(root, record)
+}
+
+func verifyRemovalMarker(
+	root *os.Root,
+	record workspaceRecord,
+) (result error) {
+	if record.Removal == nil ||
+		record.Removal.DirectoryToken == "" {
+		return nil
+	}
+	name := removalMarkerName(record)
+	info, err := root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("workspace: inspect removal marker: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("workspace: removal marker is not a regular file")
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return fmt.Errorf("workspace: open removal marker: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("workspace: inspect opened removal marker: %w", err)
+	}
+	if !os.SameFile(info, opened) {
+		return errors.New("workspace: removal marker changed while opening")
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, 128))
+	if err != nil {
+		return fmt.Errorf("workspace: read removal marker: %w", err)
+	}
+	if string(raw) != record.Removal.DirectoryToken+"\n" {
+		return errors.New("workspace: removal marker token mismatch")
+	}
+	current, err := root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("workspace: recheck removal marker: %w", err)
+	}
+	if !os.SameFile(opened, current) {
+		return errors.New("workspace: removal marker changed while reading")
+	}
+	return nil
 }
 
 func findRemovalQuarantine(
@@ -549,6 +663,23 @@ func openRealPathRoot(path string) (*os.Root, error) {
 		return nil, fmt.Errorf("%q changed while opening", path)
 	}
 	return root, nil
+}
+
+func verifyRealPathRoot(path string, opened *os.Root) error {
+	openedInfo, err := opened.Stat(".")
+	if err != nil {
+		return fmt.Errorf("inspect opened directory %q: %w", path, err)
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("reinspect directory %q: %w", path, err)
+	}
+	if !current.IsDir() ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(openedInfo, current) {
+		return fmt.Errorf("directory %q changed while in use", path)
+	}
+	return nil
 }
 
 func openRealRootFromRoot(parent *os.Root, name string) (*os.Root, error) {

@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReconcilePreparationsAdoptsDurableAndDiscardsOrphan(t *testing.T) {
@@ -128,8 +130,121 @@ func TestAcknowledgePreparationClearsBranchOwnershipMarker(t *testing.T) {
 	if err != nil || !hasRecord {
 		t.Fatalf("read acknowledged record: exists=%v err=%v", hasRecord, err)
 	}
-	if !record.PreparationCommitted || record.BranchOperationID != "" {
+	if !record.PreparationCommitted ||
+		record.BranchOperationID != prepared.branchOperationID {
 		t.Fatalf("acknowledged record = %+v", record)
+	}
+}
+
+func TestAcknowledgePreparationDoesNotOverwriteConcurrentRemoval(
+	t *testing.T,
+) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a POSIX Git wrapper")
+	}
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	first, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new first manager: %v", err)
+	}
+	second, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new second manager: %v", err)
+	}
+	prepared, err := first.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	entered := filepath.Join(t.TempDir(), "entered")
+	release := filepath.Join(t.TempDir(), "release")
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" update-ref -d refs/drove/preparations/"*)
+    : > "$DROVE_TEST_ENTERED"
+    while ! test -e "$DROVE_TEST_RELEASE"; do
+      sleep 0.01
+    done
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_ENTERED", entered)
+	t.Setenv("DROVE_TEST_RELEASE", release)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	first.git = wrapper
+
+	ackResult := make(chan error, 1)
+	go func() {
+		ackResult <- first.AcknowledgePreparation(prepared)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(entered); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("acknowledgement did not reach marker cleanup")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	type removalAttempt struct {
+		result RemovalResult
+		err    error
+	}
+	removeResult := make(chan removalAttempt, 1)
+	go func() {
+		result, err := second.Remove(
+			context.Background(),
+			prepared.AgentID,
+			true,
+		)
+		removeResult <- removalAttempt{result: result, err: err}
+	}()
+	select {
+	case result := <-removeResult:
+		t.Fatalf("removal bypassed shared manager lock: %+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatalf("release acknowledgement: %v", err)
+	}
+	if err := <-ackResult; err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	attempt := <-removeResult
+	if attempt.err != nil || attempt.result.State != RemovalComplete {
+		t.Fatalf(
+			"concurrent removal = %+v, err=%v",
+			attempt.result,
+			attempt.err,
+		)
+	}
+	record, exists, err := second.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.Removal == nil {
+		t.Fatalf(
+			"removal record = %+v, exists=%v err=%v",
+			record,
+			exists,
+			err,
+		)
+	}
+	if err := second.AcknowledgeRemoval(attempt.result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
 	}
 }
 

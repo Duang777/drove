@@ -135,3 +135,48 @@ func TestNoReplaceRenamesPreserveWindowsTargets(t *testing.T) {
 		t.Fatalf("target directory changed: %v", err)
 	}
 }
+
+func TestRenameWindowsHandleAcceptsReadOnlyFile(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	source, err := root.OpenFile(
+		"source",
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		0o444,
+	)
+	if err != nil {
+		t.Fatalf("create read-only source: %v", err)
+	}
+	defer source.Close()
+	if _, err := source.WriteString("source\n"); err != nil {
+		t.Fatalf("write read-only source handle: %v", err)
+	}
+	if err := source.Sync(); err != nil {
+		t.Fatalf("sync read-only source handle: %v", err)
+	}
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	installed, renameErr := renameRecordFile(
+		directory,
+		source,
+		"source",
+		"target",
+		false,
+	)
+	closeErr := directory.Close()
+	if renameErr != nil || !installed || closeErr != nil {
+		t.Fatalf(
+			"read-only rename = installed %v, rename %v, close %v",
+			installed,
+			renameErr,
+			closeErr,
+		)
+	}
+	assertFileContents(t, filepath.Join(rootPath, "target"), "source\n")
+}

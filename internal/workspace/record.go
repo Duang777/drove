@@ -32,15 +32,17 @@ type workspaceRecord struct {
 	PreparationCommitted bool                    `json:"preparation_committed"`
 	CreatedBranch        bool                    `json:"created_branch"`
 	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
+	GitDirectory         string                  `json:"git_directory,omitempty"`
 	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
 }
 
 type workspaceRemovalRecord struct {
-	OperationID string `json:"operation_id"`
-	Force       bool   `json:"force"`
-	Started     bool   `json:"started"`
-	Quarantined bool   `json:"quarantined,omitempty"`
-	PathAbsent  bool   `json:"path_absent,omitempty"`
+	OperationID    string `json:"operation_id"`
+	DirectoryToken string `json:"directory_token,omitempty"`
+	Force          bool   `json:"force"`
+	Started        bool   `json:"started"`
+	Quarantined    bool   `json:"quarantined,omitempty"`
+	PathAbsent     bool   `json:"path_absent,omitempty"`
 }
 
 func workspaceRecordPath(worktreePath string) string {
@@ -69,6 +71,7 @@ func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecor
 		IncludedPaths:     append([]string{}, includedPaths...),
 		CreatedBranch:     target.createdBranch,
 		BranchOperationID: target.branchOperationID,
+		GitDirectory:      target.gitDirectory,
 	}
 }
 
@@ -80,6 +83,7 @@ func (r workspaceRecord) workspace() Workspace {
 		Branch:            r.Branch,
 		createdBranch:     r.CreatedBranch,
 		branchOperationID: r.BranchOperationID,
+		gitDirectory:      r.GitDirectory,
 	}
 }
 
@@ -164,16 +168,14 @@ func (m *Manager) installWorkspaceRecordState(
 	}
 	fileOpen := true
 	defer func() {
+		if temporaryName != "" {
+			result = errors.Join(
+				result,
+				removeRecordPathIfSame(bucket, temporaryName, file),
+			)
+		}
 		if fileOpen {
 			result = errors.Join(result, file.Close())
-		}
-		if temporaryName != "" {
-			if err := bucket.Remove(temporaryName); !errors.Is(
-				err,
-				os.ErrNotExist,
-			) {
-				result = errors.Join(result, err)
-			}
 		}
 	}()
 	written, err := file.Write(raw)
@@ -280,6 +282,31 @@ func checkRecordTarget(
 		return fmt.Errorf("workspace: record %q is not a regular file", path)
 	}
 	return nil
+}
+
+func removeRecordPathIfSame(
+	root *os.Root,
+	name string,
+	expected *os.File,
+) error {
+	current, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	opened, err := expected.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(opened, current) {
+		return fmt.Errorf(
+			"workspace: temporary path %q changed identity",
+			name,
+		)
+	}
+	return root.Remove(name)
 }
 
 func (m *Manager) readWorkspaceRecord(
@@ -397,6 +424,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.PreparationCommitted ||
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
+			record.GitDirectory != "" ||
 			record.Removal != nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: legacy record %q contains newer fields",
@@ -413,7 +441,8 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		}
 		if record.PreparationCommitted ||
 			record.CreatedBranch ||
-			record.BranchOperationID != "" {
+			record.BranchOperationID != "" ||
+			record.GitDirectory != "" {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: version 2 record %q contains version 3 fields",
 				recordPath,
@@ -502,6 +531,15 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 				"workspace: absent-path removal cannot be quarantined",
 			)
 		}
+		if record.Removal.DirectoryToken != "" {
+			token, err := uuid.Parse(record.Removal.DirectoryToken)
+			if err != nil ||
+				token.String() != record.Removal.DirectoryToken {
+				return errors.New(
+					"workspace: removal directory token is not a canonical UUID",
+				)
+			}
+		}
 	}
 	if record.BranchOperationID != "" {
 		operationID, err := uuid.Parse(record.BranchOperationID)
@@ -510,6 +548,13 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 				"workspace: branch operation ID is not a canonical UUID",
 			)
 		}
+	}
+	if record.GitDirectory != "" &&
+		(!filepath.IsAbs(record.GitDirectory) ||
+			filepath.Clean(record.GitDirectory) != record.GitDirectory) {
+		return errors.New(
+			"workspace: Git directory is not a clean absolute path",
+		)
 	}
 	return nil
 }
