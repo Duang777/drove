@@ -262,6 +262,16 @@ func removalMarkerName(record workspaceRecord) string {
 	return ".drove-removal-" + record.Removal.OperationID
 }
 
+func validateRemovalMarkerPhase(
+	root *os.Root,
+	record workspaceRecord,
+) error {
+	if record.Removal != nil && record.Removal.Started {
+		return verifyRemovalMarker(root, record)
+	}
+	return ensureRemovalMarker(root, record)
+}
+
 func ensureRemovalMarker(
 	root *os.Root,
 	record workspaceRecord,

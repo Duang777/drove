@@ -453,7 +453,10 @@ func (m *Manager) resumePendingRemoval(
 		)
 		var markerErr error
 		if identityErr == nil {
-			markerErr = ensureRemovalMarker(quarantined, record)
+			markerErr = validateRemovalMarkerPhase(
+				quarantined,
+				record,
+			)
 		}
 		verifyErr := verifyRootEntryUnchanged(
 			bucket,
@@ -562,7 +565,7 @@ func (m *Manager) resumePendingRemoval(
 		}
 		return RemovalPending, err
 	}
-	markerErr := ensureRemovalMarker(opened, record)
+	markerErr := validateRemovalMarkerPhase(opened, record)
 	verifyErr = verifyRootEntryUnchanged(
 		bucket,
 		record.AgentID,
@@ -645,6 +648,17 @@ func (m *Manager) validateRemovalIdentity(
 	record workspaceRecord,
 	path string,
 ) error {
+	directoryIdentity, err := worktreeDirectoryIdentity(path)
+	if err != nil {
+		return err
+	}
+	if record.DirectoryIdentity != "" &&
+		directoryIdentity != record.DirectoryIdentity {
+		return fmt.Errorf(
+			"workspace: directory identity mismatch for removal path %q",
+			path,
+		)
+	}
 	repository, err := m.repositoryRoot(ctx, path)
 	if err != nil {
 		if record.Removal != nil &&

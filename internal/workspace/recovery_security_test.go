@@ -439,6 +439,46 @@ func TestRemoveRejectsReplacementGitWorktree(t *testing.T) {
 	)
 }
 
+func TestRemoveRejectsCopiedWorkspaceDirectory(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move original workspace: %v", err)
+	}
+	if err := os.CopyFS(prepared.Path, os.DirFS(originalPath)); err != nil {
+		t.Fatalf("copy workspace directory: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if _, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	); err == nil {
+		t.Fatal("remove accepted a copied workspace directory")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+}
+
 func TestListRejectsReplacementDataDirectory(t *testing.T) {
 	repository := newTestRepository(t)
 	parent := t.TempDir()
@@ -1095,6 +1135,68 @@ func TestReconcileStartedRemovalRejectsReplacementQuarantine(t *testing.T) {
 	assertFileContents(t, sentinel, "replacement\n")
 	if _, err := os.Stat(originalQuarantine); err != nil {
 		t.Fatalf("original quarantine changed: %v", err)
+	}
+}
+
+func TestReconcileStartedRemovalDoesNotRecreateMissingMarker(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID:    "50505050-5050-4050-8050-505050505050",
+		DirectoryToken: "51515151-5151-4151-8151-515151515151",
+		Force:          true,
+		Started:        true,
+		Quarantined:    true,
+	}
+	root, err := openRealPathRoot(prepared.Path)
+	if err != nil {
+		t.Fatalf("open workspace root: %v", err)
+	}
+	if err := ensureRemovalMarker(root, record); err != nil {
+		_ = root.Close()
+		t.Fatalf("install removal marker: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatalf("close workspace root: %v", err)
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("persist started removal: %v", err)
+	}
+	quarantineName := removalQuarantinePrefix(record) +
+		"52525252-5252-4252-8252-525252525252"
+	quarantinePath := filepath.Join(filepath.Dir(prepared.Path), quarantineName)
+	if err := os.Rename(prepared.Path, quarantinePath); err != nil {
+		t.Fatalf("quarantine workspace: %v", err)
+	}
+	markerPath := filepath.Join(quarantinePath, removalMarkerName(record))
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatalf("remove quarantine marker: %v", err)
+	}
+
+	if _, err := manager.ReconcileRemovals(context.Background()); err == nil {
+		t.Fatal("reconciliation recreated a missing started marker")
+	}
+	if _, err := os.Stat(quarantinePath); err != nil {
+		t.Fatalf("quarantine was removed: %v", err)
+	}
+	if _, err := os.Stat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing marker was recreated: %v", err)
 	}
 }
 

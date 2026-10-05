@@ -146,6 +146,11 @@ func sameWorkspace(left Workspace, right Workspace) bool {
 		left.gitDirectory != right.gitDirectory {
 		return false
 	}
+	if left.directoryIdentity != "" &&
+		right.directoryIdentity != "" &&
+		left.directoryIdentity != right.directoryIdentity {
+		return false
+	}
 	return left.AgentID == right.AgentID &&
 		left.Repository == right.Repository &&
 		left.Path == right.Path &&

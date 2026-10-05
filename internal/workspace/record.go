@@ -33,6 +33,7 @@ type workspaceRecord struct {
 	CreatedBranch        bool                    `json:"created_branch"`
 	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
 	GitDirectory         string                  `json:"git_directory,omitempty"`
+	DirectoryIdentity    string                  `json:"directory_identity,omitempty"`
 	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
 }
 
@@ -72,6 +73,7 @@ func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecor
 		CreatedBranch:     target.createdBranch,
 		BranchOperationID: target.branchOperationID,
 		GitDirectory:      target.gitDirectory,
+		DirectoryIdentity: target.directoryIdentity,
 	}
 }
 
@@ -84,6 +86,7 @@ func (r workspaceRecord) workspace() Workspace {
 		createdBranch:     r.CreatedBranch,
 		branchOperationID: r.BranchOperationID,
 		gitDirectory:      r.GitDirectory,
+		directoryIdentity: r.DirectoryIdentity,
 	}
 }
 
@@ -425,6 +428,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
 			record.GitDirectory != "" ||
+			record.DirectoryIdentity != "" ||
 			record.Removal != nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: legacy record %q contains newer fields",
@@ -442,7 +446,8 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		if record.PreparationCommitted ||
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
-			record.GitDirectory != "" {
+			record.GitDirectory != "" ||
+			record.DirectoryIdentity != "" {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: version 2 record %q contains version 3 fields",
 				recordPath,
@@ -554,6 +559,13 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 			filepath.Clean(record.GitDirectory) != record.GitDirectory) {
 		return errors.New(
 			"workspace: Git directory is not a clean absolute path",
+		)
+	}
+	if len(record.DirectoryIdentity) > 128 ||
+		strings.TrimSpace(record.DirectoryIdentity) !=
+			record.DirectoryIdentity {
+		return errors.New(
+			"workspace: directory identity is invalid",
 		)
 	}
 	return nil

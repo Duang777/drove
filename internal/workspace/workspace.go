@@ -51,6 +51,7 @@ type Workspace struct {
 	createdBranch     bool
 	branchOperationID string
 	gitDirectory      string
+	directoryIdentity string
 	protectionKnown   bool
 	includedPaths     []string
 }
@@ -346,12 +347,20 @@ func (m *Manager) prepare(
 		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
 	}
 	result.gitDirectory = gitDirectory
+	directoryIdentity, err := worktreeDirectoryIdentity(result.Path)
+	if err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return Workspace{}, errors.Join(err, m.discard(cleanupCtx, result))
+	}
+	result.directoryIdentity = directoryIdentity
 	record, exists, err := m.readWorkspaceRecord(result.Path)
 	if err == nil && !exists {
 		err = errors.New("workspace: worktree identity record is missing")
 	}
 	if err == nil {
 		record.GitDirectory = gitDirectory
+		record.DirectoryIdentity = directoryIdentity
 		err = m.replaceWorkspaceRecord(record)
 	}
 	if err != nil {
@@ -929,6 +938,10 @@ func (m *Manager) inspect(
 	if err != nil {
 		return Workspace{}, err
 	}
+	directoryIdentity, err := worktreeDirectoryIdentity(path)
+	if err != nil {
+		return Workspace{}, err
+	}
 
 	branchOutput, err := m.run(ctx, "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
 	detached := false
@@ -983,15 +996,16 @@ func (m *Manager) inspect(
 		}
 	}
 	return Workspace{
-		AgentID:         agentID,
-		Repository:      repository,
-		Path:            path,
-		Branch:          branch,
-		Dirty:           workspaceStatusDirty(status, recorded) || includedDirty,
-		Detached:        detached,
-		gitDirectory:    gitDirectory,
-		protectionKnown: protectionKnown,
-		includedPaths:   includedPaths,
+		AgentID:           agentID,
+		Repository:        repository,
+		Path:              path,
+		Branch:            branch,
+		Dirty:             workspaceStatusDirty(status, recorded) || includedDirty,
+		Detached:          detached,
+		gitDirectory:      gitDirectory,
+		directoryIdentity: directoryIdentity,
+		protectionKnown:   protectionKnown,
+		includedPaths:     includedPaths,
 	}, nil
 }
 
@@ -1052,6 +1066,32 @@ func (m *Manager) worktreeGitDirectory(
 		)
 	}
 	return gitDirectory, nil
+}
+
+func worktreeDirectoryIdentity(path string) (result string, resultErr error) {
+	root, err := openRealPathRoot(path)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: open worktree identity for %q: %w",
+			path,
+			err,
+		)
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, root.Close())
+	}()
+	identity, err := openedDirectoryIdentity(root)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: inspect worktree identity for %q: %w",
+			path,
+			err,
+		)
+	}
+	if err := verifyRealPathRoot(path, root); err != nil {
+		return "", err
+	}
+	return identity, nil
 }
 
 func (m *Manager) repositoryPaths(
