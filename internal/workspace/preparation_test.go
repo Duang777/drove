@@ -149,6 +149,64 @@ func TestReconcilePreparationsDiscardsPendingAfterRestart(t *testing.T) {
 	}
 }
 
+func TestReconcilePreparationWithIncompleteGitIdentityFailsClosed(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.DirectoryIdentity == "" {
+		t.Fatalf(
+			"read preparation record: exists=%v record=%+v err=%v",
+			exists,
+			record,
+			err,
+		)
+	}
+	record.GitDirectory = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("clear prepared Git directory: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	err = restarted.ReconcilePreparations(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "incomplete worktree identity") {
+		t.Fatalf("reconcile incomplete preparation error = %v", err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("incomplete preparation path was changed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("incomplete preparation record was changed: %v", err)
+	}
+	runGit(
+		t,
+		repository,
+		"show-ref",
+		"--verify",
+		"refs/heads/"+prepared.Branch,
+	)
+}
+
 func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 	t *testing.T,
 ) {

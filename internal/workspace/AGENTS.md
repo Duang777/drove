@@ -26,7 +26,8 @@
   源 manifest 路径打开。
   只有该文件匹配的未跟踪文件会复制到新 worktree，普通未跟踪文件不会复制；匹配项
   必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 4+
-  sidecar 中，后续 dirty 检查不得重新解释目标 worktree 的 manifest。
+  sidecar 中；复制入口和出口都必须把重新打开的目标目录与 sidecar 目录身份比对，
+  后续 dirty 检查不得重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
   sidecar，并在受约束 repository bucket 内预创建空目标目录、固定目录身份、同步父目录
   后把身份写回 sidecar。每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager

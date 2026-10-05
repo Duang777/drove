@@ -41,6 +41,30 @@ func (m *Manager) copyIncludedFiles(
 	defer func() {
 		result = errors.Join(result, destination.Close())
 	}()
+	if target.directoryIdentity == "" {
+		return errors.New(
+			"workspace: include destination identity is unavailable",
+		)
+	}
+	destinationIdentity, err := openedDirectoryIdentity(destination)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect include destination identity: %w",
+			err,
+		)
+	}
+	if destinationIdentity != target.directoryIdentity {
+		return errors.New(
+			"workspace: include destination identity changed",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		target.AgentID,
+		destination,
+	); err != nil {
+		return fmt.Errorf("workspace: verify include destination: %w", err)
+	}
 
 	for _, relative := range paths {
 		if err := copyIncludedPath(
@@ -52,6 +76,25 @@ func (m *Manager) copyIncludedFiles(
 		); err != nil {
 			return fmt.Errorf("workspace: copy included path %q: %w", relative, err)
 		}
+	}
+	destinationIdentity, err = openedDirectoryIdentity(destination)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: reinspect include destination identity: %w",
+			err,
+		)
+	}
+	if destinationIdentity != target.directoryIdentity {
+		return errors.New(
+			"workspace: include destination identity changed while copying",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		target.AgentID,
+		destination,
+	); err != nil {
+		return fmt.Errorf("workspace: reverify include destination: %w", err)
 	}
 	return nil
 }

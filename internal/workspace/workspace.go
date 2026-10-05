@@ -49,7 +49,6 @@ type Workspace struct {
 
 	createdBranch      bool
 	branchOperationID  string
-	expectedHeadOID    string
 	gitDirectory       string
 	directoryIdentity  string
 	protectionKnown    bool
@@ -266,23 +265,11 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 
-	branchOID, exists, err := sourceRepository.refOID(
-		ctx,
-		"refs/heads/"+branch,
-	)
+	exists, err := sourceRepository.branchExists(ctx, branch)
 	if err != nil {
 		return Workspace{}, err
 	}
 	createdBranch := !exists
-	expectedHeadOID := branchOID
-	if createdBranch {
-		expectedHeadOID = sourceRepository.startOID
-	}
-	if expectedHeadOID == "" {
-		return Workspace{}, errors.New(
-			"workspace: prepared branch start is unavailable",
-		)
-	}
 	branchOperationID := uuid.NewString()
 	result := Workspace{
 		AgentID:           agentID,
@@ -290,7 +277,6 @@ func (m *Manager) prepare(
 		Path:              path,
 		Branch:            branch,
 		branchOperationID: branchOperationID,
-		expectedHeadOID:   expectedHeadOID,
 		repositoryEvidence: cloneRepositoryEvidence(
 			&lease.evidence,
 		),
@@ -721,7 +707,7 @@ func (m *Manager) discardWithRepository(
 	ctx context.Context,
 	target Workspace,
 	repository repositoryCapability,
-	allowIdentityCapture bool,
+	allowIncompleteGitIdentity bool,
 ) error {
 	if err := m.validateManagedPath(target); err != nil {
 		return err
@@ -755,7 +741,7 @@ func (m *Manager) discardWithRepository(
 	}
 	if pathExists &&
 		(record.DirectoryIdentity == "" ||
-			(record.GitDirectory == "" && !allowIdentityCapture)) {
+			(record.GitDirectory == "" && !allowIncompleteGitIdentity)) {
 		return errors.Join(
 			result,
 			errors.New(
@@ -780,7 +766,7 @@ func (m *Manager) discardWithRepository(
 					target,
 					record,
 					repository,
-					allowIdentityCapture,
+					allowIncompleteGitIdentity,
 				)
 			} else {
 				removeErr = m.removeDiscardedPath(

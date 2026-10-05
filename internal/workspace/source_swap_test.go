@@ -368,6 +368,96 @@ exit "$status"
 	assertFileContents(t, filepath.Join(targetPath, "must-remain"), "replacement\n")
 }
 
+func TestPrepareRollsBackExistingBranchMovedBeforeWorktreeAdd(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+	oldOID := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+	runGit(t, source, "branch", "existing", oldOID)
+	if err := os.WriteFile(
+		filepath.Join(source, "second.txt"),
+		[]byte("second\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write second commit: %v", err)
+	}
+	runGit(t, source, "add", "second.txt")
+	runGit(t, source, "commit", "-m", "second")
+	newOID := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	canonicalSource, err := resolvePath(source)
+	if err != nil {
+		t.Fatalf("resolve source: %v", err)
+	}
+	targetPath := filepath.Join(
+		manager.root,
+		repositoryHash(canonicalSource),
+		testAgentID,
+	)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	wrapper := filepath.Join(parent, "git-wrapper-move-existing-branch")
+	script := `#!/bin/sh
+matched=
+saw_worktree=
+for argument in "$@"; do
+  if [ "$saw_worktree" = "1" ] && [ "$argument" = "add" ]; then
+    matched=1
+    break
+  fi
+  [ "$argument" = "worktree" ] && saw_worktree=1
+done
+if [ -n "$matched" ]; then
+  "$DROVE_TEST_REAL_GIT" --git-dir="$DROVE_TEST_GIT_DIR" update-ref \
+    refs/heads/existing "$DROVE_TEST_NEW_OID" "$DROVE_TEST_OLD_OID" || exit 96
+fi
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$matched" ]; then
+  exit 97
+fi
+exit "$status"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_GIT_DIR", filepath.Join(source, ".git"))
+	t.Setenv("DROVE_TEST_OLD_OID", oldOID)
+	t.Setenv("DROVE_TEST_NEW_OID", newOID)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	manager.git = wrapper
+
+	if _, err := manager.Prepare(
+		context.Background(),
+		source,
+		"existing",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare succeeded when worktree add reported failure")
+	}
+	if _, err := os.Lstat(targetPath); !os.IsNotExist(err) {
+		t.Fatalf("failed preparation target remains or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(targetPath)); !os.IsNotExist(err) {
+		t.Fatalf("failed preparation record remains or inspect failed: %v", err)
+	}
+	assertWorktreeUnregistered(t, source, targetPath)
+	if branchOID := strings.TrimSpace(runGit(
+		t,
+		source,
+		"rev-parse",
+		"refs/heads/existing",
+	)); branchOID != newOID {
+		t.Fatalf("existing branch OID = %q, want %q", branchOID, newOID)
+	}
+}
+
 func TestDiscardUsesRetainedRepositoryAfterPrepareSourceSwap(
 	t *testing.T,
 ) {

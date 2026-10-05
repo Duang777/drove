@@ -43,7 +43,23 @@ func (m *Manager) removePreparedWorktreeAtRoot(
 			"workspace: prepared worktree identity is incomplete",
 		)
 	case exists:
-		if target.expectedHeadOID == "" {
+		expectedHeadOID := repository.startOID
+		if !target.createdBranch {
+			var branchExists bool
+			expectedHeadOID, branchExists, err = repository.refOID(
+				ctx,
+				"refs/heads/"+target.Branch,
+			)
+			if err != nil {
+				return err
+			}
+			if !branchExists {
+				return errors.New(
+					"workspace: prepared worktree branch disappeared",
+				)
+			}
+		}
+		if expectedHeadOID == "" {
 			return errors.New(
 				"workspace: prepared worktree expected HEAD is unavailable",
 			)
@@ -51,7 +67,7 @@ func (m *Manager) removePreparedWorktreeAtRoot(
 		if err := repository.verifyPreparedWorktreeRegistration(
 			target,
 			registered,
-			target.expectedHeadOID,
+			expectedHeadOID,
 		); err != nil {
 			return err
 		}

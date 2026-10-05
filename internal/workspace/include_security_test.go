@@ -119,6 +119,17 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	if err := os.Mkdir(target.Path, 0o700); err != nil {
 		t.Fatalf("create destination: %v", err)
 	}
+	destination, err := openRealPathRoot(target.Path)
+	if err != nil {
+		t.Fatalf("open destination: %v", err)
+	}
+	target.directoryIdentity, err = openedDirectoryIdentity(destination)
+	if closeErr := destination.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("inspect destination identity: %v", err)
+	}
 
 	openedSourcePath := sourcePath + "-opened"
 	if err := os.Rename(sourcePath, openedSourcePath); err != nil {
@@ -145,6 +156,77 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	assertFileContents(t, filepath.Join(target.Path, "secret"), "original\n")
 	if err := verifyRealPathRoot(sourcePath, source); err == nil {
 		t.Fatal("source replacement passed final identity verification")
+	}
+}
+
+func TestCopyIncludedFilesRejectsReplacementTargetIdentity(t *testing.T) {
+	sourcePath := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(sourcePath, "secret"),
+		[]byte("inside\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	source, err := openRealPathRoot(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer source.Close()
+
+	repository := filepath.Join(t.TempDir(), "repository")
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := manager.ensureManagedRoot(); err != nil {
+		t.Fatalf("ensure managed root: %v", err)
+	}
+	if err := manager.ensureManagedBucket(repository); err != nil {
+		t.Fatalf("ensure managed bucket: %v", err)
+	}
+	target := Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path: filepath.Join(
+			manager.root,
+			repositoryHash(repository),
+			testAgentID,
+		),
+		Branch: "replacement-target",
+	}
+	if err := os.Mkdir(target.Path, 0o700); err != nil {
+		t.Fatalf("create destination: %v", err)
+	}
+	destination, err := openRealPathRoot(target.Path)
+	if err != nil {
+		t.Fatalf("open destination: %v", err)
+	}
+	target.directoryIdentity, err = openedDirectoryIdentity(destination)
+	if closeErr := destination.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("inspect destination identity: %v", err)
+	}
+	if err := os.Rename(target.Path, target.Path+"-original"); err != nil {
+		t.Fatalf("move destination: %v", err)
+	}
+	if err := os.Mkdir(target.Path, 0o700); err != nil {
+		t.Fatalf("create replacement destination: %v", err)
+	}
+
+	if err := manager.copyIncludedFiles(
+		source,
+		target,
+		[]string{"secret"},
+	); err == nil {
+		t.Fatal("copy accepted a replacement destination")
+	}
+	if _, err := os.Lstat(
+		filepath.Join(target.Path, "secret"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("copy wrote into replacement destination: %v", err)
 	}
 }
 
