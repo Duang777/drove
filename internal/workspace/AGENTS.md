@@ -19,8 +19,8 @@
   `git worktree add` 都必须从该根句柄执行，并禁用 Git hooks。Linux 使用
   `/proc/self/fd`，其他 Unix 通过继承目录描述符后 `fchdir`，Windows 持有不允许
   share-delete 的目录句柄并复核目录身份；不能提供等价约束的平台必须 fail-stop。
-  `git worktree add` 使用 `--no-checkout`，新 worktree 打开后先持久化 Git 私有目录和
-  文件系统目录身份，再从固定目标根执行 `git reset --hard`。仓库根目录的
+  `git worktree add` 使用 `--no-checkout`，新 worktree 打开后先核对预先持久化的
+  文件系统目录身份，再持久化 Git 私有目录，最后从固定目标根执行 `git reset --hard`。仓库根目录的
   `.worktreeinclude` 使用 gitignore 语义，并从已打开文件读取一次。Unix 通过继承的
   只读文件描述符交给 Git，其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按
   源 manifest 路径打开。
@@ -28,7 +28,9 @@
   必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 4+
   sidecar 中，后续 dirty 检查不得重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
-  sidecar，每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager 的冲突清理。
+  sidecar，并在受约束 repository bucket 内预创建空目标目录、固定目录身份、同步父目录
+  后把身份写回 sidecar。每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager
+  的冲突清理。
   version 5 sidecar 记录源 worktree、源私有 Git directory 和 common Git directory
   的规范路径及目录实例身份。重启恢复必须先重开并逐项匹配这些证据，再取得 rooted
   repository capability；源路径、linked-worktree `.git` 指针或 common Git directory
@@ -82,8 +84,10 @@
   对应原子原语的平台必须返回错误。
 - `Discard` 只供创建事务在会话元数据持久化前回滚；它会删除本次新建的 worktree 和
   本次新建的分支。普通或重启后的 Discard 遇到路径存在但 preparation sidecar 尚未持久化
-  完整目录身份时必须 fail-stop；同一次 Prepare 仍持有原始仓库根句柄时，可先从该句柄验证
-  worktree registration、Git 私有目录、分支和 HEAD，再固定并持久化目标目录身份后回滚。
+  完整 Git 身份时必须 fail-stop；同一次 Prepare 仍持有原始仓库根句柄时，如果 sidecar
+  已有预创建目标的目录身份但尚无 Git 私有目录，可验证公开 worktree registration 的
+  路径、分支和预期 HEAD 后通过固定目录句柄回滚。不得扫描或推测 Git 私有 worktree
+  管理目录名；路径删除后由 `git worktree prune --expire now` 收敛任意私有后缀。
   重启后的 Discard 和 AcknowledgePreparation 必须使用 version 5 仓库证据重开 capability，
   禁止退回 `git -C <recorded-path>`。
   禁止把同名替代目录当作失败创建的残留删除。未注册残留目录通过已验证的 `os.Root`
