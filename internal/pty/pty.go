@@ -16,17 +16,19 @@ import (
 )
 
 const (
-	maxTerminalDimension     = 1<<16 - 1
-	defaultTerminationGrace  = 5 * time.Second
-	processGroupPollInterval = 10 * time.Millisecond
-	writeTimeout             = time.Second
+	maxTerminalDimension              = 1<<16 - 1
+	defaultTerminationGrace           = 5 * time.Second
+	processGroupKillConfirmationGrace = 250 * time.Millisecond
+	processGroupPollInterval          = 10 * time.Millisecond
+	writeTimeout                      = time.Second
 )
 
 // ExitInfo 描述进程退出信息。
 type ExitInfo struct {
-	PID        int
-	Code       int
-	Err        error
+	PID  int
+	Code int
+	Err  error
+	// CleanupErr reports a process-group cleanup failure.
 	CleanupErr error
 }
 
@@ -106,6 +108,7 @@ type Session struct {
 	masterCloseOnce sync.Once
 	groupCloseOnce  sync.Once
 	closeErr        error
+	groupCloseErr   error
 
 	cmd         *exec.Cmd
 	ptmx        *os.File
@@ -293,7 +296,7 @@ func (s *Session) waitLoop() {
 		info.Code = 0
 	}
 	s.mu.Lock()
-	info.CleanupErr = s.closeErr
+	info.CleanupErr = s.groupCloseErr
 	s.mu.Unlock()
 	if s.onExit != nil {
 		s.onExit(info)
@@ -383,6 +386,30 @@ func (s *Session) closeProcessGroup() {
 						closeErrors,
 						fmt.Errorf("pty: kill process group: %w", killErr),
 					)
+				} else if !killFoundExited {
+					killExited, killWaitErr := waitForProcessGroupExit(
+						s.groupSignal,
+						s.cmd.Process.Pid,
+						processGroupKillConfirmationGrace,
+					)
+					groupGone = killExited
+					if killWaitErr != nil {
+						closeErrors = append(
+							closeErrors,
+							fmt.Errorf(
+								"pty: confirm process group exit: %w",
+								killWaitErr,
+							),
+						)
+					} else if !groupGone {
+						closeErrors = append(
+							closeErrors,
+							fmt.Errorf(
+								"pty: process group %d remains after SIGKILL",
+								s.cmd.Process.Pid,
+							),
+						)
+					}
 				}
 			}
 			if terminateErr != nil &&
@@ -396,8 +423,10 @@ func (s *Session) closeProcessGroup() {
 				)
 			}
 		}
+		groupCloseErr := errors.Join(closeErrors...)
 		s.mu.Lock()
-		s.closeErr = errors.Join(s.closeErr, errors.Join(closeErrors...))
+		s.groupCloseErr = groupCloseErr
+		s.closeErr = errors.Join(s.closeErr, groupCloseErr)
 		s.mu.Unlock()
 	})
 }
@@ -522,7 +551,11 @@ func waitForProcessGroupExit(
 		}
 		select {
 		case <-timer.C:
-			return false, nil
+			alive, err := processGroupAliveWith(signal, pid)
+			if err != nil {
+				return false, err
+			}
+			return !alive, nil
 		case <-ticker.C:
 		}
 	}
