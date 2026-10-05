@@ -154,6 +154,82 @@ func openRecordForRename(directory *os.File, name string) (*os.File, error) {
 	return file, nil
 }
 
-func syncRecordDirectory(_ *os.File) error {
+func openRecordDirectory(root *os.Root) (_ *os.File, result error) {
+	anchor, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if anchor != nil {
+			result = errors.Join(result, anchor.Close())
+		}
+	}()
+	anchorInfo, err := anchor.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect directory anchor: %w", err)
+	}
+	objectName, err := windows.NewNTUnicodeString(".")
+	if err != nil {
+		return nil, err
+	}
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		Length:        uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})),
+		RootDirectory: windows.Handle(anchor.Fd()),
+		ObjectName:    objectName,
+	}
+	var (
+		handle windows.Handle
+		status windows.IO_STATUS_BLOCK
+	)
+	err = windows.NtCreateFile(
+		&handle,
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE,
+		attributes,
+		&status,
+		nil,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		windows.FILE_OPEN,
+		windows.FILE_SYNCHRONOUS_IO_NONALERT|
+			windows.FILE_DIRECTORY_FILE|
+			windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	directory := os.NewFile(uintptr(handle), ".")
+	if directory == nil {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New("create directory file from Windows handle")
+	}
+	openedInfo, err := directory.Stat()
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("inspect writable directory handle: %w", err),
+			directory.Close(),
+		)
+	}
+	if !openedInfo.IsDir() || !os.SameFile(anchorInfo, openedInfo) {
+		return nil, errors.Join(
+			errors.New("writable directory handle changed identity"),
+			directory.Close(),
+		)
+	}
+	closeErr := anchor.Close()
+	anchor = nil
+	if closeErr != nil {
+		return nil, errors.Join(closeErr, directory.Close())
+	}
+	return directory, nil
+}
+
+func syncRecordDirectory(directory *os.File) error {
+	if err := windows.FlushFileBuffers(
+		windows.Handle(directory.Fd()),
+	); err != nil {
+		return fmt.Errorf("flush directory metadata: %w", err)
+	}
 	return nil
 }

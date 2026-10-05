@@ -77,6 +77,73 @@ func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 	)
 }
 
+func TestCopyIncludedPathRejectsSameSizeRewriteDuringCopy(t *testing.T) {
+	sourcePath := t.TempDir()
+	sourceFile := filepath.Join(sourcePath, "secret")
+	if err := os.WriteFile(sourceFile, []byte("before\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	sourceInfo, err := os.Stat(sourceFile)
+	if err != nil {
+		t.Fatalf("inspect source: %v", err)
+	}
+	destinationPath := t.TempDir()
+	source, err := openRealPathRoot(sourcePath)
+	if err != nil {
+		t.Fatalf("open source root: %v", err)
+	}
+	defer source.Close()
+	destinationBucket, err := openRealPathRoot(filepath.Dir(destinationPath))
+	if err != nil {
+		t.Fatalf("open destination bucket: %v", err)
+	}
+	defer destinationBucket.Close()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		filepath.Base(destinationPath),
+	)
+	if err != nil {
+		t.Fatalf("open destination root: %v", err)
+	}
+	defer destination.Close()
+
+	err = copyIncludedPathAfterCopy(
+		source,
+		destinationBucket,
+		destination,
+		filepath.Base(destinationPath),
+		"secret",
+		func() {
+			if err := os.WriteFile(
+				sourceFile,
+				[]byte("after!\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("rewrite source: %v", err)
+			}
+			if err := os.Chtimes(
+				sourceFile,
+				sourceInfo.ModTime(),
+				sourceInfo.ModTime(),
+			); err != nil {
+				t.Fatalf("restore source modification time: %v", err)
+			}
+		},
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"source changed while verifying copied contents",
+		) {
+		t.Fatalf("same-size source rewrite error = %v", err)
+	}
+	if _, err := os.Lstat(
+		filepath.Join(destinationPath, "secret"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected source rewrite installed destination: %v", err)
+	}
+}
+
 func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source")
 	if err := os.Mkdir(sourcePath, 0o700); err != nil {

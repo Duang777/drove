@@ -254,7 +254,7 @@ func (m *Manager) installWorkspaceRecordState(
 	if err := m.verifyRecordBucket(record.Path, bucket); err != nil {
 		return false, err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return false, fmt.Errorf(
 			"workspace: open record directory %q: %w",
@@ -865,7 +865,7 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 		return err
 	}
 
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open record directory %q: %w",
@@ -1338,7 +1338,7 @@ func (m *Manager) removeRecordAcknowledgementQuarantine(
 	); err != nil {
 		return err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open quarantined record directory %q: %w",
@@ -1397,7 +1397,7 @@ func restoreRecordAcknowledgement(
 	if err != nil {
 		return err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return err
 	}
@@ -1434,7 +1434,7 @@ func syncRecordBucket(
 	bucket *os.Root,
 	recordPath string,
 ) error {
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open record directory %q for sync: %w",

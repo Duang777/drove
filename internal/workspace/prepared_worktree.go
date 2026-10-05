@@ -98,7 +98,7 @@ func (m *Manager) createPreparedWorktreeTarget(
 	); err != nil {
 		return nil, err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"workspace: open prepared worktree parent: %w",
@@ -290,7 +290,7 @@ func (m *Manager) promotePreparedWorktreeTarget(
 	if err != nil {
 		return err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return err
 	}

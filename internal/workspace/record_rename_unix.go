@@ -224,6 +224,10 @@ func verifyRecordPathIdentity(
 	return nil
 }
 
+func openRecordDirectory(root *os.Root) (*os.File, error) {
+	return root.Open(".")
+}
+
 func syncRecordDirectory(directory *os.File) error {
 	return directory.Sync()
 }

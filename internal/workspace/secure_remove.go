@@ -346,7 +346,7 @@ func installRemovalMarker(
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("workspace: sync removal marker: %w", err)
 	}
-	directory, err := root.Open(".")
+	directory, err := openRecordDirectory(root)
 	if err != nil {
 		return fmt.Errorf("workspace: open removal marker directory: %w", err)
 	}
@@ -424,7 +424,7 @@ func removeRemovalMarkerIfPresent(
 	if err := root.Remove(name); err != nil {
 		return fmt.Errorf("workspace: remove removal marker: %w", err)
 	}
-	directory, err := root.Open(".")
+	directory, err := openRecordDirectory(root)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open removal marker directory: %w",
@@ -538,7 +538,7 @@ func quarantineManagedPath(
 		return "", false, err
 	}
 	name = removalQuarantinePrefix(record) + uuid.NewString()
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return "", false, err
 	}
@@ -583,7 +583,7 @@ func restoreManagedQuarantine(
 	if err != nil {
 		return err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return err
 	}

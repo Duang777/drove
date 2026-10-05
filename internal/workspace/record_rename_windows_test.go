@@ -8,14 +8,19 @@ import (
 	"testing"
 )
 
-func TestSyncRecordDirectoryAcceptsReadOnlyWindowsHandle(t *testing.T) {
-	directory, err := os.Open(t.TempDir())
+func TestOpenRecordDirectoryProvidesSyncableWindowsHandle(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
 	if err != nil {
-		t.Fatalf("open directory: %v", err)
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		t.Fatalf("open syncable directory: %v", err)
 	}
 	defer directory.Close()
 	if err := syncRecordDirectory(directory); err != nil {
-		t.Fatalf("sync read-only directory handle: %v", err)
+		t.Fatalf("sync directory handle: %v", err)
 	}
 }
 

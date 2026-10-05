@@ -3,6 +3,7 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -659,6 +660,24 @@ func copyIncludedPath(
 	destinationRoot *os.Root,
 	destinationName string,
 	relative string,
+) error {
+	return copyIncludedPathAfterCopy(
+		sourceRoot,
+		destinationBucket,
+		destinationRoot,
+		destinationName,
+		relative,
+		nil,
+	)
+}
+
+func copyIncludedPathAfterCopy(
+	sourceRoot *os.Root,
+	destinationBucket *os.Root,
+	destinationRoot *os.Root,
+	destinationName string,
+	relative string,
+	afterCopy func(),
 ) (result error) {
 	relative, err := validateIncludedPath(relative)
 	if err != nil {
@@ -766,19 +785,52 @@ func copyIncludedPath(
 			result = errors.Join(result, output.Close())
 		}
 	}()
-	copied, err := io.Copy(output, input)
+	copiedDigest := sha256.New()
+	copied, err := io.Copy(io.MultiWriter(output, copiedDigest), input)
 	if err != nil {
 		return fmt.Errorf("copy staged contents: %w", err)
 	}
-	afterCopy, err := input.Stat()
+	if afterCopy != nil {
+		afterCopy()
+	}
+	afterCopyInfo, err := input.Stat()
 	if err != nil {
 		return fmt.Errorf("reinspect copied source: %w", err)
 	}
 	if copied != openedInfo.Size() ||
-		afterCopy.Size() != openedInfo.Size() ||
-		afterCopy.Mode() != openedInfo.Mode() ||
-		!afterCopy.ModTime().Equal(openedInfo.ModTime()) {
+		afterCopyInfo.Size() != openedInfo.Size() ||
+		afterCopyInfo.Mode() != openedInfo.Mode() ||
+		!afterCopyInfo.ModTime().Equal(openedInfo.ModTime()) {
 		return errors.New("source changed while copying")
+	}
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind copied source: %w", err)
+	}
+	verifiedDigest := sha256.New()
+	verified, err := io.Copy(verifiedDigest, input)
+	if err != nil {
+		return fmt.Errorf("verify copied source contents: %w", err)
+	}
+	afterVerification, err := input.Stat()
+	if err != nil {
+		return fmt.Errorf("reinspect verified source: %w", err)
+	}
+	if verified != openedInfo.Size() ||
+		afterVerification.Size() != openedInfo.Size() ||
+		afterVerification.Mode() != openedInfo.Mode() ||
+		!afterVerification.ModTime().Equal(openedInfo.ModTime()) ||
+		!bytes.Equal(copiedDigest.Sum(nil), verifiedDigest.Sum(nil)) {
+		return errors.New("source changed while verifying copied contents")
+	}
+	if err := output.Chmod(openedInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("set staged destination mode: %w", err)
+	}
+	stagedInfo, err := output.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect staged destination: %w", err)
+	}
+	if stagedInfo.Mode().Perm() != openedInfo.Mode().Perm() {
+		return errors.New("staged destination mode does not match source")
 	}
 	if err := output.Sync(); err != nil {
 		return fmt.Errorf("sync staged destination: %w", err)
@@ -799,7 +851,7 @@ func copyIncludedPath(
 		return fmt.Errorf("verify destination parent: %w", err)
 	}
 
-	directoryFile, err := destinationParent.Open(".")
+	directoryFile, err := openRecordDirectory(destinationParent)
 	if err != nil {
 		return fmt.Errorf("open destination parent for install: %w", err)
 	}
@@ -876,7 +928,7 @@ func openIncludedParent(
 					err,
 				)
 			}
-			directory, openErr := current.Open(".")
+			directory, openErr := openRecordDirectory(current)
 			if openErr != nil {
 				return nil, false, fmt.Errorf(
 					"open destination parent for sync: %w",
