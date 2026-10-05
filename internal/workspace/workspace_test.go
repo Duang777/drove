@@ -10,10 +10,117 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testAgentID = "11111111-1111-4111-8111-111111111111"
 const secondTestAgentID = "22222222-2222-4222-8222-222222222222"
+
+func TestConcurrentPrepareRecordConflictPreservesWinner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		nil,
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	dataDir := filepath.Join(t.TempDir(), "data")
+	first, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new first manager: %v", err)
+	}
+	second, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new second manager: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	barrier := t.TempDir()
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+case " $* " in
+  *" ls-files --others "*)
+    : > "$DROVE_TEST_BARRIER/$$"
+    while test "$(find "$DROVE_TEST_BARRIER" -type f | wc -l | tr -d ' ')" -lt 2; do
+      sleep 0.01
+    done
+    ;;
+esac
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_BARRIER", barrier)
+	first.git = wrapper
+	second.git = wrapper
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	type prepareResult struct {
+		manager   *Manager
+		workspace Workspace
+		err       error
+	}
+	results := make(chan prepareResult, 2)
+	for _, manager := range []*Manager{first, second} {
+		go func() {
+			prepared, err := manager.Prepare(
+				ctx,
+				repository,
+				"",
+				testAgentID,
+			)
+			results <- prepareResult{
+				manager:   manager,
+				workspace: prepared,
+				err:       err,
+			}
+		}()
+	}
+	var succeeded *prepareResult
+	var failed int
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			failed++
+			continue
+		}
+		current := result
+		succeeded = &current
+	}
+	if succeeded == nil || failed != 1 {
+		t.Fatalf("concurrent prepare = success %+v, failures %d", succeeded, failed)
+	}
+	record, exists, err := succeeded.manager.readWorkspaceRecord(
+		succeeded.workspace.Path,
+	)
+	if err != nil || !exists ||
+		record.BranchOperationID != succeeded.workspace.branchOperationID {
+		t.Fatalf(
+			"winning record = %+v, exists=%v err=%v",
+			record,
+			exists,
+			err,
+		)
+	}
+	if _, err := os.Stat(succeeded.workspace.Path); err != nil {
+		t.Fatalf("winning workspace was removed: %v", err)
+	}
+	if err := succeeded.manager.Discard(
+		context.Background(),
+		succeeded.workspace,
+	); err != nil {
+		t.Fatalf("discard winning workspace: %v", err)
+	}
+}
 
 func TestInstallWorkspaceRecordRejectsOversizedEncoding(t *testing.T) {
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

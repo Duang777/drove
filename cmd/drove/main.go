@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -57,7 +58,10 @@ func main() {
 	// CLI 静默日志，避免污染输出。
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	root := newRootCmd()
+	root.SetContext(ctx)
 	if err := executeRoot(root, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "drove:", err)
 		os.Exit(commandExitCode(err))
@@ -194,7 +198,7 @@ func newUpCmd() *cobra.Command {
 		Use:   "up <vendor|command>",
 		Short: "启动一个 Agent 会话（自动拉起 daemon）",
 		Args:  usageArgs(cobra.ExactArgs(1)),
-		RunE: func(_ *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			hookPolicy := agent.HookPolicy(hooks)
 			if hookPolicy != "" && !agent.ValidHookPolicy(hookPolicy) {
 				return markUsageError(
@@ -213,7 +217,7 @@ func newUpCmd() *cobra.Command {
 					return err
 				}
 			}
-			ctx := context.Background()
+			ctx := cmd.Context()
 			c, err := newClient(ctx)
 			if err != nil {
 				return err

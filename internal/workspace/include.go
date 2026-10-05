@@ -196,54 +196,20 @@ func copyIncludedPath(
 		return errors.New("source changed while opening")
 	}
 
-	temporaryName := "." + destinationName + ".include-" + uuid.NewString()
-	output, err := destinationBucket.OpenFile(
-		temporaryName,
-		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-		sourceInfo.Mode().Perm(),
-	)
-	if err != nil {
-		return fmt.Errorf("create staged destination: %w", err)
-	}
-	outputOpen := true
-	defer func() {
-		if outputOpen {
-			result = errors.Join(result, output.Close())
-		}
-		if temporaryName != "" {
-			if err := destinationBucket.Remove(temporaryName); !errors.Is(
-				err,
-				os.ErrNotExist,
-			) {
-				result = errors.Join(result, err)
-			}
-		}
-	}()
-	if _, err := io.Copy(output, input); err != nil {
-		return fmt.Errorf("copy staged contents: %w", err)
-	}
-	if err := output.Sync(); err != nil {
-		return fmt.Errorf("sync staged destination: %w", err)
-	}
-
-	parentName, err := ensureIncludedParent(
-		destinationBucket,
-		destinationName,
-		directory,
-	)
-	if err != nil {
-		return err
-	}
-	destinationParent, err := openRealRootFromRoot(
+	parentName := filepath.Clean(filepath.Join(destinationName, directory))
+	destinationParent, destinationOwned, err := openIncludedParent(
 		destinationBucket,
 		parentName,
+		true,
 	)
 	if err != nil {
 		return fmt.Errorf("open destination parent: %w", err)
 	}
-	defer func() {
-		result = errors.Join(result, destinationParent.Close())
-	}()
+	if destinationOwned {
+		defer func() {
+			result = errors.Join(result, destinationParent.Close())
+		}()
+	}
 	if err := verifyRootEntryUnchanged(
 		destinationBucket,
 		destinationName,
@@ -259,27 +225,90 @@ func copyIncludedPath(
 		return fmt.Errorf("verify destination parent: %w", err)
 	}
 
-	directoryFile, err := destinationBucket.Open(".")
+	temporaryName := "." + destinationName + ".include-" + uuid.NewString()
+	output, err := destinationParent.OpenFile(
+		temporaryName,
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		sourceInfo.Mode().Perm(),
+	)
 	if err != nil {
-		return fmt.Errorf("open destination bucket for install: %w", err)
+		return fmt.Errorf("create staged destination: %w", err)
 	}
-	targetName := filepath.Join(parentName, name)
-	_, renameErr := renameRecordFile(
+	outputOpen := true
+	defer func() {
+		if outputOpen {
+			result = errors.Join(result, output.Close())
+		}
+		if temporaryName != "" {
+			if err := destinationParent.Remove(temporaryName); !errors.Is(
+				err,
+				os.ErrNotExist,
+			) {
+				result = errors.Join(result, err)
+			}
+		}
+	}()
+	copied, err := io.Copy(output, input)
+	if err != nil {
+		return fmt.Errorf("copy staged contents: %w", err)
+	}
+	afterCopy, err := input.Stat()
+	if err != nil {
+		return fmt.Errorf("reinspect copied source: %w", err)
+	}
+	if copied != openedInfo.Size() ||
+		afterCopy.Size() != openedInfo.Size() ||
+		afterCopy.Mode() != openedInfo.Mode() ||
+		!afterCopy.ModTime().Equal(openedInfo.ModTime()) {
+		return errors.New("source changed while copying")
+	}
+	if err := output.Sync(); err != nil {
+		return fmt.Errorf("sync staged destination: %w", err)
+	}
+
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		destinationName,
+		destinationRoot,
+	); err != nil {
+		return fmt.Errorf("verify destination workspace: %w", err)
+	}
+	if err := verifyRootEntryUnchanged(
+		destinationBucket,
+		parentName,
+		destinationParent,
+	); err != nil {
+		return fmt.Errorf("verify destination parent: %w", err)
+	}
+
+	directoryFile, err := destinationParent.Open(".")
+	if err != nil {
+		return fmt.Errorf("open destination parent for install: %w", err)
+	}
+	installed, renameErr := renameRecordFile(
 		directoryFile,
 		output,
 		temporaryName,
-		targetName,
+		name,
 		false,
 	)
-	if renameErr != nil {
-		_ = directoryFile.Close()
-		return fmt.Errorf("install destination: %w", renameErr)
+	if !installed {
+		directoryCloseErr := directoryFile.Close()
+		if err := errors.Join(renameErr, directoryCloseErr); err != nil {
+			return fmt.Errorf("install destination: %w", err)
+		}
+		return errors.New("destination was not installed")
 	}
 	closeErr := output.Close()
 	outputOpen = false
 	syncErr := syncRecordDirectory(directoryFile)
 	directoryCloseErr := directoryFile.Close()
-	if err := errors.Join(closeErr, syncErr, directoryCloseErr); err != nil {
+	if err := errors.Join(
+		renameErr,
+		closeErr,
+		syncErr,
+		directoryCloseErr,
+	); err != nil {
 		return fmt.Errorf("sync installed destination: %w", err)
 	}
 	if err := verifyRootEntryUnchanged(
@@ -297,56 +326,6 @@ func copyIncludedPath(
 		return fmt.Errorf("reverify destination parent: %w", err)
 	}
 	return nil
-}
-
-func ensureIncludedParent(
-	root *os.Root,
-	destinationName string,
-	directory string,
-) (string, error) {
-	current := destinationName
-	for _, component := range strings.Split(
-		directory,
-		string(filepath.Separator),
-	) {
-		if component == "." || component == "" {
-			continue
-		}
-		current = filepath.Join(current, component)
-		info, err := root.Lstat(current)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			if err := root.Mkdir(current, 0o700); err != nil &&
-				!errors.Is(err, os.ErrExist) {
-				return "", fmt.Errorf(
-					"create destination directory %q: %w",
-					current,
-					err,
-				)
-			}
-			info, err = root.Lstat(current)
-			if err != nil {
-				return "", fmt.Errorf(
-					"inspect created destination directory %q: %w",
-					current,
-					err,
-				)
-			}
-		case err != nil:
-			return "", fmt.Errorf(
-				"inspect destination directory %q: %w",
-				current,
-				err,
-			)
-		}
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf(
-				"destination parent %q is not a real directory",
-				current,
-			)
-		}
-	}
-	return current, nil
 }
 
 func openIncludedParent(
@@ -375,6 +354,22 @@ func openIncludedParent(
 				!errors.Is(err, os.ErrExist) {
 				return nil, false, fmt.Errorf(
 					"create destination directory %q: %w",
+					component,
+					err,
+				)
+			}
+			directory, openErr := current.Open(".")
+			if openErr != nil {
+				return nil, false, fmt.Errorf(
+					"open destination parent for sync: %w",
+					openErr,
+				)
+			}
+			syncErr := syncRecordDirectory(directory)
+			closeErr := directory.Close()
+			if err := errors.Join(syncErr, closeErr); err != nil {
+				return nil, false, fmt.Errorf(
+					"sync created destination directory %q: %w",
 					component,
 					err,
 				)

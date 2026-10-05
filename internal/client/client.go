@@ -32,6 +32,8 @@ var (
 	ErrUnauthorized = errors.New("client: daemon rejected control token")
 )
 
+const worktreeStartPath = "/api/v1/worktrees"
+
 type responseError struct {
 	statusCode int
 	status     string
@@ -49,10 +51,11 @@ func IsUserError(err error) bool {
 	if errors.As(err, &responseErr) {
 		switch responseErr.statusCode {
 		case http.StatusBadRequest,
-			http.StatusNotFound,
 			http.StatusConflict,
 			http.StatusRequestEntityTooLarge:
 			return true
+		case http.StatusNotFound:
+			return responseErr.path != worktreeStartPath
 		}
 	}
 
@@ -160,7 +163,7 @@ func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.
 	path := "/api/v1/agents"
 	httpClient := c.hc
 	if req.Worktree != nil {
-		path = "/api/v1/worktrees"
+		path = worktreeStartPath
 		httpClient = c.longRunningHTTPClient()
 	}
 	var out session.Status
@@ -171,6 +174,15 @@ func (c *Client) Start(ctx context.Context, req session.StartRequest) (*session.
 		req,
 		&out,
 	); err != nil {
+		var responseErr *responseError
+		if req.Worktree != nil &&
+			errors.As(err, &responseErr) &&
+			responseErr.statusCode == http.StatusNotFound {
+			return nil, fmt.Errorf(
+				"client: daemon does not support worktree startup; restart the daemon: %w",
+				err,
+			)
+		}
 		return nil, err
 	}
 	return &out, nil

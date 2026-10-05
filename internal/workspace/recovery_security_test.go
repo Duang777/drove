@@ -335,6 +335,48 @@ func TestDiscardRejectsReplacementRepositoryBucket(t *testing.T) {
 	assertFileContents(t, sentinel, "replacement\n")
 }
 
+func TestDiscardRejectsReplacementWorkspacePath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move prepared workspace: %v", err)
+	}
+	if err := os.Mkdir(prepared.Path, 0o700); err != nil {
+		t.Fatalf("create replacement workspace: %v", err)
+	}
+	sentinel := filepath.Join(prepared.Path, "must-remain")
+	if err := os.WriteFile(sentinel, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement sentinel: %v", err)
+	}
+
+	if err := manager.Discard(context.Background(), prepared); err == nil {
+		t.Fatal("discard accepted a replacement workspace path")
+	}
+	assertFileContents(t, sentinel, "replacement\n")
+	if err := os.RemoveAll(prepared.Path); err != nil {
+		t.Fatalf("remove replacement workspace: %v", err)
+	}
+	if err := os.Rename(originalPath, prepared.Path); err != nil {
+		t.Fatalf("restore prepared workspace: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard restored workspace: %v", err)
+	}
+}
+
 func TestListRejectsReplacementDataDirectory(t *testing.T) {
 	repository := newTestRepository(t)
 	parent := t.TempDir()
@@ -470,7 +512,7 @@ func TestPreparePersistsRecordBeforeCreatingBranch(t *testing.T) {
 	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
 	script := `#!/bin/sh
 case " $* " in
-  *" update-ref --stdin "*)
+  *" update-ref "*" --stdin "*)
     test -f "$DROVE_TEST_RECORD" || exit 97
     : > "$DROVE_TEST_MARKER"
     ;;
@@ -522,7 +564,7 @@ func TestPreparePreservesConcurrentlyCreatedBranch(t *testing.T) {
 	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
 	script := `#!/bin/sh
 case " $* " in
-  *" update-ref --stdin "*)
+  *" update-ref "*" --stdin "*)
     "$DROVE_TEST_REAL_GIT" -C "$DROVE_TEST_REPOSITORY" branch "$DROVE_TEST_BRANCH" HEAD
     ;;
 esac
@@ -681,6 +723,79 @@ func TestReconcilePreparationPreservesRecreatedBranch(t *testing.T) {
 	))
 	if currentOID != replacementOID {
 		t.Fatalf("recreated branch object ID = %q, want %q", currentOID, replacementOID)
+	}
+	if marker, err := manager.branchOwnershipMarkerExists(
+		context.Background(),
+		repository,
+		operationID,
+	); err != nil || marker {
+		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(target.Path)); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("discarded preparation record remains or inspect failed: %v", err)
+	}
+}
+
+func TestReconcilePreparationPreservesSameCommitRecreatedBranch(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if err := manager.ensureManagedRoot(); err != nil {
+		t.Fatalf("ensure managed root: %v", err)
+	}
+	if err := manager.ensureManagedBucket(repository); err != nil {
+		t.Fatalf("ensure repository bucket: %v", err)
+	}
+	const operationID = "46464646-4646-4646-8646-464646464646"
+	target := Workspace{
+		AgentID:    testAgentID,
+		Repository: repository,
+		Path: filepath.Join(
+			manager.root,
+			repositoryHash(repository),
+			testAgentID,
+		),
+		Branch:            "same-commit-recreated-branch",
+		branchOperationID: operationID,
+	}
+	if err := manager.writeWorkspaceRecord(target, nil); err != nil {
+		t.Fatalf("write pending preparation: %v", err)
+	}
+	if err := manager.createOwnedBranch(
+		context.Background(),
+		repository,
+		target.Branch,
+		operationID,
+	); err != nil {
+		t.Fatalf("create marker-owned branch: %v", err)
+	}
+	originalOID := strings.TrimSpace(runGit(
+		t,
+		repository,
+		"rev-parse",
+		"refs/heads/"+target.Branch,
+	))
+	runGit(t, repository, "branch", "-D", target.Branch)
+	runGit(t, repository, "branch", target.Branch, originalOID)
+
+	if err := manager.ReconcilePreparations(context.Background(), nil); err != nil {
+		t.Fatalf("reconcile pending preparation: %v", err)
+	}
+	currentOID := strings.TrimSpace(runGit(
+		t,
+		repository,
+		"rev-parse",
+		"refs/heads/"+target.Branch,
+	))
+	if currentOID != originalOID {
+		t.Fatalf("recreated branch object ID = %q, want %q", currentOID, originalOID)
 	}
 	if marker, err := manager.branchOwnershipMarkerExists(
 		context.Background(),

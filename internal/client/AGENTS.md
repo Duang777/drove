@@ -11,7 +11,8 @@
   IssueLoginCode）；
   普通 Start 使用 `/api/v1/agents`，带 Worktree 的 Start 使用
   `/api/v1/worktrees`，避免旧 daemon 忽略未知字段后在原仓库启动进程。worktree 创建和
-  清理不使用 Client 的固定 HTTP timeout，只由调用方 context 控制；
+  清理不使用 Client 的固定 HTTP timeout，只由调用方 context 控制；旧 daemon 对专用
+  路由返回的 404 属于版本不兼容运行错误，不归类为用户输入错误；
   CLI 使用 `NewLocal` 经
   `$DataDir/run/droved.sock` 调用，
   TCP 构造器保留给测试与浏览器边界；Explain 仅编码路径、可选 limit 并解码类型化

@@ -21,6 +21,7 @@ const (
 	worktreeDirectory        = "worktrees"
 	repositoryHashLen        = 16
 	branchOwnershipRefPrefix = "refs/drove/preparations/"
+	branchOwnershipLogPrefix = "drove preparation "
 )
 
 var (
@@ -222,10 +223,7 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 	createdBranch := !exists
-	branchOperationID := ""
-	if createdBranch {
-		branchOperationID = uuid.NewString()
-	}
+	branchOperationID := uuid.NewString()
 	result := Workspace{
 		AgentID:           agentID,
 		Repository:        repository,
@@ -238,12 +236,19 @@ func (m *Manager) prepare(
 	if err != nil {
 		return Workspace{}, err
 	}
-	if err := m.writeWorkspaceRecord(result, includedPaths); err != nil {
+	recordInstalled, err := m.writeWorkspaceRecordState(result, includedPaths)
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
 		)
 		defer cancel()
+		if !recordInstalled {
+			return Workspace{}, errors.Join(
+				err,
+				m.removeManagedBucketIfEmpty(result),
+			)
+		}
 		cleanupTarget := result
 		cleanupTarget.createdBranch = false
 		return Workspace{}, errors.Join(
@@ -507,6 +512,23 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 	if err := m.validateManagedPath(target); err != nil {
 		return err
 	}
+	record, exists, err := m.readWorkspaceRecord(target.Path)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("workspace: preparation record is missing")
+	}
+	if record.PreparationCommitted {
+		return errors.New("workspace: committed preparation cannot be discarded")
+	}
+	if target.branchOperationID == "" ||
+		record.BranchOperationID != target.branchOperationID ||
+		!sameWorkspace(record.workspace(), target) {
+		return errors.New(
+			"workspace: preparation record does not match discard request",
+		)
+	}
 	var result error
 	_, pathErr := os.Lstat(target.Path)
 	pathExists := pathErr == nil
@@ -528,7 +550,11 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 	} else {
 		pathRemoved := pathMissing
 		if pathExists {
-			if err := m.removeManagedPath(target); err != nil {
+			if err := m.removeDiscardedPath(
+				ctx,
+				target,
+				record,
+			); err != nil {
 				result = errors.Join(
 					result,
 					fmt.Errorf("workspace: remove partial worktree: %w", err),
@@ -598,6 +624,50 @@ func (m *Manager) discard(ctx context.Context, target Workspace) error {
 	return result
 }
 
+func (m *Manager) removeDiscardedPath(
+	ctx context.Context,
+	target Workspace,
+	record workspaceRecord,
+) (result error) {
+	bucket, err := m.openManagedBucketRoot(target)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	opened, err := openRealRootFromRoot(bucket, target.AgentID)
+	if err != nil {
+		return err
+	}
+	openedOwned := true
+	defer func() {
+		if openedOwned {
+			result = errors.Join(result, opened.Close())
+		}
+	}()
+	current, inspectErr := m.inspect(ctx, target.Path, &record)
+	verifyErr := verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	)
+	if err := errors.Join(inspectErr, verifyErr); err != nil {
+		return err
+	}
+	if !sameWorkspace(current, target) {
+		return errors.New(
+			"workspace: discarded worktree identity changed",
+		)
+	}
+	openedOwned = false
+	return removeOpenedDirectoryFromRoot(
+		bucket,
+		target.AgentID,
+		opened,
+	)
+}
+
 func (m *Manager) cleanupPreparedBranch(
 	ctx context.Context,
 	target Workspace,
@@ -622,8 +692,21 @@ func (m *Manager) cleanupPreparedBranch(
 	if err != nil {
 		return err
 	}
-	var input string
+	branchOwned := false
 	if branchExists && branchOID == markerOID {
+		subject, exists, err := m.refLogSubject(
+			ctx,
+			target.Repository,
+			branchRef,
+		)
+		if err != nil {
+			return err
+		}
+		branchOwned = exists &&
+			subject == branchOwnershipLogMessage(target.branchOperationID)
+	}
+	var input string
+	if branchOwned {
 		input = fmt.Sprintf(
 			"start\ndelete %s %s\ndelete %s %s\nprepare\ncommit\n",
 			branchRef,
@@ -1037,11 +1120,54 @@ func (m *Manager) createOwnedBranch(
 		"-C",
 		repository,
 		"update-ref",
+		"--create-reflog",
+		"-m",
+		branchOwnershipLogMessage(operationID),
 		"--stdin",
 	); err != nil {
 		return fmt.Errorf("workspace: create owned branch transaction: %w", err)
 	}
 	return nil
+}
+
+func (m *Manager) refLogSubject(
+	ctx context.Context,
+	repository string,
+	ref string,
+) (string, bool, error) {
+	output, err := m.run(
+		ctx,
+		"-C",
+		repository,
+		"reflog",
+		"show",
+		"--format=%gs",
+		"-n",
+		"1",
+		ref,
+	)
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"workspace: inspect reflog for %q: %w",
+			ref,
+			err,
+		)
+	}
+	subject := strings.TrimSpace(string(output))
+	if subject == "" {
+		return "", false, nil
+	}
+	if strings.ContainsAny(subject, "\r\n") {
+		return "", false, fmt.Errorf(
+			"workspace: reflog for %q returned multiple entries",
+			ref,
+		)
+	}
+	return subject, true, nil
+}
+
+func branchOwnershipLogMessage(operationID string) string {
+	return branchOwnershipLogPrefix + operationID
 }
 
 func (m *Manager) branchOwnershipMarkerExists(

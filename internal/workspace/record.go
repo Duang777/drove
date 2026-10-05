@@ -87,9 +87,16 @@ func (m *Manager) writeWorkspaceRecord(
 	target Workspace,
 	includedPaths []string,
 ) error {
-	record := newWorkspaceRecord(target, includedPaths)
-	_, err := m.installWorkspaceRecordState(record, true)
+	_, err := m.writeWorkspaceRecordState(target, includedPaths)
 	return err
+}
+
+func (m *Manager) writeWorkspaceRecordState(
+	target Workspace,
+	includedPaths []string,
+) (bool, error) {
+	record := newWorkspaceRecord(target, includedPaths)
+	return m.installWorkspaceRecordState(record, true)
 }
 
 func (m *Manager) replaceWorkspaceRecord(record workspaceRecord) error {
@@ -212,29 +219,33 @@ func (m *Manager) installWorkspaceRecordState(
 		name,
 		!requireAbsent,
 	)
-	if renameErr != nil {
-		_ = directory.Close()
-		return installed, fmt.Errorf(
-			"workspace: install record %q: %w",
+	if !installed {
+		directoryCloseErr := directory.Close()
+		if err := errors.Join(renameErr, directoryCloseErr); err != nil {
+			return false, fmt.Errorf(
+				"workspace: install record %q: %w",
+				recordPath,
+				err,
+			)
+		}
+		return false, fmt.Errorf(
+			"workspace: record %q was not installed",
 			recordPath,
-			renameErr,
 		)
 	}
 	closeErr := file.Close()
 	fileOpen = false
-	if closeErr != nil {
-		_ = directory.Close()
-		return true, fmt.Errorf(
-			"workspace: close installed record %q: %w",
-			recordPath,
-			closeErr,
-		)
-	}
 	syncErr := syncRecordDirectory(directory)
 	directoryCloseErr := directory.Close()
-	if err := errors.Join(syncErr, directoryCloseErr); err != nil {
+	if err := errors.Join(
+		renameErr,
+		closeErr,
+		syncErr,
+		directoryCloseErr,
+	); err != nil {
 		return true, fmt.Errorf(
-			"workspace: sync record directory %q: %w",
+			"workspace: finalize installed record %q in %q: %w",
+			recordPath,
 			filepath.Dir(recordPath),
 			err,
 		)

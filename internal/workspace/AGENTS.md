@@ -19,9 +19,11 @@
   拒绝。创建时选中的规范相对路径保存在 version 3 sidecar 中，后续 dirty 检查不得
   重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
-  sidecar。新分支与私有 ownership ref 通过同一 `git update-ref --stdin` transaction
-  创建；只有该 marker 或已确认的 `CreatedBranch` 才能授权回滚删除分支，避免并发外部
-  建分支时误删。session 创建事件 durable 后必须调用 `AcknowledgePreparation`；
+  sidecar，每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager 的冲突清理。
+  新分支与私有 ownership ref 通过同一 `git update-ref --stdin` transaction 创建，并用
+  含 operation ID 的 reflog subject 标记 ref 世代；只有 marker、OID 和最新 reflog
+  subject 同时匹配才允许回滚删除分支，避免外部分支删除后同 OID 重建形成 ABA。session
+  创建事件 durable 后必须调用 `AcknowledgePreparation`；
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
@@ -57,6 +59,8 @@
 - `.worktreeinclude` 匹配文件不受 Git 跟踪；只要 worktree 中存在创建时记录的路径，
   `List` 就保守报告 dirty，清理需要显式 `force`。非强制 Remove 在 Git 删除前再次检查，
   防止首次枚举后出现的 include 文件被当作 ignored 内容删除。
+  include 复制前后必须确认已打开源文件的大小、模式和修改时间未变化；临时文件创建、
+  原子安装与目录同步都在实际目标父目录句柄内完成，新建的每一级父目录也同步其父目录。
 
 ## 约束
 

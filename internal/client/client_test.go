@@ -193,6 +193,12 @@ func TestWorktreeStartDoesNotFallBackToOldAgentEndpoint(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "404 Not Found") {
 		t.Fatalf("worktree start error = %v, want 404", err)
 	}
+	if IsUserError(err) {
+		t.Fatalf("old daemon incompatibility was classified as user error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "restart the daemon") {
+		t.Fatalf("worktree start error = %v, want restart guidance", err)
+	}
 	if agentStarts.Load() != 0 {
 		t.Fatalf("old agent endpoint starts = %d, want 0", agentStarts.Load())
 	}

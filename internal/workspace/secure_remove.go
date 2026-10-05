@@ -622,12 +622,20 @@ func removeAllFromRoot(root *os.Root, name string) (result error) {
 	if err != nil {
 		return err
 	}
+	return removeOpenedDirectoryFromRoot(root, name, child)
+}
+
+func removeOpenedDirectoryFromRoot(
+	parent *os.Root,
+	name string,
+	root *os.Root,
+) (result error) {
 	defer func() {
-		if child != nil {
-			result = errors.Join(result, child.Close())
+		if root != nil {
+			result = errors.Join(result, root.Close())
 		}
 	}()
-	directory, err := child.Open(".")
+	directory, err := root.Open(".")
 	if err != nil {
 		return err
 	}
@@ -636,23 +644,23 @@ func removeAllFromRoot(root *os.Root, name string) (result error) {
 	if err := errors.Join(readErr, closeErr); err != nil {
 		return err
 	}
-	if err := verifyRootEntryUnchanged(root, name, child); err != nil {
+	if err := verifyRootEntryUnchanged(parent, name, root); err != nil {
 		return err
 	}
 	if err := removeRootDirectoryContents(
-		root,
+		parent,
 		name,
-		child,
+		root,
 		entries,
 	); err != nil {
 		return err
 	}
-	closeErr = child.Close()
-	child = nil
+	closeErr = root.Close()
+	root = nil
 	if closeErr != nil {
 		return closeErr
 	}
-	return root.Remove(name)
+	return parent.Remove(name)
 }
 
 func removeRootDirectoryContents(

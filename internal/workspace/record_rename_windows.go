@@ -91,9 +91,8 @@ func renameWindowsHandle(
 	size := int(unsafe.Offsetof(header.FileName)) + nameLength
 	buffer := make([]byte, size)
 	information := (*recordRenameInformation)(unsafe.Pointer(&buffer[0]))
-	information.ReplaceIfExists = windows.FILE_RENAME_POSIX_SEMANTICS
 	if replace {
-		information.ReplaceIfExists |= windows.FILE_RENAME_REPLACE_IF_EXISTS
+		information.ReplaceIfExists = 1
 	}
 	information.RootDirectory = windows.Handle(directory.Fd())
 	information.FileNameLength = uint32(nameLength)
