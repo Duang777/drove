@@ -903,6 +903,11 @@ func TestReconcilePreparationUsesBranchOwnershipMarker(t *testing.T) {
 		Branch:            "marker-owned-branch",
 		branchOperationID: operationID,
 	}
+	target.repositoryEvidence = testRepositoryEvidence(
+		t,
+		manager,
+		repository,
+	)
 	if err := manager.writeWorkspaceRecord(target, nil); err != nil {
 		t.Fatalf("write pending preparation: %v", err)
 	}
@@ -963,6 +968,11 @@ func TestReconcilePreparationPreservesRecreatedBranch(t *testing.T) {
 		Branch:            "recreated-external-branch",
 		branchOperationID: operationID,
 	}
+	target.repositoryEvidence = testRepositoryEvidence(
+		t,
+		manager,
+		repository,
+	)
 	if err := manager.writeWorkspaceRecord(target, nil); err != nil {
 		t.Fatalf("write pending preparation: %v", err)
 	}
@@ -1049,6 +1059,11 @@ func TestReconcilePreparationPreservesSameCommitRecreatedBranch(
 		Branch:            "same-commit-recreated-branch",
 		branchOperationID: operationID,
 	}
+	target.repositoryEvidence = testRepositoryEvidence(
+		t,
+		manager,
+		repository,
+	)
 	if err := manager.writeWorkspaceRecord(target, nil); err != nil {
 		t.Fatalf("write pending preparation: %v", err)
 	}
@@ -1535,4 +1550,31 @@ func TestStaleAcknowledgementPreservesNewWorkspaceRecord(t *testing.T) {
 	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old acknowledgement quarantine remains: %v", err)
 	}
+}
+
+func testRepositoryEvidence(
+	t *testing.T,
+	manager *Manager,
+	repository string,
+) *repositoryEvidence {
+	t.Helper()
+	root, err := openRealPathRoot(repository)
+	if err != nil {
+		t.Fatalf("open test repository: %v", err)
+	}
+	lease, err := newPreparationLease(
+		context.Background(),
+		manager,
+		repository,
+		root,
+	)
+	if err != nil {
+		_ = root.Close()
+		t.Fatalf("capture test repository evidence: %v", err)
+	}
+	evidence := cloneRepositoryEvidence(&lease.evidence)
+	if err := lease.Close(); err != nil {
+		t.Fatalf("close test repository evidence lease: %v", err)
+	}
+	return evidence
 }

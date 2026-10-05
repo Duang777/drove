@@ -16,7 +16,9 @@ func (m *Manager) AcknowledgePreparation(target Workspace) error {
 	return m.acknowledgePreparation(target)
 }
 
-func (m *Manager) acknowledgePreparation(target Workspace) error {
+func (m *Manager) acknowledgePreparation(
+	target Workspace,
+) (result error) {
 	record, exists, err := m.readWorkspaceRecord(target.Path)
 	if err != nil {
 		return err
@@ -29,26 +31,55 @@ func (m *Manager) acknowledgePreparation(target Workspace) error {
 			"workspace: preparation acknowledgement does not match record",
 		)
 	}
+	if record.PreparationCommitted && record.BranchOperationID == "" {
+		return target.preparation.Close()
+	}
+	lease := target.preparation
+	temporaryLease := false
+	if lease == nil {
+		lease, err = openRecordedPreparationLease(
+			context.Background(),
+			m,
+			record,
+		)
+		if err != nil {
+			return err
+		}
+		temporaryLease = true
+		defer func() {
+			result = errors.Join(result, lease.Close())
+		}()
+	}
 	if !record.PreparationCommitted {
-		record.Version = workspaceRecordVersion
 		record.PreparationCommitted = true
 		if err := m.replaceWorkspaceRecord(record); err != nil {
 			return fmt.Errorf("workspace: commit preparation record: %w", err)
 		}
 	}
-	if record.BranchOperationID == "" {
+	if record.BranchOperationID != "" {
+		cleanupCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		if err := lease.repository.removeOwnershipMarker(
+			cleanupCtx,
+			record.BranchOperationID,
+		); err != nil {
+			return err
+		}
+		record.BranchOperationID = ""
+		if err := m.replaceWorkspaceRecord(record); err != nil {
+			return fmt.Errorf(
+				"workspace: confirm branch ownership cleanup: %w",
+				err,
+			)
+		}
+	}
+	if temporaryLease {
 		return nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := m.removeBranchOwnershipMarker(
-		cleanupCtx,
-		record.Repository,
-		record.BranchOperationID,
-	); err != nil {
-		return err
-	}
-	return nil
+	return lease.Close()
 }
 
 // ReconcilePreparations adopts preparations referenced by durable sessions and

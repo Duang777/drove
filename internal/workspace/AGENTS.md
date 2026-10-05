@@ -25,10 +25,14 @@
   只读文件描述符交给 Git，其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按
   源 manifest 路径打开。
   只有该文件匹配的未跟踪文件会复制到新 worktree，普通未跟踪文件不会复制；匹配项
-  必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 3
+  必须是普通文件，symlink 一律拒绝。创建时选中的规范相对路径保存在 version 4
   sidecar 中，后续 dirty 检查不得重新解释目标 worktree 的 manifest。
 - `Prepare` 在创建新分支和执行 `git worktree add` 前持久化未提交的 preparation
   sidecar，每次 preparation 都有唯一 operation ID，用于拒绝另一 Manager 的冲突清理。
+  version 4 sidecar 还记录源 worktree 和 common Git directory 的规范路径及目录实例
+  身份。重启恢复必须先重开并逐项匹配这些证据，再取得 rooted repository capability；
+  源路径或 common Git directory 被替换时，在执行清理前 fail-stop。pending version 3
+  记录可读取但不能授权基于路径的回滚或 ownership marker 清理。
   新分支与私有 ownership ref 通过同一 `git update-ref --stdin` transaction 创建，并用
   含 operation ID 的 reflog subject 标记 ref 世代；回滚先让 `git update-ref` prepare
   并锁定 branch/marker refs，再在锁内校验最新 reflog subject，只有 marker、OID 和
@@ -74,6 +78,8 @@
   本次新建的分支。普通或重启后的 Discard 遇到路径存在但 preparation sidecar 尚未持久化
   完整目录身份时必须 fail-stop；同一次 Prepare 仍持有原始仓库根句柄时，可先从该句柄验证
   worktree registration、Git 私有目录、分支和 HEAD，再固定并持久化目标目录身份后回滚。
+  重启后的 Discard 和 AcknowledgePreparation 必须使用 version 4 仓库证据重开 capability，
+  禁止退回 `git -C <recorded-path>`。
   禁止把同名替代目录当作失败创建的残留删除。未注册残留目录通过已验证的 `os.Root`
   相对操作删除，任一中间 symlink 或目录替换都会使回滚失败。Remove 与 Discard 均先通过 `os.Root` 删除物理
   目录，再仅调用 `git worktree prune --expire now` 清理 stale registration；禁止把受管

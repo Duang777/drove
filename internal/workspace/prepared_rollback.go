@@ -12,6 +12,11 @@ func (m *Manager) capturePreparedWorktreeIdentity(
 	record workspaceRecord,
 	repository repositoryCapability,
 ) (_ workspaceRecord, result error) {
+	if (record.GitDirectory == "") != (record.DirectoryIdentity == "") {
+		return workspaceRecord{}, errors.New(
+			"workspace: prepared worktree identity is incomplete",
+		)
+	}
 	registered, exists, err := repository.worktreeRegistration(
 		ctx,
 		target.Path,
@@ -61,6 +66,12 @@ func (m *Manager) capturePreparedWorktreeIdentity(
 			err,
 		)
 	}
+	if record.DirectoryIdentity != "" &&
+		record.DirectoryIdentity != directoryIdentity {
+		return workspaceRecord{}, errors.New(
+			"workspace: prepared worktree directory identity changed",
+		)
+	}
 	if err := verifyRootEntryUnchanged(
 		bucket,
 		target.AgentID,
@@ -81,11 +92,14 @@ func (m *Manager) capturePreparedWorktreeIdentity(
 	if err != nil {
 		return workspaceRecord{}, err
 	}
+	persistedTarget := target
+	persistedTarget.gitDirectory = gitDirectory
+	persistedTarget.directoryIdentity = directoryIdentity
 	if !exists ||
 		persisted.GitDirectory != gitDirectory ||
 		persisted.DirectoryIdentity != directoryIdentity ||
 		persisted.BranchOperationID != target.branchOperationID ||
-		!sameWorkspace(persisted.workspace(), target) {
+		!sameWorkspace(persisted.workspace(), persistedTarget) {
 		return workspaceRecord{}, errors.New(
 			"workspace: prepared worktree identity was not persisted",
 		)

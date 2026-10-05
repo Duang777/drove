@@ -60,6 +60,55 @@ func (r repositoryCapability) run(
 	)
 }
 
+func (r repositoryCapability) runForward(
+	ctx context.Context,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	if r.root != nil {
+		return r.manager.runRootedGitInput(
+			ctx,
+			r.path,
+			r.root,
+			input,
+			arguments...,
+		)
+	}
+	return r.run(ctx, input, arguments...)
+}
+
+func (r repositoryCapability) commonGitDirectory(
+	ctx context.Context,
+) (string, error) {
+	output, err := r.runForward(
+		ctx,
+		"",
+		"rev-parse",
+		"--path-format=absolute",
+		"--git-common-dir",
+	)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: inspect common Git directory: %w",
+			err,
+		)
+	}
+	path := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(path) {
+		return "", errors.New(
+			"workspace: common Git directory is not absolute",
+		)
+	}
+	path, err = resolvePath(path)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: resolve common Git directory: %w",
+			err,
+		)
+	}
+	return path, nil
+}
+
 func (r repositoryCapability) command(
 	ctx context.Context,
 	arguments ...string,
@@ -343,6 +392,34 @@ func (r repositoryCapability) cleanupOwnedBranch(
 		"--stdin",
 	); err != nil {
 		return fmt.Errorf("workspace: discard owned branch transaction: %w", err)
+	}
+	return nil
+}
+
+func (r repositoryCapability) removeOwnershipMarker(
+	ctx context.Context,
+	operationID string,
+) error {
+	if operationID == "" {
+		return nil
+	}
+	markerRef := branchOwnershipRef(operationID)
+	markerOID, exists, err := r.refOID(ctx, markerRef)
+	if err != nil || !exists {
+		return err
+	}
+	if _, err := r.run(
+		ctx,
+		"",
+		"update-ref",
+		"-d",
+		markerRef,
+		markerOID,
+	); err != nil {
+		return fmt.Errorf(
+			"workspace: remove branch ownership marker: %w",
+			err,
+		)
 	}
 	return nil
 }

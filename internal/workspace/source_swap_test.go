@@ -99,6 +99,248 @@ func TestPrepareRollsBackRootedWorktreeAfterPostSuccessSourceSwap(
 	assertPreparationRefsAbsent(t, source, branch)
 }
 
+func TestDiscardUsesRetainedRepositoryAfterPrepareSourceSwap(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := os.Rename(source, openedSource); err != nil {
+		t.Fatalf("move prepared source: %v", err)
+	}
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatalf("install replacement source: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard through retained repository: %v", err)
+	}
+
+	if _, err := os.Lstat(prepared.Path); !os.IsNotExist(err) {
+		t.Fatalf("prepared worktree remains or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(
+		workspaceRecordPath(prepared.Path),
+	); !os.IsNotExist(err) {
+		t.Fatalf("preparation record remains or inspect failed: %v", err)
+	}
+	assertWorktreeUnregistered(t, openedSource, prepared.Path)
+	assertPreparationRefsAbsent(t, openedSource, prepared.Branch)
+	assertPreparationRefsAbsent(t, source, prepared.Branch)
+}
+
+func TestAcknowledgeUsesRetainedRepositoryAfterPrepareSourceSwap(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := os.Rename(source, openedSource); err != nil {
+		t.Fatalf("move prepared source: %v", err)
+	}
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatalf("install replacement source: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge through retained repository: %v", err)
+	}
+
+	assertBranchExists(t, openedSource, prepared.Branch)
+	assertOwnershipRefsAbsent(t, openedSource)
+	assertPreparationRefsAbsent(t, source, prepared.Branch)
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil {
+		t.Fatalf("read acknowledged record: %v", err)
+	}
+	if !exists || !record.PreparationCommitted {
+		t.Fatalf("acknowledged record = %+v, exists=%v", record, exists)
+	}
+}
+
+func TestReconcileRejectsReplacementSourceBeforeRunningGit(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedSource := source + "-opened"
+	dataDir := filepath.Join(parent, "data")
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+	if err := os.Rename(source, openedSource); err != nil {
+		t.Fatalf("move prepared source: %v", err)
+	}
+	if err := os.Rename(replacement, source); err != nil {
+		t.Fatalf("install replacement source: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	invoked := filepath.Join(parent, "git-invoked")
+	wrapper := filepath.Join(parent, "git-reconcile-wrapper")
+	script := `#!/bin/sh
+: > "$DROVE_TEST_GIT_INVOKED"
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_GIT_INVOKED", invoked)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	restarted.git = wrapper
+
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err == nil {
+		t.Fatal("reconciliation accepted a replacement source repository")
+	}
+	if _, err := os.Lstat(invoked); !os.IsNotExist(err) {
+		t.Fatalf("reconciliation ran Git against the replacement source: %v", err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("prepared worktree was changed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("preparation record was changed: %v", err)
+	}
+	assertBranchExists(t, openedSource, prepared.Branch)
+	runGit(
+		t,
+		openedSource,
+		"show-ref",
+		"--verify",
+		branchOwnershipRef(prepared.branchOperationID),
+	)
+	assertPreparationRefsAbsent(t, source, prepared.Branch)
+}
+
+func TestReconcileRejectsReplacementCommonGitDirectory(t *testing.T) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	replacement := filepath.Join(parent, "replacement")
+	openedGitDirectory := filepath.Join(source, ".git-opened")
+	dataDir := filepath.Join(parent, "data")
+	initSourceSwapRepository(t, source)
+	initSourceSwapRepository(t, replacement)
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+	if err := os.Rename(
+		filepath.Join(source, ".git"),
+		openedGitDirectory,
+	); err != nil {
+		t.Fatalf("move common Git directory: %v", err)
+	}
+	if err := os.Rename(
+		filepath.Join(replacement, ".git"),
+		filepath.Join(source, ".git"),
+	); err != nil {
+		t.Fatalf("install replacement common Git directory: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err == nil {
+		t.Fatal("reconciliation accepted a replacement common Git directory")
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("prepared worktree was changed: %v", err)
+	}
+	if _, err := os.Lstat(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("preparation record was changed: %v", err)
+	}
+	for _, ref := range []string{
+		"refs/heads/" + prepared.Branch,
+		branchOwnershipRef(prepared.branchOperationID),
+	} {
+		command := exec.Command(
+			"git",
+			"--git-dir="+openedGitDirectory,
+			"show-ref",
+			"--verify",
+			ref,
+		)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("original ref %q was changed: %v\n%s", ref, err, output)
+		}
+	}
+	assertPreparationRefsAbsent(t, source, prepared.Branch)
+}
+
 func TestPrepareDoesNotRunCheckoutFromReplacementSource(t *testing.T) {
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
@@ -243,7 +485,32 @@ func assertPreparationRefsAbsent(
 	if err := command.Run(); !isExitCode(err, 1) {
 		t.Fatalf("owned branch remains in %q: %v", repository, err)
 	}
-	command = exec.Command(
+	assertOwnershipRefsAbsent(t, repository)
+}
+
+func assertBranchExists(
+	t *testing.T,
+	repository string,
+	branch string,
+) {
+	t.Helper()
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+branch,
+	)
+	if err := command.Run(); err != nil {
+		t.Fatalf("branch %q is missing from %q: %v", branch, repository, err)
+	}
+}
+
+func assertOwnershipRefsAbsent(t *testing.T, repository string) {
+	t.Helper()
+	command := exec.Command(
 		"git",
 		"-C",
 		repository,

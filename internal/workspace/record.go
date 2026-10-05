@@ -14,11 +14,12 @@ import (
 )
 
 const (
-	workspaceRecordSuffix           = ".workspace.json"
-	legacyWorkspaceRecordVersion    = 1
-	protectedWorkspaceRecordVersion = 2
-	workspaceRecordVersion          = 3
-	maxWorkspaceRecordSize          = 64 * 1024
+	workspaceRecordSuffix             = ".workspace.json"
+	legacyWorkspaceRecordVersion      = 1
+	protectedWorkspaceRecordVersion   = 2
+	preparationWorkspaceRecordVersion = 3
+	workspaceRecordVersion            = 4
+	maxWorkspaceRecordSize            = 64 * 1024
 )
 
 type workspaceRecord struct {
@@ -34,7 +35,15 @@ type workspaceRecord struct {
 	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
 	GitDirectory         string                  `json:"git_directory,omitempty"`
 	DirectoryIdentity    string                  `json:"directory_identity,omitempty"`
+	RepositoryEvidence   *repositoryEvidence     `json:"repository_evidence,omitempty"`
 	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
+}
+
+type repositoryEvidence struct {
+	SourcePath                 string `json:"source_path"`
+	SourceDirectoryIdentity    string `json:"source_directory_identity"`
+	CommonGitDirectory         string `json:"common_git_directory"`
+	CommonGitDirectoryIdentity string `json:"common_git_directory_identity"`
 }
 
 type workspaceRemovalRecord struct {
@@ -74,6 +83,9 @@ func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecor
 		BranchOperationID: target.branchOperationID,
 		GitDirectory:      target.gitDirectory,
 		DirectoryIdentity: target.directoryIdentity,
+		RepositoryEvidence: cloneRepositoryEvidence(
+			target.repositoryEvidence,
+		),
 	}
 }
 
@@ -87,7 +99,20 @@ func (r workspaceRecord) workspace() Workspace {
 		branchOperationID: r.BranchOperationID,
 		gitDirectory:      r.GitDirectory,
 		directoryIdentity: r.DirectoryIdentity,
+		repositoryEvidence: cloneRepositoryEvidence(
+			r.RepositoryEvidence,
+		),
 	}
+}
+
+func cloneRepositoryEvidence(
+	evidence *repositoryEvidence,
+) *repositoryEvidence {
+	if evidence == nil {
+		return nil
+	}
+	cloned := *evidence
+	return &cloned
 }
 
 func (m *Manager) writeWorkspaceRecord(
@@ -429,6 +454,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.BranchOperationID != "" ||
 			record.GitDirectory != "" ||
 			record.DirectoryIdentity != "" ||
+			record.RepositoryEvidence != nil ||
 			record.Removal != nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: legacy record %q contains newer fields",
@@ -447,7 +473,8 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
 			record.GitDirectory != "" ||
-			record.DirectoryIdentity != "" {
+			record.DirectoryIdentity != "" ||
+			record.RepositoryEvidence != nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: version 2 record %q contains version 3 fields",
 				recordPath,
@@ -457,10 +484,23 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		if record.Removal != nil {
 			record.Removal.Started = true
 		}
-	case workspaceRecordVersion:
+	case preparationWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
 			return workspaceRecord{}, false, fmt.Errorf(
 				"workspace: version 3 record %q has no included paths",
+				recordPath,
+			)
+		}
+		if record.RepositoryEvidence != nil {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: version 3 record %q contains version 4 fields",
+				recordPath,
+			)
+		}
+	case workspaceRecordVersion:
+		if record.IncludedPaths == nil {
+			return workspaceRecord{}, false, fmt.Errorf(
+				"workspace: version 4 record %q has no included paths",
 				recordPath,
 			)
 		}
@@ -490,8 +530,15 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 	if record.Version != legacyWorkspaceRecordVersion &&
 		record.Version != protectedWorkspaceRecordVersion &&
+		record.Version != preparationWorkspaceRecordVersion &&
 		record.Version != workspaceRecordVersion {
 		return fmt.Errorf("workspace: unsupported record version %d", record.Version)
+	}
+	if record.Version < workspaceRecordVersion &&
+		record.RepositoryEvidence != nil {
+		return errors.New(
+			"workspace: repository evidence requires record version 4",
+		)
 	}
 	target := record.workspace()
 	if err := m.validateManagedPath(target); err != nil {
@@ -568,7 +615,48 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 			"workspace: directory identity is invalid",
 		)
 	}
+	if record.RepositoryEvidence != nil {
+		if err := validateRepositoryEvidence(*record.RepositoryEvidence); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func validateRepositoryEvidence(evidence repositoryEvidence) error {
+	if !cleanAbsolutePath(evidence.SourcePath) {
+		return errors.New(
+			"workspace: source repository path is not a clean absolute path",
+		)
+	}
+	if !validDirectoryIdentity(evidence.SourceDirectoryIdentity) {
+		return errors.New(
+			"workspace: source repository identity is invalid",
+		)
+	}
+	if !cleanAbsolutePath(evidence.CommonGitDirectory) {
+		return errors.New(
+			"workspace: common Git directory is not a clean absolute path",
+		)
+	}
+	if !validDirectoryIdentity(evidence.CommonGitDirectoryIdentity) {
+		return errors.New(
+			"workspace: common Git directory identity is invalid",
+		)
+	}
+	return nil
+}
+
+func cleanAbsolutePath(path string) bool {
+	return path != "" &&
+		filepath.IsAbs(path) &&
+		filepath.Clean(path) == path
+}
+
+func validDirectoryIdentity(identity string) bool {
+	return identity != "" &&
+		len(identity) <= 128 &&
+		strings.TrimSpace(identity) == identity
 }
 
 func (m *Manager) removeWorkspaceRecord(

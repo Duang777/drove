@@ -47,12 +47,14 @@ type Workspace struct {
 	Detached   bool   `json:"detached,omitempty"`
 	Missing    bool   `json:"missing,omitempty"`
 
-	createdBranch     bool
-	branchOperationID string
-	gitDirectory      string
-	directoryIdentity string
-	protectionKnown   bool
-	includedPaths     []string
+	createdBranch      bool
+	branchOperationID  string
+	gitDirectory       string
+	directoryIdentity  string
+	protectionKnown    bool
+	includedPaths      []string
+	preparation        *preparationLease
+	repositoryEvidence *repositoryEvidence
 }
 
 // Manager owns worktrees below one Drove data directory.
@@ -208,8 +210,11 @@ func (m *Manager) prepare(
 			err,
 		)
 	}
+	sourceRootOwned := true
 	defer func() {
-		resultErr = errors.Join(resultErr, sourceRoot.Close())
+		if sourceRootOwned {
+			resultErr = errors.Join(resultErr, sourceRoot.Close())
+		}
 	}()
 	pinnedRepository, err := m.repositoryRootAtRoot(
 		ctx,
@@ -224,7 +229,21 @@ func (m *Manager) prepare(
 			"workspace: source repository changed while opening",
 		)
 	}
-	sourceRepository := rootedRepositoryCapability(m, sourcePath, sourceRoot)
+	lease, err := newPreparationLease(ctx, m, sourcePath, sourceRoot)
+	if err != nil {
+		return Workspace{}, fmt.Errorf(
+			"workspace: retain source repository: %w",
+			err,
+		)
+	}
+	sourceRootOwned = false
+	leaseReturned := false
+	defer func() {
+		if !leaseReturned {
+			resultErr = errors.Join(resultErr, lease.Close())
+		}
+	}()
+	sourceRepository := lease.repository
 	if branch == "" {
 		branch = "drove/" + agentID
 	}
@@ -263,6 +282,9 @@ func (m *Manager) prepare(
 		Path:              path,
 		Branch:            branch,
 		branchOperationID: branchOperationID,
+		repositoryEvidence: cloneRepositoryEvidence(
+			&lease.evidence,
+		),
 	}
 	includedPaths, err := m.includedPaths(ctx, sourcePath, sourceRoot)
 	if err != nil {
@@ -311,6 +333,7 @@ func (m *Manager) prepare(
 					cleanupCtx,
 					result,
 					sourceRepository,
+					true,
 				),
 			)
 		}
@@ -334,6 +357,7 @@ func (m *Manager) prepare(
 					cleanupCtx,
 					result,
 					sourceRepository,
+					true,
 				),
 			)
 		}
@@ -353,28 +377,14 @@ func (m *Manager) prepare(
 					cleanupCtx,
 					result,
 					sourceRepository,
+					true,
 				),
 			)
 		}
 	}
 	arguments := []string{"worktree", "add", "--quiet", "--no-checkout"}
 	arguments = append(arguments, path, branch)
-	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: source repository changed: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-			),
-		)
-	}
-	if _, err := sourceRepository.run(
+	if _, err := sourceRepository.runForward(
 		ctx,
 		"",
 		arguments...,
@@ -390,6 +400,7 @@ func (m *Manager) prepare(
 				cleanupCtx,
 				result,
 				sourceRepository,
+				true,
 			),
 		)
 	}
@@ -403,6 +414,7 @@ func (m *Manager) prepare(
 				cleanupCtx,
 				result,
 				sourceRepository,
+				true,
 			),
 		)
 	}
@@ -419,6 +431,7 @@ func (m *Manager) prepare(
 				cleanupCtx,
 				result,
 				sourceRepository,
+				true,
 			),
 		)
 	}
@@ -431,6 +444,7 @@ func (m *Manager) prepare(
 				cleanupCtx,
 				result,
 				sourceRepository,
+				true,
 			),
 		)
 	}
@@ -443,11 +457,14 @@ func (m *Manager) prepare(
 				cleanupCtx,
 				result,
 				sourceRepository,
+				true,
 			),
 		)
 	}
 	result.protectionKnown = true
 	result.includedPaths = append([]string(nil), includedPaths...)
+	result.preparation = lease
+	leaseReturned = true
 	return result, nil
 }
 
@@ -628,18 +645,55 @@ func (m *Manager) Discard(ctx context.Context, target Workspace) error {
 	return m.discard(ctx, target)
 }
 
-func (m *Manager) discard(ctx context.Context, target Workspace) error {
-	return m.discardWithRepository(
+func (m *Manager) discard(
+	ctx context.Context,
+	target Workspace,
+) (result error) {
+	lease := target.preparation
+	temporaryLease := false
+	if lease == nil {
+		record, exists, err := m.readWorkspaceRecord(target.Path)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return errors.New("workspace: preparation record is missing")
+		}
+		if target.branchOperationID == "" ||
+			record.BranchOperationID != target.branchOperationID ||
+			!sameWorkspace(record.workspace(), target) {
+			return errors.New(
+				"workspace: preparation record does not match discard request",
+			)
+		}
+		lease, err = openRecordedPreparationLease(ctx, m, record)
+		if err != nil {
+			return err
+		}
+		temporaryLease = true
+		defer func() {
+			result = errors.Join(result, lease.Close())
+		}()
+	}
+	if err := m.discardWithRepository(
 		ctx,
 		target,
-		pathRepositoryCapability(m, target.Repository),
-	)
+		lease.repository,
+		target.preparation != nil,
+	); err != nil {
+		return err
+	}
+	if temporaryLease {
+		return nil
+	}
+	return lease.Close()
 }
 
 func (m *Manager) discardWithRepository(
 	ctx context.Context,
 	target Workspace,
 	repository repositoryCapability,
+	allowIdentityCapture bool,
 ) error {
 	if err := m.validateManagedPath(target); err != nil {
 		return err
@@ -671,7 +725,7 @@ func (m *Manager) discardWithRepository(
 			fmt.Errorf("workspace: inspect discarded worktree: %w", pathErr),
 		)
 	}
-	if pathExists && repository.root != nil {
+	if pathExists && allowIdentityCapture {
 		record, err = m.capturePreparedWorktreeIdentity(
 			ctx,
 			target,
@@ -1427,42 +1481,6 @@ func (m *Manager) createOwnedBranchAtRoot(
 	return nil
 }
 
-func (m *Manager) refLogSubject(
-	ctx context.Context,
-	repository string,
-	ref string,
-) (string, bool, error) {
-	output, err := m.run(
-		ctx,
-		"-C",
-		repository,
-		"reflog",
-		"show",
-		"--format=%gs",
-		"-n",
-		"1",
-		ref,
-	)
-	if err != nil {
-		return "", false, fmt.Errorf(
-			"workspace: inspect reflog for %q: %w",
-			ref,
-			err,
-		)
-	}
-	subject := strings.TrimSpace(string(output))
-	if subject == "" {
-		return "", false, nil
-	}
-	if strings.ContainsAny(subject, "\r\n") {
-		return "", false, fmt.Errorf(
-			"workspace: reflog for %q returned multiple entries",
-			ref,
-		)
-	}
-	return subject, true, nil
-}
-
 func branchOwnershipLogMessage(operationID string) string {
 	return branchOwnershipLogPrefix + operationID
 }
@@ -1481,36 +1499,6 @@ func (m *Manager) branchOwnershipMarkerExists(
 		branchOwnershipRef(operationID),
 	)
 	return exists, err
-}
-
-func (m *Manager) removeBranchOwnershipMarker(
-	ctx context.Context,
-	repository string,
-	operationID string,
-) error {
-	if operationID == "" {
-		return nil
-	}
-	markerRef := branchOwnershipRef(operationID)
-	markerOID, exists, err := m.refOID(ctx, repository, markerRef)
-	if err != nil || !exists {
-		return err
-	}
-	if _, err := m.run(
-		ctx,
-		"-C",
-		repository,
-		"update-ref",
-		"-d",
-		markerRef,
-		markerOID,
-	); err != nil {
-		return fmt.Errorf(
-			"workspace: remove branch ownership marker: %w",
-			err,
-		)
-	}
-	return nil
 }
 
 func (m *Manager) refOID(
