@@ -9,7 +9,7 @@ import (
 
 func terminateProcessGroup(pid int) error {
 	err := syscall.Kill(-pid, syscall.SIGTERM)
-	if processGroupUnavailable(err) {
+	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
 	return err
@@ -17,16 +17,10 @@ func terminateProcessGroup(pid int) error {
 
 func killProcessGroup(pid int) error {
 	err := syscall.Kill(-pid, syscall.SIGKILL)
-	if processGroupUnavailable(err) {
+	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
 	return err
-}
-
-// Darwin may return EPERM when a process group disappears between probing and
-// signaling; it is also safer to leave a recycled, foreign group untouched.
-func processGroupUnavailable(err error) bool {
-	return errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.EPERM)
 }
 
 func processGroupAlive(pid int) (bool, error) {
@@ -34,7 +28,11 @@ func processGroupAlive(pid int) (bool, error) {
 	switch {
 	case err == nil:
 		return true, nil
-	case processGroupUnavailable(err):
+	case errors.Is(err, syscall.EPERM):
+		// EPERM proves neither ownership nor disappearance. Keep polling until
+		// ESRCH or the caller's bounded grace period resolves the ambiguity.
+		return true, nil
+	case errors.Is(err, syscall.ESRCH):
 		return false, nil
 	default:
 		return false, err

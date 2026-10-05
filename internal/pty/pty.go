@@ -340,20 +340,25 @@ func (s *Session) closeProcessGroup() {
 				fmt.Errorf("pty: inspect process group: %w", err),
 			)
 		} else if alive {
-			if err := terminateProcessGroup(s.cmd.Process.Pid); err != nil {
-				closeErrors = append(
-					closeErrors,
-					fmt.Errorf("pty: terminate process group: %w", err),
-				)
-			}
-			exited, err := waitForProcessGroupExit(
+			terminateErr := terminateProcessGroup(s.cmd.Process.Pid)
+			exited, waitErr := waitForProcessGroupExit(
 				s.cmd.Process.Pid,
 				s.grace,
 			)
-			if err != nil {
+			if terminateErr != nil &&
+				!(exited && errors.Is(terminateErr, syscall.EPERM)) {
 				closeErrors = append(
 					closeErrors,
-					fmt.Errorf("pty: wait for process group: %w", err),
+					fmt.Errorf(
+						"pty: terminate process group: %w",
+						terminateErr,
+					),
+				)
+			}
+			if waitErr != nil {
+				closeErrors = append(
+					closeErrors,
+					fmt.Errorf("pty: wait for process group: %w", waitErr),
 				)
 			}
 			if !exited {
