@@ -8,6 +8,17 @@ import (
 	"testing"
 )
 
+func TestSyncRecordDirectoryAcceptsReadOnlyWindowsHandle(t *testing.T) {
+	directory, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	if err := syncRecordDirectory(directory); err != nil {
+		t.Fatalf("sync read-only directory handle: %v", err)
+	}
+}
+
 func TestInstallAndReplaceWorkspaceRecordOnWindows(t *testing.T) {
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {

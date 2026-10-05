@@ -357,6 +357,39 @@ func removeRecordPathIfSame(
 	return root.Remove(name)
 }
 
+func isolateRecordPathIfSame(
+	root *os.Root,
+	directory *os.File,
+	name string,
+	isolatedName string,
+	expected *os.File,
+	afterValidation func(),
+) (bool, error) {
+	current, err := root.Lstat(name)
+	if err != nil {
+		return false, err
+	}
+	opened, err := expected.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !os.SameFile(opened, current) {
+		return false, fmt.Errorf(
+			"workspace: record path %q changed identity",
+			name,
+		)
+	}
+	if afterValidation != nil {
+		afterValidation()
+	}
+	return moveRecordFile(
+		directory,
+		expected,
+		name,
+		isolatedName,
+	)
+}
+
 func (m *Manager) readWorkspaceRecord(
 	worktreePath string,
 ) (_ workspaceRecord, _ bool, result error) {
@@ -1086,6 +1119,18 @@ func findRecordAcknowledgementQuarantine(
 func coalesceRecordAcknowledgements(
 	bucket *os.Root,
 	candidates []recordAcknowledgement,
+) (recordAcknowledgement, error) {
+	return coalesceRecordAcknowledgementsAfterValidation(
+		bucket,
+		candidates,
+		nil,
+	)
+}
+
+func coalesceRecordAcknowledgementsAfterValidation(
+	bucket *os.Root,
+	candidates []recordAcknowledgement,
+	afterValidation func(),
 ) (_ recordAcknowledgement, result error) {
 	if len(candidates) == 0 {
 		return recordAcknowledgement{}, errors.New(
@@ -1151,15 +1196,54 @@ func coalesceRecordAcknowledgements(
 			return recordAcknowledgement{}, err
 		}
 	}
+	agentID, parsedOperationID, ok := recordAcknowledgementIdentity(
+		candidates[0].name,
+	)
+	if !ok || parsedOperationID != operationID {
+		return recordAcknowledgement{}, errors.New(
+			"workspace: acknowledgement candidate name is invalid",
+		)
+	}
 	for _, duplicate := range candidates[1:] {
+		directory, err := bucket.Open(".")
+		if err != nil {
+			return recordAcknowledgement{}, err
+		}
+		isolatedName := recordAcknowledgementPrefix(
+			agentID,
+			operationID,
+		) + uuid.NewString()
+		isolated, isolateErr := isolateRecordPathIfSame(
+			bucket,
+			directory,
+			duplicate.name,
+			isolatedName,
+			expected,
+			afterValidation,
+		)
+		afterValidation = nil
+		closeErr := directory.Close()
+		if err := errors.Join(isolateErr, closeErr); err != nil {
+			return recordAcknowledgement{}, fmt.Errorf(
+				"workspace: isolate acknowledgement alias %q: %w",
+				duplicate.name,
+				err,
+			)
+		}
+		if !isolated {
+			return recordAcknowledgement{}, fmt.Errorf(
+				"workspace: acknowledgement alias %q was not isolated",
+				duplicate.name,
+			)
+		}
 		if err := removeRecordPathIfSame(
 			bucket,
-			duplicate.name,
+			isolatedName,
 			expected,
 		); err != nil {
 			return recordAcknowledgement{}, fmt.Errorf(
-				"workspace: remove acknowledgement alias %q: %w",
-				duplicate.name,
+				"workspace: remove isolated acknowledgement alias %q: %w",
+				isolatedName,
 				err,
 			)
 		}

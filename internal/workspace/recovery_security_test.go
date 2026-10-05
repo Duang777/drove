@@ -488,6 +488,82 @@ func TestDiscardRejectsReplacementWorkspacePath(t *testing.T) {
 	}
 }
 
+func TestDiscardPreservesRecoveryEvidenceWhenStagingProbeFails(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	originalPath := prepared.Path + "-original"
+	if err := os.Rename(prepared.Path, originalPath); err != nil {
+		t.Fatalf("move prepared workspace: %v", err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		prepared.branchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(prepared.Path), stagingName)
+	if err := os.Symlink(originalPath, stagingPath); err != nil {
+		t.Skipf("create replacement staging symlink: %v", err)
+	}
+
+	if err := manager.Discard(context.Background(), prepared); err == nil {
+		t.Fatal("discard accepted a replacement staging path")
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf(
+			"recovery record after failed staging probe: exists=%v err=%v",
+			exists,
+			err,
+		)
+	}
+	if record.BranchOperationID != prepared.branchOperationID {
+		t.Fatalf("recovery record changed after failed staging probe: %+v", record)
+	}
+	if err := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+prepared.Branch,
+	).Run(); err != nil {
+		t.Fatalf("owned branch was removed after failed staging probe: %v", err)
+	}
+	marker, err := manager.branchOwnershipMarkerExists(
+		context.Background(),
+		repository,
+		prepared.branchOperationID,
+	)
+	if err != nil || !marker {
+		t.Fatalf("branch ownership marker = %v, err=%v", marker, err)
+	}
+
+	if err := os.Remove(stagingPath); err != nil {
+		t.Fatalf("remove replacement staging path: %v", err)
+	}
+	if err := os.Rename(originalPath, prepared.Path); err != nil {
+		t.Fatalf("restore prepared workspace: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard restored workspace: %v", err)
+	}
+}
+
 func TestRemoveRejectsReplacementGitWorktree(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
@@ -1671,6 +1747,56 @@ func TestReconcileRemovalCoalescesAcknowledgementHardLinks(t *testing.T) {
 			t.Fatalf("acknowledgement path %q remains: %v", path, err)
 		}
 	}
+}
+
+func TestCoalesceAcknowledgementAliasesPreservesReplacementAfterValidation(
+	t *testing.T,
+) {
+	rootPath := t.TempDir()
+	operationID := "73737373-7373-4737-8737-737373737373"
+	prefix := recordAcknowledgementPrefix(testAgentID, operationID)
+	firstName := prefix + "74747474-7474-4747-8747-747474747474"
+	secondName := prefix + "75757575-7575-4757-8757-757575757575"
+	firstPath := filepath.Join(rootPath, firstName)
+	secondPath := filepath.Join(rootPath, secondName)
+	if err := os.WriteFile(firstPath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write first acknowledgement alias: %v", err)
+	}
+	if err := os.Link(firstPath, secondPath); err != nil {
+		t.Skipf("create acknowledgement hard link: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open acknowledgement root: %v", err)
+	}
+	defer root.Close()
+	originalSecondPath := secondPath + "-original"
+
+	_, err = coalesceRecordAcknowledgementsAfterValidation(
+		root,
+		[]recordAcknowledgement{
+			{name: firstName, operationID: operationID},
+			{name: secondName, operationID: operationID},
+		},
+		func() {
+			if err := os.Rename(secondPath, originalSecondPath); err != nil {
+				t.Fatalf("move validated acknowledgement alias: %v", err)
+			}
+			if err := os.WriteFile(
+				secondPath,
+				[]byte("replacement\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("install replacement acknowledgement path: %v", err)
+			}
+		},
+	)
+	if err == nil {
+		t.Fatal("coalescing accepted a replacement acknowledgement alias")
+	}
+	assertFileContents(t, firstPath, "record\n")
+	assertFileContents(t, originalSecondPath, "record\n")
+	assertFileContents(t, secondPath, "replacement\n")
 }
 
 func TestRemoveRecoversQuarantinedAcknowledgementRecord(t *testing.T) {

@@ -356,7 +356,10 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 	}
 	draft.state = to
 	draft.restartStopped =
-		to == agent.StateStopped && row.Reason == restartStopReason
+		to == agent.StateStopped &&
+			from != agent.StateDone &&
+			from != agent.StateStopped &&
+			row.Reason == restartStopReason
 	if known {
 		draft.lastTransition = evidence
 	}

@@ -12,6 +12,7 @@ require (
 	github.com/muesli/cancelreader v0.2.2
 	github.com/spf13/cobra v1.8.1
 	golang.org/x/sys v0.41.0
+	golang.org/x/text v0.29.0
 	modernc.org/sqlite v1.33.1
 )
 

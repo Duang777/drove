@@ -154,11 +154,6 @@ func openRecordForRename(directory *os.File, name string) (*os.File, error) {
 	return file, nil
 }
 
-func syncRecordDirectory(directory *os.File) error {
-	if err := windows.FlushFileBuffers(
-		windows.Handle(directory.Fd()),
-	); err != nil {
-		return fmt.Errorf("flush directory metadata: %w", err)
-	}
+func syncRecordDirectory(_ *os.File) error {
 	return nil
 }

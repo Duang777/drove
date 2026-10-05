@@ -5,8 +5,10 @@ package workspace
 import (
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 func workspaceManagerLockKey(path string) string {
-	return strings.ToUpper(filepath.Clean(path))
+	return norm.NFD.String(strings.ToUpper(filepath.Clean(path)))
 }

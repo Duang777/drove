@@ -844,7 +844,7 @@ func (m *Manager) discardWithRepository(
 		stagingPath, exists, stagingErr :=
 			m.preparedWorktreeStagingPath(target, record)
 		if stagingErr != nil {
-			result = errors.Join(result, stagingErr)
+			return errors.Join(result, stagingErr)
 		} else if exists {
 			activePath = stagingPath
 			pathExists = true
