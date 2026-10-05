@@ -5,6 +5,22 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 specs_dir="$repo_root/specs"
 
+invalid_names=0
+for spec_dir in "$specs_dir"/*; do
+	[ -d "$spec_dir" ] || continue
+	spec_name=${spec_dir##*/}
+	case "$spec_name" in
+	[0-9][0-9][0-9]-?*) ;;
+	*)
+		printf 'invalid spec directory: %s\n' "${spec_dir#"$repo_root"/}" >&2
+		invalid_names=1
+		;;
+	esac
+done
+if [ "$invalid_names" -ne 0 ]; then
+	exit 1
+fi
+
 duplicate_ids=$(
 	for spec_dir in "$specs_dir"/[0-9][0-9][0-9]-*; do
 		[ -d "$spec_dir" ] || continue
