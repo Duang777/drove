@@ -219,6 +219,9 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 			"workspace: prepared worktree identity is incomplete",
 		)
 	}
+	if err := repository.verifyBinding(); err != nil {
+		return err
+	}
 	bucket, err := m.openManagedBucketRoot(target)
 	if err != nil {
 		return err
@@ -291,11 +294,14 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 			"workspace: prepared worktree directory identity changed while acknowledging",
 		)
 	}
-	return verifyRootEntryUnchanged(
+	if err := verifyRootEntryUnchanged(
 		bucket,
 		target.AgentID,
 		opened,
-	)
+	); err != nil {
+		return err
+	}
+	return repository.verifyBinding()
 }
 
 func (m *Manager) worktreeGitDirectoryAtRoot(

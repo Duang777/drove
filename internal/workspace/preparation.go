@@ -76,8 +76,20 @@ func (m *Manager) acknowledgePreparation(
 		if err := m.replaceWorkspaceRecord(record); err != nil {
 			return fmt.Errorf("workspace: commit preparation record: %w", err)
 		}
+		if err := lease.repository.verifyBinding(); err != nil {
+			return fmt.Errorf(
+				"workspace: verify repository after committing preparation: %w",
+				err,
+			)
+		}
 	}
 	if record.BranchOperationID != "" {
+		if err := lease.repository.verifyBinding(); err != nil {
+			return fmt.Errorf(
+				"workspace: verify repository before ownership cleanup: %w",
+				err,
+			)
+		}
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
@@ -88,6 +100,12 @@ func (m *Manager) acknowledgePreparation(
 			record.BranchOperationID,
 		); err != nil {
 			return err
+		}
+		if err := lease.repository.verifyBinding(); err != nil {
+			return fmt.Errorf(
+				"workspace: verify repository after ownership cleanup: %w",
+				err,
+			)
 		}
 		record.BranchOperationID = ""
 		if err := m.replaceWorkspaceRecord(record); err != nil {

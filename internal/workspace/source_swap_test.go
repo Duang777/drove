@@ -640,7 +640,7 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	assertPreparationRefsAbsent(t, source, prepared.Branch)
 }
 
-func TestAcknowledgeUsesRetainedCommonGitDirectoryAfterReplacement(
+func TestAcknowledgeRejectsReplacementCommonGitDirectory(
 	t *testing.T,
 ) {
 	parent := t.TempDir()
@@ -664,11 +664,11 @@ func TestAcknowledgeUsesRetainedCommonGitDirectoryAfterReplacement(
 	replacementGitDirectory := filepath.Join(source, ".git")
 	t.Setenv("GIT_COMMON_DIR", replacementGitDirectory)
 
-	if err := manager.AcknowledgePreparation(prepared); err != nil {
-		t.Fatalf("acknowledge through retained common Git directory: %v", err)
+	if err := manager.AcknowledgePreparation(prepared); err == nil {
+		t.Fatal("acknowledgement accepted a replacement common Git directory")
 	}
 
-	assertGitRefAbsent(
+	assertGitRefExists(
 		t,
 		openedGitDirectory,
 		branchOwnershipRef(prepared.branchOperationID),
@@ -682,8 +682,19 @@ func TestAcknowledgeUsesRetainedCommonGitDirectoryAfterReplacement(
 	if err != nil || !exists {
 		t.Fatalf("read acknowledged record: exists=%v err=%v", exists, err)
 	}
-	if !record.PreparationCommitted || record.BranchOperationID != "" {
-		t.Fatalf("acknowledged record = %+v", record)
+	if record.PreparationCommitted || record.BranchOperationID == "" {
+		t.Fatalf("failed acknowledgement record = %+v", record)
+	}
+
+	displaced := filepath.Join(parent, "replacement-git")
+	if err := os.Rename(replacementGitDirectory, displaced); err != nil {
+		t.Fatalf("remove replacement common Git directory: %v", err)
+	}
+	if err := os.Rename(openedGitDirectory, replacementGitDirectory); err != nil {
+		t.Fatalf("restore common Git directory: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard restored preparation: %v", err)
 	}
 }
 

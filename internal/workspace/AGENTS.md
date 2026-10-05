@@ -52,7 +52,9 @@
   `ReconcilePreparations` 在重启时只采纳与 session 私有 metadata 完全匹配的 pending
   preparation，其余工作区及本次新建分支全部回滚。version 1/2 sidecar 兼容视为已提交。
   `AcknowledgePreparation` 在提交 sidecar 或清理 ownership ref 前必须重新验证当前目标
-  目录身份、Git registration 与私有 Git directory；不能只信 session 携带的历史值。
+  目录身份、Git registration、私有 Git directory，以及源 worktree、源私有 Git
+  directory 和 common Git directory 的公开路径仍绑定 preparation lease 固定的目录
+  实例；提交 sidecar 后和清理 ownership ref 前后也要复核，不能只信 session 携带的历史值。
 - `List` 只枚举 Drove 根目录下符合路径约定的 worktree，并从 Git 查询仓库、分支和
   dirty 状态。每个成功创建的 worktree 都有同目录私有记录，用于识别 detached HEAD
   和修复目录已丢失但 Git 注册仍存在的情况。路径存在时必须同时匹配记录中的 Git

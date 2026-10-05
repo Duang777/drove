@@ -59,6 +59,36 @@ func (r repositoryCapability) withRepositoryBinding(
 	return r
 }
 
+func (r repositoryCapability) verifyBinding() error {
+	if r.root == nil ||
+		r.gitRoot == nil ||
+		r.commonRoot == nil ||
+		r.path == "" ||
+		r.gitPath == "" ||
+		r.commonPath == "" {
+		return errors.New("workspace: repository binding is incomplete")
+	}
+	if err := verifyRealPathRoot(r.path, r.root); err != nil {
+		return fmt.Errorf(
+			"workspace: verify source repository binding: %w",
+			err,
+		)
+	}
+	if err := verifyRealPathRoot(r.gitPath, r.gitRoot); err != nil {
+		return fmt.Errorf(
+			"workspace: verify source Git directory binding: %w",
+			err,
+		)
+	}
+	if err := verifyRealPathRoot(r.commonPath, r.commonRoot); err != nil {
+		return fmt.Errorf(
+			"workspace: verify common Git directory binding: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 func (r repositoryCapability) run(
 	ctx context.Context,
 	input string,
