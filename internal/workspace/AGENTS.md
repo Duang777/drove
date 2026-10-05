@@ -40,7 +40,9 @@
   被替换时，在执行清理前 fail-stop。capability 的 Git 命令以已打开的 common Git
   directory 为执行目录，不再从源路径重新发现 `.git`；执行前清除继承的 `GIT_*`
   环境变量，再显式设置受约束的 `GIT_DIR` 与 `GIT_WORK_TREE`。include 规则的
-  `ls-files` 也必须使用同一 capability，并用 top-level pathspec 覆盖整个 worktree。
+  `ls-files` 必须先从已打开的私有 Git directory 读取 linked-worktree index，再在
+  私有 Git 路径身份仍匹配时从已打开的源 worktree root 复核；两次输出必须一致，并用
+  top-level pathspec 覆盖整个 worktree。
   version 4 只有源 worktree 与 common Git directory 证据；pending version 3/4 记录可
   读取但不能授权基于路径的回滚或 ownership marker 清理；已提交的 version 1-4 记录可
   直接兼容采纳，不执行缺少完整 identity evidence 的 Git 清理。
@@ -71,10 +73,11 @@
   worktree 记录同时持久化 Git 私有目录路径与文件系统目录实例身份，每个 removal intent
   另有随机目录 token，隔离前写入 worktree 并随原目录移动。物理路径存在时，创建
   removal intent 前必须取得并校验两种身份；任何已开始或待恢复的删除只要缺少任一身份
-  或目录 token 都必须 fail-stop。调用任何
-  物理删除前先把已检查的 workspace 原子移动到 operation ID 隔离名，再持久化
-  `quarantined + started`；之后只删除隔离名，失败必须保留 intent 并在重启后继续，
-  不能再因 dirty 状态回滚。每次恢复和递归删除隔离目录前都必须复核 Git 身份、目录
+  或目录 token 都必须 fail-stop。调用任何物理删除前先把已检查的 workspace 原子移动到
+  operation ID 隔离名；非强制删除必须在隔离后再次验证身份、marker 和 dirty 状态，
+  发现 dirty 时恢复原路径并拒绝删除。复核通过后才持久化 `quarantined + started`；
+  此后只删除隔离名，失败必须保留 intent 并在重启后继续，不能再因 dirty 状态回滚。
+  每次恢复和递归删除隔离目录前都必须复核 Git 身份、目录
   token 与已打开句柄；`Started` 不代表隔离路径永久可信，且 Started 状态只允许验证
   既有 token，禁止为当前路径重新创建 marker。新 intent 会记录创建时原路径是否已缺失；此后同名路径出现
   时必须 fail-stop，禁止把替代目录当成旧 workspace 删除。version 2 的历史 removal

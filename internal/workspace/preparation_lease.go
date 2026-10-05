@@ -159,6 +159,13 @@ func newPreparationLease(
 			),
 		)
 	}
+	repository = repository.withRepositoryBinding(
+		gitPath,
+		gitRoot,
+		commonPath,
+		commonRoot,
+		"",
+	)
 	startOID, err := repository.headOID(ctx)
 	if err != nil {
 		return nil, cleanup(err)

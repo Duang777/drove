@@ -281,7 +281,7 @@ func (m *Manager) prepare(
 			&lease.evidence,
 		),
 	}
-	includedPaths, err := m.includedPaths(
+	includeSelection, err := m.selectIncludedPaths(
 		ctx,
 		sourcePath,
 		sourceRoot,
@@ -290,6 +290,7 @@ func (m *Manager) prepare(
 	if err != nil {
 		return Workspace{}, err
 	}
+	includedPaths := includeSelection.paths
 	recordInstalled, err := m.writeWorkspaceRecordState(result, includedPaths)
 	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(
@@ -449,11 +450,13 @@ func (m *Manager) prepare(
 			),
 		)
 	}
-	copiedPaths, err := m.copyIncludedFiles(
+	copiedPaths, err := m.copyIncludedSelection(
 		ctx,
+		sourcePath,
 		sourceRoot,
+		sourceRepository,
 		result,
-		includedPaths,
+		includeSelection,
 	)
 	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1199,7 +1202,9 @@ func (m *Manager) repositoryPaths(
 }
 
 func (m *Manager) validateBranch(ctx context.Context, branch string) error {
-	if branch == "" || strings.HasPrefix(branch, "-") {
+	if branch == "" ||
+		strings.HasPrefix(branch, "-") ||
+		strings.ContainsRune(branch, '\x00') {
 		return fmt.Errorf("%w: %q", ErrInvalidBranch, branch)
 	}
 	if _, err := m.run(ctx, "check-ref-format", "refs/heads/"+branch); err != nil {
@@ -1418,6 +1423,7 @@ func (m *Manager) branchExists(
 		"--quiet",
 		"refs/heads/"+branch,
 	)
+	command.Env = rootedGitEnvironment(command.Environ())
 	err := command.Run()
 	if err == nil {
 		return true, nil
@@ -1556,6 +1562,7 @@ func (m *Manager) runInput(
 	arguments ...string,
 ) ([]byte, error) {
 	command := exec.CommandContext(ctx, m.git, arguments...)
+	command.Env = rootedGitEnvironment(command.Environ())
 	return runGitCommand(command, input)
 }
 

@@ -4,6 +4,7 @@ package workspace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,4 +52,82 @@ func rootedGitCommand(
 	)
 	command.Args = append(command.Args, arguments...)
 	return command, directory.Close, nil
+}
+
+func rootedPrivateGitCommand(
+	ctx context.Context,
+	git string,
+	worktreePath string,
+	_ string,
+	gitRoot *os.Root,
+	arguments []string,
+) (*exec.Cmd, func() error, error) {
+	gitDirectory, err := gitRoot.Open(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted private Git directory: %w",
+			err,
+		)
+	}
+	command := exec.CommandContext(ctx, git)
+	command.ExtraFiles = []*os.File{gitDirectory}
+	command.Env = boundGitEnvironment(
+		command.Environ(),
+		".",
+		worktreePath,
+	)
+	command.Args = append(
+		command.Args,
+		"-c",
+		"core.hooksPath=/dev/null",
+		"-C",
+		"/proc/self/fd/3",
+	)
+	command.Args = append(command.Args, arguments...)
+	return command, gitDirectory.Close, nil
+}
+
+func rootedWorktreeGitCommand(
+	ctx context.Context,
+	git string,
+	_ string,
+	root *os.Root,
+	_ string,
+	gitRoot *os.Root,
+	arguments []string,
+) (*exec.Cmd, func() error, error) {
+	gitDirectory, err := gitRoot.Open(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted private Git directory: %w",
+			err,
+		)
+	}
+	worktree, err := root.Open(".")
+	if err != nil {
+		_ = gitDirectory.Close()
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted Git worktree: %w",
+			err,
+		)
+	}
+	command := exec.CommandContext(ctx, git)
+	command.ExtraFiles = []*os.File{gitDirectory, worktree}
+	command.Env = boundGitEnvironment(
+		command.Environ(),
+		".",
+		"/proc/self/fd/4",
+	)
+	command.Args = append(
+		command.Args,
+		"-c",
+		"core.hooksPath=/dev/null",
+		"-C",
+		"/proc/self/fd/3",
+	)
+	command.Args = append(command.Args, arguments...)
+	cleanup := func() error {
+		return errors.Join(worktree.Close(), gitDirectory.Close())
+	}
+	return command, cleanup, nil
 }

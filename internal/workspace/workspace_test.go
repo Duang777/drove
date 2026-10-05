@@ -2051,6 +2051,28 @@ func newTestRepository(t *testing.T) string {
 	return resolved
 }
 
+func initTestRepositoryAt(t *testing.T, path string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is unavailable")
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatalf("create repository: %v", err)
+	}
+	runGit(t, path, "init", "--initial-branch=main")
+	runGit(t, path, "config", "user.name", "Drove Test")
+	runGit(t, path, "config", "user.email", "drove@example.invalid")
+	if err := os.WriteFile(
+		filepath.Join(path, "tracked.txt"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	runGit(t, path, "add", ".")
+	runGit(t, path, "commit", "-m", "initial")
+}
+
 func runGit(t *testing.T, directory string, arguments ...string) string {
 	t.Helper()
 	command := exec.Command("git", append([]string{"-C", directory}, arguments...)...)

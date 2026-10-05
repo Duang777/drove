@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -18,6 +20,50 @@ const (
 	worktreeIncludeFile    = ".worktreeinclude"
 	maxWorktreeIncludeSize = 1024 * 1024
 )
+
+type includeSelection struct {
+	paths    []string
+	manifest []byte
+	exists   bool
+}
+
+func (m *Manager) copyIncludedSelection(
+	ctx context.Context,
+	sourcePath string,
+	sourceRoot *os.Root,
+	repository repositoryCapability,
+	target Workspace,
+	selection includeSelection,
+) ([]string, error) {
+	if err := m.verifyIncludeSelection(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		repository,
+		selection,
+	); err != nil {
+		return nil, err
+	}
+	copiedPaths, err := m.copyIncludedFiles(
+		ctx,
+		sourceRoot,
+		target,
+		selection.paths,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.verifyIncludeSelection(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		repository,
+		selection,
+	); err != nil {
+		return nil, err
+	}
+	return copiedPaths, nil
+}
 
 func (m *Manager) copyIncludedFiles(
 	ctx context.Context,
@@ -165,14 +211,52 @@ func (m *Manager) includedPaths(
 	sourceRoot *os.Root,
 	repository repositoryCapability,
 ) ([]string, error) {
+	selection, err := m.selectIncludedPaths(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		repository,
+	)
+	return selection.paths, err
+}
+
+func (m *Manager) selectIncludedPaths(
+	ctx context.Context,
+	sourcePath string,
+	sourceRoot *os.Root,
+	repository repositoryCapability,
+) (includeSelection, error) {
 	manifest, exists, err := readWorktreeInclude(sourceRoot)
 	if err != nil {
-		return nil, err
+		return includeSelection{}, err
 	}
 	if !exists {
-		return nil, nil
+		return includeSelection{}, nil
 	}
+	paths, err := m.evaluateIncludedPaths(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		repository,
+		manifest,
+	)
+	if err != nil {
+		return includeSelection{}, err
+	}
+	return includeSelection{
+		paths:    paths,
+		manifest: manifest,
+		exists:   true,
+	}, nil
+}
 
+func (m *Manager) evaluateIncludedPaths(
+	ctx context.Context,
+	sourcePath string,
+	sourceRoot *os.Root,
+	repository repositoryCapability,
+	manifest []byte,
+) ([]string, error) {
 	output, err := m.runIncludeManifest(
 		ctx,
 		sourcePath,
@@ -211,6 +295,34 @@ func (m *Manager) includedPaths(
 		}
 	}
 	return unique, nil
+}
+
+func (m *Manager) verifyIncludeSelection(
+	ctx context.Context,
+	sourcePath string,
+	sourceRoot *os.Root,
+	repository repositoryCapability,
+	selection includeSelection,
+) error {
+	if !selection.exists {
+		return nil
+	}
+	current, err := m.evaluateIncludedPaths(
+		ctx,
+		sourcePath,
+		sourceRoot,
+		repository,
+		selection.manifest,
+	)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(current, selection.paths) {
+		return errors.New(
+			"workspace: included paths changed while preparing worktree",
+		)
+	}
+	return nil
 }
 
 func (m *Manager) runIncludeManifest(
@@ -303,40 +415,77 @@ func (m *Manager) runIncludeManifest(
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
 		return nil, err
 	}
-	command, cleanupCommand, err := repository.worktreeCommand(
+	manifestPath := filepath.Join(directory, name)
+	runCommand := func(
+		command *exec.Cmd,
+		cleanup func() error,
+	) (_ []byte, commandResult error) {
+		defer func() {
+			commandResult = errors.Join(commandResult, cleanup())
+		}()
+		excludePath, unlinkBeforeRun, err := configureIncludeManifestCommand(
+			command,
+			reader,
+			manifestPath,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if unlinkBeforeRun && name != "" {
+			if err := root.Remove(name); err != nil {
+				return nil, fmt.Errorf(
+					"workspace: unlink include rule file: %w",
+					err,
+				)
+			}
+			name = ""
+		}
+		command.Args = append(
+			command.Args,
+			"--exclude-from="+excludePath,
+			"--",
+			":(top)",
+		)
+		return runGitCommand(command, "")
+	}
+
+	command, cleanupCommand, err := repository.privateGitCommand(
 		ctx,
 		arguments...,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		result = errors.Join(result, cleanupCommand())
-	}()
-	excludePath, unlinkBeforeRun, err := configureIncludeManifestCommand(
-		command,
-		reader,
-		filepath.Join(directory, name),
-	)
-	if err != nil {
-		return nil, err
-	}
-	if unlinkBeforeRun {
-		if err := root.Remove(name); err != nil {
-			return nil, fmt.Errorf(
-				"workspace: unlink include rule file: %w",
-				err,
+	output, commandErr := runCommand(command, cleanupCommand)
+
+	var sourceVerificationErr error
+	if commandErr == nil &&
+		repository.gitRoot != nil &&
+		verifyRealPathRoot(repository.gitPath, repository.gitRoot) == nil {
+		if _, err := reader.Seek(0, io.SeekStart); err != nil {
+			sourceVerificationErr = err
+		} else {
+			verifier, cleanupVerifier, err := repository.worktreeCommand(
+				ctx,
+				arguments...,
 			)
+			if err != nil {
+				sourceVerificationErr = err
+			} else {
+				verifiedOutput, err := runCommand(
+					verifier,
+					cleanupVerifier,
+				)
+				sourceVerificationErr = err
+				if err == nil && !bytes.Equal(output, verifiedOutput) {
+					sourceVerificationErr = errors.New(
+						"workspace: included paths changed while " +
+							"verifying source root",
+					)
+				}
+			}
 		}
-		name = ""
 	}
-	command.Args = append(
-		command.Args,
-		"--exclude-from="+excludePath,
-		"--",
-		":(top)",
-	)
-	output, commandErr := runGitCommand(command, "")
 
 	verifyErr := errors.Join(
 		verifyIncludeManifest(
@@ -348,7 +497,7 @@ func (m *Manager) runIncludeManifest(
 		),
 		verifyRealPathRoot(sourcePath, sourceRoot),
 	)
-	if err := errors.Join(commandErr, verifyErr); err != nil {
+	if err := errors.Join(commandErr, sourceVerificationErr, verifyErr); err != nil {
 		return nil, err
 	}
 	return output, nil

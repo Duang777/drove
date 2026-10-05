@@ -160,6 +160,19 @@ func (r repositoryCapability) runForward(
 	return r.run(ctx, input, arguments...)
 }
 
+func (r repositoryCapability) runWorktree(
+	ctx context.Context,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	command, cleanup, err := r.worktreeCommand(ctx, arguments...)
+	if err != nil {
+		return nil, err
+	}
+	output, commandErr := runGitCommand(command, input)
+	return output, errors.Join(commandErr, cleanup())
+}
+
 func (r repositoryCapability) commonGitDirectory(
 	ctx context.Context,
 ) (string, error) {
@@ -227,7 +240,7 @@ func (r repositoryCapability) gitDirectory(
 func (r repositoryCapability) headOID(
 	ctx context.Context,
 ) (string, error) {
-	output, err := r.runForward(ctx, "", "rev-parse", "--verify", "HEAD")
+	output, err := r.runWorktree(ctx, "", "rev-parse", "--verify", "HEAD")
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve branch start: %w", err)
 	}
@@ -260,6 +273,7 @@ func (r repositoryCapability) command(
 		r.manager.git,
 		append([]string{"-C", r.path}, arguments...)...,
 	)
+	command.Env = rootedGitEnvironment(command.Environ())
 	return command, func() error { return nil }, nil
 }
 
@@ -268,11 +282,28 @@ func (r repositoryCapability) worktreeCommand(
 	arguments ...string,
 ) (*exec.Cmd, func() error, error) {
 	if r.root != nil && r.gitRoot != nil {
-		return rootedGitCommand(
+		return rootedWorktreeGitCommand(
 			ctx,
 			r.manager.git,
 			r.path,
 			r.root,
+			r.gitPath,
+			r.gitRoot,
+			arguments,
+		)
+	}
+	return r.command(ctx, arguments...)
+}
+
+func (r repositoryCapability) privateGitCommand(
+	ctx context.Context,
+	arguments ...string,
+) (*exec.Cmd, func() error, error) {
+	if r.root != nil && r.gitRoot != nil {
+		return rootedPrivateGitCommand(
+			ctx,
+			r.manager.git,
+			r.path,
 			r.gitPath,
 			r.gitRoot,
 			arguments,

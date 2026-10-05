@@ -628,11 +628,7 @@ func (m *Manager) resumePendingRemoval(
 			"workspace: managed worktree was not quarantined",
 		)
 	}
-	record, err = m.persistRemovalStart(record, true)
-	if err != nil {
-		return RemovalPending, err
-	}
-	return m.completeRemoval(ctx, record)
+	return m.resumePendingRemoval(ctx, record)
 }
 
 func validateRemovalPathState(
