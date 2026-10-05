@@ -283,6 +283,44 @@ func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
 	}
 }
 
+func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		wantOutput string
+	}{
+		{
+			name:       "help",
+			args:       []string{"help", "worktree"},
+			wantOutput: "Usage:",
+		},
+		{
+			name:       "completion",
+			args:       []string{"completion", "bash"},
+			wantOutput: "__start_drove",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := newRootCmd()
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+
+			if err := executeRoot(root, test.args); err != nil {
+				t.Fatalf("execute %v: %v", test.args, err)
+			}
+			if !strings.Contains(output.String(), test.wantOutput) {
+				t.Fatalf(
+					"execute %v output does not contain %q",
+					test.args,
+					test.wantOutput,
+				)
+			}
+		})
+	}
+}
+
 func TestWorktreeCommandIsRegisteredWithForceFlag(t *testing.T) {
 	command, _, err := newRootCmd().Find([]string{"worktree", "rm"})
 	if err != nil {

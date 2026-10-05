@@ -69,6 +69,8 @@ func main() {
 }
 
 func executeRoot(root *cobra.Command, args []string) error {
+	root.InitDefaultHelpCmd()
+	root.InitDefaultCompletionCmd()
 	command, remaining, err := root.Find(args)
 	if err != nil {
 		return markUsageError(err)
