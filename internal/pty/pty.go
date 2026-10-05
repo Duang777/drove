@@ -111,6 +111,7 @@ type Session struct {
 	closed      bool
 	writeActive bool
 	grace       time.Duration
+	groupSignal processGroupSignalFunc
 
 	onOutput      func(chunk []byte, offset uint64)
 	onOutputEnd   func(offset uint64)
@@ -134,6 +135,13 @@ var (
 
 // Start 创建 PTY 并启动命令。返回会话，或错误。
 func Start(cfg Config) (*Session, error) {
+	return startWithProcessGroupSignal(cfg, unixProcessGroupSignal)
+}
+
+func startWithProcessGroupSignal(
+	cfg Config,
+	groupSignal processGroupSignalFunc,
+) (*Session, error) {
 	windowSize, err := cfg.Size.windowSize()
 	if err != nil {
 		return nil, fmt.Errorf("pty: invalid initial size: %w", err)
@@ -166,6 +174,7 @@ func Start(cfg Config) (*Session, error) {
 		cmd:           cmd,
 		ptmx:          ptmx,
 		grace:         grace,
+		groupSignal:   groupSignal,
 		onOutput:      cfg.OnOutput,
 		onOutputEnd:   cfg.OnOutputEnd,
 		onExit:        cfg.OnExit,
@@ -333,15 +342,22 @@ func (s *Session) joinWriter() {
 func (s *Session) closeProcessGroup() {
 	s.groupCloseOnce.Do(func() {
 		var closeErrors []error
-		alive, err := processGroupAlive(s.cmd.Process.Pid)
+		alive, err := processGroupAliveWith(
+			s.groupSignal,
+			s.cmd.Process.Pid,
+		)
 		if err != nil {
 			closeErrors = append(
 				closeErrors,
 				fmt.Errorf("pty: inspect process group: %w", err),
 			)
 		} else if alive {
-			terminateErr := terminateProcessGroup(s.cmd.Process.Pid)
+			terminateErr := terminateProcessGroupWith(
+				s.groupSignal,
+				s.cmd.Process.Pid,
+			)
 			exited, waitErr := waitForProcessGroupExit(
+				s.groupSignal,
 				s.cmd.Process.Pid,
 				s.grace,
 			)
@@ -362,7 +378,10 @@ func (s *Session) closeProcessGroup() {
 				)
 			}
 			if !exited {
-				if err := killProcessGroup(s.cmd.Process.Pid); err != nil {
+				if err := killProcessGroupWith(
+					s.groupSignal,
+					s.cmd.Process.Pid,
+				); err != nil {
 					closeErrors = append(
 						closeErrors,
 						fmt.Errorf("pty: kill process group: %w", err),
@@ -476,14 +495,18 @@ func (s *Session) Close() error {
 	return s.closeErr
 }
 
-func waitForProcessGroupExit(pid int, grace time.Duration) (bool, error) {
+func waitForProcessGroupExit(
+	signal processGroupSignalFunc,
+	pid int,
+	grace time.Duration,
+) (bool, error) {
 	timer := time.NewTimer(grace)
 	defer timer.Stop()
 	ticker := time.NewTicker(processGroupPollInterval)
 	defer ticker.Stop()
 
 	for {
-		alive, err := processGroupAlive(pid)
+		alive, err := processGroupAliveWith(signal, pid)
 		if err != nil {
 			return false, err
 		}

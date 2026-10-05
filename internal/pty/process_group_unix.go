@@ -7,8 +7,18 @@ import (
 	"syscall"
 )
 
+type processGroupSignalFunc func(pid int, signal syscall.Signal) error
+
+func unixProcessGroupSignal(pid int, signal syscall.Signal) error {
+	return syscall.Kill(-pid, signal)
+}
+
 func terminateProcessGroup(pid int) error {
-	err := syscall.Kill(-pid, syscall.SIGTERM)
+	return terminateProcessGroupWith(unixProcessGroupSignal, pid)
+}
+
+func terminateProcessGroupWith(signal processGroupSignalFunc, pid int) error {
+	err := signal(pid, syscall.SIGTERM)
 	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
@@ -16,7 +26,11 @@ func terminateProcessGroup(pid int) error {
 }
 
 func killProcessGroup(pid int) error {
-	err := syscall.Kill(-pid, syscall.SIGKILL)
+	return killProcessGroupWith(unixProcessGroupSignal, pid)
+}
+
+func killProcessGroupWith(signal processGroupSignalFunc, pid int) error {
+	err := signal(pid, syscall.SIGKILL)
 	if errors.Is(err, syscall.ESRCH) {
 		return nil
 	}
@@ -24,7 +38,11 @@ func killProcessGroup(pid int) error {
 }
 
 func processGroupAlive(pid int) (bool, error) {
-	err := syscall.Kill(-pid, 0)
+	return processGroupAliveWith(unixProcessGroupSignal, pid)
+}
+
+func processGroupAliveWith(signal processGroupSignalFunc, pid int) (bool, error) {
+	err := signal(pid, 0)
 	switch {
 	case err == nil:
 		return true, nil

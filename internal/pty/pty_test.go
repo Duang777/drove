@@ -177,6 +177,24 @@ func TestNormalizeTerminationGrace(t *testing.T) {
 	}
 }
 
+func TestProcessGroupAliveTreatsPermissionDeniedAsAlive(t *testing.T) {
+	alive, err := processGroupAliveWith(
+		func(pid int, signal syscall.Signal) error {
+			if pid != 42 || signal != 0 {
+				t.Fatalf("signal process group = (%d, %d), want (42, 0)", pid, signal)
+			}
+			return syscall.EPERM
+		},
+		42,
+	)
+	if err != nil {
+		t.Fatalf("inspect process group: %v", err)
+	}
+	if !alive {
+		t.Fatal("permission-denied process group reported as exited")
+	}
+}
+
 func TestSessionChildObservesInitialSize(t *testing.T) {
 	stty, err := exec.LookPath("stty")
 	if err != nil {
@@ -477,6 +495,71 @@ func TestCloseKillsProcessGroupAfterGrace(t *testing.T) {
 	info := waitExit(t, exits)
 	if info.Err == nil || info.Code != -1 {
 		t.Fatalf("exit info = %+v, want forced signal exit", info)
+	}
+}
+
+func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
+	const grace = time.Millisecond
+	var signalsMu sync.Mutex
+	var signals []syscall.Signal
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+		},
+		func(pid int, signal syscall.Signal) error {
+			if pid <= 0 {
+				t.Fatalf("process group pid = %d, want positive", pid)
+			}
+			signalsMu.Lock()
+			signals = append(signals, signal)
+			signalsMu.Unlock()
+			return syscall.EPERM
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process exit")
+	}
+	closeErr := sess.Close()
+	if !errors.Is(closeErr, syscall.EPERM) {
+		t.Fatalf("close error = %v, want EPERM", closeErr)
+	}
+	for _, message := range []string{
+		"pty: terminate process group",
+		"pty: kill process group",
+	} {
+		if !strings.Contains(closeErr.Error(), message) {
+			t.Fatalf("close error = %q, want %q", closeErr, message)
+		}
+	}
+
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	var inspected, terminated, killed bool
+	for _, signal := range signals {
+		switch signal {
+		case 0:
+			inspected = true
+		case syscall.SIGTERM:
+			terminated = true
+		case syscall.SIGKILL:
+			killed = true
+		}
+	}
+	if !inspected || !terminated || !killed {
+		t.Fatalf(
+			"signals = %v, want probe, SIGTERM, and SIGKILL",
+			signals,
+		)
 	}
 }
 
