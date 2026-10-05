@@ -112,7 +112,9 @@
   root/bucket 句柄。sidecar 的原子写、确认读取和删除必须在受约束 bucket 句柄内完成。
   初次 sidecar 安装必须使用 no-replace 原语；removal acknowledgement 先把匹配 token 的
   sidecar 原子移动到 operation ID 隔离名，校验后再移动到同格式的新随机私有名并按已打开
-  文件身份删除，崩溃后从任一隔离名恢复。
+  文件身份删除，崩溃后从任一隔离名恢复。sidecar 与确认隔离名均缺失时必须 fail-closed；
+  只有当前 Manager 已成功删除同一 Agent ID 与 operation ID 的 sidecar 后，进程内重复确认
+  才可幂等成功。
   sidecar 安装在原子改名前后都要确认已打开的 repository bucket 仍位于规范 hash 路径，
   文件改名先把已校验源链接到内部随机别名，再从别名安装最终目标；公开临时路径被替换
   只能导致失败，不得覆盖最终记录。清理临时名时也必须确认它仍指向已打开文件。缺少

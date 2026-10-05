@@ -90,9 +90,14 @@ type inputAuditPayload struct {
 const MaxInputBytes = 64 * 1024
 
 const (
-	initialTerminalRows    = 40
-	initialTerminalColumns = 120
+	initialTerminalRows          = 40
+	initialTerminalColumns       = 120
+	startupResumeCompletedReason = "startup_resume_completed"
 )
+
+type startupResumeCompletedPayload struct {
+	Version int `json:"version"`
+}
 
 var (
 	// ErrUnknownAgent 表示目标 Agent 不存在。
@@ -696,12 +701,7 @@ func (m *Manager) resumeReserved(
 	entry adapter.Entry,
 	ref string,
 ) (*Status, error) {
-	reserved := true
-	defer func() {
-		if reserved {
-			m.releaseResume(id)
-		}
-	}()
+	defer m.releaseResume(id)
 
 	target := managed.agent
 	command, err := entry.ResumeCommand(
@@ -790,9 +790,7 @@ func (m *Manager) resumeReserved(
 
 	m.mu.Lock()
 	m.sessions[id] = running
-	delete(m.resuming, id)
 	m.mu.Unlock()
-	reserved = false
 
 	if err := m.activate(ctx, activation{
 		id:           id,
@@ -807,6 +805,11 @@ func (m *Manager) resumeReserved(
 		outputOffset: initialOutputOffset,
 	}); err != nil {
 		return nil, err
+	}
+	if managed.shouldResumeOnStart() {
+		if err := m.completeStartupResume(id, managed); err != nil {
+			return nil, err
+		}
 	}
 	return m.Status(id)
 }
@@ -1194,12 +1197,45 @@ func (m *Manager) resumeOnStart(
 		}
 
 		_, err = m.resumeReserved(ctx, id, managed, entry, ref)
-		if err == nil {
-			managed.consumeResumeOnStart()
+		if err != nil {
+			m.endStart()
+			return true, err
 		}
 		m.endStart()
-		return true, err
+		return true, nil
 	}
+}
+
+func (m *Manager) completeStartupResume(
+	id agent.ID,
+	managed *managedAgent,
+) error {
+	payload, err := json.Marshal(startupResumeCompletedPayload{Version: 1})
+	if err != nil {
+		return fmt.Errorf(
+			"session: encode startup resume completion: %w",
+			err,
+		)
+	}
+	receipt, commitErr := m.committer.CommitEvents(
+		context.Background(),
+		[]event.Draft{event.NewSessionLifecycleDraft(
+			string(id),
+			string(id),
+			startupResumeCompletedReason,
+			string(payload),
+		)},
+	)
+	if receipt.Durable {
+		managed.consumeResumeOnStart()
+	}
+	if commitErr != nil {
+		return fmt.Errorf(
+			"session: persist startup resume completion: %w",
+			commitErr,
+		)
+	}
+	return nil
 }
 
 // Replay 返回某会话的事件流（来自 store，按 seq 升序）。

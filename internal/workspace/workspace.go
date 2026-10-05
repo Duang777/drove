@@ -59,13 +59,19 @@ type Workspace struct {
 
 // Manager owns worktrees below one Drove data directory.
 type Manager struct {
-	root         string
-	git          string
-	dataDirInfo  os.FileInfo
-	worktreeInfo os.FileInfo
-	bucketInfo   map[string]os.FileInfo
-	rootErr      error
-	mu           *sync.Mutex
+	root                 string
+	git                  string
+	dataDirInfo          os.FileInfo
+	worktreeInfo         os.FileInfo
+	bucketInfo           map[string]os.FileInfo
+	acknowledgedRemovals map[removalAcknowledgementReceipt]struct{}
+	rootErr              error
+	mu                   *sync.Mutex
+}
+
+type removalAcknowledgementReceipt struct {
+	agentID     string
+	operationID string
 }
 
 // New creates a worktree manager without changing the filesystem.
@@ -120,13 +126,14 @@ func New(dataDir string) (*Manager, error) {
 		rootErr = fmt.Errorf("workspace: inspect worktree root: %w", err)
 	}
 	manager := &Manager{
-		root:         rootPath,
-		git:          "git",
-		dataDirInfo:  dataDirInfo,
-		worktreeInfo: worktreeInfo,
-		bucketInfo:   bucketInfo,
-		rootErr:      rootErr,
-		mu:           workspaceManagerLock(rootPath),
+		root:                 rootPath,
+		git:                  "git",
+		dataDirInfo:          dataDirInfo,
+		worktreeInfo:         worktreeInfo,
+		bucketInfo:           bucketInfo,
+		acknowledgedRemovals: make(map[removalAcknowledgementReceipt]struct{}),
+		rootErr:              rootErr,
+		mu:                   workspaceManagerLock(rootPath),
 	}
 	if worktreeInfo == nil || rootErr != nil {
 		return manager, nil

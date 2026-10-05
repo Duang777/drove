@@ -1204,6 +1204,82 @@ func TestResumeOnStartRetriesFailedCandidate(t *testing.T) {
 	}
 }
 
+func TestResumeOnStartPersistsCompletionAfterContextCancellation(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		cancel()
+		return &fakeProcessSession{}, nil
+	}
+
+	results := manager.ResumeOnStart(ctx)
+	if len(results) != 1 ||
+		results[0].AgentID != managed.agent.ID() ||
+		results[0].Err != nil {
+		t.Fatalf("startup resume results = %+v", results)
+	}
+	if managed.shouldResumeOnStart() {
+		t.Fatal("durably completed startup resume retained candidate")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay startup resume: %v", err)
+	}
+	last := rows[len(rows)-1]
+	if last.Type != string(event.TypeSessionLifecycle) ||
+		last.Reason != startupResumeCompletedReason ||
+		last.Payload != `{"version":1}` {
+		t.Fatalf("startup resume completion = %+v", last)
+	}
+}
+
+func TestManualResumeCompletesStartupResumeIntent(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	manager.committer.Close()
+	commitStore := &resumeReservationCommitStore{
+		commitStore: st,
+		manager:     manager,
+		id:          managed.agent.ID(),
+	}
+	manager.committer = newCommitter(0, commitStore, manager.hub)
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		return &fakeProcessSession{}, nil
+	}
+
+	status, err := manager.Resume(context.Background(), managed.agent.ID())
+	if err != nil {
+		t.Fatalf("manual resume: %v", err)
+	}
+	if status.State != agent.StateWorking {
+		t.Fatalf("manual resume status = %+v", status)
+	}
+	if managed.shouldResumeOnStart() {
+		t.Fatal("manual resume retained startup resume intent")
+	}
+	if !commitStore.observedCompletion {
+		t.Fatal("startup resume completion was not committed")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay manual resume: %v", err)
+	}
+	last := rows[len(rows)-1]
+	if last.Type != string(event.TypeSessionLifecycle) ||
+		last.Reason != startupResumeCompletedReason ||
+		last.Payload != `{"version":1}` {
+		t.Fatalf("startup resume completion = %+v", last)
+	}
+}
+
 func TestNormalizeRunMode(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -2342,6 +2418,36 @@ type cancelAfterAppendStore struct {
 	commitStore
 	cancel context.CancelFunc
 	once   sync.Once
+}
+
+type resumeReservationCommitStore struct {
+	commitStore
+	manager            *Manager
+	id                 agent.ID
+	observedCompletion bool
+}
+
+func (s *resumeReservationCommitStore) AppendEvents(
+	ctx context.Context,
+	expectedLastSeq uint64,
+	rows []store.EventRow,
+) (uint64, error) {
+	for _, row := range rows {
+		if row.Type != string(event.TypeSessionLifecycle) ||
+			row.Reason != startupResumeCompletedReason {
+			continue
+		}
+		s.manager.mu.RLock()
+		_, reserved := s.manager.resuming[s.id]
+		s.manager.mu.RUnlock()
+		if !reserved {
+			return expectedLastSeq, errors.New(
+				"startup resume completion committed without reservation",
+			)
+		}
+		s.observedCompletion = true
+	}
+	return s.commitStore.AppendEvents(ctx, expectedLastSeq, rows)
 }
 
 func (s *cancelAfterAppendStore) AppendEvents(

@@ -448,6 +448,113 @@ func TestRecoveryProjectorPreservesResumeAfterPersistedRestartStop(
 	}
 }
 
+func TestRecoveryProjectorRequiresDurableCompletionToConsumeStartupResume(
+	t *testing.T,
+) {
+	base := time.Date(2026, time.October, 5, 13, 0, 0, 0, time.UTC)
+	baseRows := []store.EventRow{
+		{
+			Seq: 1, Timestamp: base, Type: string(event.TypeSessionLifecycle),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "created",
+			Payload: `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq: 2, Timestamp: base.Add(time.Second), Type: string(event.TypeAgentSignal),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "hook",
+			Payload: `{"version":1,"source":"hook","kind":"observed","vendor":"claude",` +
+				`"vendor_event":"Notification","scope":"root","vendor_session_ref":"resume-ref",` +
+				`"confidence":1,"received_at":"2026-10-05T13:00:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440001","outcome":"observed"}`,
+		},
+		{
+			Seq: 3, Timestamp: base.Add(2 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "pending", To: "starting",
+		},
+		{
+			Seq: 4, Timestamp: base.Add(3 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "starting", To: "working",
+		},
+		{
+			Seq: 5, Timestamp: base.Add(4 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "working", To: "stopped",
+			Reason: restartStopReason,
+		},
+		{
+			Seq: 6, Timestamp: base.Add(5 * time.Second), Type: string(event.TypeAgentResumed),
+			SessionID: "agent-1", AgentID: "agent-1", Reason: "requested",
+			Payload: `{"version":1,"vendor_session_ref":"resume-ref"}`,
+		},
+		{
+			Seq: 7, Timestamp: base.Add(6 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "stopped", To: "starting",
+		},
+		{
+			Seq: 8, Timestamp: base.Add(7 * time.Second), Type: string(event.TypeStateChanged),
+			SessionID: "agent-1", AgentID: "agent-1", From: "starting", To: "working",
+		},
+	}
+	tests := []struct {
+		name       string
+		finalRows  []store.EventRow
+		wantResume bool
+	}{
+		{
+			name: "required hook failure",
+			finalRows: []store.EventRow{{
+				Seq: 9, Timestamp: base.Add(8 * time.Second), Type: string(event.TypeStateChanged),
+				SessionID: "agent-1", AgentID: "agent-1", From: "working", To: "stopped",
+				Reason: "required hook activation failed",
+			}},
+			wantResume: true,
+		},
+		{
+			name: "durable completion",
+			finalRows: []store.EventRow{
+				{
+					Seq: 9, Timestamp: base.Add(8 * time.Second),
+					Type:      string(event.TypeSessionLifecycle),
+					SessionID: "agent-1", AgentID: "agent-1",
+					Reason:  startupResumeCompletedReason,
+					Payload: `{"version":1}`,
+				},
+				{
+					Seq: 10, Timestamp: base.Add(9 * time.Second),
+					Type:      string(event.TypeStateChanged),
+					SessionID: "agent-1", AgentID: "agent-1",
+					From: "working", To: "stopped",
+					Reason: "process exited",
+				},
+			},
+			wantResume: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projector := newRecoveryProjector()
+			rows := append(
+				append([]store.EventRow(nil), baseRows...),
+				test.finalRows...,
+			)
+			for _, row := range rows {
+				if err := projector.Apply(row); err != nil {
+					t.Fatalf("apply seq %d: %v", row.Seq, err)
+				}
+			}
+			plan, err := projector.Finish(base.Add(time.Hour))
+			if err != nil {
+				t.Fatalf("finish projection: %v", err)
+			}
+			if got := plan.ResumeOnStart["agent-1"]; got != test.wantResume {
+				t.Fatalf(
+					"startup resume eligibility = %t, want %t",
+					got,
+					test.wantResume,
+				)
+			}
+		})
+	}
+}
+
 func TestRecoveryProjectorDoesNotResumeCompletedSessionAfterRestartStop(
 	t *testing.T,
 ) {

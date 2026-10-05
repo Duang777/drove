@@ -451,6 +451,57 @@ func TestAcknowledgeRemovalRetryDoesNotRequireDeletedRepository(
 	}
 }
 
+func TestAcknowledgeRemovalRejectsMissingRecordWithReplacementWorkspace(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+	if err := os.Remove(workspaceRecordPath(prepared.Path)); err != nil {
+		t.Fatalf("remove pending acknowledgement record: %v", err)
+	}
+	if err := os.Mkdir(prepared.Path, 0o700); err != nil {
+		t.Fatalf("create replacement workspace: %v", err)
+	}
+	replacementMarker := filepath.Join(prepared.Path, "replacement")
+	if err := os.WriteFile(replacementMarker, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement marker: %v", err)
+	}
+
+	if err := manager.AcknowledgeRemoval(result.Removal); err == nil {
+		t.Fatal("acknowledgement accepted a missing record")
+	}
+	contents, err := os.ReadFile(replacementMarker)
+	if err != nil {
+		t.Fatalf("read replacement marker: %v", err)
+	}
+	if string(contents) != "replacement\n" {
+		t.Fatalf("replacement marker = %q", contents)
+	}
+}
+
 func TestDiscardRejectsReplacementRepositoryBucket(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))

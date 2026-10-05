@@ -165,6 +165,8 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	switch row.Reason {
 	case "created":
 		return p.applyCreated(row)
+	case startupResumeCompletedReason:
+		return p.applyStartupResumeCompleted(row)
 	case workspaceRemovedReason:
 		return p.applyWorkspaceRemoved(row)
 	default:
@@ -281,6 +283,41 @@ func (p *recoveryProjector) applyCreated(row store.EventRow) error {
 	return nil
 }
 
+func (p *recoveryProjector) applyStartupResumeCompleted(
+	row store.EventRow,
+) error {
+	draft := p.draft(row)
+	if !draft.hasCreated && !draft.hasState {
+		return projectionError(
+			row,
+			"startup resume completion has no session history",
+		)
+	}
+	var payload startupResumeCompletedPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return projectionWrapError(
+			row,
+			"decode startup resume completion",
+			err,
+		)
+	}
+	if payload.Version != 1 {
+		return projectionError(
+			row,
+			"unsupported startup resume completion version %d",
+			payload.Version,
+		)
+	}
+	if !draft.restartStopped {
+		return projectionError(
+			row,
+			"startup resume completion has no restart resume candidate",
+		)
+	}
+	draft.restartStopped = false
+	return nil
+}
+
 func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 	draft := p.draft(row)
 	if !draft.hasCreated && !draft.hasState {
@@ -360,14 +397,7 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		from != agent.StateDone &&
 		from != agent.StateStopped &&
 		row.Reason == restartStopReason
-	isFailedRestartResume := draft.restartStopped &&
-		from == agent.StateStarting &&
-		to == agent.StateStopped
-	isRestartResumeStarting := draft.restartStopped &&
-		from == agent.StateStopped &&
-		to == agent.StateStarting
-	draft.restartStopped =
-		isRestartStop || isFailedRestartResume || isRestartResumeStarting
+	draft.restartStopped = draft.restartStopped || isRestartStop
 	if known {
 		draft.lastTransition = evidence
 	}

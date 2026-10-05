@@ -210,12 +210,21 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 			"workspace: removal acknowledgement token is invalid",
 		)
 	}
+	receipt := removalAcknowledgementReceipt{
+		agentID:     removal.Workspace.AgentID,
+		operationID: removal.operationID,
+	}
 	pending, err := m.removalAcknowledgementPending(removal)
 	if err != nil {
 		return err
 	}
 	if !pending {
-		return nil
+		if _, acknowledged := m.acknowledgedRemovals[receipt]; acknowledged {
+			return nil
+		}
+		return errors.New(
+			"workspace: removal acknowledgement record is missing",
+		)
 	}
 	record := newWorkspaceRecord(removal.Workspace, nil)
 	record.Removal = &workspaceRemovalRecord{
@@ -237,6 +246,7 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 	if err := m.removeAcknowledgedWorkspaceRecord(removal); err != nil {
 		return err
 	}
+	m.acknowledgedRemovals[receipt] = struct{}{}
 	return nil
 }
 
