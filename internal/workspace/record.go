@@ -196,6 +196,16 @@ func (m *Manager) installWorkspaceRecordState(
 			err,
 		)
 	}
+	if err := m.recoverWorkspaceRecordArtifacts(
+		bucket,
+		filepath.Base(filepath.Dir(record.Path)),
+		record.AgentID,
+	); err != nil {
+		return false, fmt.Errorf(
+			"workspace: recover record artifacts: %w",
+			err,
+		)
+	}
 	name := agentID + workspaceRecordSuffix
 	if err := checkRecordTarget(bucket, name, recordPath, requireAbsent); err != nil {
 		return false, err
@@ -212,7 +222,7 @@ func (m *Manager) installWorkspaceRecordState(
 		)
 	}
 
-	temporaryName := "." + name + ".tmp-" + uuid.NewString()
+	temporaryName := workspaceRecordTemporaryName(name)
 	file, err := bucket.OpenFile(
 		temporaryName,
 		os.O_RDWR|os.O_CREATE|os.O_EXCL,
@@ -230,7 +240,13 @@ func (m *Manager) installWorkspaceRecordState(
 		if temporaryName != "" {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(bucket, temporaryName, file),
+				removeOwnedRecordPathIfSame(
+					bucket,
+					temporaryName,
+					file,
+					workspaceRecordTemporaryName(name),
+					nil,
+				),
 			)
 		}
 		if fileOpen {
@@ -451,6 +467,16 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			err,
 		)
 	}
+	if err := m.recoverWorkspaceRecordArtifacts(
+		bucket,
+		filepath.Base(filepath.Dir(worktreePath)),
+		agentID,
+	); err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: recover record artifacts: %w",
+			err,
+		)
+	}
 	info, err := bucket.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return workspaceRecord{}, false, nil
@@ -500,16 +526,32 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			recordPath,
 		)
 	}
+	record, err := m.decodeWorkspaceRecordFile(
+		file,
+		recordPath,
+		worktreePath,
+	)
+	if err != nil {
+		return workspaceRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (m *Manager) decodeWorkspaceRecordFile(
+	file *os.File,
+	recordPath string,
+	worktreePath string,
+) (workspaceRecord, error) {
 	raw, err := io.ReadAll(io.LimitReader(file, maxWorkspaceRecordSize+1))
 	if err != nil {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: read record %q: %w",
 			recordPath,
 			err,
 		)
 	}
 	if len(raw) > maxWorkspaceRecordSize {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q exceeds %d bytes",
 			recordPath,
 			maxWorkspaceRecordSize,
@@ -519,14 +561,14 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 	decoder.DisallowUnknownFields()
 	var record workspaceRecord
 	if err := decoder.Decode(&record); err != nil {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: decode record %q: %w",
 			recordPath,
 			err,
 		)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q has trailing data",
 			recordPath,
 		)
@@ -543,7 +585,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.DirectoryIdentity != "" ||
 			record.RepositoryEvidence != nil ||
 			record.Removal != nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: legacy record %q contains newer fields",
 				recordPath,
 			)
@@ -551,7 +593,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		record.PreparationCommitted = true
 	case protectedWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 2 record %q has no included paths",
 				recordPath,
 			)
@@ -563,7 +605,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.GitDirectory != "" ||
 			record.DirectoryIdentity != "" ||
 			record.RepositoryEvidence != nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 2 record %q contains version 3 fields",
 				recordPath,
 			)
@@ -574,52 +616,52 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		}
 	case preparationWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 3 record %q has no included paths",
 				recordPath,
 			)
 		}
 		if record.RepositoryEvidence != nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 3 record %q contains version 4 fields",
 				recordPath,
 			)
 		}
 	case repositoryWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 4 record %q has no included paths",
 				recordPath,
 			)
 		}
 	case workspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 5 record %q has no included paths",
 				recordPath,
 			)
 		}
 	default:
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q has unsupported version %d",
 			recordPath,
 			record.Version,
 		)
 	}
 	if filepath.Clean(worktreePath) != record.Path {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q path mismatch",
 			recordPath,
 		)
 	}
 	if err := m.validateWorkspaceRecord(record); err != nil {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: validate record %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	return record, true, nil
+	return record, nil
 }
 
 func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
@@ -872,56 +914,54 @@ func (m *Manager) removeWorkspaceRecordAfterValidation(
 			recordPath,
 		)
 	}
-	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
-		return err
-	}
-	directory, err := openRecordDirectory(bucket)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: open record directory %q: %w",
-			recordPath,
-			err,
-		)
-	}
-	isolatedName := ".drove-record-remove-" + uuid.NewString()
-	isolated, isolateErr := isolateRecordPathIfSame(
-		bucket,
-		directory,
-		name,
-		isolatedName,
+	record, err := m.decodeWorkspaceRecordFile(
 		opened,
-		afterValidation,
+		recordPath,
+		worktreePath,
 	)
-	syncErr := syncRecordDirectory(directory)
-	closeErr := directory.Close()
-	if err := errors.Join(isolateErr, syncErr, closeErr); err != nil {
-		return fmt.Errorf(
-			"workspace: isolate record %q: %w",
-			recordPath,
-			err,
-		)
-	}
-	if !isolated {
-		return fmt.Errorf(
-			"workspace: record %q was not isolated",
-			recordPath,
-		)
+	if err != nil {
+		return err
 	}
 	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
 		return err
 	}
-	if err := removeRecordPathIfSame(
+	isolatedName := workspaceRecordRemovalName(record)
+	if err := removeOwnedRecordPath(
 		bucket,
-		isolatedName,
+		name,
 		opened,
+		isolatedName,
+		func(candidate *os.File) error {
+			if _, err := candidate.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			current, err := m.decodeWorkspaceRecordFile(
+				candidate,
+				recordPath,
+				worktreePath,
+			)
+			if err != nil {
+				return err
+			}
+			if current.AgentID != record.AgentID {
+				return errors.New(
+					"workspace: isolated record changed ownership",
+				)
+			}
+			return nil
+		},
+		afterValidation,
 	); err != nil {
 		return fmt.Errorf(
-			"workspace: remove isolated record %q: %w",
+			"workspace: remove record %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	return syncRecordBucket(bucket, recordPath)
+	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) removeAcknowledgedWorkspaceRecord(
@@ -1245,6 +1285,17 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 				err,
 			)
 		}
+		if err := m.recoverWorkspaceRecordArtifacts(
+			bucketRoot,
+			bucket.Name(),
+			"",
+		); err != nil {
+			_ = bucketRoot.Close()
+			return fmt.Errorf(
+				"workspace: recover record artifacts: %w",
+				err,
+			)
+		}
 		entries, err := readRootDirectory(bucketRoot)
 		if err != nil {
 			_ = bucketRoot.Close()
@@ -1446,48 +1497,25 @@ func coalesceRecordAcknowledgementsAfterValidation(
 		)
 	}
 	for _, duplicate := range candidates[1:] {
-		directory, err := openRecordDirectory(bucket)
-		if err != nil {
-			return recordAcknowledgement{}, err
-		}
 		isolatedName := recordAcknowledgementPrefix(
 			agentID,
 			operationID,
 		) + uuid.NewString()
-		isolated, isolateErr := isolateRecordPathIfSame(
+		if err := removeOwnedRecordPath(
 			bucket,
-			directory,
 			duplicate.name,
-			isolatedName,
 			expected,
+			isolatedName,
+			nil,
 			afterValidation,
-		)
-		afterValidation = nil
-		closeErr := directory.Close()
-		if err := errors.Join(isolateErr, closeErr); err != nil {
-			return recordAcknowledgement{}, fmt.Errorf(
-				"workspace: isolate acknowledgement alias %q: %w",
-				duplicate.name,
-				err,
-			)
-		}
-		if !isolated {
-			return recordAcknowledgement{}, fmt.Errorf(
-				"workspace: acknowledgement alias %q was not isolated",
-				duplicate.name,
-			)
-		}
-		if err := removeRecordPathIfSame(
-			bucket,
-			isolatedName,
-			expected,
 		); err != nil {
 			return recordAcknowledgement{}, fmt.Errorf(
-				"workspace: remove isolated acknowledgement alias %q: %w",
-				isolatedName,
+				"workspace: remove acknowledgement alias %q: %w",
+				duplicate.name,
 				err,
 			)
 		}
+		afterValidation = nil
 	}
 	if len(candidates) > 1 {
 		if err := syncRecordBucket(bucket, candidates[0].name); err != nil {
@@ -1511,60 +1539,38 @@ func (m *Manager) removeRecordAcknowledgementQuarantine(
 			err,
 		)
 	}
-	fileOpen := true
 	defer func() {
-		if fileOpen {
-			result = errors.Join(result, file.Close())
-		}
+		result = errors.Join(result, file.Close())
 	}()
-	if _, err := m.verifyRemovalRecordFile(
-		file,
-		recordPath,
-		removal,
-	); err != nil {
-		return err
-	}
-	directory, err := openRecordDirectory(bucket)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: open quarantined record directory %q: %w",
-			recordPath,
-			err,
-		)
-	}
 	deleteName := recordAcknowledgementPrefix(
 		removal.Workspace.AgentID,
 		removal.operationID,
 	) + uuid.NewString()
-	moved, moveErr := moveRecordFile(
-		directory,
-		file,
+	if err := removeOwnedRecordPath(
+		bucket,
 		name,
+		file,
 		deleteName,
-	)
-	syncErr := syncRecordDirectory(directory)
-	closeErr := directory.Close()
-	if err := errors.Join(moveErr, syncErr, closeErr); err != nil {
-		return fmt.Errorf(
-			"workspace: isolate quarantined record %q: %w",
-			recordPath,
-			err,
-		)
-	}
-	if !moved {
-		return fmt.Errorf(
-			"workspace: quarantined record %q was not isolated",
-			recordPath,
-		)
-	}
-	if err := removeRecordPathIfSame(bucket, deleteName, file); err != nil {
+		func(candidate *os.File) error {
+			if _, err := candidate.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			_, err := m.verifyRemovalRecordFile(
+				candidate,
+				recordPath,
+				removal,
+			)
+			return err
+		},
+		nil,
+	); err != nil {
 		return fmt.Errorf(
 			"workspace: remove quarantined record %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	return syncRecordBucket(bucket, recordPath)
+	return nil
 }
 
 func restoreRecordAcknowledgement(
