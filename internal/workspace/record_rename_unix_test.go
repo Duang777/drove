@@ -122,3 +122,86 @@ func TestUnlinkRecordPreservesReplacementAfterValidation(t *testing.T) {
 	assertFileContents(t, sourcePath, "replacement\n")
 	assertFileContents(t, movedPath, "original\n")
 }
+
+func TestRecoverRecordInstallAliasUsesSameFileWitness(t *testing.T) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	aliasName := recordInstallAliasPrefix +
+		"78787878-7878-4787-8787-787878787878"
+	aliasPath := filepath.Join(rootPath, aliasName)
+	if err := os.Link(sourcePath, aliasPath); err != nil {
+		t.Fatalf("link install alias: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+
+	if err := recoverRecordRenameDebris(root); err != nil {
+		t.Fatalf("recover install alias: %v", err)
+	}
+	if err := recoverRecordRenameDebris(root); err != nil {
+		t.Fatalf("repeat install alias recovery: %v", err)
+	}
+	assertFileContents(t, sourcePath, "record\n")
+	if _, err := os.Lstat(aliasPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("install alias remains: %v", err)
+	}
+}
+
+func TestRecoverRecordInstallAliasRejectsMissingWitness(t *testing.T) {
+	rootPath := t.TempDir()
+	aliasName := recordInstallAliasPrefix +
+		"89898989-8989-4898-8989-898989898989"
+	aliasPath := filepath.Join(rootPath, aliasName)
+	if err := os.WriteFile(aliasPath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write install alias: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+
+	if err := recoverRecordRenameDebris(root); err == nil {
+		t.Fatal("recovery accepted an install alias without an owner")
+	}
+	assertFileContents(t, aliasPath, "record\n")
+}
+
+func TestRecoverRecordRenameDebrisRejectsLegacyRemovalBeforeMutation(
+	t *testing.T,
+) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	aliasName := recordInstallAliasPrefix +
+		"90909090-9090-4090-8090-909090909090"
+	aliasPath := filepath.Join(rootPath, aliasName)
+	if err := os.Link(sourcePath, aliasPath); err != nil {
+		t.Fatalf("link install alias: %v", err)
+	}
+	legacyName := recordRemoveLegacyPrefix +
+		"67676767-6767-4767-8767-676767676767"
+	legacyPath := filepath.Join(rootPath, legacyName)
+	if err := os.WriteFile(legacyPath, []byte("legacy\n"), 0o600); err != nil {
+		t.Fatalf("write legacy removal artifact: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+
+	if err := recoverRecordRenameDebris(root); err == nil {
+		t.Fatal("recovery accepted a legacy removal artifact")
+	}
+	assertFileContents(t, aliasPath, "record\n")
+	assertFileContents(t, legacyPath, "legacy\n")
+}

@@ -190,6 +190,12 @@ func (m *Manager) installWorkspaceRecordState(
 	defer func() {
 		result = errors.Join(result, bucket.Close())
 	}()
+	if err := recoverRecordRenameDebris(bucket); err != nil {
+		return false, fmt.Errorf(
+			"workspace: recover record file operations: %w",
+			err,
+		)
+	}
 	name := agentID + workspaceRecordSuffix
 	if err := checkRecordTarget(bucket, name, recordPath, requireAbsent); err != nil {
 		return false, err
@@ -439,6 +445,12 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 ) (_ workspaceRecord, _ bool, result error) {
 	recordPath := workspaceRecordPath(worktreePath)
 	name := agentID + workspaceRecordSuffix
+	if err := recoverRecordRenameDebris(bucket); err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: recover record file operations: %w",
+			err,
+		)
+	}
 	info, err := bucket.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return workspaceRecord{}, false, nil
@@ -1225,6 +1237,13 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 		if err := m.verifyRepositoryBucket(bucket.Name(), bucketRoot); err != nil {
 			_ = bucketRoot.Close()
 			return err
+		}
+		if err := recoverRecordRenameDebris(bucketRoot); err != nil {
+			_ = bucketRoot.Close()
+			return fmt.Errorf(
+				"workspace: recover record file operations: %w",
+				err,
+			)
 		}
 		entries, err := readRootDirectory(bucketRoot)
 		if err != nil {
