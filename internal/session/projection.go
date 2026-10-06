@@ -403,6 +403,9 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 	if isRestartStop {
 		draft.restartStopped = true
 		draft.startupResumePending = true
+	} else if to == agent.StateStopped && row.Reason == "user stop" {
+		draft.restartStopped = false
+		draft.startupResumePending = false
 	} else if to == agent.StateDone {
 		draft.restartStopped = false
 	}

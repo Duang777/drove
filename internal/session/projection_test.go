@@ -575,6 +575,15 @@ func TestRecoveryProjectorRequiresDurableCompletionToConsumeStartupResume(
 		wantResume bool
 	}{
 		{
+			name: "legacy explicit user stop",
+			finalRows: []store.EventRow{{
+				Seq: 9, Timestamp: base.Add(8 * time.Second), Type: string(event.TypeStateChanged),
+				SessionID: "agent-1", AgentID: "agent-1", From: "working", To: "stopped",
+				Reason: "user stop",
+			}},
+			wantResume: false,
+		},
+		{
 			name: "required hook failure",
 			finalRows: []store.EventRow{{
 				Seq: 9, Timestamp: base.Add(8 * time.Second), Type: string(event.TypeStateChanged),
