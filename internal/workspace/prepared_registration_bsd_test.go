@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -167,6 +168,84 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 	if err := manager.Discard(context.Background(), prepared); err != nil {
 		t.Fatalf("discard prepared worktree: %v", err)
+	}
+}
+
+func TestBSDPrepareCleansRegistrationWhenFinalizationFails(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	initSourceSwapRepository(t, repository)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	stageFile := filepath.Join(parent, "common-stage")
+	wrapper := filepath.Join(parent, "git-wrapper-finalization-failure")
+	script := `#!/bin/sh
+target=
+next_target=
+for argument in "$@"; do
+  if [ -n "$next_target" ]; then
+    target=$argument
+    next_target=
+  fi
+  [ "$argument" = "--no-checkout" ] && next_target=1
+done
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$target" ]; then
+  stage=${target#./}
+  printf '%s/%s' "$PWD" "$stage" > "$DROVE_TEST_STAGE" || exit 90
+  mkdir "$PWD/worktrees/$stage-unexpected" || exit 91
+fi
+exit "$status"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_STAGE", stageFile)
+
+	dataDir := filepath.Join(parent, "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	if _, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare succeeded after finalization validation failed")
+	}
+
+	rawStage, err := os.ReadFile(stageFile)
+	if err != nil {
+		t.Fatalf("read internal stage path: %v", err)
+	}
+	stagePath := filepath.Clean(string(rawStage))
+	if _, err := os.Lstat(stagePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("internal common-root stage remains: %v", err)
+	}
+	privatePath := filepath.Join(
+		repository,
+		".git",
+		"worktrees",
+		filepath.Base(stagePath),
+	)
+	if _, err := os.Lstat(privatePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("private Git registration remains: %v", err)
+	}
+	if output := runGit(
+		t,
+		repository,
+		"worktree",
+		"list",
+		"--porcelain",
+	); strings.Contains(output, stagePath) {
+		t.Fatalf("failed worktree remains registered:\n%s", output)
 	}
 }
 

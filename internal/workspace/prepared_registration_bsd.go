@@ -103,19 +103,25 @@ func finalizePreparedWorktreeAdd(
 			"",
 		)
 	}
+	finalized := false
+	defer func() {
+		if !finalized {
+			result = errors.Join(
+				result,
+				cleanupBSDPreparedWorktreeStage(
+					ctx,
+					repository,
+					stageName,
+					worktreePath,
+				),
+			)
+		}
+	}()
 	if err := errors.Join(
 		repository.verifyBinding(ctx),
 		verifyRealPathRoot(worktreePath, worktreeRoot),
 	); err != nil {
-		return errors.Join(
-			err,
-			cleanupBSDPreparedWorktreeStage(
-				ctx,
-				repository,
-				stageName,
-				"",
-			),
-		)
+		return err
 	}
 	privatePath := filepath.Join(
 		repository.commonPath,
@@ -221,10 +227,14 @@ func finalizePreparedWorktreeAdd(
 			err,
 		)
 	}
-	return errors.Join(
+	if err := errors.Join(
 		repository.verifyBinding(ctx),
 		verifyRealPathRoot(worktreePath, worktreeRoot),
-	)
+	); err != nil {
+		return err
+	}
+	finalized = true
+	return nil
 }
 
 func repairBoundPreparedWorktreeRegistration(
