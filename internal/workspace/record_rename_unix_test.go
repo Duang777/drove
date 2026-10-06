@@ -125,6 +125,43 @@ func TestUnlinkRecordPreservesReplacementAfterValidation(t *testing.T) {
 	assertFileContents(t, movedPath, "original\n")
 }
 
+func TestUnlinkLinkedRecordPathAcceptsMissingSourceWithMatchingWitness(
+	t *testing.T,
+) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	targetPath := filepath.Join(rootPath, "target")
+	if err := os.Link(sourcePath, targetPath); err != nil {
+		t.Fatalf("link target witness: %v", err)
+	}
+	expected, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer expected.Close()
+	if err := os.Remove(sourcePath); err != nil {
+		t.Fatalf("remove source: %v", err)
+	}
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+
+	if err := unlinkLinkedRecordPath(
+		directory,
+		expected,
+		"source",
+		"target",
+	); err != nil {
+		t.Fatalf("accept missing linked source: %v", err)
+	}
+	assertFileContents(t, targetPath, "record\n")
+}
+
 func TestRecoverRecordInstallAliasUsesSameFileWitness(t *testing.T) {
 	rootPath := t.TempDir()
 	sourcePath := filepath.Join(rootPath, "source")

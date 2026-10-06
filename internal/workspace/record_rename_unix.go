@@ -194,20 +194,31 @@ func unlinkLinkedRecordPath(
 	if err := verifyRecordPathIdentity(
 		directory,
 		expected,
-		name,
-	); err != nil {
-		return err
-	}
-	if err := verifyRecordPathIdentity(
-		directory,
-		expected,
 		witnessName,
 	); err != nil {
 		return fmt.Errorf("verify linked record witness: %w", err)
 	}
+	if err := verifyRecordPathIdentity(
+		directory,
+		expected,
+		name,
+	); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 	fd := int(directory.Fd())
 	isolatedName := ".drove-install-" + uuid.NewString()
 	if err := unix.Renameat(fd, name, fd, isolatedName); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if witnessErr := verifyRecordPathIdentity(
+				directory,
+				expected,
+				witnessName,
+			); witnessErr == nil {
+				return nil
+			}
+		}
 		return fmt.Errorf("isolate linked record path %q: %w", name, err)
 	}
 	restore := func() error {
