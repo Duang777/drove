@@ -48,11 +48,17 @@ func rootedPrivateGitCommand(
 	worktreePath string,
 	gitPath string,
 	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
-	guard, err := openRepositoryGuard(gitPath, gitRoot)
+	gitGuard, err := openRepositoryGuard(gitPath, gitRoot)
 	if err != nil {
 		return nil, nil, err
+	}
+	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
+	if err != nil {
+		return nil, nil, errors.Join(err, gitGuard.Close())
 	}
 	command := exec.CommandContext(
 		ctx,
@@ -63,12 +69,19 @@ func rootedPrivateGitCommand(
 		)...,
 	)
 	command.Dir = gitPath
-	command.Env = boundGitEnvironment(
+	command.Env = boundGitEnvironmentWithCommon(
 		command.Environ(),
 		gitPath,
 		worktreePath,
+		commonPath,
 	)
-	return command, guard.Close, nil
+	cleanup := func() error {
+		return errors.Join(
+			commonGuard.Close(),
+			gitGuard.Close(),
+		)
+	}
+	return command, cleanup, nil
 }
 
 func rootedWorktreeGitCommand(

@@ -451,12 +451,19 @@ func (r repositoryCapability) privateGitCommandAt(
 	arguments ...string,
 ) (*exec.Cmd, func() error, error) {
 	if r.root != nil && r.gitRoot != nil {
+		if r.commonPath == "" || r.commonRoot == nil {
+			return nil, nil, errors.New(
+				"workspace: private Git binding has no common directory",
+			)
+		}
 		return rootedPrivateGitCommand(
 			ctx,
 			r.manager.git,
 			worktreePath,
 			r.gitPath,
 			r.gitRoot,
+			r.commonPath,
+			r.commonRoot,
 			arguments,
 		)
 	}

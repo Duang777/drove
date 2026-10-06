@@ -29,6 +29,8 @@ func rootedPrivateGitCommand(
 	string,
 	string,
 	*os.Root,
+	string,
+	*os.Root,
 	[]string,
 ) (*exec.Cmd, func() error, error) {
 	return nil, nil, errors.New(

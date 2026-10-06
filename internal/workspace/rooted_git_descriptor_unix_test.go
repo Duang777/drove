@@ -15,6 +15,56 @@ func inheritedDirectoryPath(fd int) string {
 	return "/proc/self/fd/" + fmt.Sprint(fd)
 }
 
+func TestRootedPrivateGitCommandBindsCommonDirectory(t *testing.T) {
+	parent := t.TempDir()
+	gitPath := filepath.Join(parent, "git")
+	commonPath := filepath.Join(parent, "common")
+	for _, path := range []string{gitPath, commonPath} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("create directory %q: %v", path, err)
+		}
+	}
+	gitRoot, err := openRealPathRoot(gitPath)
+	if err != nil {
+		t.Fatalf("open Git root: %v", err)
+	}
+	defer gitRoot.Close()
+	commonRoot, err := openRealPathRoot(commonPath)
+	if err != nil {
+		t.Fatalf("open common root: %v", err)
+	}
+	defer commonRoot.Close()
+
+	command, cleanup, err := rootedPrivateGitCommand(
+		context.Background(),
+		"git",
+		filepath.Join(parent, "worktree"),
+		gitPath,
+		gitRoot,
+		commonPath,
+		commonRoot,
+		[]string{"version"},
+	)
+	if err != nil {
+		t.Fatalf("create rooted private command: %v", err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			t.Errorf("cleanup rooted private command: %v", err)
+		}
+	}()
+	if len(command.ExtraFiles) != 2 {
+		t.Fatalf(
+			"private command inherited files = %d, want 2",
+			len(command.ExtraFiles),
+		)
+	}
+	want := "GIT_COMMON_DIR=" + inheritedDirectoryPath(4)
+	if !slices.Contains(command.Env, want) {
+		t.Fatalf("private command environment lacks %q: %q", want, command.Env)
+	}
+}
+
 func TestRootedPreparedWorktreeGitCommandBindsAllDirectories(t *testing.T) {
 	parent := t.TempDir()
 	repositoryPath := filepath.Join(parent, "repository")

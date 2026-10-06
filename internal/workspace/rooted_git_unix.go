@@ -91,10 +91,18 @@ func rootedPrivateGitCommand(
 	ctx context.Context,
 	git string,
 	worktreePath string,
-	_ string,
+	gitPath string,
 	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
+	if err := verifyRealPathRoot(commonPath, commonRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify rooted common Git directory: %w",
+			err,
+		)
+	}
 	directory, err := gitRoot.Open(".")
 	if err != nil {
 		return nil, nil, fmt.Errorf(
@@ -124,12 +132,23 @@ func rootedPrivateGitCommand(
 	helperArguments = append(helperArguments, arguments...)
 	command := exec.CommandContext(ctx, executable, helperArguments...)
 	command.ExtraFiles = []*os.File{directory}
-	command.Env = boundGitEnvironment(
+	commonDirectory := commonPath
+	if commonPath == gitPath {
+		commonDirectory = "."
+	}
+	command.Env = boundGitEnvironmentWithCommon(
 		command.Environ(),
 		".",
 		worktreePath,
+		commonDirectory,
 	)
-	return command, directory.Close, nil
+	cleanup := func() error {
+		return errors.Join(
+			verifyRealPathRoot(commonPath, commonRoot),
+			directory.Close(),
+		)
+	}
+	return command, cleanup, nil
 }
 
 func rootedWorktreeGitCommand(

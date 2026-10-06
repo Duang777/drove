@@ -11,6 +11,13 @@ import (
 	"testing"
 )
 
+func TestValidateIncludedPathRejectsInvalidUTF8(t *testing.T) {
+	path := string([]byte{'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 0xff})
+	if _, err := validateIncludedPath(path); err == nil {
+		t.Fatal("included path validation accepted invalid UTF-8")
+	}
+}
+
 func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source")
 	if err := os.Mkdir(sourcePath, 0o700); err != nil {

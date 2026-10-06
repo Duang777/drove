@@ -116,6 +116,9 @@ func validateDefaultHelpArgs(root *cobra.Command, args []string) error {
 			afterTerminator = true
 			continue
 		}
+		if argument == "-h" || argument == "--help" {
+			return nil
+		}
 		if strings.HasPrefix(argument, "-") {
 			continue
 		}

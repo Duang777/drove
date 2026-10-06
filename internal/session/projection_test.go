@@ -603,6 +603,26 @@ func TestRecoveryProjectorRequiresDurableCompletionToConsumeStartupResume(
 			},
 			wantResume: false,
 		},
+		{
+			name: "terminal exit before durable completion",
+			finalRows: []store.EventRow{
+				{
+					Seq: 9, Timestamp: base.Add(8 * time.Second),
+					Type:      string(event.TypeStateChanged),
+					SessionID: "agent-1", AgentID: "agent-1",
+					From: "working", To: "done",
+					Reason: "process exited",
+				},
+				{
+					Seq: 10, Timestamp: base.Add(9 * time.Second),
+					Type:      string(event.TypeSessionLifecycle),
+					SessionID: "agent-1", AgentID: "agent-1",
+					Reason:  startupResumeCompletedReason,
+					Payload: `{"version":1}`,
+				},
+			},
+			wantResume: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

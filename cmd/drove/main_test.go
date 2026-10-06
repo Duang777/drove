@@ -332,6 +332,25 @@ func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
 			wantOutput: "Usage:",
 		},
 		{
+			name: "help flag overrides invalid topic",
+			args: []string{
+				"help",
+				"--help",
+				"definitely-not-a-command",
+			},
+			wantOutput: "Usage:",
+		},
+		{
+			name: "target help flag overrides invalid topic",
+			args: []string{
+				"help",
+				"worktree",
+				"-h",
+				"definitely-not-a-command",
+			},
+			wantOutput: "Usage:",
+		},
+		{
 			name:       "completion",
 			args:       []string{"completion", "bash"},
 			wantOutput: "__start_drove",

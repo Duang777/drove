@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 )
@@ -641,6 +642,9 @@ func readWorktreeInclude(
 }
 
 func validateIncludedPath(path string) (string, error) {
+	if !utf8.ValidString(path) {
+		return "", fmt.Errorf("workspace: invalid included path %q", path)
+	}
 	path = filepath.FromSlash(path)
 	clean := filepath.Clean(path)
 	if clean == "." ||

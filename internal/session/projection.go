@@ -60,6 +60,7 @@ type sessionDraft struct {
 	workspace              *workspaceMetadata
 	workspaceRemoved       bool
 	restartStopped         bool
+	startupResumePending   bool
 	hasCreated             bool
 	hasState               bool
 }
@@ -308,13 +309,14 @@ func (p *recoveryProjector) applyStartupResumeCompleted(
 			payload.Version,
 		)
 	}
-	if !draft.restartStopped {
+	if !draft.startupResumePending {
 		return projectionError(
 			row,
 			"startup resume completion has no restart resume candidate",
 		)
 	}
 	draft.restartStopped = false
+	draft.startupResumePending = false
 	return nil
 }
 
@@ -339,6 +341,7 @@ func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 	}
 	draft.workspaceRemoved = true
 	draft.restartStopped = false
+	draft.startupResumePending = false
 	return nil
 }
 
@@ -397,10 +400,11 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		from != agent.StateDone &&
 		from != agent.StateStopped &&
 		row.Reason == restartStopReason
-	if to == agent.StateDone {
+	if isRestartStop {
+		draft.restartStopped = true
+		draft.startupResumePending = true
+	} else if to == agent.StateDone {
 		draft.restartStopped = false
-	} else {
-		draft.restartStopped = draft.restartStopped || isRestartStop
 	}
 	if known {
 		draft.lastTransition = evidence
