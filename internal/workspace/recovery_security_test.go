@@ -185,6 +185,92 @@ func TestRemoveRootDirectoryContentsRejectsReplacementParent(t *testing.T) {
 	}
 }
 
+func TestRemoveOpenedDirectoryPreservesCanonicalReplacement(t *testing.T) {
+	parentPath := t.TempDir()
+	originalPath := filepath.Join(parentPath, "workspace")
+	if err := os.Mkdir(originalPath, 0o700); err != nil {
+		t.Fatalf("create original directory: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(originalPath, "old"),
+		[]byte("old\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write original file: %v", err)
+	}
+	parent, err := openRealPathRoot(parentPath)
+	if err != nil {
+		t.Fatalf("open parent root: %v", err)
+	}
+	defer parent.Close()
+	opened, err := openRealRootFromRoot(parent, "workspace")
+	if err != nil {
+		t.Fatalf("open original directory: %v", err)
+	}
+	replacement := filepath.Join(originalPath, "replacement")
+
+	err = removeOpenedDirectoryFromRootAfterIsolation(
+		parent,
+		"workspace",
+		opened,
+		"workspace",
+		func(string) {
+			if err := os.Mkdir(originalPath, 0o700); err != nil {
+				t.Fatalf("create canonical replacement: %v", err)
+			}
+			if err := os.WriteFile(
+				replacement,
+				[]byte("replacement\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("write replacement file: %v", err)
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("remove opened directory: %v", err)
+	}
+	assertFileContents(t, replacement, "replacement\n")
+	entries, err := os.ReadDir(parentPath)
+	if err != nil {
+		t.Fatalf("read parent directory: %v", err)
+	}
+	for _, entry := range entries {
+		if isRootDeletionName(entry.Name(), "workspace") {
+			t.Fatalf("deletion debris remains: %q", entry.Name())
+		}
+	}
+}
+
+func TestRemoveAllRecoversIsolatedDirectoryDeletion(t *testing.T) {
+	parentPath := t.TempDir()
+	debrisName := rootDeletionPrefix("workspace") +
+		"49494949-4949-4949-8949-494949494949"
+	debrisPath := filepath.Join(parentPath, debrisName)
+	if err := os.Mkdir(debrisPath, 0o700); err != nil {
+		t.Fatalf("create deletion debris: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(debrisPath, "old"),
+		[]byte("old\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write deletion debris: %v", err)
+	}
+	parent, err := openRealPathRoot(parentPath)
+	if err != nil {
+		t.Fatalf("open parent root: %v", err)
+	}
+	defer parent.Close()
+
+	if err := removeAllFromRoot(parent, "workspace"); err != nil {
+		t.Fatalf("recover isolated deletion: %v", err)
+	}
+	if _, err := os.Lstat(debrisPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deletion debris remains: %v", err)
+	}
+}
+
 func TestRenameRecordRejectsReplacedTemporaryPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires renaming an open file")
@@ -1681,6 +1767,92 @@ func TestReconcileStartedRemovalRejectsReplacementQuarantine(t *testing.T) {
 	assertFileContents(t, sentinel, "replacement\n")
 	if _, err := os.Stat(originalQuarantine); err != nil {
 		t.Fatalf("original quarantine changed: %v", err)
+	}
+}
+
+func TestEnsureRemovalMarkerRecoversInterruptedPublication(t *testing.T) {
+	record := workspaceRecord{
+		AgentID: "11111111-1111-4111-8111-111111111111",
+		Removal: &workspaceRemovalRecord{
+			OperationID:    "47474747-4747-4747-8747-474747474747",
+			DirectoryToken: "48484848-4848-4848-8848-484848484848",
+		},
+	}
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{
+			name: "staged payload",
+			path: removalMarkerTemporaryPrefix(record) +
+				"49494949-4949-4949-8949-494949494949",
+		},
+		{
+			name: "canonical payload",
+			path: removalMarkerName(record),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir()
+			if err := os.WriteFile(
+				filepath.Join(path, test.path),
+				[]byte("partial"),
+				0o600,
+			); err != nil {
+				t.Fatalf("write interrupted marker: %v", err)
+			}
+			root, err := openRealPathRoot(path)
+			if err != nil {
+				t.Fatalf("open marker root: %v", err)
+			}
+			defer root.Close()
+
+			if err := ensureRemovalMarker(root, record); err != nil {
+				t.Fatalf("recover removal marker: %v", err)
+			}
+			if err := verifyRemovalMarker(root, record); err != nil {
+				t.Fatalf("verify recovered marker: %v", err)
+			}
+			if test.path != removalMarkerName(record) {
+				if _, err := root.Lstat(test.path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("staged marker remains after recovery: %v", err)
+				}
+			}
+			entries, err := readRootDirectory(root)
+			if err != nil {
+				t.Fatalf("read recovered marker directory: %v", err)
+			}
+			if len(entries) != 1 ||
+				entries[0].Name() != removalMarkerName(record) {
+				t.Fatalf("recovered marker entries = %v", entries)
+			}
+		})
+	}
+}
+
+func TestWorkspaceStatusDirtyIgnoresOnlyActiveRemovalFiles(t *testing.T) {
+	record := workspaceRecord{
+		Removal: &workspaceRemovalRecord{
+			OperationID:    "47474747-4747-4747-8747-474747474747",
+			DirectoryToken: "48484848-4848-4848-8848-484848484848",
+		},
+	}
+	temporary := removalMarkerTemporaryPrefix(record) +
+		"49494949-4949-4949-8949-494949494949"
+	clean := []byte(
+		"?? " + removalMarkerName(record) + "\n" +
+			"?? " + temporary + "\n",
+	)
+	if workspaceStatusDirty(clean, &record) {
+		t.Fatalf("active removal files were classified as dirty: %q", clean)
+	}
+	for _, dirty := range [][]byte{
+		[]byte("?? " + removalMarkerTemporaryPrefix(record) + "not-a-uuid\n"),
+		[]byte("?? .drove-removal-other.install-49494949-4949-4949-8949-494949494949\n"),
+	} {
+		if !workspaceStatusDirty(dirty, &record) {
+			t.Fatalf("unrelated removal file was ignored: %q", dirty)
+		}
 	}
 }
 

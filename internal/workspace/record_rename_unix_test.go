@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -65,6 +66,15 @@ func TestRenameRecordRejectsSourceReplacementAfterValidation(t *testing.T) {
 	}
 	assertFileContents(t, sourcePath, "replacement\n")
 	assertFileContents(t, movedPath, "original\n")
+	entries, err := os.ReadDir(rootPath)
+	if err != nil {
+		t.Fatalf("read record directory: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".drove-install-") {
+			t.Fatalf("staged alias remains after rejected replacement: %q", entry.Name())
+		}
+	}
 }
 
 func TestUnlinkRecordPreservesReplacementAfterValidation(t *testing.T) {

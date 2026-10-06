@@ -66,7 +66,7 @@ func renameRecordPathAfterValidation(
 	targetName string,
 	replace bool,
 	afterValidation func(),
-) (bool, error) {
+) (installed bool, result error) {
 	if err := verifyRecordPathIdentity(
 		directory,
 		expected,
@@ -82,17 +82,19 @@ func renameRecordPathAfterValidation(
 	if err := unix.Linkat(fd, sourceName, fd, alias, 0); err != nil {
 		return false, err
 	}
+	aliasFile, err := openRecordPath(directory, alias)
+	if err != nil {
+		return false, fmt.Errorf("open staged record alias: %w", err)
+	}
 	aliasPresent := true
 	defer func() {
 		if aliasPresent {
-			if verifyRecordPathIdentity(
-				directory,
-				expected,
-				alias,
-			) == nil {
-				_ = unix.Unlinkat(fd, alias, 0)
-			}
+			result = errors.Join(
+				result,
+				unlinkRecordPath(directory, aliasFile, alias),
+			)
 		}
+		result = errors.Join(result, aliasFile.Close())
 	}()
 	if err := verifyRecordPathIdentity(
 		directory,
@@ -144,7 +146,7 @@ func renameRecordPathAfterValidation(
 			err,
 		)
 	}
-	if err := unix.Unlinkat(fd, alias, 0); err != nil {
+	if err := unlinkRecordPath(directory, aliasFile, alias); err != nil {
 		return true, err
 	}
 	aliasPresent = false
@@ -256,19 +258,9 @@ func verifyRecordPathIdentity(
 	if err != nil {
 		return fmt.Errorf("inspect opened record: %w", err)
 	}
-	fd, err := unix.Openat(
-		int(directory.Fd()),
-		name,
-		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
-		0,
-	)
+	current, err := openRecordPath(directory, name)
 	if err != nil {
-		return fmt.Errorf("open record path %q: %w", name, err)
-	}
-	current := os.NewFile(uintptr(fd), name)
-	if current == nil {
-		_ = unix.Close(fd)
-		return errors.New("create record file from descriptor")
+		return err
 	}
 	defer func() {
 		result = errors.Join(result, current.Close())
@@ -277,12 +269,41 @@ func verifyRecordPathIdentity(
 	if err != nil {
 		return fmt.Errorf("inspect record path %q: %w", name, err)
 	}
-	if !currentInfo.Mode().IsRegular() ||
-		currentInfo.Mode()&os.ModeSymlink != 0 ||
-		!os.SameFile(expectedInfo, currentInfo) {
+	if !os.SameFile(expectedInfo, currentInfo) {
 		return fmt.Errorf("record path %q changed identity", name)
 	}
 	return nil
+}
+
+func openRecordPath(
+	directory *os.File,
+	name string,
+) (*os.File, error) {
+	fd, err := unix.Openat(
+		int(directory.Fd()),
+		name,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("open record path %q: %w", name, err)
+	}
+	current := os.NewFile(uintptr(fd), name)
+	if current == nil {
+		_ = unix.Close(fd)
+		return nil, errors.New("create record file from descriptor")
+	}
+	currentInfo, err := current.Stat()
+	if err != nil {
+		_ = current.Close()
+		return nil, fmt.Errorf("inspect record path %q: %w", name, err)
+	}
+	if !currentInfo.Mode().IsRegular() ||
+		currentInfo.Mode()&os.ModeSymlink != 0 {
+		_ = current.Close()
+		return nil, fmt.Errorf("record path %q is not a regular file", name)
+	}
+	return current, nil
 }
 
 func openRecordDirectory(root *os.Root) (*os.File, error) {

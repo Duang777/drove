@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -280,6 +281,25 @@ func removalMarkerName(record workspaceRecord) string {
 	return ".drove-removal-" + record.Removal.OperationID
 }
 
+func removalMarkerTemporaryPrefix(record workspaceRecord) string {
+	return removalMarkerName(record) + ".install-"
+}
+
+func isRemovalMarkerTemporaryName(
+	record workspaceRecord,
+	name string,
+) bool {
+	suffix, found := strings.CutPrefix(
+		name,
+		removalMarkerTemporaryPrefix(record),
+	)
+	if !found {
+		return false
+	}
+	_, err := uuid.Parse(suffix)
+	return err == nil
+}
+
 func removalQuarantineIsolationName(name string) string {
 	const suffix = ".rename"
 	if strings.HasSuffix(name, suffix) {
@@ -309,6 +329,9 @@ func ensureRemovalMarker(
 		record.Removal.DirectoryToken == "" {
 		return errors.New("workspace: removal record has no directory token")
 	}
+	if err := cleanupRemovalMarkerTemps(root, record); err != nil {
+		return err
+	}
 	name := removalMarkerName(record)
 	_, err := root.Lstat(name)
 	switch {
@@ -319,6 +342,19 @@ func ensureRemovalMarker(
 	case err != nil:
 		return fmt.Errorf("workspace: inspect removal marker: %w", err)
 	}
+	if err := verifyRemovalMarker(root, record); err == nil {
+		return nil
+	}
+	if err := removeIncompleteRemovalMarker(root, name); err != nil {
+		return err
+	}
+	if err := installRemovalMarker(
+		root,
+		name,
+		record.Removal.DirectoryToken,
+	); err != nil {
+		return err
+	}
 	return verifyRemovalMarker(root, record)
 }
 
@@ -327,8 +363,9 @@ func installRemovalMarker(
 	name string,
 	token string,
 ) (result error) {
+	temporaryName := name + ".install-" + uuid.NewString()
 	file, err := root.OpenFile(
-		name,
+		temporaryName,
 		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
 		0o600,
 	)
@@ -340,8 +377,8 @@ func installRemovalMarker(
 		if cleanupOnFailure {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(root, name, file),
-				syncRecordBucket(root, name),
+				removeRecordPathIfSame(root, temporaryName, file),
+				syncRecordBucket(root, temporaryName),
 			)
 		}
 		result = errors.Join(result, file.Close())
@@ -361,13 +398,114 @@ func installRemovalMarker(
 	if err != nil {
 		return fmt.Errorf("workspace: open removal marker directory: %w", err)
 	}
-	syncErr := syncRecordDirectory(directory)
-	closeDirectoryErr := directory.Close()
-	if err := errors.Join(syncErr, closeDirectoryErr); err != nil {
-		return fmt.Errorf("workspace: sync removal marker directory: %w", err)
+	installed, renameErr := renameRecordFile(
+		directory,
+		file,
+		temporaryName,
+		name,
+		false,
+	)
+	if !installed {
+		closeDirectoryErr := directory.Close()
+		return fmt.Errorf(
+			"workspace: install removal marker: %w",
+			errors.Join(renameErr, closeDirectoryErr),
+		)
 	}
 	cleanupOnFailure = false
+	syncErr := syncRecordDirectory(directory)
+	closeDirectoryErr := directory.Close()
+	if err := errors.Join(renameErr, syncErr, closeDirectoryErr); err != nil {
+		return fmt.Errorf("workspace: sync removal marker directory: %w", err)
+	}
 	return nil
+}
+
+func cleanupRemovalMarkerTemps(
+	root *os.Root,
+	record workspaceRecord,
+) (result error) {
+	entries, err := readRootDirectory(root)
+	if err != nil {
+		return fmt.Errorf("workspace: inspect removal marker staging files: %w", err)
+	}
+	removed := false
+	for _, entry := range entries {
+		if !isRemovalMarkerTemporaryName(record, entry.Name()) {
+			continue
+		}
+		info, err := root.Lstat(entry.Name())
+		if err != nil {
+			return fmt.Errorf(
+				"workspace: inspect removal marker staging file: %w",
+				err,
+			)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New(
+				"workspace: removal marker staging path is not a regular file",
+			)
+		}
+		file, err := root.Open(entry.Name())
+		if err != nil {
+			return fmt.Errorf(
+				"workspace: open removal marker staging file: %w",
+				err,
+			)
+		}
+		opened, statErr := file.Stat()
+		if statErr == nil && !os.SameFile(info, opened) {
+			statErr = errors.New(
+				"workspace: removal marker staging file changed while opening",
+			)
+		}
+		removeErr := error(nil)
+		if statErr == nil {
+			removeErr = removeRecordPathIfSame(root, entry.Name(), file)
+		}
+		closeErr := file.Close()
+		if err := errors.Join(statErr, removeErr, closeErr); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return syncRecordBucket(root, removalMarkerName(record))
+	}
+	return nil
+}
+
+func removeIncompleteRemovalMarker(
+	root *os.Root,
+	name string,
+) (result error) {
+	info, err := root.Lstat(name)
+	if err != nil {
+		return fmt.Errorf("workspace: inspect incomplete removal marker: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("workspace: incomplete removal marker is not a regular file")
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return fmt.Errorf("workspace: open incomplete removal marker: %w", err)
+	}
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("workspace: inspect incomplete removal marker: %w", err)
+	}
+	if !os.SameFile(info, opened) {
+		return errors.New(
+			"workspace: incomplete removal marker changed while opening",
+		)
+	}
+	if err := removeRecordPathIfSame(root, name, file); err != nil {
+		return fmt.Errorf("workspace: remove incomplete removal marker: %w", err)
+	}
+	return syncRecordBucket(root, name)
 }
 
 func verifyRemovalMarker(
@@ -949,7 +1087,7 @@ func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 func removeAllFromRoot(root *os.Root, name string) (result error) {
 	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return removeRootDeletionDebris(root, name)
 	}
 	if err != nil {
 		return err
@@ -970,6 +1108,22 @@ func removeOpenedDirectoryFromRoot(
 	name string,
 	root *os.Root,
 ) (result error) {
+	return removeOpenedDirectoryFromRootAfterIsolation(
+		parent,
+		name,
+		root,
+		name,
+		nil,
+	)
+}
+
+func removeOpenedDirectoryFromRootAfterIsolation(
+	parent *os.Root,
+	name string,
+	root *os.Root,
+	recoveryName string,
+	afterIsolation func(string),
+) (result error) {
 	defer func() {
 		if root != nil {
 			result = errors.Join(result, root.Close())
@@ -987,6 +1141,19 @@ func removeOpenedDirectoryFromRoot(
 	if err := verifyRootEntryUnchanged(parent, name, root); err != nil {
 		return err
 	}
+	if debris, err := findRootDeletionDebris(
+		parent,
+		recoveryName,
+		name,
+	); err != nil {
+		return err
+	} else if debris != "" {
+		return fmt.Errorf(
+			"directory %q has existing deletion debris %q",
+			recoveryName,
+			debris,
+		)
+	}
 	if err := removeRootDirectoryContents(
 		parent,
 		name,
@@ -995,12 +1162,119 @@ func removeOpenedDirectoryFromRoot(
 	); err != nil {
 		return err
 	}
+	openedInfo, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	deleteName := rootDeletionPrefix(recoveryName) + uuid.NewString()
+	directory, err = openRecordDirectory(parent)
+	if err != nil {
+		return err
+	}
+	moved, renameErr := renameDirectoryNoReplace(
+		directory,
+		openedInfo,
+		name,
+		deleteName+".rename",
+		deleteName,
+	)
+	closeDirectoryErr := directory.Close()
+	if moved {
+		name = deleteName
+	}
+	if err := errors.Join(renameErr, closeDirectoryErr); err != nil {
+		return fmt.Errorf("isolate removed directory: %w", err)
+	}
+	if !moved {
+		return errors.New("removed directory was not isolated")
+	}
+	if err := verifyRootEntryUnchanged(parent, name, root); err != nil {
+		return err
+	}
+	if afterIsolation != nil {
+		afterIsolation(name)
+	}
 	closeErr = root.Close()
 	root = nil
 	if closeErr != nil {
 		return closeErr
 	}
-	return parent.Remove(name)
+	if err := parent.Remove(name); err != nil {
+		return err
+	}
+	return syncRecordBucket(parent, name)
+}
+
+func rootDeletionPrefix(name string) string {
+	digest := sha256.Sum256([]byte(name))
+	return fmt.Sprintf(".drove-delete-%x-", digest[:8])
+}
+
+func isRootDeletionName(name string, recoveryName string) bool {
+	suffix, found := strings.CutPrefix(name, rootDeletionPrefix(recoveryName))
+	if !found {
+		return false
+	}
+	suffix = strings.TrimSuffix(suffix, ".rename")
+	_, err := uuid.Parse(suffix)
+	return err == nil
+}
+
+func findRootDeletionDebris(
+	parent *os.Root,
+	recoveryName string,
+	ignoredName string,
+) (string, error) {
+	entries, err := readRootDirectory(parent)
+	if err != nil {
+		return "", err
+	}
+	found := ""
+	for _, entry := range entries {
+		if entry.Name() == ignoredName ||
+			!isRootDeletionName(entry.Name(), recoveryName) {
+			continue
+		}
+		info, err := parent.Lstat(entry.Name())
+		if err != nil {
+			return "", err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf(
+				"deletion debris %q is not a real directory",
+				entry.Name(),
+			)
+		}
+		if found != "" {
+			return "", fmt.Errorf(
+				"directory %q has multiple deletion debris paths",
+				recoveryName,
+			)
+		}
+		found = entry.Name()
+	}
+	return found, nil
+}
+
+func removeRootDeletionDebris(
+	parent *os.Root,
+	recoveryName string,
+) error {
+	name, err := findRootDeletionDebris(parent, recoveryName, "")
+	if err != nil || name == "" {
+		return err
+	}
+	root, err := openRealRootFromRoot(parent, name)
+	if err != nil {
+		return err
+	}
+	return removeOpenedDirectoryFromRootAfterIsolation(
+		parent,
+		name,
+		root,
+		recoveryName,
+		nil,
+	)
 }
 
 func removeRootDirectoryContents(

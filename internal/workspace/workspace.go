@@ -1136,23 +1136,34 @@ func workspaceStatusDirty(
 	status []byte,
 	recorded *workspaceRecord,
 ) bool {
-	ignored := ""
-	if recorded != nil &&
-		recorded.Removal != nil &&
-		recorded.Removal.DirectoryToken != "" {
-		ignored = "?? " + removalMarkerName(*recorded)
-	}
 	for _, line := range strings.Split(
 		strings.TrimSpace(string(status)),
 		"\n",
 	) {
 		line = strings.TrimSuffix(line, "\r")
-		if line == "" || line == ignored {
+		if line == "" || isRemovalInternalStatus(line, recorded) {
 			continue
 		}
 		return true
 	}
 	return false
+}
+
+func isRemovalInternalStatus(
+	line string,
+	recorded *workspaceRecord,
+) bool {
+	if recorded == nil ||
+		recorded.Removal == nil ||
+		recorded.Removal.DirectoryToken == "" {
+		return false
+	}
+	name, found := strings.CutPrefix(line, "?? ")
+	if !found {
+		return false
+	}
+	return name == removalMarkerName(*recorded) ||
+		isRemovalMarkerTemporaryName(*recorded, name)
 }
 
 func (m *Manager) worktreeGitDirectory(
