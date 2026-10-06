@@ -35,7 +35,7 @@ func TestWindowsRenameHandlesBlockCanonicalReplacement(t *testing.T) {
 			make: func(path string) error {
 				return os.WriteFile(path, []byte("record\n"), 0o600)
 			},
-			open: openRecordForRename,
+			open: openRecordForMutation,
 		},
 		{
 			name: "directory",
@@ -72,6 +72,31 @@ func TestWindowsRenameHandlesBlockCanonicalReplacement(t *testing.T) {
 				t.Fatalf("rename source after releasing protection: %v", err)
 			}
 		})
+	}
+}
+
+func TestUnlinkRecordUsesCompatibleIdentityHandle(t *testing.T) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	expected, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer expected.Close()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open parent directory: %v", err)
+	}
+	defer directory.Close()
+
+	if err := unlinkRecordPath(directory, expected, "source"); err != nil {
+		t.Fatalf("unlink source while mutation handle is held: %v", err)
+	}
+	if _, err := os.Lstat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("source remains after unlink: %v", err)
 	}
 }
 

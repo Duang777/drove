@@ -25,7 +25,7 @@ func renameRecordFile(
 	recordName string,
 	replace bool,
 ) (installed bool, result error) {
-	renaming, err := openRecordForRename(directory, temporaryName)
+	renaming, err := openRecordForMutation(directory, temporaryName)
 	if err != nil {
 		return false, err
 	}
@@ -90,7 +90,7 @@ func unlinkRecordPathAfterValidation(
 	name string,
 	afterValidation func(),
 ) (result error) {
-	deleting, err := openRecordForRename(directory, name)
+	deleting, err := openRecordForMutation(directory, name)
 	if err != nil {
 		return err
 	}
@@ -113,7 +113,7 @@ func unlinkRecordPathAfterValidation(
 		afterValidation()
 	}
 
-	current, err := openRecordForRename(directory, name)
+	current, err := openRecordForIdentity(directory, name)
 	if err != nil {
 		return fmt.Errorf("reopen record path %q: %w", name, err)
 	}
@@ -176,7 +176,32 @@ func renameWindowsHandle(
 	return true, nil
 }
 
-func openRecordForRename(directory *os.File, name string) (*os.File, error) {
+func openRecordForMutation(directory *os.File, name string) (*os.File, error) {
+	return openRecordWithAccess(
+		directory,
+		name,
+		windows.FILE_READ_ATTRIBUTES|windows.DELETE|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+	)
+}
+
+func openRecordForIdentity(directory *os.File, name string) (*os.File, error) {
+	return openRecordWithAccess(
+		directory,
+		name,
+		windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|
+			windows.FILE_SHARE_WRITE|
+			windows.FILE_SHARE_DELETE,
+	)
+}
+
+func openRecordWithAccess(
+	directory *os.File,
+	name string,
+	access uint32,
+	share uint32,
+) (*os.File, error) {
 	objectName, err := windows.NewNTUnicodeString(name)
 	if err != nil {
 		return nil, err
@@ -192,14 +217,12 @@ func openRecordForRename(directory *os.File, name string) (*os.File, error) {
 	)
 	err = windows.NtCreateFile(
 		&handle,
-		windows.FILE_READ_ATTRIBUTES|
-			windows.DELETE|
-			windows.SYNCHRONIZE,
+		access,
 		attributes,
 		&status,
 		nil,
 		windows.FILE_ATTRIBUTE_NORMAL,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		share,
 		windows.FILE_OPEN,
 		windows.FILE_SYNCHRONOUS_IO_NONALERT|
 			windows.FILE_NON_DIRECTORY_FILE|
