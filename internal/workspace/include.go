@@ -572,9 +572,20 @@ func (m *Manager) runIncludeManifest(
 	output, commandErr := runCommand(command, cleanupCommand)
 
 	var sourceVerificationErr error
-	if commandErr == nil &&
-		repository.gitRoot != nil &&
-		verifyRealPathRoot(repository.gitPath, repository.gitRoot) == nil {
+	if commandErr == nil && repository.gitRoot != nil {
+		sourceVerificationErr = verifyRealPathRoot(
+			repository.gitPath,
+			repository.gitRoot,
+		)
+		if sourceVerificationErr == nil && repository.commonRoot != nil {
+			sourceVerificationErr = verifyRealPathRoot(
+				repository.commonPath,
+				repository.commonRoot,
+			)
+		}
+	}
+	if commandErr == nil && sourceVerificationErr == nil &&
+		repository.gitRoot != nil {
 		if _, err := reader.Seek(0, io.SeekStart); err != nil {
 			sourceVerificationErr = err
 		} else {
