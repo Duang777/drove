@@ -32,7 +32,7 @@ func (m *Manager) acknowledgePreparation(
 		)
 	}
 	if record.PreparationCommitted &&
-		record.Version < workspaceRecordVersion {
+		record.Version < removalWorkspaceRecordVersion {
 		return target.preparation.Close()
 	}
 	if record.PreparationCommitted &&

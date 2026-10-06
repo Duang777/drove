@@ -84,37 +84,187 @@ func validateBSDPreparedWorktreeNamesAvailable(
 	return nil
 }
 
+func preparePreparedWorktreeAdd(
+	target Workspace,
+	prepared *preparedWorktreeTarget,
+	repository repositoryCapability,
+) (_ bool, result error) {
+	stageName, err := bsdPreparedWorktreeStageName(prepared.path)
+	if err != nil {
+		return false, err
+	}
+	if err := validateBSDPreparedWorktreeNamesAvailable(
+		repository.commonRoot,
+		stageName,
+	); err != nil {
+		return false, err
+	}
+	if err := repository.commonRoot.Mkdir(stageName, 0o700); err != nil {
+		return false, fmt.Errorf(
+			"workspace: create prepared registration stage: %w",
+			err,
+		)
+	}
+	stageRoot, err := openRealRootFromRoot(
+		repository.commonRoot,
+		stageName,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: open prepared registration stage: %w",
+			err,
+		)
+	}
+	identityPersisted := false
+	defer func() {
+		if stageRoot == nil {
+			return
+		}
+		if !identityPersisted {
+			entries, readErr := readRootDirectory(stageRoot)
+			if readErr == nil && len(entries) == 0 {
+				result = errors.Join(
+					result,
+					removeOpenedDirectoryFromRoot(
+						repository.commonRoot,
+						stageName,
+						stageRoot,
+					),
+				)
+				stageRoot = nil
+			} else {
+				result = errors.Join(result, readErr)
+			}
+		}
+		if stageRoot != nil {
+			result = errors.Join(result, stageRoot.Close())
+		}
+	}()
+	stageIdentity, err := openedDirectoryIdentity(stageRoot)
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: inspect prepared registration stage identity: %w",
+			err,
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		repository.commonRoot,
+		stageName,
+		stageRoot,
+	); err != nil {
+		return false, err
+	}
+	if err := syncRecordBucket(
+		repository.commonRoot,
+		stageName,
+	); err != nil {
+		return false, err
+	}
+	record, exists, err := repository.manager.readWorkspaceRecord(
+		target.Path,
+	)
+	if err == nil && !exists {
+		err = errors.New("workspace: preparation record is missing")
+	}
+	if err != nil {
+		return false, err
+	}
+	if target.branchOperationID == "" ||
+		record.BranchOperationID != target.branchOperationID ||
+		record.PreparedStageDirectoryIdentity != "" ||
+		!sameWorkspace(record.workspace(), target) {
+		return false, errors.New(
+			"workspace: preparation record does not accept a registration stage",
+		)
+	}
+	record.PreparedStageDirectoryIdentity = stageIdentity
+	if err := repository.manager.replaceWorkspaceRecord(record); err != nil {
+		return false, fmt.Errorf(
+			"workspace: persist prepared registration stage identity: %w",
+			err,
+		)
+	}
+	identityPersisted = true
+	persisted, exists, err := repository.manager.readWorkspaceRecord(
+		target.Path,
+	)
+	if err != nil {
+		return false, err
+	}
+	if !exists ||
+		persisted.PreparedStageDirectoryIdentity != stageIdentity ||
+		persisted.BranchOperationID != target.branchOperationID ||
+		!sameWorkspace(persisted.workspace(), target) {
+		return false, errors.New(
+			"workspace: prepared registration stage identity was not persisted",
+		)
+	}
+	currentIdentity, err := openedDirectoryIdentity(stageRoot)
+	if err != nil {
+		return false, err
+	}
+	if currentIdentity != stageIdentity {
+		return false, errors.New(
+			"workspace: prepared registration stage identity changed after persistence",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		repository.commonRoot,
+		stageName,
+		stageRoot,
+	); err != nil {
+		return false, err
+	}
+	prepared.registrationStageRoot = stageRoot
+	stageRoot = nil
+	return true, nil
+}
+
 func finalizePreparedWorktreeAdd(
 	ctx context.Context,
 	repository repositoryCapability,
-	worktreePath string,
-	worktreeRoot *os.Root,
+	target Workspace,
+	prepared *preparedWorktreeTarget,
 	commandSucceeded bool,
 ) (result error) {
+	worktreePath := prepared.path
+	worktreeRoot := prepared.root
 	stageName, err := bsdPreparedWorktreeStageName(worktreePath)
 	if err != nil {
 		return err
 	}
+	stageRoot := prepared.registrationStageRoot
+	prepared.registrationStageRoot = nil
+	if stageRoot == nil {
+		return errors.New(
+			"workspace: prepared registration stage is unavailable",
+		)
+	}
 	if !commandSucceeded {
-		return cleanupBSDPreparedWorktreeStage(
+		return cleanupOpenedBSDPreparedWorktreeStage(
 			ctx,
 			repository,
 			stageName,
+			target.AgentID,
 			"",
+			stageRoot,
 		)
 	}
 	finalized := false
 	defer func() {
-		if !finalized {
+		if !finalized && stageRoot != nil {
 			result = errors.Join(
 				result,
-				cleanupBSDPreparedWorktreeStage(
+				cleanupOpenedBSDPreparedWorktreeStage(
 					ctx,
 					repository,
 					stageName,
+					target.AgentID,
 					worktreePath,
+					stageRoot,
 				),
 			)
+			stageRoot = nil
 		}
 	}()
 	if err := errors.Join(
@@ -123,39 +273,12 @@ func finalizePreparedWorktreeAdd(
 	); err != nil {
 		return err
 	}
-	privatePath := filepath.Join(
-		repository.commonPath,
-		"worktrees",
-		stageName,
-	)
-	internalPath := filepath.Join(repository.commonPath, stageName)
-	stageRoot, err := openRealRootFromRoot(repository.commonRoot, stageName)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: open prepared registration stage: %w",
-			err,
+	privatePath, privateName, privateRoot, err :=
+		openBSDPreparedPrivateGitDirectory(
+			repository,
+			stageRoot,
+			target.AgentID,
 		)
-	}
-	stageOwned := true
-	defer func() {
-		if stageOwned {
-			result = errors.Join(result, stageRoot.Close())
-		}
-	}()
-	if err := validateBoundGitPointer(
-		stageRoot,
-		".git",
-		"gitdir: "+privatePath+"\n",
-	); err != nil {
-		return fmt.Errorf(
-			"workspace: validate prepared registration stage: %w",
-			err,
-		)
-	}
-	privateRoot, err := openRealRootFromRoot(
-		repository.commonRoot,
-		filepath.Join("worktrees", stageName),
-	)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open prepared private Git directory: %w",
@@ -168,9 +291,11 @@ func finalizePreparedWorktreeAdd(
 	if err := validateBSDPrivateAdminSet(
 		repository.commonRoot,
 		stageName,
+		privateName,
 	); err != nil {
 		return err
 	}
+	internalPath := filepath.Join(repository.commonPath, stageName)
 	if err := ensureBoundGitPointer(
 		worktreeRoot,
 		".git",
@@ -186,7 +311,7 @@ func finalizePreparedWorktreeAdd(
 	if err := ensureBoundGitPointer(
 		privateRoot,
 		"gitdir",
-		boundGitPointerTempPrefix(stageName, "gitdir"),
+		boundGitPointerTempPrefix(privateName, "gitdir"),
 		worktreePath+string(filepath.Separator)+".git\n",
 		internalPath+string(filepath.Separator)+".git\n",
 	); err != nil {
@@ -216,11 +341,12 @@ func finalizePreparedWorktreeAdd(
 	); err != nil {
 		return err
 	}
-	stageOwned = false
+	ownedStageRoot := stageRoot
+	stageRoot = nil
 	if err := removeOpenedDirectoryFromRoot(
 		repository.commonRoot,
 		stageName,
-		stageRoot,
+		ownedStageRoot,
 	); err != nil {
 		return fmt.Errorf(
 			"workspace: remove prepared registration stage: %w",
@@ -244,19 +370,8 @@ func repairBoundPreparedWorktreeRegistration(
 	repository repositoryCapability,
 	stalePath string,
 ) (handled bool, result error) {
-	stageName, err := bsdPreparedWorktreeStageName(stalePath)
-	if err != nil {
+	if _, err := bsdPreparedWorktreeStageName(stalePath); err != nil {
 		return true, err
-	}
-	privatePath := filepath.Join(
-		repository.commonPath,
-		"worktrees",
-		stageName,
-	)
-	if prepared.gitDirectory != privatePath {
-		return true, errors.New(
-			"workspace: prepared private Git directory does not match its operation",
-		)
 	}
 	if err := errors.Join(
 		repository.verifyBinding(ctx),
@@ -264,9 +379,17 @@ func repairBoundPreparedWorktreeRegistration(
 	); err != nil {
 		return true, err
 	}
+	relativePrivatePath, err := repository.boundGitDirectory(
+		prepared.gitDirectory,
+		target.AgentID,
+	)
+	if err != nil {
+		return true, err
+	}
+	privatePath := prepared.gitDirectory
 	privateRoot, err := openRealRootFromRoot(
 		repository.commonRoot,
-		filepath.Join("worktrees", stageName),
+		relativePrivatePath,
 	)
 	if err != nil {
 		return true, err
@@ -284,7 +407,10 @@ func repairBoundPreparedWorktreeRegistration(
 	if err := ensureBoundGitPointer(
 		privateRoot,
 		"gitdir",
-		boundGitPointerTempPrefix(stageName, "gitdir"),
+		boundGitPointerTempPrefix(
+			filepath.Base(relativePrivatePath),
+			"gitdir",
+		),
 		target.Path+string(filepath.Separator)+".git\n",
 		stalePath+string(filepath.Separator)+".git\n",
 	); err != nil {
@@ -342,7 +468,9 @@ func cleanupPreparedWorktreeAddDebris(
 		ctx,
 		repository,
 		stageName,
+		target.AgentID,
 		target.Path,
+		record.PreparedStageDirectoryIdentity,
 	)
 }
 
@@ -350,7 +478,9 @@ func cleanupBSDPreparedWorktreeStage(
 	ctx context.Context,
 	repository repositoryCapability,
 	stageName string,
+	agentID string,
 	allowedTargetPath string,
+	expectedIdentity string,
 ) (result error) {
 	if err := removeRootDeletionDebris(
 		repository.commonRoot,
@@ -365,27 +495,77 @@ func cleanupBSDPreparedWorktreeStage(
 	if err != nil {
 		return err
 	}
-	stageOwned := true
 	defer func() {
-		if stageOwned {
+		if stageRoot != nil {
 			result = errors.Join(result, stageRoot.Close())
 		}
 	}()
-	privatePath := filepath.Join(
-		repository.commonPath,
-		"worktrees",
+	if expectedIdentity == "" {
+		return errors.New(
+			"workspace: prepared registration stage identity is unavailable",
+		)
+	}
+	stageIdentity, err := openedDirectoryIdentity(stageRoot)
+	if err != nil {
+		return err
+	}
+	if stageIdentity != expectedIdentity {
+		return errors.New(
+			"workspace: prepared registration stage identity changed",
+		)
+	}
+	ownedStageRoot := stageRoot
+	stageRoot = nil
+	return cleanupOpenedBSDPreparedWorktreeStage(
+		ctx,
+		repository,
 		stageName,
+		agentID,
+		allowedTargetPath,
+		ownedStageRoot,
 	)
-	if err := validateBoundGitPointer(
+}
+
+func cleanupOpenedBSDPreparedWorktreeStage(
+	ctx context.Context,
+	repository repositoryCapability,
+	stageName string,
+	agentID string,
+	allowedTargetPath string,
+	stageRoot *os.Root,
+) (result error) {
+	defer func() {
+		if stageRoot != nil {
+			result = errors.Join(result, stageRoot.Close())
+		}
+	}()
+	if err := verifyRootEntryUnchanged(
+		repository.commonRoot,
+		stageName,
 		stageRoot,
-		".git",
-		"gitdir: "+privatePath+"\n",
 	); err != nil {
 		return err
 	}
-	privateRoot, err := openRealRootFromRoot(
-		repository.commonRoot,
-		filepath.Join("worktrees", stageName),
+	entries, err := readRootDirectory(stageRoot)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		ownedStageRoot := stageRoot
+		stageRoot = nil
+		if err := removeOpenedDirectoryFromRoot(
+			repository.commonRoot,
+			stageName,
+			ownedStageRoot,
+		); err != nil {
+			return err
+		}
+		return repository.pruneWorktrees(ctx)
+	}
+	_, _, privateRoot, err := openBSDPreparedPrivateGitDirectory(
+		repository,
+		stageRoot,
+		agentID,
 	)
 	if err != nil {
 		return err
@@ -412,11 +592,12 @@ func cleanupBSDPreparedWorktreeStage(
 	if err := validateBSDStageContents(stageRoot); err != nil {
 		return err
 	}
-	stageOwned = false
+	ownedStageRoot := stageRoot
+	stageRoot = nil
 	if err := removeOpenedDirectoryFromRoot(
 		repository.commonRoot,
 		stageName,
-		stageRoot,
+		ownedStageRoot,
 	); err != nil {
 		return err
 	}
@@ -426,6 +607,7 @@ func cleanupBSDPreparedWorktreeStage(
 func validateBSDPrivateAdminSet(
 	commonRoot *os.Root,
 	stageName string,
+	privateName string,
 ) (result error) {
 	worktrees, err := openRealRootFromRoot(commonRoot, "worktrees")
 	if err != nil {
@@ -440,7 +622,7 @@ func validateBSDPrivateAdminSet(
 	}
 	found := false
 	for _, entry := range entries {
-		if entry.Name() == stageName {
+		if entry.Name() == privateName {
 			found = true
 			continue
 		}
@@ -457,6 +639,39 @@ func validateBSDPrivateAdminSet(
 		)
 	}
 	return nil
+}
+
+func openBSDPreparedPrivateGitDirectory(
+	repository repositoryCapability,
+	stageRoot *os.Root,
+	agentID string,
+) (string, string, *os.Root, error) {
+	pointer, err := readBoundRegularFile(stageRoot, ".git")
+	if err != nil {
+		return "", "", nil, err
+	}
+	privatePath, found := strings.CutPrefix(pointer, "gitdir: ")
+	if !found || !strings.HasSuffix(privatePath, "\n") {
+		return "", "", nil, errors.New(
+			"workspace: prepared registration stage has an invalid Git pointer",
+		)
+	}
+	privatePath = strings.TrimSuffix(privatePath, "\n")
+	relativePath, err := repository.boundGitDirectory(
+		privatePath,
+		agentID,
+	)
+	if err != nil {
+		return "", "", nil, err
+	}
+	privateRoot, err := openRealRootFromRoot(
+		repository.commonRoot,
+		relativePath,
+	)
+	if err != nil {
+		return "", "", nil, err
+	}
+	return privatePath, filepath.Base(relativePath), privateRoot, nil
 }
 
 func validateBSDStageContents(stageRoot *os.Root) error {

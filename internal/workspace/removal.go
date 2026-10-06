@@ -39,7 +39,7 @@ type RemovalResult struct {
 
 func workspaceForRemoval(record workspaceRecord) Workspace {
 	target := record.workspace()
-	if record.Version < workspaceRecordVersion {
+	if record.Version < removalWorkspaceRecordVersion {
 		target.repositoryEvidence = nil
 	}
 	return target
@@ -314,7 +314,7 @@ func (m *Manager) removalRepository(
 	ctx context.Context,
 	record workspaceRecord,
 ) (repositoryCapability, func() error, error) {
-	if record.Version < workspaceRecordVersion ||
+	if record.Version < removalWorkspaceRecordVersion ||
 		record.RepositoryEvidence == nil {
 		return repositoryCapability{}, nil, errors.New(
 			"workspace: pending removal has no repository identity evidence",
@@ -331,7 +331,7 @@ func (m *Manager) ensureRemovalRepositoryEvidence(
 	ctx context.Context,
 	record workspaceRecord,
 ) (_ workspaceRecord, result error) {
-	if record.Version >= workspaceRecordVersion &&
+	if record.Version >= removalWorkspaceRecordVersion &&
 		record.RepositoryEvidence != nil {
 		return record, nil
 	}

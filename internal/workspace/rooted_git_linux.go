@@ -174,6 +174,7 @@ func rootedPreparedWorktreeGitCommand(
 	commonRoot *os.Root,
 	_ string,
 	worktreeRoot *os.Root,
+	_ *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	worktree, err := worktreeRoot.Open(".")

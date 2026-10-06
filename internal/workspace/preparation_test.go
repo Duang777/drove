@@ -151,6 +151,69 @@ func TestReconcilePreparationsDiscardsPendingAfterRestart(t *testing.T) {
 	}
 }
 
+func TestReconcilePreparationsAcceptsVersionFiveEvidence(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf(
+			"read preparation record: exists=%v err=%v record=%+v",
+			exists,
+			err,
+			record,
+		)
+	}
+	record.Version = removalWorkspaceRecordVersion
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write version 5 preparation record: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{{
+			AgentID:    prepared.AgentID,
+			Repository: prepared.Repository,
+			Path:       prepared.Path,
+			Branch:     prepared.Branch,
+		}},
+	); err != nil {
+		t.Fatalf("adopt version 5 preparation: %v", err)
+	}
+	adopted, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf(
+			"read adopted preparation: exists=%v err=%v",
+			exists,
+			err,
+		)
+	}
+	if adopted.Version != removalWorkspaceRecordVersion ||
+		!adopted.PreparationCommitted ||
+		adopted.RepositoryEvidence == nil {
+		t.Fatalf("adopted version 5 preparation = %+v", adopted)
+	}
+}
+
 func TestReconcilePreparationsDiscardsPromotePendingStagingWorktree(
 	t *testing.T,
 ) {

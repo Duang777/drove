@@ -222,6 +222,7 @@ func rootedPreparedWorktreeGitCommand(
 	commonRoot *os.Root,
 	worktreePath string,
 	worktreeRoot *os.Root,
+	stageRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	if err := verifyRealPathRoot(repositoryPath, repositoryRoot); err != nil {
@@ -240,23 +241,36 @@ func rootedPreparedWorktreeGitCommand(
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := validateBSDPreparedWorktreeNamesAvailable(
+	if stageRoot == nil {
+		return nil, nil, errors.New(
+			"workspace: prepared registration stage is unavailable",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
 		commonRoot,
 		stageName,
+		stageRoot,
 	); err != nil {
 		return nil, nil, err
+	}
+	entries, err := readRootDirectory(stageRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(entries) != 0 {
+		return nil, nil, errors.New(
+			"workspace: prepared registration stage is not empty",
+		)
 	}
 	if len(arguments) < 2 || arguments[len(arguments)-2] != "." {
 		return nil, nil, errors.New(
 			"workspace: prepared worktree command has an unexpected target",
 		)
 	}
-	arguments = append([]string(nil), arguments...)
-	arguments[len(arguments)-2] = "./" + stageName
-	directory, err := commonRoot.Open(".")
+	directory, err := stageRoot.Open(".")
 	if err != nil {
 		return nil, nil, fmt.Errorf(
-			"workspace: open rooted common Git directory: %w",
+			"workspace: open rooted prepared registration stage: %w",
 			err,
 		)
 	}
@@ -291,8 +305,8 @@ func rootedPreparedWorktreeGitCommand(
 	command.ExtraFiles = []*os.File{directory}
 	command.Env = boundGitEnvironment(
 		command.Environ(),
-		".",
-		".",
+		"..",
+		"..",
 	)
 	cleanup := func() error {
 		return errors.Join(

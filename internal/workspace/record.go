@@ -20,26 +20,28 @@ const (
 	protectedWorkspaceRecordVersion   = 2
 	preparationWorkspaceRecordVersion = 3
 	repositoryWorkspaceRecordVersion  = 4
-	workspaceRecordVersion            = 5
+	removalWorkspaceRecordVersion     = 5
+	workspaceRecordVersion            = 6
 	maxWorkspaceRecordSize            = 64 * 1024
 )
 
 type workspaceRecord struct {
-	Version              int                     `json:"version"`
-	AgentID              string                  `json:"agent_id"`
-	Repository           string                  `json:"repository"`
-	Path                 string                  `json:"path"`
-	Branch               string                  `json:"branch"`
-	ProtectionKnown      bool                    `json:"protection_known"`
-	IncludedPaths        []string                `json:"included_paths"`
-	PreparationCommitted bool                    `json:"preparation_committed"`
-	CreatedBranch        bool                    `json:"created_branch"`
-	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
-	ExpectedHeadOID      string                  `json:"expected_head_oid,omitempty"`
-	GitDirectory         string                  `json:"git_directory,omitempty"`
-	DirectoryIdentity    string                  `json:"directory_identity,omitempty"`
-	RepositoryEvidence   *repositoryEvidence     `json:"repository_evidence,omitempty"`
-	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
+	Version                        int                     `json:"version"`
+	AgentID                        string                  `json:"agent_id"`
+	Repository                     string                  `json:"repository"`
+	Path                           string                  `json:"path"`
+	Branch                         string                  `json:"branch"`
+	ProtectionKnown                bool                    `json:"protection_known"`
+	IncludedPaths                  []string                `json:"included_paths"`
+	PreparationCommitted           bool                    `json:"preparation_committed"`
+	CreatedBranch                  bool                    `json:"created_branch"`
+	BranchOperationID              string                  `json:"branch_operation_id,omitempty"`
+	ExpectedHeadOID                string                  `json:"expected_head_oid,omitempty"`
+	GitDirectory                   string                  `json:"git_directory,omitempty"`
+	DirectoryIdentity              string                  `json:"directory_identity,omitempty"`
+	PreparedStageDirectoryIdentity string                  `json:"prepared_stage_directory_identity,omitempty"`
+	RepositoryEvidence             *repositoryEvidence     `json:"repository_evidence,omitempty"`
+	Removal                        *workspaceRemovalRecord `json:"removal,omitempty"`
 }
 
 type repositoryEvidence struct {
@@ -132,11 +134,15 @@ func upgradeWorkspaceRecord(record *workspaceRecord) {
 	if record.Version >= workspaceRecordVersion {
 		return
 	}
+	previousVersion := record.Version
 	record.Version = workspaceRecordVersion
-	record.RepositoryEvidence = nil
-	record.ExpectedHeadOID = ""
-	if record.PreparationCommitted {
-		record.BranchOperationID = ""
+	record.PreparedStageDirectoryIdentity = ""
+	if previousVersion < removalWorkspaceRecordVersion {
+		record.RepositoryEvidence = nil
+		record.ExpectedHeadOID = ""
+		if record.PreparationCommitted {
+			record.BranchOperationID = ""
+		}
 	}
 }
 
@@ -560,10 +566,17 @@ func (m *Manager) decodeWorkspaceRecordFile(
 				recordPath,
 			)
 		}
-	case workspaceRecordVersion:
+	case removalWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
 			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 5 record %q has no included paths",
+				recordPath,
+			)
+		}
+	case workspaceRecordVersion:
+		if record.IncludedPaths == nil {
+			return workspaceRecord{}, fmt.Errorf(
+				"workspace: version 6 record %q has no included paths",
 				recordPath,
 			)
 		}
@@ -577,6 +590,13 @@ func (m *Manager) decodeWorkspaceRecordFile(
 	if filepath.Clean(worktreePath) != record.Path {
 		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q path mismatch",
+			recordPath,
+		)
+	}
+	if record.Version < workspaceRecordVersion &&
+		record.PreparedStageDirectoryIdentity != "" {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: record %q contains version 6 fields",
 			recordPath,
 		)
 	}
@@ -595,6 +615,7 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 		record.Version != protectedWorkspaceRecordVersion &&
 		record.Version != preparationWorkspaceRecordVersion &&
 		record.Version != repositoryWorkspaceRecordVersion &&
+		record.Version != removalWorkspaceRecordVersion &&
 		record.Version != workspaceRecordVersion {
 		return fmt.Errorf("workspace: unsupported record version %d", record.Version)
 	}
@@ -642,7 +663,7 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 				"workspace: quarantined removal has not been started",
 			)
 		}
-		if record.Version >= workspaceRecordVersion &&
+		if record.Version >= removalWorkspaceRecordVersion &&
 			record.Removal.Started &&
 			!record.Removal.Quarantined &&
 			!record.Removal.PathAbsent {
@@ -698,6 +719,18 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 			record.DirectoryIdentity {
 		return errors.New(
 			"workspace: directory identity is invalid",
+		)
+	}
+	if record.PreparedStageDirectoryIdentity != "" &&
+		!validDirectoryIdentity(record.PreparedStageDirectoryIdentity) {
+		return errors.New(
+			"workspace: prepared stage directory identity is invalid",
+		)
+	}
+	if record.PreparedStageDirectoryIdentity != "" &&
+		(record.BranchOperationID == "" || record.PreparationCommitted) {
+		return errors.New(
+			"workspace: prepared stage identity has no pending preparation",
 		)
 	}
 	if record.RepositoryEvidence != nil {

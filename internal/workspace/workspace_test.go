@@ -966,6 +966,35 @@ func TestRemoveUpgradesCommittedVersionFourRecord(t *testing.T) {
 	}
 }
 
+func TestUpgradeVersionFiveRecordPreservesRecoveryEvidence(t *testing.T) {
+	evidence := &repositoryEvidence{
+		SourcePath:                 "/source",
+		SourceDirectoryIdentity:    "source-identity",
+		GitDirectory:               "/source/.git",
+		GitDirectoryIdentity:       "git-identity",
+		CommonGitDirectory:         "/source/.git",
+		CommonGitDirectoryIdentity: "common-identity",
+	}
+	record := workspaceRecord{
+		Version:              removalWorkspaceRecordVersion,
+		PreparationCommitted: true,
+		BranchOperationID:    "11111111-1111-4111-8111-111111111111",
+		ExpectedHeadOID:      "expected-head",
+		RepositoryEvidence:   evidence,
+	}
+
+	upgradeWorkspaceRecord(&record)
+
+	if record.Version != workspaceRecordVersion ||
+		record.BranchOperationID !=
+			"11111111-1111-4111-8111-111111111111" ||
+		record.ExpectedHeadOID != "expected-head" ||
+		record.RepositoryEvidence != evidence ||
+		record.PreparedStageDirectoryIdentity != "" {
+		t.Fatalf("upgraded version 5 record = %+v", record)
+	}
+}
+
 func TestRemoveReturnsPendingAfterPartialGitMutation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test requires a POSIX shell")

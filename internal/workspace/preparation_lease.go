@@ -244,7 +244,7 @@ func openRecordedPreparationLease(
 	manager *Manager,
 	record workspaceRecord,
 ) (*preparationLease, error) {
-	if record.Version < workspaceRecordVersion ||
+	if record.Version < removalWorkspaceRecordVersion ||
 		record.RepositoryEvidence == nil {
 		return nil, errors.New(
 			"workspace: pending preparation has no repository identity evidence",

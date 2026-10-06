@@ -418,8 +418,8 @@ func (m *Manager) prepare(
 	}
 	if _, err := sourceRepository.addPreparedWorktree(
 		ctx,
-		preparedTarget.path,
-		preparedTarget.root,
+		result,
+		preparedTarget,
 		result.Branch,
 		expectedHeadOID,
 	); err != nil {
@@ -772,6 +772,17 @@ func (m *Manager) discardWithRepository(
 		!sameWorkspace(record.workspace(), target) {
 		return errors.New(
 			"workspace: preparation record does not match discard request",
+		)
+	}
+	if err := cleanupPreparedWorktreeAddDebris(
+		ctx,
+		repository,
+		target,
+		record,
+	); err != nil {
+		return fmt.Errorf(
+			"workspace: clean prepared worktree registration stage: %w",
+			err,
 		)
 	}
 	stagingPath, stagingRegistrationPath, stagingExists, err :=

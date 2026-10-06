@@ -144,6 +144,7 @@ func rootedPreparedWorktreeGitCommand(
 	commonRoot *os.Root,
 	worktreePath string,
 	worktreeRoot *os.Root,
+	_ *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	worktreeGuard, err := openRepositoryGuard(worktreePath, worktreeRoot)

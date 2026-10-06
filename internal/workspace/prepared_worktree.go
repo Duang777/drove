@@ -12,10 +12,11 @@ import (
 )
 
 type preparedWorktreeTarget struct {
-	root         *os.Root
-	name         string
-	path         string
-	gitDirectory string
+	root                  *os.Root
+	registrationStageRoot *os.Root
+	name                  string
+	path                  string
+	gitDirectory          string
 }
 
 func preparedWorktreeStagingName(
@@ -545,12 +546,23 @@ func (m *Manager) cleanupPreparedWorktreeTarget(
 }
 
 func (prepared *preparedWorktreeTarget) Close() error {
-	if prepared == nil || prepared.root == nil {
+	if prepared == nil {
 		return nil
 	}
-	err := prepared.root.Close()
+	var result error
+	if prepared.registrationStageRoot != nil {
+		result = errors.Join(
+			result,
+			prepared.registrationStageRoot.Close(),
+		)
+		prepared.registrationStageRoot = nil
+	}
+	if prepared.root == nil {
+		return result
+	}
+	result = errors.Join(result, prepared.root.Close())
 	prepared.root = nil
-	return err
+	return result
 }
 
 func (m *Manager) preparedWorktreeStagingPaths(

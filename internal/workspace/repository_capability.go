@@ -169,11 +169,13 @@ func (r repositoryCapability) runForward(
 
 func (r repositoryCapability) addPreparedWorktree(
 	ctx context.Context,
-	path string,
-	root *os.Root,
+	target Workspace,
+	prepared *preparedWorktreeTarget,
 	branch string,
 	expectedHeadOID string,
 ) ([]byte, error) {
+	path := prepared.path
+	root := prepared.root
 	verifyBranch := func() error {
 		oid, exists, err := r.refOID(ctx, "refs/heads/"+branch)
 		if err != nil {
@@ -189,6 +191,14 @@ func (r repositoryCapability) addPreparedWorktree(
 	if err := errors.Join(r.verifyBinding(ctx), verifyBranch()); err != nil {
 		return nil, err
 	}
+	stagePrepared, err := preparePreparedWorktreeAdd(
+		target,
+		prepared,
+		r,
+	)
+	if err != nil {
+		return nil, err
+	}
 	command, cleanup, err := rootedPreparedWorktreeGitCommand(
 		ctx,
 		r.manager.git,
@@ -198,6 +208,7 @@ func (r repositoryCapability) addPreparedWorktree(
 		r.commonRoot,
 		path,
 		root,
+		prepared.registrationStageRoot,
 		[]string{
 			"worktree",
 			"add",
@@ -214,10 +225,14 @@ func (r repositoryCapability) addPreparedWorktree(
 	finalizeErr := finalizePreparedWorktreeAdd(
 		ctx,
 		r,
-		path,
-		root,
+		target,
+		prepared,
 		commandErr == nil,
 	)
+	var clearStageErr error
+	if stagePrepared && finalizeErr == nil {
+		clearStageErr = r.clearPreparedWorktreeStageIdentity(target)
+	}
 	verifyErr := errors.Join(
 		r.verifyBinding(ctx),
 		verifyRealPathRoot(path, root),
@@ -226,9 +241,51 @@ func (r repositoryCapability) addPreparedWorktree(
 	return output, errors.Join(
 		commandErr,
 		finalizeErr,
+		clearStageErr,
 		verifyErr,
 		cleanup(),
 	)
+}
+
+func (r repositoryCapability) clearPreparedWorktreeStageIdentity(
+	target Workspace,
+) error {
+	record, exists, err := r.manager.readWorkspaceRecord(target.Path)
+	if err == nil && !exists {
+		err = errors.New("workspace: preparation record is missing")
+	}
+	if err != nil {
+		return err
+	}
+	if record.PreparedStageDirectoryIdentity == "" {
+		return errors.New(
+			"workspace: prepared stage directory identity is missing",
+		)
+	}
+	if target.branchOperationID == "" ||
+		record.BranchOperationID != target.branchOperationID ||
+		!sameWorkspace(record.workspace(), target) {
+		return errors.New(
+			"workspace: preparation record changed while clearing stage identity",
+		)
+	}
+	record.PreparedStageDirectoryIdentity = ""
+	if err := r.manager.replaceWorkspaceRecord(record); err != nil {
+		return fmt.Errorf(
+			"workspace: clear prepared stage directory identity: %w",
+			err,
+		)
+	}
+	persisted, exists, err := r.manager.readWorkspaceRecord(target.Path)
+	if err != nil {
+		return err
+	}
+	if !exists || persisted.PreparedStageDirectoryIdentity != "" {
+		return errors.New(
+			"workspace: prepared stage directory identity was not cleared",
+		)
+	}
+	return nil
 }
 
 func (r repositoryCapability) runPrivateGit(

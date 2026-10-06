@@ -100,6 +100,7 @@ func TestRootedPreparedWorktreeGitCommandBindsAllDirectories(t *testing.T) {
 		commonRoot,
 		worktreePath,
 		worktreeRoot,
+		nil,
 		[]string{"version"},
 	)
 	if err != nil {

@@ -166,6 +166,17 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	if _, err := os.Lstat(repairInvoked); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("public worktree repair was invoked: %v", err)
 	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf(
+			"read prepared workspace record: exists=%v err=%v",
+			exists,
+			err,
+		)
+	}
+	if record.PreparedStageDirectoryIdentity != "" {
+		t.Fatal("completed preparation retained registration stage identity")
+	}
 	if err := manager.Discard(context.Background(), prepared); err != nil {
 		t.Fatalf("discard prepared worktree: %v", err)
 	}
@@ -246,6 +257,116 @@ exit "$status"
 		"--porcelain",
 	); strings.Contains(output, stagePath) {
 		t.Fatalf("failed worktree remains registered:\n%s", output)
+	}
+}
+
+func TestBSDPreparePreservesReplacedRegistrationStage(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	initSourceSwapRepository(t, repository)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	stageFile := filepath.Join(parent, "common-stage")
+	originalFile := filepath.Join(parent, "original-common-stage")
+	wrapper := filepath.Join(parent, "git-wrapper-stage-replacement")
+	script := `#!/bin/sh
+target=
+next_target=
+for argument in "$@"; do
+  if [ -n "$next_target" ]; then
+    target=$argument
+    next_target=
+  fi
+  [ "$argument" = "--no-checkout" ] && next_target=1
+done
+"$DROVE_TEST_REAL_GIT" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ -n "$target" ]; then
+  stage=$(CDPATH= cd -- "$target" && pwd -P) || exit 90
+  original=$stage-original
+  mv "$stage" "$original" || exit 91
+  mkdir "$stage" || exit 92
+  cp "$original/.git" "$stage/.git" || exit 93
+  printf '%s' "$stage" > "$DROVE_TEST_STAGE" || exit 94
+  printf '%s' "$original" > "$DROVE_TEST_ORIGINAL_STAGE" || exit 95
+  name=${stage##*/}
+  mkdir "${stage%/*}/worktrees/$name-unexpected" || exit 96
+fi
+exit "$status"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_STAGE", stageFile)
+	t.Setenv("DROVE_TEST_ORIGINAL_STAGE", originalFile)
+
+	dataDir := filepath.Join(parent, "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	if _, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	); err == nil {
+		t.Fatal("prepare succeeded after registration stage replacement")
+	}
+
+	rawStage, err := os.ReadFile(stageFile)
+	if err != nil {
+		t.Fatalf("read replacement stage path: %v", err)
+	}
+	rawOriginal, err := os.ReadFile(originalFile)
+	if err != nil {
+		t.Fatalf("read original stage path: %v", err)
+	}
+	stagePath := filepath.Clean(string(rawStage))
+	originalPath := filepath.Clean(string(rawOriginal))
+	replacementInfo, err := os.Stat(stagePath)
+	if err != nil {
+		t.Fatalf("replacement registration stage was removed: %v", err)
+	}
+	originalInfo, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatalf("original registration stage was removed: %v", err)
+	}
+	if os.SameFile(replacementInfo, originalInfo) {
+		t.Fatal("replacement and original registration stages share identity")
+	}
+	replacementPointer, err := os.ReadFile(filepath.Join(stagePath, ".git"))
+	if err != nil {
+		t.Fatalf("read replacement Git pointer: %v", err)
+	}
+	originalPointer, err := os.ReadFile(filepath.Join(originalPath, ".git"))
+	if err != nil {
+		t.Fatalf("read original Git pointer: %v", err)
+	}
+	if string(replacementPointer) != string(originalPointer) {
+		t.Fatal("replacement Git pointer does not match the original")
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err == nil {
+		t.Fatal("reconcile accepted a replaced registration stage")
+	}
+	current, err := os.Stat(stagePath)
+	if err != nil {
+		t.Fatalf("reconcile removed the replacement registration stage: %v", err)
+	}
+	if !os.SameFile(current, replacementInfo) {
+		t.Fatal("reconcile changed the replacement registration stage")
 	}
 }
 

@@ -4,14 +4,21 @@ package workspace
 
 import (
 	"context"
-	"os"
 )
+
+func preparePreparedWorktreeAdd(
+	_ Workspace,
+	_ *preparedWorktreeTarget,
+	_ repositoryCapability,
+) (bool, error) {
+	return false, nil
+}
 
 func finalizePreparedWorktreeAdd(
 	_ context.Context,
 	_ repositoryCapability,
-	_ string,
-	_ *os.Root,
+	_ Workspace,
+	_ *preparedWorktreeTarget,
 	_ bool,
 ) error {
 	return nil
