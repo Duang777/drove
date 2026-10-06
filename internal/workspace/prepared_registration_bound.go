@@ -70,20 +70,7 @@ func repairBoundPreparedWorktreeRegistration(
 			err,
 		)
 	}
-	oldPointer, err := readBoundRegularFile(gitRoot, "gitdir")
-	if err != nil {
-		return true, err
-	}
-	if err := validateGitPointerContent(
-		oldPointer,
-		"",
-		filepath.Join(stalePath, ".git"),
-	); err != nil {
-		return true, fmt.Errorf(
-			"workspace: validate prepared private Git pointer: %w",
-			err,
-		)
-	}
+	oldPointer := filepath.ToSlash(filepath.Join(stalePath, ".git")) + "\n"
 	newPointer := filepath.ToSlash(filepath.Join(target.Path, ".git")) + "\n"
 	if err := ensureBoundGitPointer(
 		gitRoot,

@@ -162,21 +162,23 @@ func (m *Manager) repairPromotedPreparedWorktree(
 	}
 	stagingPath := filepath.Join(filepath.Dir(target.Path), stagingName)
 	stale, exists, err := repository.worktreeRegistration(ctx, stagingPath)
-	if err != nil || !exists {
+	if err != nil {
 		return false, err
 	}
-	stagingTarget := target
-	stagingTarget.Path = stagingPath
-	if err := repository.verifyPreparedWorktree(
-		ctx,
-		stagingTarget,
-		record.GitDirectory,
-		stale,
-	); err != nil {
-		return false, fmt.Errorf(
-			"workspace: verify promoted worktree staging registration: %w",
-			err,
-		)
+	if exists {
+		stagingTarget := target
+		stagingTarget.Path = stagingPath
+		if err := repository.verifyPreparedWorktree(
+			ctx,
+			stagingTarget,
+			record.GitDirectory,
+			stale,
+		); err != nil {
+			return false, fmt.Errorf(
+				"workspace: verify promoted worktree staging registration: %w",
+				err,
+			)
+		}
 	}
 
 	bucket, err := m.openManagedBucketRoot(target)

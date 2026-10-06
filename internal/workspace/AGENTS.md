@@ -31,7 +31,9 @@
   和 gitlink。macOS/BSD 遇到普通文件的 `filter` 属性必须 fail-stop，因为 filter
   无法同时取得固定 worktree cwd 与描述符绑定的私有 Git 上下文。初始化完成后把
   staging 目录 no-replace 原子提升到公开路径，再从固定 worktree 根执行
-  `git worktree repair .`。仓库根目录的
+  `git worktree repair .`。私有 `gitdir` 指针替换中断后，重启恢复必须先从绑定私有
+  Git 目录校验并恢复 `old-*` artifact，不能先要求 Git worktree 列表仍能看到缺失
+  `gitdir` 的 staging 注册；唯一允许的旧指针从 operation staging 路径推导。仓库根目录的
   `.worktreeinclude` 使用 gitignore 语义，并从已打开文件读取一次。Unix 通过继承的
   只读文件描述符交给 Git，其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按
   源 manifest 路径打开。

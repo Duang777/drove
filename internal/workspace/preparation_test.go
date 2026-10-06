@@ -2,8 +2,10 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -350,6 +352,117 @@ func TestReconcilePreparationsRepairsPromotionBeforeDiscard(t *testing.T) {
 	if strings.Contains(listing, prepared.Path) ||
 		strings.Contains(listing, stagingPath) {
 		t.Fatalf("reconciled worktree registration remains:\n%s", listing)
+	}
+}
+
+func TestReconcilePreparationsRecoversIsolatedPrivateGitPointer(
+	t *testing.T,
+) {
+	switch runtime.GOOS {
+	case "darwin", "dragonfly", "freebsd", "linux",
+		"netbsd", "openbsd", "windows":
+	default:
+		t.Skip("bound Git pointer recovery is unsupported")
+	}
+
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(prepared.Path), stagingName)
+	privatePointerPath := filepath.Join(record.GitDirectory, "gitdir")
+	stalePointer := filepath.ToSlash(filepath.Join(stagingPath, ".git")) + "\n"
+	if err := os.WriteFile(
+		privatePointerPath,
+		[]byte(stalePointer),
+		0o600,
+	); err != nil {
+		t.Fatalf("restore stale private Git pointer: %v", err)
+	}
+	digest := sha256.Sum256(
+		[]byte(filepath.Base(record.GitDirectory) + "\x00gitdir"),
+	)
+	backupName := fmt.Sprintf(
+		".drove-git-pointer-%x-old-%s",
+		digest[:8],
+		"78787878-7878-4787-8787-787878787878",
+	)
+	backupPath := filepath.Join(record.GitDirectory, backupName)
+	if err := os.Rename(privatePointerPath, backupPath); err != nil {
+		t.Fatalf("isolate stale private Git pointer: %v", err)
+	}
+	if _, err := os.Lstat(privatePointerPath); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("private Git pointer still exists: %v", err)
+	}
+	listing := runGit(t, repository, "worktree", "list", "--porcelain")
+	if strings.Contains(listing, prepared.Path) ||
+		strings.Contains(listing, stagingPath) {
+		t.Fatalf("isolated private pointer remained registered:\n%s", listing)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile isolated private pointer: %v", err)
+	}
+	for _, path := range []string{
+		prepared.Path,
+		stagingPath,
+		workspaceRecordPath(prepared.Path),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reconciled path %q remains: %v", path, err)
+		}
+	}
+	listing = runGit(t, repository, "worktree", "list", "--porcelain")
+	if strings.Contains(listing, prepared.Path) ||
+		strings.Contains(listing, stagingPath) {
+		t.Fatalf("reconciled worktree registration remains:\n%s", listing)
+	}
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+prepared.Branch,
+	)
+	if err := command.Run(); !isExitCode(err, 1) {
+		t.Fatalf("pending branch remains after recovery: %v", err)
 	}
 }
 
