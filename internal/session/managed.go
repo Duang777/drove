@@ -100,10 +100,31 @@ func (m *managedAgent) hasResumeOnStart() bool {
 		!m.workspace.removed
 }
 
-func (m *managedAgent) consumeResumeOnStart() {
+func (m *managedAgent) completeResumeOnStart(
+	commit func() (commitReceipt, error),
+) (bool, error) {
 	m.workspaceMu.Lock()
+	defer m.workspaceMu.Unlock()
+	if !m.workspace.resumeOnStart ||
+		m.workspace.removalPending ||
+		m.workspace.removed {
+		return false, nil
+	}
+	receipt, err := commit()
+	if receipt.Durable {
+		m.workspace.resumeOnStart = false
+	}
+	return true, err
+}
+
+func (m *managedAgent) cancelResumeOnStartAfter(commit func() error) error {
+	m.workspaceMu.Lock()
+	defer m.workspaceMu.Unlock()
+	if err := commit(); err != nil {
+		return err
+	}
 	m.workspace.resumeOnStart = false
-	m.workspaceMu.Unlock()
+	return nil
 }
 
 func (m *managedAgent) setProcessGroupCleanupPending(pid int) {

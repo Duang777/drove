@@ -1395,6 +1395,49 @@ func TestManualResumeCompletesStartupResumeIntent(t *testing.T) {
 	}
 }
 
+func TestUserStopConsumesLiveStartupResumeIntent(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	if _, err := manager.Resume(
+		context.Background(),
+		managed.agent.ID(),
+	); err != nil {
+		t.Fatalf("resume agent: %v", err)
+	}
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	manager.mu.RLock()
+	running := manager.sessions[managed.agent.ID()]
+	manager.mu.RUnlock()
+	if running == nil {
+		t.Fatal("resumed session is missing")
+	}
+	manager.requestStop(managed.agent.ID(), running, stopCauseUser)
+	started.OnExit(pty.ExitInfo{PID: 1, Code: 0})
+	started.OnOutputEnd(0)
+
+	if managed.hasResumeOnStart() {
+		t.Fatal("durable user stop retained the live startup resume intent")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay stopped resume: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) &&
+			row.Reason == startupResumeCompletedReason {
+			t.Fatalf("user-stopped resume committed stale completion: %+v", row)
+		}
+	}
+}
+
 func TestNormalizeRunMode(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -702,11 +702,11 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	}
 	defer m.endStart()
 
-	managed, entry, ref, err := m.reserveResume(ctx, id)
+	managed, entry, ref, startupResume, err := m.reserveResume(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return m.resumeReserved(ctx, id, managed, entry, ref)
+	return m.resumeReserved(ctx, id, managed, entry, ref, startupResume)
 }
 
 func (m *Manager) resumeReserved(
@@ -715,6 +715,7 @@ func (m *Manager) resumeReserved(
 	managed *managedAgent,
 	entry adapter.Entry,
 	ref string,
+	startupResume bool,
 ) (*Status, error) {
 	defer m.releaseResume(id)
 
@@ -821,7 +822,7 @@ func (m *Manager) resumeReserved(
 	}); err != nil {
 		return nil, err
 	}
-	if managed.hasResumeOnStart() {
+	if startupResume {
 		if err := m.completeStartupResume(id, managed); err != nil {
 			return nil, err
 		}
@@ -846,17 +847,24 @@ func closePreparedRuntime(running *runningSession) error {
 func (m *Manager) reserveResume(
 	ctx context.Context,
 	id agent.ID,
-) (*managedAgent, adapter.Entry, string, error) {
+) (*managedAgent, adapter.Entry, string, bool, error) {
 	managed, ok := m.managed(id)
 	if !ok {
-		return nil, adapter.Entry{}, "", fmt.Errorf("%w: %q", ErrUnknownAgent, id)
+		return nil, adapter.Entry{}, "", false, fmt.Errorf(
+			"%w: %q",
+			ErrUnknownAgent,
+			id,
+		)
 	}
 	pending, err := m.resolveProcessGroupCleanup(ctx, id, managed)
 	if err != nil {
-		return nil, adapter.Entry{}, "", errors.Join(ErrResumeConflict, err)
+		return nil, adapter.Entry{}, "", false, errors.Join(
+			ErrResumeConflict,
+			err,
+		)
 	}
 	if pending {
-		return nil, adapter.Entry{}, "", fmt.Errorf(
+		return nil, adapter.Entry{}, "", false, fmt.Errorf(
 			"%w: agent %q process group cleanup remains unresolved",
 			ErrResumeConflict,
 			id,
@@ -864,7 +872,11 @@ func (m *Manager) reserveResume(
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.reserveResumeLocked(id)
+	managed, entry, ref, err := m.reserveResumeLocked(id)
+	if err != nil {
+		return nil, adapter.Entry{}, "", false, err
+	}
+	return managed, entry, ref, managed.hasResumeOnStart(), nil
 }
 
 func (m *Manager) reserveResumeLocked(
@@ -1258,7 +1270,7 @@ func (m *Manager) resumeOnStart(
 			return false, err
 		}
 
-		_, err = m.resumeReserved(ctx, id, managed, entry, ref)
+		_, err = m.resumeReserved(ctx, id, managed, entry, ref, true)
 		if err != nil {
 			m.endStart()
 			return true, err
@@ -1279,18 +1291,19 @@ func (m *Manager) completeStartupResume(
 			err,
 		)
 	}
-	receipt, commitErr := m.committer.CommitEvents(
-		context.Background(),
-		[]event.Draft{event.NewSessionLifecycleDraft(
-			string(id),
-			string(id),
-			startupResumeCompletedReason,
-			string(payload),
-		)},
+	_, commitErr := managed.completeResumeOnStart(
+		func() (commitReceipt, error) {
+			return m.committer.CommitEvents(
+				context.Background(),
+				[]event.Draft{event.NewSessionLifecycleDraft(
+					string(id),
+					string(id),
+					startupResumeCompletedReason,
+					string(payload),
+				)},
+			)
+		},
 	)
-	if receipt.Durable {
-		managed.consumeResumeOnStart()
-	}
 	if commitErr != nil {
 		return fmt.Errorf(
 			"session: persist startup resume completion: %w",
@@ -1683,7 +1696,16 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	if err != nil {
 		return
 	}
-	_ = running.observer.terminate(observation, lifecycleDrafts)
+	terminate := func() error {
+		return running.observer.terminate(observation, lifecycleDrafts)
+	}
+	if cause == stopCauseUser && info.CleanupErr == nil {
+		if managed, exists := m.managed(id); exists {
+			_ = managed.cancelResumeOnStartAfter(terminate)
+			return
+		}
+	}
+	_ = terminate()
 }
 
 func processObservation(
