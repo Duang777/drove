@@ -403,6 +403,7 @@ func (m *model) handleSendKey(message tea.KeyMsg) tea.Cmd {
 		m.focus = focusFleet
 		return m.startSend(id, payload)
 	default:
+		m.notice = ""
 		var command tea.Cmd
 		m.input, command = m.input.Update(message)
 		return command

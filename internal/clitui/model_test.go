@@ -277,6 +277,17 @@ func TestActionSendAddsExactlyOneNewlineAndEnforcesByteLimit(t *testing.T) {
 	if !strings.Contains(m.notice, "maximum") || m.focus != focusSend {
 		t.Fatalf("oversized input notice=%q focus=%d", m.notice, m.focus)
 	}
+	if view := m.View(); !strings.Contains(view, "maximum") {
+		t.Fatalf("oversized input notice is not visible:\n%s", view)
+	}
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	if m.notice != "" {
+		t.Fatalf("editing oversized input retained notice %q", m.notice)
+	}
+	if view := m.View(); !strings.Contains(view, "SEND agent-1") {
+		t.Fatalf("send editor did not return after editing:\n%s", view)
+	}
 }
 
 func TestPendingActionBlocksOtherActionsAndCancellationStopsRequest(t *testing.T) {

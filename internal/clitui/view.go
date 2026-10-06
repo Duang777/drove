@@ -221,6 +221,9 @@ func (m *model) renderExplainPane(width, height int) string {
 func (m *model) renderStatus() string {
 	switch m.focus {
 	case focusSend:
+		if m.notice != "" {
+			return errorStyle.Render(terminalInlineText(m.notice))
+		}
 		return fmt.Sprintf(
 			"SEND %s  %s",
 			terminalInlineText(m.actionID),
