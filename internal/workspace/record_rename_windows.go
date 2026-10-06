@@ -18,8 +18,6 @@ type recordRenameInformation struct {
 	FileName        [1]uint16
 }
 
-var reopenFile = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReOpenFile")
-
 func renameRecordFile(
 	directory *os.File,
 	temporary *os.File,
@@ -257,22 +255,36 @@ func openRecordDirectory(root *os.Root) (_ *os.File, result error) {
 	if err != nil {
 		return nil, fmt.Errorf("inspect directory anchor: %w", err)
 	}
-	rawHandle, _, callErr := reopenFile.Call(
-		anchor.Fd(),
-		uintptr(windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE),
-		uintptr(
-			windows.FILE_SHARE_READ|
-				windows.FILE_SHARE_WRITE|
-				windows.FILE_SHARE_DELETE,
-		),
-		uintptr(
-			windows.FILE_FLAG_BACKUP_SEMANTICS|
-				windows.FILE_FLAG_OPEN_REPARSE_POINT,
-		),
+	objectName, err := windows.NewNTUnicodeString("")
+	if err != nil {
+		return nil, err
+	}
+	attributes := &windows.OBJECT_ATTRIBUTES{
+		Length:        uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})),
+		RootDirectory: windows.Handle(anchor.Fd()),
+		ObjectName:    objectName,
+	}
+	var (
+		handle windows.Handle
+		status windows.IO_STATUS_BLOCK
 	)
-	handle := windows.Handle(rawHandle)
-	if handle == windows.InvalidHandle {
-		return nil, fmt.Errorf("reopen writable directory handle: %w", callErr)
+	err = windows.NtCreateFile(
+		&handle,
+		windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE,
+		attributes,
+		&status,
+		nil,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		windows.FILE_OPEN,
+		windows.FILE_SYNCHRONOUS_IO_NONALERT|
+			windows.FILE_DIRECTORY_FILE|
+			windows.FILE_OPEN_REPARSE_POINT,
+		0,
+		0,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reopen writable directory handle: %w", err)
 	}
 	directory := os.NewFile(uintptr(handle), ".")
 	if directory == nil {
