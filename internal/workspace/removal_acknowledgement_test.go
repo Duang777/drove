@@ -7,8 +7,177 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
+
+func TestParseRemovalAcknowledgementReservationName(t *testing.T) {
+	const (
+		prefix = ".record.ack-path-operation-"
+		id     = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+	)
+	for _, test := range []struct {
+		name    string
+		value   string
+		valid   bool
+		renamed bool
+	}{
+		{name: "base", value: prefix + id, valid: true},
+		{
+			name:    "rename",
+			value:   prefix + id + ".rename",
+			valid:   true,
+			renamed: true,
+		},
+		{name: "wrong prefix", value: "other-" + id},
+		{name: "uppercase UUID", value: prefix + strings.ToUpper(id)},
+		{name: "double rename", value: prefix + id + ".rename.rename"},
+		{name: "extra suffix", value: prefix + id + ".extra"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate, valid := parseRemovalAcknowledgementReservationName(
+				test.value,
+				prefix,
+			)
+			if valid != test.valid {
+				t.Fatalf("valid = %v, want %v", valid, test.valid)
+			}
+			if valid && candidate.renamed != test.renamed {
+				t.Fatalf(
+					"renamed = %v, want %v",
+					candidate.renamed,
+					test.renamed,
+				)
+			}
+		})
+	}
+}
+
+func TestCleanupRemovalAcknowledgementReservationsRecoversRenamePhase(
+	t *testing.T,
+) {
+	for _, renamed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "base", true: "rename"}[renamed], func(t *testing.T) {
+			bucketPath := t.TempDir()
+			bucket, err := os.OpenRoot(bucketPath)
+			if err != nil {
+				t.Fatalf("open bucket: %v", err)
+			}
+			defer bucket.Close()
+			record := removalAcknowledgementTestRecord(bucketPath)
+			name := removalAcknowledgementReservationPrefix(record) +
+				"89898989-8989-4898-8989-898989898989"
+			createRemovalAcknowledgementReservationFixture(
+				t,
+				bucket,
+				record,
+				name,
+			)
+			if renamed {
+				renamedPath := filepath.Join(bucketPath, name+".rename")
+				if err := os.Rename(
+					filepath.Join(bucketPath, name),
+					renamedPath,
+				); err != nil {
+					t.Fatalf("isolate reservation: %v", err)
+				}
+				name += ".rename"
+			}
+
+			if err := cleanupRemovalAcknowledgementReservations(
+				bucket,
+				record,
+			); err != nil {
+				t.Fatalf("cleanup reservation: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(bucketPath, name)); !errors.Is(
+				err,
+				os.ErrNotExist,
+			) {
+				t.Fatalf("reservation remains: %v", err)
+			}
+			if err := cleanupRemovalAcknowledgementReservations(
+				bucket,
+				record,
+			); err != nil {
+				t.Fatalf("repeat cleanup reservation: %v", err)
+			}
+		})
+	}
+}
+
+func TestCleanupRemovalAcknowledgementReservationsRejectsAmbiguousPhases(
+	t *testing.T,
+) {
+	bucketPath := t.TempDir()
+	bucket, err := os.OpenRoot(bucketPath)
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+	record := removalAcknowledgementTestRecord(bucketPath)
+	baseName := removalAcknowledgementReservationPrefix(record) +
+		"90909090-9090-4090-8090-909090909090"
+	for _, name := range []string{baseName, baseName + ".rename"} {
+		createRemovalAcknowledgementReservationFixture(
+			t,
+			bucket,
+			record,
+			name,
+		)
+	}
+
+	if err := cleanupRemovalAcknowledgementReservations(
+		bucket,
+		record,
+	); err == nil {
+		t.Fatal("cleanup accepted ambiguous reservation phases")
+	}
+	for _, name := range []string{baseName, baseName + ".rename"} {
+		if _, err := os.Stat(filepath.Join(bucketPath, name)); err != nil {
+			t.Fatalf("ambiguous reservation %q changed: %v", name, err)
+		}
+	}
+}
+
+func removalAcknowledgementTestRecord(bucketPath string) workspaceRecord {
+	return workspaceRecord{
+		AgentID: testAgentID,
+		Path:    filepath.Join(bucketPath, testAgentID),
+		Removal: &workspaceRemovalRecord{
+			OperationID:    "67676767-6767-4767-8767-676767676767",
+			DirectoryToken: "68686868-6868-4868-8868-686868686868",
+			Started:        true,
+		},
+	}
+}
+
+func createRemovalAcknowledgementReservationFixture(
+	t *testing.T,
+	bucket *os.Root,
+	record workspaceRecord,
+	name string,
+) {
+	t.Helper()
+	if err := bucket.Mkdir(name, 0o700); err != nil {
+		t.Fatalf("create reservation %q: %v", name, err)
+	}
+	root, err := openRealRootFromRoot(bucket, name)
+	if err != nil {
+		t.Fatalf("open reservation %q: %v", name, err)
+	}
+	if err := installRemovalMarker(
+		root,
+		removalMarkerName(record),
+		record.Removal.DirectoryToken,
+	); err != nil {
+		_ = root.Close()
+		t.Fatalf("install reservation marker: %v", err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatalf("close reservation %q: %v", name, err)
+	}
+}
 
 func TestAcknowledgeRemovalReservesManagedPathDuringRepositoryCheck(
 	t *testing.T,

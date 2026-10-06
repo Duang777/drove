@@ -4,9 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 )
+
+type removalAcknowledgementReservationCandidate struct {
+	name    string
+	id      uuid.UUID
+	renamed bool
+}
 
 type removalAcknowledgementReservation struct {
 	bucket *os.Root
@@ -288,9 +295,24 @@ func cleanupRemovalAcknowledgementReservations(
 		return err
 	}
 	prefix := removalAcknowledgementReservationPrefix(record)
+	candidates := make(
+		[]removalAcknowledgementReservationCandidate,
+		0,
+	)
+	seen := make(map[uuid.UUID]removalAcknowledgementReservationCandidate)
 	for _, entry := range entries {
-		if !validRemovalAcknowledgementReservationName(entry.Name(), prefix) {
+		if !strings.HasPrefix(entry.Name(), prefix) {
 			continue
+		}
+		candidate, valid := parseRemovalAcknowledgementReservationName(
+			entry.Name(),
+			prefix,
+		)
+		if !valid {
+			return fmt.Errorf(
+				"workspace: removal acknowledgement reservation %q has an invalid name",
+				entry.Name(),
+			)
 		}
 		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
 			return fmt.Errorf(
@@ -298,7 +320,18 @@ func cleanupRemovalAcknowledgementReservations(
 				entry.Name(),
 			)
 		}
-		root, err := openRealRootFromRoot(bucket, entry.Name())
+		if previous, exists := seen[candidate.id]; exists {
+			return fmt.Errorf(
+				"workspace: removal acknowledgement reservations %q and %q have ambiguous phases",
+				previous.name,
+				candidate.name,
+			)
+		}
+		seen[candidate.id] = candidate
+		candidates = append(candidates, candidate)
+	}
+	for _, candidate := range candidates {
+		root, err := openRealRootFromRoot(bucket, candidate.name)
 		if err != nil {
 			return err
 		}
@@ -306,7 +339,7 @@ func cleanupRemovalAcknowledgementReservations(
 			bucket: bucket,
 			root:   root,
 			record: record,
-			name:   entry.Name(),
+			name:   candidate.name,
 		}
 		if err := cleanupIsolatedRemovalAcknowledgementReservation(
 			reservation,
@@ -352,16 +385,31 @@ func cleanupIsolatedRemovalAcknowledgementReservation(
 	return syncRecordBucket(reservation.bucket, reservation.record.Path)
 }
 
-func validRemovalAcknowledgementReservationName(
+func parseRemovalAcknowledgementReservationName(
 	name string,
 	prefix string,
-) bool {
-	if len(name) != len(prefix)+36 || name[:len(prefix)] != prefix {
-		return false
+) (removalAcknowledgementReservationCandidate, bool) {
+	raw, found := strings.CutPrefix(name, prefix)
+	if !found {
+		return removalAcknowledgementReservationCandidate{}, false
 	}
-	raw := name[len(prefix):]
+	const renameSuffix = ".rename"
+	renamed := strings.HasSuffix(raw, renameSuffix)
+	if renamed {
+		raw = strings.TrimSuffix(raw, renameSuffix)
+	}
+	if len(raw) != 36 {
+		return removalAcknowledgementReservationCandidate{}, false
+	}
 	parsed, err := uuid.Parse(raw)
-	return err == nil && parsed.String() == raw
+	if err != nil || parsed.String() != raw {
+		return removalAcknowledgementReservationCandidate{}, false
+	}
+	return removalAcknowledgementReservationCandidate{
+		name:    name,
+		id:      parsed,
+		renamed: renamed,
+	}, true
 }
 
 func removalPathIsAcknowledgementReservation(
