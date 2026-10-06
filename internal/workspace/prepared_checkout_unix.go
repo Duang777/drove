@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -520,7 +521,13 @@ func installPreparedCheckoutFile(
 		if !installed {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(parent, name, output),
+				removeOwnedRecordPathIfSame(
+					parent,
+					name,
+					output,
+					".drove-checkout-discard-"+uuid.NewString(),
+					nil,
+				),
 			)
 		}
 		if outputOpen {

@@ -92,17 +92,19 @@ func TestUnlinkRecordPreservesReplacementAfterValidation(t *testing.T) {
 	if _, err := source.WriteString("original\n"); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	directory, err := os.Open(rootPath)
+	root, err := os.OpenRoot(rootPath)
 	if err != nil {
-		t.Fatalf("open directory: %v", err)
+		t.Fatalf("open root: %v", err)
 	}
-	defer directory.Close()
+	defer root.Close()
 	movedPath := filepath.Join(rootPath, "source-original")
 
-	err = unlinkRecordPathAfterValidation(
-		directory,
-		source,
+	err = removeOwnedRecordPath(
+		root,
 		"source",
+		source,
+		"source-owned-removal",
+		nil,
 		func() {
 			if err := os.Rename(sourcePath, movedPath); err != nil {
 				t.Fatalf("move validated source: %v", err)

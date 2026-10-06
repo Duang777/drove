@@ -28,10 +28,12 @@ func TestRemoveRecordPathPreservesReplacementAfterValidation(t *testing.T) {
 	defer expected.Close()
 	originalPath := recordPath + ".original"
 
-	err = removeRecordPathIfSameAfterValidation(
+	err = removeOwnedRecordPath(
 		root,
 		"temporary",
 		expected,
+		"temporary-owned-removal",
+		nil,
 		func() {
 			if err := os.Rename(recordPath, originalPath); err != nil {
 				t.Fatalf("move validated temporary record: %v", err)

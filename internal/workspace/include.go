@@ -32,6 +32,29 @@ type includeSelection struct {
 	exists   bool
 }
 
+func includeManifestTemporaryName() string {
+	return "." + worktreeIncludeFile + "-" + uuid.NewString()
+}
+
+func includedFileTemporaryName(destinationName string) string {
+	return "." + destinationName + ".include-" + uuid.NewString()
+}
+
+func removeIncludeTemporary(
+	root *os.Root,
+	name string,
+	expected *os.File,
+	nextName string,
+) error {
+	return removeOwnedRecordPathIfSame(
+		root,
+		name,
+		expected,
+		nextName,
+		nil,
+	)
+}
+
 func (m *Manager) copyIncludedSelection(
 	ctx context.Context,
 	sourcePath string,
@@ -405,7 +428,7 @@ func (m *Manager) runIncludeManifest(
 		result = errors.Join(result, verifyErr, closeErr, removeErr)
 	}()
 
-	name := "." + worktreeIncludeFile + "-" + uuid.NewString()
+	name := includeManifestTemporaryName()
 	writer, err := root.OpenFile(
 		name,
 		os.O_RDWR|os.O_CREATE|os.O_EXCL,
@@ -417,14 +440,24 @@ func (m *Manager) runIncludeManifest(
 	if _, err := writer.Write(manifest); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: write include rule file: %w", err),
-			removeRecordPathIfSame(root, name, writer),
+			removeIncludeTemporary(
+				root,
+				name,
+				writer,
+				includeManifestTemporaryName(),
+			),
 			writer.Close(),
 		)
 	}
 	if err := writer.Sync(); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: sync include rule file: %w", err),
-			removeRecordPathIfSame(root, name, writer),
+			removeIncludeTemporary(
+				root,
+				name,
+				writer,
+				includeManifestTemporaryName(),
+			),
 			writer.Close(),
 		)
 	}
@@ -432,7 +465,12 @@ func (m *Manager) runIncludeManifest(
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: reopen include rule file: %w", err),
-			removeRecordPathIfSame(root, name, writer),
+			removeIncludeTemporary(
+				root,
+				name,
+				writer,
+				includeManifestTemporaryName(),
+			),
 			writer.Close(),
 		)
 	}
@@ -442,14 +480,24 @@ func (m *Manager) runIncludeManifest(
 	if err := errors.Join(statErr, readerStatErr, closeErr); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: inspect include rule file: %w", err),
-			removeRecordPathIfSame(root, name, reader),
+			removeIncludeTemporary(
+				root,
+				name,
+				reader,
+				includeManifestTemporaryName(),
+			),
 			reader.Close(),
 		)
 	}
 	if !os.SameFile(writerInfo, readerInfo) {
 		return nil, errors.Join(
 			errors.New("workspace: include rule file changed while reopening"),
-			removeRecordPathIfSame(root, name, reader),
+			removeIncludeTemporary(
+				root,
+				name,
+				reader,
+				includeManifestTemporaryName(),
+			),
 			reader.Close(),
 		)
 	}
@@ -457,7 +505,12 @@ func (m *Manager) runIncludeManifest(
 		if name != "" {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(root, name, reader),
+				removeIncludeTemporary(
+					root,
+					name,
+					reader,
+					includeManifestTemporaryName(),
+				),
 			)
 		}
 		result = errors.Join(result, reader.Close())
@@ -487,7 +540,12 @@ func (m *Manager) runIncludeManifest(
 			commandResult = errors.Join(commandResult, cleanupManifest())
 		}()
 		if unlinkBeforeRun && name != "" {
-			if err := root.Remove(name); err != nil {
+			if err := removeIncludeTemporary(
+				root,
+				name,
+				reader,
+				includeManifestTemporaryName(),
+			); err != nil {
 				return nil, fmt.Errorf(
 					"workspace: unlink include rule file: %w",
 					err,
@@ -816,7 +874,7 @@ func copyIncludedPathAfterCopy(
 		return fmt.Errorf("verify destination parent: %w", err)
 	}
 
-	temporaryName := "." + destinationName + ".include-" + uuid.NewString()
+	temporaryName := includedFileTemporaryName(destinationName)
 	output, err := destinationParent.OpenFile(
 		temporaryName,
 		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
@@ -830,10 +888,11 @@ func copyIncludedPathAfterCopy(
 		if temporaryName != "" {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(
+				removeIncludeTemporary(
 					destinationParent,
 					temporaryName,
 					output,
+					includedFileTemporaryName(destinationName),
 				),
 			)
 		}
