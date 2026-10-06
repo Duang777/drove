@@ -414,6 +414,9 @@ func TestReconcilePreparationWithIncompleteGitIdentityFailsClosed(
 func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 	t *testing.T,
 ) {
+	if runtime.GOOS != "linux" {
+		t.Skip("BSD registration rejects deterministic admin collisions")
+	}
 	repository := newTestRepository(t)
 	stalePath := filepath.Join(t.TempDir(), "-")
 	runGit(

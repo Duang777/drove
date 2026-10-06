@@ -19,6 +19,14 @@ func (m *Manager) removePreparedWorktreeAtRoot(
 			"workspace: prepared worktree identity is incomplete",
 		)
 	}
+	if err := cleanupPreparedWorktreeAddDebris(
+		ctx,
+		repository,
+		target,
+		record,
+	); err != nil {
+		return err
+	}
 	registered, exists, err := repository.worktreeRegistration(
 		ctx,
 		target.Path,

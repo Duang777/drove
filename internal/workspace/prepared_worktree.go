@@ -510,6 +510,16 @@ func (m *Manager) repairPreparedWorktreeRegistration(
 			"workspace: prepared private Git directory is unavailable",
 		)
 	}
+	handled, err := repairBoundPreparedWorktreeRegistration(
+		ctx,
+		target,
+		prepared,
+		repository,
+		stalePath,
+	)
+	if handled {
+		return err
+	}
 	gitRoot, err := openRealPathRoot(prepared.gitDirectory)
 	if err != nil {
 		return fmt.Errorf(

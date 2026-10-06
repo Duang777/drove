@@ -232,6 +232,9 @@ func TestPrepareRollsBackAfterUnlistedAdminDirectoryCollisions(
 }
 
 func TestPrepareRemovesPrecreatedTargetWhenWorktreeAddFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("BSD registration uses a separate common-root stage")
+	}
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
 	initSourceSwapRepository(t, source)
@@ -303,6 +306,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 }
 
 func TestPreparePreservesReplacedPrecreatedTarget(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("BSD registration does not run Git from the managed target")
+	}
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
 	initSourceSwapRepository(t, source)
@@ -470,6 +476,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 }
 
 func TestPreparePruneFailurePreservesRecoveryRecord(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("BSD promotion does not invoke git worktree repair")
+	}
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
 	initSourceSwapRepository(t, source)
@@ -2335,17 +2344,26 @@ worktree=
 add=
 no_checkout=
 checkout=
+target=
+next_target=
 for argument in "$@"; do
+  if [ -n "$next_target" ]; then
+    target=$argument
+    next_target=
+  fi
   [ "$argument" = "worktree" ] && worktree=1
   [ "$argument" = "add" ] && add=1
-  [ "$argument" = "--no-checkout" ] && no_checkout=1
+  if [ "$argument" = "--no-checkout" ]; then
+    no_checkout=1
+    next_target=1
+  fi
   [ "$argument" = "read-tree" ] && checkout=1
 done
 if [ -n "$worktree" ] && [ -n "$add" ] && [ -n "$no_checkout" ]; then
   "$DROVE_TEST_REAL_GIT" "$@"
   status=$?
   if [ "$status" -eq 0 ]; then
-    sed 's/^gitdir: //' .git > "$DROVE_TEST_GIT_PATH" || exit 90
+    sed 's/^gitdir: //' "$target/.git" > "$DROVE_TEST_GIT_PATH" || exit 90
   fi
   exit "$status"
 fi
@@ -2509,6 +2527,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 }
 
 func TestPrepareProtectsPromotedWorktreePointerDuringRepair(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("BSD promotion rewrites the bound private pointer directly")
+	}
 	parent := t.TempDir()
 	repository := filepath.Join(parent, "repository")
 	sibling := filepath.Join(parent, "sibling")

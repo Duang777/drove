@@ -220,7 +220,7 @@ func rootedPreparedWorktreeGitCommand(
 	repositoryRoot *os.Root,
 	commonPath string,
 	commonRoot *os.Root,
-	_ string,
+	worktreePath string,
 	worktreeRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
@@ -230,10 +230,33 @@ func rootedPreparedWorktreeGitCommand(
 			err,
 		)
 	}
-	directory, err := worktreeRoot.Open(".")
+	if err := verifyRealPathRoot(worktreePath, worktreeRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify prepared worktree target: %w",
+			err,
+		)
+	}
+	stageName, err := bsdPreparedWorktreeStageName(worktreePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := validateBSDPreparedWorktreeNamesAvailable(
+		commonRoot,
+		stageName,
+	); err != nil {
+		return nil, nil, err
+	}
+	if len(arguments) < 2 || arguments[len(arguments)-2] != "." {
+		return nil, nil, errors.New(
+			"workspace: prepared worktree command has an unexpected target",
+		)
+	}
+	arguments = append([]string(nil), arguments...)
+	arguments[len(arguments)-2] = "./" + stageName
+	directory, err := commonRoot.Open(".")
 	if err != nil {
 		return nil, nil, fmt.Errorf(
-			"workspace: open prepared worktree target: %w",
+			"workspace: open rooted common Git directory: %w",
 			err,
 		)
 	}
@@ -268,13 +291,14 @@ func rootedPreparedWorktreeGitCommand(
 	command.ExtraFiles = []*os.File{directory}
 	command.Env = boundGitEnvironment(
 		command.Environ(),
-		commonPath,
-		repositoryPath,
+		".",
+		".",
 	)
 	cleanup := func() error {
 		return errors.Join(
 			verifyRealPathRoot(repositoryPath, repositoryRoot),
 			verifyRealPathRoot(commonPath, commonRoot),
+			verifyRealPathRoot(worktreePath, worktreeRoot),
 			commonGuard.Close(),
 			directory.Close(),
 		)

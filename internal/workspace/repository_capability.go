@@ -211,12 +211,24 @@ func (r repositoryCapability) addPreparedWorktree(
 		return nil, err
 	}
 	output, commandErr := runGitCommand(command, "")
+	finalizeErr := finalizePreparedWorktreeAdd(
+		ctx,
+		r,
+		path,
+		root,
+		commandErr == nil,
+	)
 	verifyErr := errors.Join(
 		r.verifyBinding(ctx),
 		verifyRealPathRoot(path, root),
 		verifyBranch(),
 	)
-	return output, errors.Join(commandErr, verifyErr, cleanup())
+	return output, errors.Join(
+		commandErr,
+		finalizeErr,
+		verifyErr,
+		cleanup(),
+	)
 }
 
 func (r repositoryCapability) runPrivateGit(
