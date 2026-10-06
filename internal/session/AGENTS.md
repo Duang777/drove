@@ -77,6 +77,11 @@
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - PTY 进程组清理失败优先于自然成功或主动停止原因，必须持久化 error 并进入
   `stopped`，不得把仍有不可控后代的会话记录为 `done`。
+- PTY 进程组清理失败还必须把 leader PID 作为 typed
+  `session_lifecycle(process_group_cleanup_failed)` 与退出终态同批持久化。运行时和恢复
+  投影据此关闭 `Status.Resumable`、手动/启动恢复及 workspace cleanup；操作前只有
+  `internal/pty` 以 signal 0 明确确认进程组不存在，才能先持久化
+  `process_group_cleanup_completed` 再解除门禁。
 - `Close()`：拒绝新 Start → 等待进行中的 Start 和 workspace cleanup → 关闭全部 PTY 并等待回调 →
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
 - Manager 把同一 `terminationGrace` 传给新建和恢复的 PTY；关闭顺序仍按 Agent ID

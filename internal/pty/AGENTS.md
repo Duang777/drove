@@ -29,6 +29,8 @@
   完整的 termination grace。
 - 进程退出回调通过 `ExitInfo.CleanupErr` 暴露进程组清理失败；直接子进程退出成功
   不得掩盖仍存活但当前用户无权终止的后代。
+- `ProcessGroupAlive` 是 session 层解除持久化 cleanup fence 的唯一探测入口；只有
+  signal 0 返回 `ESRCH` 才报告不存在，`EPERM` 仍报告存活。
 - PTY master 只在直接子进程已回收后关闭；`Close` 幂等，并等待读取、进程退出和
   全部回调及 writer 完成。健康的自然退出先排空读取再关闭 master；进程组清理失败时
   先关闭 master 打断继承 slave 的不可清理后代，再等待读取结束。两条路径共享唯一的

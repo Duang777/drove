@@ -14,6 +14,9 @@ type managedAgent struct {
 
 	workspaceMu sync.RWMutex
 	workspace   workspaceRuntimeState
+
+	processGroupMu      sync.Mutex
+	processGroupCleanup processGroupCleanupState
 }
 
 type workspaceRuntimeState struct {
@@ -21,6 +24,11 @@ type workspaceRuntimeState struct {
 	resumeOnStart  bool
 	removalPending bool
 	removed        bool
+}
+
+type processGroupCleanupState struct {
+	pending bool
+	pid     int
 }
 
 func newManagedAgent(target *agent.Agent) *managedAgent {
@@ -78,6 +86,13 @@ func (m *managedAgent) applyWorkspaceRemoved() {
 }
 
 func (m *managedAgent) shouldResumeOnStart() bool {
+	if m.processGroupCleanupPending() {
+		return false
+	}
+	return m.hasResumeOnStart()
+}
+
+func (m *managedAgent) hasResumeOnStart() bool {
 	m.workspaceMu.RLock()
 	defer m.workspaceMu.RUnlock()
 	return m.workspace.resumeOnStart &&
@@ -89,4 +104,19 @@ func (m *managedAgent) consumeResumeOnStart() {
 	m.workspaceMu.Lock()
 	m.workspace.resumeOnStart = false
 	m.workspaceMu.Unlock()
+}
+
+func (m *managedAgent) setProcessGroupCleanupPending(pid int) {
+	m.processGroupMu.Lock()
+	m.processGroupCleanup = processGroupCleanupState{
+		pending: true,
+		pid:     pid,
+	}
+	m.processGroupMu.Unlock()
+}
+
+func (m *managedAgent) processGroupCleanupPending() bool {
+	m.processGroupMu.Lock()
+	defer m.processGroupMu.Unlock()
+	return m.processGroupCleanup.pending
 }

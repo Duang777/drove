@@ -322,6 +322,93 @@ func TestRecoveryProjectorRestoresLatestVendorSessionReference(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorRestoresProcessGroupCleanupFence(t *testing.T) {
+	base := time.Date(2026, time.October, 6, 15, 0, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "starting",
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "starting",
+			To:        "working",
+		},
+		{
+			Seq:       4,
+			Timestamp: base.Add(3 * time.Second),
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    processGroupCleanupFailed,
+			Payload:   `{"version":1,"pid":4242}`,
+		},
+		{
+			Seq:       5,
+			Timestamp: base.Add(4 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "working",
+			To:        "stopped",
+		},
+	}
+	project := func(t *testing.T, rows []store.EventRow) recoveryPlan {
+		t.Helper()
+		projector := newRecoveryProjector()
+		for _, row := range rows {
+			if err := projector.Apply(row); err != nil {
+				t.Fatalf("apply seq %d: %v", row.Seq, err)
+			}
+		}
+		plan, err := projector.Finish(base.Add(time.Hour))
+		if err != nil {
+			t.Fatalf("finish projection: %v", err)
+		}
+		return plan
+	}
+
+	pending := project(t, rows)
+	if got := pending.ProcessGroupCleanup["agent-1"]; got != 4242 {
+		t.Fatalf("restored process group PID = %d, want 4242", got)
+	}
+
+	rows = append(rows, store.EventRow{
+		Seq:       6,
+		Timestamp: base.Add(5 * time.Second),
+		Type:      string(event.TypeSessionLifecycle),
+		SessionID: "agent-1",
+		AgentID:   "agent-1",
+		Reason:    processGroupCleanupCompleted,
+		Payload:   `{"version":1,"pid":4242}`,
+	})
+	completed := project(t, rows)
+	if _, exists := completed.ProcessGroupCleanup["agent-1"]; exists {
+		t.Fatalf(
+			"completed process group cleanup remained pending: %+v",
+			completed.ProcessGroupCleanup,
+		)
+	}
+}
+
 func TestRecoveryProjectorPreservesResumeAfterPersistedRestartStop(
 	t *testing.T,
 ) {
