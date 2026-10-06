@@ -92,6 +92,51 @@ func TestOpenTerminalUsesLocalUnixSocket(t *testing.T) {
 	}
 }
 
+func TestOpenTerminalCancellationInterruptsHelloRead(t *testing.T) {
+	upgraded := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		upgrader := websocket.Upgrader{
+			Subprotocols: []string{terminalProtocol},
+			CheckOrigin: func(*http.Request) bool {
+				return true
+			},
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		close(upgraded)
+		_, _, _ = conn.ReadMessage()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := New(strings.TrimPrefix(server.URL, "http://")).OpenTerminal(ctx)
+		result <- err
+	}()
+	select {
+	case <-upgraded:
+	case <-time.After(time.Second):
+		t.Fatal("terminal WebSocket did not upgrade")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("OpenTerminal error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OpenTerminal did not stop its hello read after cancellation")
+	}
+}
+
 func TestTerminalStreamCommandsAndApplyThenAdvance(t *testing.T) {
 	serverErrors := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

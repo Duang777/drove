@@ -3,7 +3,7 @@
 ## 职责
 
 **CLI 主程序入口**（daemon 客户端模式）。提供子命令（init / up / resume / ps /
-log / timeline / explain / attach / stop / worktree / token rotate / web / version），
+log / timeline / explain / attach / tui / stop / worktree / token rotate / web / version），
 所有会话操作都经
 `internal/client` 与常驻 daemon
 通信；daemon 未运行时自动拉起（docker 式体验）。
@@ -38,6 +38,8 @@ log / timeline / explain / attach / stop / worktree / token rotate / web / versi
 - `drove attach <id>` 把当前 TTY 交给 `internal/cliattach` 打开可写 v2 raw
   attachment；`--read-only` 改为用户只读 access。Cobra 不持有 raw mode、pump、
   signal 或 cleanup 逻辑。
+- `drove tui` 创建 daemon client 后调用 `internal/clitui.Run`。Cobra 不持有
+  Bubble Tea model、轮询、snapshot stream、按键处理或 attach 交接逻辑。
 - 每次命令经 DataDir 下的 Unix socket 调用 daemon，并从同一目录读取控制令牌后调用
   `client.EnsureDaemon`；仅 socket 不可达时后台拉起 `droved`，认证失败直接返回。
 - 根命令使用进程 interrupt context；所有 daemon 请求必须传递 `cmd.Context()`，

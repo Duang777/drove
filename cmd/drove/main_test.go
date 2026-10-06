@@ -519,6 +519,67 @@ func TestAttachCommandMapsAgentAndAccessToRunner(t *testing.T) {
 	}
 }
 
+func TestTUICommandIsRegisteredWithoutArguments(t *testing.T) {
+	command, _, err := newRootCmd().Find([]string{"tui"})
+	if err != nil {
+		t.Fatalf("find tui command: %v", err)
+	}
+	if command.Name() != "tui" {
+		t.Fatalf("command = %q, want tui", command.Name())
+	}
+
+	command = newTUICmdWith(
+		func(context.Context) (*client.Client, error) {
+			t.Fatal("client factory ran for invalid arguments")
+			return nil, nil
+		},
+		func(context.Context, *client.Client) error {
+			t.Fatal("runner ran for invalid arguments")
+			return nil
+		},
+	)
+	command.SetArgs([]string{"extra"})
+	err = command.Execute()
+	if err == nil {
+		t.Fatal("tui accepted a positional argument")
+	}
+	if got := commandExitCode(err); got != exitUsage {
+		t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+	}
+}
+
+func TestTUICommandDelegatesClientAndContext(t *testing.T) {
+	daemon := &client.Client{}
+	var (
+		factoryContext context.Context
+		runContext     context.Context
+		runClient      *client.Client
+	)
+	command := newTUICmdWith(
+		func(ctx context.Context) (*client.Client, error) {
+			factoryContext = ctx
+			return daemon, nil
+		},
+		func(ctx context.Context, gotClient *client.Client) error {
+			runContext = ctx
+			runClient = gotClient
+			return nil
+		},
+	)
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("test"), "tui")
+	command.SetContext(ctx)
+	if err := command.Execute(); err != nil {
+		t.Fatalf("execute tui: %v", err)
+	}
+	if factoryContext != ctx || runContext != ctx {
+		t.Fatal("tui command did not preserve its context")
+	}
+	if runClient != daemon {
+		t.Fatalf("runner client = %p, want %p", runClient, daemon)
+	}
+}
+
 func TestResumeCommandUsesEscapedAgentIDAndPrintsStatus(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "drove-resume-")
 	if err != nil {

@@ -7,13 +7,13 @@
 ## 包与依赖方向（禁止循环依赖）
 
 ```
-cmd/* ──▶ internal/client ──▶ internal/session
-                                  ├──▶ agent
-                                  ├──▶ event
-                                  ├──▶ store
-                                  ├──▶ pty
-                                  ├──▶ adapter ──▶ detect
-                                  └──▶ workspace
+cmd/* ──▶ internal/clitui ──▶ internal/client ──▶ internal/session
+                │                   │                  ├──▶ agent
+                └──▶ cliattach ─────┘                  ├──▶ event
+                                                       ├──▶ store
+                                                       ├──▶ pty
+                                                       ├──▶ adapter ──▶ detect
+                                                       └──▶ workspace
 ```
 
 - `session` 编排一切：agent + pty + adapter + detect + event + store + workspace。
@@ -22,6 +22,8 @@ cmd/* ──▶ internal/client ──▶ internal/session
   和 client 依赖。
 - `api` 只依赖 `session` 与 `event` 的公开接口。
 - `client` 只做 JSON 透传（HTTP 客户端），不解析领域类型。
+- `clitui` 只协调 client 公开能力与 `cliattach` 交接；fleet 状态来自
+  `session.Status`，只有选中会话持有 snapshot stream。
 - `adapter` 依赖 `detect` 的标准信号类型和 `agent` 的运行模式；`detect` 只依赖
   `agent` 快照与 Change。其余叶子包不得反向依赖 `session`。
 - `term` 负责无厂商逻辑的流式控制序列清洗、屏幕仿真和有界终端查询应答，

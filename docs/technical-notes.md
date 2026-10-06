@@ -848,3 +848,56 @@ PTY 启动的直接子进程是独立 session 和进程组 leader。主动关闭
 默认宽限是 5 秒。Manager 保留按 Agent ID 串行关闭，避免改变既有持久化顺序。
 `scripts/verify-issue16.sh` 重复运行聚焦 race 测试，并执行全量 race、vet、Go
 构建、Web 类型检查、Web 构建和 diff whitespace 检查。
+
+## 14. Bubble Tea 多会话终端总览
+
+Issue #41 增加了 `drove tui`。Cobra 只创建已认证的 daemon client 并调用
+`internal/clitui.Run`。Bubble Tea model、状态投影、snapshot 生命周期、按键操作和
+attach 交接都留在 `internal/clitui`。
+
+### 状态与 preview 所有权
+
+总览启动后立即调用一次 `client.List`，之后每 500 ms 刷新完整会话列表。任何时刻
+最多有一个 List 请求；请求进行期间收到的刷新信号会合并成一个 trailing refresh。
+失败的刷新保留上一次成功列表。列表只从 `session.Status` 投影，不从终端文本或原始
+事件 payload 推断状态。
+
+Blocked 会话形成稳定前缀，其余会话保持 daemon 顺序。选择同时记录 Agent ID 和
+回退索引，因此刷新重排时仍跟随同一个 Agent，Agent 消失时才选择邻近行。
+
+preview actor 只为选中的 Agent 打开 snapshot stream。目标 channel 和事件 channel
+容量都是 1，新值替换未消费旧值。每个 generation 只有一个 `Next` 调用者；切换选择
+时先取消并等待旧 worker，再打开新 stream。重连等待依次是 250 ms、500 ms、1 秒和
+最多 2 秒。snapshot 是有界、live-only 的显示数据，不进入 SQLite，也不能作为精确
+回放起点。
+
+### 交互与终端交接
+
+列表支持八种状态过滤器。`a` 进入 writable attach，`r` 进入 read-only attach；
+两者都通过 `tea.Exec` 暂停 Bubble Tea，再调用 `cliattach.Run`。raw mode、stdin 和
+stdout pump、SIGWINCH、resize、Ctrl-Q 及 attach 清理由 `internal/cliattach`
+继续独占。Ctrl-Q 返回总览后保留原 Agent ID，立即刷新列表并替换 preview
+generation。
+
+`s` 发送编辑器内容并精确追加一个换行，`x` 只在 `y` 确认后停止会话，`e` 使用
+Bubbles viewport 显示类型化 explain。`q` 和 Ctrl-C 只退出本地总览，不调用
+`client.Stop`，远端 Agent 继续运行。
+
+`Run` 为一次 TUI 创建私有 context。用户退出或父 context 取消时，它先取消未完成的
+轮询、操作和重连，再关闭 preview actor 并等待当前 worker。生产模式使用 Bubble Tea
+默认的 stdin 和 stdout，并启用 alternate screen。
+
+### 自动验收
+
+自动测试覆盖以下行为：
+
+- 第二次 500 ms 刷新后的 10 个变更会话在一秒期限内完成渲染。
+- writable 和 read-only attach 返回后都保留原选择。
+- 连续 resize 不创建 preview worker；连续切换选择时，每个旧 worker 都在新 worker
+  启动前退出。
+- 退出不调用 Stop。
+- 真实 pseudo-terminal 连续经过两次 `tea.Exec` 交接，最终终端状态与启动前逐字段
+  相同。
+
+`go test ./internal/clitui ./cmd/drove -race -count=20`、串行全仓库 race、
+`go vet ./...` 和 `make build` 均通过。

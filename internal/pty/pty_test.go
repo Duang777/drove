@@ -177,6 +177,51 @@ func TestNormalizeTerminationGrace(t *testing.T) {
 	}
 }
 
+func TestProcessGroupAliveTreatsPermissionDeniedAsAlive(t *testing.T) {
+	alive, err := processGroupAliveWith(
+		func(pid int, signal syscall.Signal) error {
+			if pid != 42 || signal != 0 {
+				t.Fatalf("signal process group = (%d, %d), want (42, 0)", pid, signal)
+			}
+			return syscall.EPERM
+		},
+		42,
+	)
+	if err != nil {
+		t.Fatalf("inspect process group: %v", err)
+	}
+	if !alive {
+		t.Fatal("permission-denied process group reported as exited")
+	}
+}
+
+func TestWaitForProcessGroupExitChecksAgainAtDeadline(t *testing.T) {
+	probes := 0
+	exited, err := waitForProcessGroupExit(
+		func(pid int, signal syscall.Signal) error {
+			if pid != 42 || signal != 0 {
+				t.Fatalf("signal process group = (%d, %d), want (42, 0)", pid, signal)
+			}
+			probes++
+			if probes == 1 {
+				return nil
+			}
+			return syscall.ESRCH
+		},
+		42,
+		time.Millisecond,
+	)
+	if err != nil {
+		t.Fatalf("wait for process group: %v", err)
+	}
+	if !exited {
+		t.Fatal("process group exit at deadline was not observed")
+	}
+	if probes != 2 {
+		t.Fatalf("process group probes = %d, want 2", probes)
+	}
+}
+
 func TestSessionChildObservesInitialSize(t *testing.T) {
 	stty, err := exec.LookPath("stty")
 	if err != nil {
@@ -477,6 +522,297 @@ func TestCloseKillsProcessGroupAfterGrace(t *testing.T) {
 	info := waitExit(t, exits)
 	if info.Err == nil || info.Code != -1 {
 		t.Fatalf("exit info = %+v, want forced signal exit", info)
+	}
+}
+
+func TestExitInfoOnlyReportsProcessGroupCleanupErrors(t *testing.T) {
+	outputs := make(chan []byte, 128)
+	exits := make(chan ExitInfo, 1)
+	sess, err := Start(Config{
+		Command:          os.Args[0],
+		Args:             ptyHelperArgs("cooperative"),
+		Env:              []string{"DROVE_PTY_HELPER=1"},
+		Size:             testSize(t),
+		TerminationGrace: 2 * time.Second,
+		OnOutput: func(chunk []byte, _ uint64) {
+			outputs <- append([]byte(nil), chunk...)
+		},
+		OnExit: func(info ExitInfo) {
+			exits <- info
+		},
+	})
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	waitForOutput(t, outputs, "ready")
+
+	closeErr := errors.New("unrelated close failure")
+	sess.mu.Lock()
+	sess.closeErr = closeErr
+	sess.mu.Unlock()
+
+	if err := sess.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("close error = %v, want unrelated close failure", err)
+	}
+	if info := waitExit(t, exits); info.CleanupErr != nil {
+		t.Fatalf(
+			"exit cleanup error = %v, want only process group failures",
+			info.CleanupErr,
+		)
+	}
+}
+
+func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
+	const grace = time.Millisecond
+	type signalCall struct {
+		pid    int
+		signal syscall.Signal
+	}
+	var signalsMu sync.Mutex
+	var calls []signalCall
+	exits := make(chan ExitInfo, 1)
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+			OnExit: func(info ExitInfo) {
+				exits <- info
+			},
+		},
+		func(pid int, signal syscall.Signal) error {
+			signalsMu.Lock()
+			calls = append(calls, signalCall{pid: pid, signal: signal})
+			signalsMu.Unlock()
+			return syscall.EPERM
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process exit")
+	}
+	closeErr := sess.Close()
+	if !errors.Is(closeErr, syscall.EPERM) {
+		t.Fatalf("close error = %v, want EPERM", closeErr)
+	}
+	exit := waitExit(t, exits)
+	if !errors.Is(exit.CleanupErr, syscall.EPERM) {
+		t.Fatalf("exit cleanup error = %v, want EPERM", exit.CleanupErr)
+	}
+	for _, message := range []string{
+		"pty: terminate process group",
+		"pty: kill process group",
+	} {
+		if !strings.Contains(closeErr.Error(), message) {
+			t.Fatalf("close error = %q, want %q", closeErr, message)
+		}
+	}
+
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	var inspected, terminated, killed bool
+	for _, call := range calls {
+		if call.pid <= 0 {
+			t.Fatalf("process group pid = %d, want positive", call.pid)
+		}
+		switch call.signal {
+		case 0:
+			inspected = true
+		case syscall.SIGTERM:
+			terminated = true
+		case syscall.SIGKILL:
+			killed = true
+		}
+	}
+	if !inspected || !terminated || !killed {
+		t.Fatalf(
+			"signals = %v, want probe, SIGTERM, and SIGKILL",
+			calls,
+		)
+	}
+}
+
+func TestCloseSuppressesTermPermissionErrorAfterProcessGroupExits(t *testing.T) {
+	const grace = time.Second
+	var signalsMu sync.Mutex
+	var signals []syscall.Signal
+	probes := 0
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+		},
+		func(_ int, signal syscall.Signal) error {
+			signalsMu.Lock()
+			defer signalsMu.Unlock()
+			signals = append(signals, signal)
+			if signal == 0 {
+				probes++
+				if probes > 1 {
+					return syscall.ESRCH
+				}
+			}
+			return syscall.EPERM
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process group exit")
+	}
+	if closeErr := sess.Close(); closeErr != nil {
+		t.Fatalf("close after process group exit: %v", closeErr)
+	}
+
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	for _, signal := range signals {
+		if signal == syscall.SIGKILL {
+			t.Fatalf("signals = %v, want no SIGKILL after ESRCH", signals)
+		}
+	}
+}
+
+func TestCloseSuppressesTermPermissionErrorWhenKillFindsExitedGroup(t *testing.T) {
+	const grace = time.Millisecond
+	var signalsMu sync.Mutex
+	var signals []syscall.Signal
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+		},
+		func(_ int, signal syscall.Signal) error {
+			signalsMu.Lock()
+			signals = append(signals, signal)
+			signalsMu.Unlock()
+			if signal == syscall.SIGKILL {
+				return syscall.ESRCH
+			}
+			return syscall.EPERM
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process group exit")
+	}
+	if closeErr := sess.Close(); closeErr != nil {
+		t.Fatalf("close after kill found exited group: %v", closeErr)
+	}
+
+	signalsMu.Lock()
+	defer signalsMu.Unlock()
+	if len(signals) == 0 || signals[len(signals)-1] != syscall.SIGKILL {
+		t.Fatalf("signals = %v, want final SIGKILL probe", signals)
+	}
+}
+
+func TestCloseSuppressesTermPermissionErrorAfterKillConfirmsExit(t *testing.T) {
+	const grace = time.Millisecond
+	killed := false
+	postKillProbes := 0
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+		},
+		func(_ int, signal syscall.Signal) error {
+			switch {
+			case signal == syscall.SIGKILL:
+				killed = true
+				return nil
+			case signal == 0 && killed:
+				postKillProbes++
+				if postKillProbes >= 3 {
+					return syscall.ESRCH
+				}
+				return nil
+			default:
+				return syscall.EPERM
+			}
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after confirmed process group exit")
+	}
+	if closeErr := sess.Close(); closeErr != nil {
+		t.Fatalf("close after confirmed process group exit: %v", closeErr)
+	}
+}
+
+func TestCloseReportsProcessGroupRemainingAfterAcceptedKill(t *testing.T) {
+	const grace = time.Millisecond
+	exits := make(chan ExitInfo, 1)
+
+	sess, err := startWithProcessGroupSignal(
+		Config{
+			Command:          "/bin/sh",
+			Args:             []string{"-c", "exit 0"},
+			Size:             testSize(t),
+			TerminationGrace: grace,
+			OnExit: func(info ExitInfo) {
+				exits <- info
+			},
+		},
+		func(_ int, _ syscall.Signal) error {
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("session did not finish after process group cleanup failure")
+	}
+	closeErr := sess.Close()
+	if closeErr == nil ||
+		!strings.Contains(closeErr.Error(), "remains after SIGKILL") {
+		t.Fatalf(
+			"close error = %v, want process group remains after SIGKILL",
+			closeErr,
+		)
+	}
+	exit := waitExit(t, exits)
+	if exit.CleanupErr == nil ||
+		!strings.Contains(exit.CleanupErr.Error(), "remains after SIGKILL") {
+		t.Fatalf(
+			"exit cleanup error = %v, want process group remains after SIGKILL",
+			exit.CleanupErr,
+		)
 	}
 }
 
