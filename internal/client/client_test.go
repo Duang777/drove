@@ -633,6 +633,9 @@ func TestFrameReturnsTypedOutputExpiry(t *testing.T) {
 	if !errors.As(err, &expired) {
 		t.Fatalf("frame error = %v, want OutputExpiredError", err)
 	}
+	if !IsUserError(err) {
+		t.Fatalf("frame expiry was not classified as a user error: %v", err)
+	}
 	if expired.SessionID != "agent-1" ||
 		len(expired.Missing) != 1 ||
 		expired.Missing[0] != (recording.OutputRange{Start: 3, End: 8}) {
