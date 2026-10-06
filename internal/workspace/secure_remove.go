@@ -285,19 +285,41 @@ func removalMarkerTemporaryPrefix(record workspaceRecord) string {
 	return removalMarkerName(record) + ".install-"
 }
 
+func removalMarkerTemporaryName(record workspaceRecord) string {
+	return removalMarkerTemporaryPrefix(record) + uuid.NewString()
+}
+
+func removalMarkerDiscardPrefix(record workspaceRecord) string {
+	return removalMarkerName(record) + ".discard-"
+}
+
+func removalMarkerDiscardName(record workspaceRecord) string {
+	return removalMarkerDiscardPrefix(record) + uuid.NewString()
+}
+
 func isRemovalMarkerTemporaryName(
 	record workspaceRecord,
 	name string,
 ) bool {
-	suffix, found := strings.CutPrefix(
+	return validRemovalMarkerArtifactName(
 		name,
 		removalMarkerTemporaryPrefix(record),
 	)
-	if !found {
-		return false
-	}
-	_, err := uuid.Parse(suffix)
-	return err == nil
+}
+
+func isRemovalMarkerDiscardName(
+	record workspaceRecord,
+	name string,
+) bool {
+	return validRemovalMarkerArtifactName(
+		name,
+		removalMarkerDiscardPrefix(record),
+	)
+}
+
+func validRemovalMarkerArtifactName(name string, prefix string) bool {
+	suffix, found := strings.CutPrefix(name, prefix)
+	return found && canonicalUUID(suffix)
 }
 
 func removalQuarantineIsolationName(name string) string {
@@ -312,6 +334,9 @@ func validateRemovalMarkerPhase(
 	root *os.Root,
 	record workspaceRecord,
 ) error {
+	if err := cleanupRemovalMarkerTemps(root, record); err != nil {
+		return err
+	}
 	if record.Removal != nil && record.Removal.ContentsCleared {
 		return validateClearedRemovalDirectory(root, record, false)
 	}
@@ -345,7 +370,7 @@ func ensureRemovalMarker(
 	if err := verifyRemovalMarker(root, record); err == nil {
 		return nil
 	}
-	if err := removeIncompleteRemovalMarker(root, name); err != nil {
+	if err := removeIncompleteRemovalMarker(root, name, record); err != nil {
 		return err
 	}
 	if err := installRemovalMarker(
@@ -377,7 +402,13 @@ func installRemovalMarker(
 		if cleanupOnFailure {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(root, temporaryName, file),
+				removeOwnedRecordPathIfSame(
+					root,
+					temporaryName,
+					file,
+					name+".install-"+uuid.NewString(),
+					nil,
+				),
 				syncRecordBucket(root, temporaryName),
 			)
 		}
@@ -425,13 +456,34 @@ func cleanupRemovalMarkerTemps(
 	root *os.Root,
 	record workspaceRecord,
 ) (result error) {
+	if record.Removal == nil ||
+		record.Removal.OperationID == "" ||
+		record.Removal.DirectoryToken == "" {
+		return errors.New(
+			"workspace: removal record has no marker identity",
+		)
+	}
 	entries, err := readRootDirectory(root)
 	if err != nil {
 		return fmt.Errorf("workspace: inspect removal marker staging files: %w", err)
 	}
 	removed := false
 	for _, entry := range entries {
-		if !isRemovalMarkerTemporaryName(record, entry.Name()) {
+		temporary := isRemovalMarkerTemporaryName(record, entry.Name())
+		discard := isRemovalMarkerDiscardName(record, entry.Name())
+		if !temporary && !discard {
+			if strings.HasPrefix(
+				entry.Name(),
+				removalMarkerTemporaryPrefix(record),
+			) || strings.HasPrefix(
+				entry.Name(),
+				removalMarkerDiscardPrefix(record),
+			) {
+				return fmt.Errorf(
+					"workspace: removal marker artifact %q has an invalid name",
+					entry.Name(),
+				)
+			}
 			continue
 		}
 		info, err := root.Lstat(entry.Name())
@@ -461,7 +513,18 @@ func cleanupRemovalMarkerTemps(
 		}
 		removeErr := error(nil)
 		if statErr == nil {
-			removeErr = removeRecordPathIfSame(root, entry.Name(), file)
+			isolatedName := removalMarkerDiscardName(record)
+			if temporary {
+				isolatedName = removalMarkerTemporaryName(record)
+			}
+			removeErr = removeOwnedRecordPath(
+				root,
+				entry.Name(),
+				file,
+				isolatedName,
+				nil,
+				nil,
+			)
 		}
 		closeErr := file.Close()
 		if err := errors.Join(statErr, removeErr, closeErr); err != nil {
@@ -478,6 +541,7 @@ func cleanupRemovalMarkerTemps(
 func removeIncompleteRemovalMarker(
 	root *os.Root,
 	name string,
+	record workspaceRecord,
 ) (result error) {
 	info, err := root.Lstat(name)
 	if err != nil {
@@ -502,10 +566,17 @@ func removeIncompleteRemovalMarker(
 			"workspace: incomplete removal marker changed while opening",
 		)
 	}
-	if err := removeRecordPathIfSame(root, name, file); err != nil {
+	if err := removeOwnedRecordPath(
+		root,
+		name,
+		file,
+		removalMarkerDiscardName(record),
+		nil,
+		nil,
+	); err != nil {
 		return fmt.Errorf("workspace: remove incomplete removal marker: %w", err)
 	}
-	return syncRecordBucket(root, name)
+	return nil
 }
 
 func verifyRemovalMarker(
@@ -538,12 +609,8 @@ func verifyRemovalMarker(
 	if !os.SameFile(info, opened) {
 		return errors.New("workspace: removal marker changed while opening")
 	}
-	raw, err := io.ReadAll(io.LimitReader(file, 128))
-	if err != nil {
-		return fmt.Errorf("workspace: read removal marker: %w", err)
-	}
-	if string(raw) != record.Removal.DirectoryToken+"\n" {
-		return errors.New("workspace: removal marker token mismatch")
+	if err := validateRemovalMarkerFile(file, record); err != nil {
+		return err
 	}
 	current, err := root.Lstat(name)
 	if err != nil {
@@ -555,10 +622,33 @@ func verifyRemovalMarker(
 	return nil
 }
 
+func validateRemovalMarkerFile(
+	file *os.File,
+	record workspaceRecord,
+) error {
+	if record.Removal == nil || record.Removal.DirectoryToken == "" {
+		return errors.New("workspace: removal record has no directory token")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("workspace: rewind removal marker: %w", err)
+	}
+	raw, err := io.ReadAll(io.LimitReader(file, 128))
+	if err != nil {
+		return fmt.Errorf("workspace: read removal marker: %w", err)
+	}
+	if string(raw) != record.Removal.DirectoryToken+"\n" {
+		return errors.New("workspace: removal marker token mismatch")
+	}
+	return nil
+}
+
 func removalDirectoryContainsOnlyMarker(
 	root *os.Root,
 	record workspaceRecord,
 ) (bool, error) {
+	if err := cleanupRemovalMarkerTemps(root, record); err != nil {
+		return false, err
+	}
 	entries, err := readRootDirectory(root)
 	if err != nil {
 		return false, err
@@ -632,35 +722,46 @@ func removeRootEntriesExcept(
 func removeRemovalMarkerIfPresent(
 	root *os.Root,
 	record workspaceRecord,
-) error {
+) (result error) {
+	if err := cleanupRemovalMarkerTemps(root, record); err != nil {
+		return err
+	}
 	name := removalMarkerName(record)
-	_, err := root.Lstat(name)
+	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("workspace: inspect removal marker: %w", err)
 	}
-	if err := verifyRemovalMarker(root, record); err != nil {
-		return err
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("workspace: removal marker is not a regular file")
 	}
-	if err := root.Remove(name); err != nil {
-		return fmt.Errorf("workspace: remove removal marker: %w", err)
-	}
-	directory, err := openRecordDirectory(root)
+	file, err := root.Open(name)
 	if err != nil {
-		return fmt.Errorf(
-			"workspace: open removal marker directory: %w",
-			err,
-		)
+		return fmt.Errorf("workspace: open removal marker: %w", err)
 	}
-	syncErr := syncRecordDirectory(directory)
-	closeErr := directory.Close()
-	if err := errors.Join(syncErr, closeErr); err != nil {
-		return fmt.Errorf(
-			"workspace: sync removal marker deletion: %w",
-			err,
-		)
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("workspace: inspect opened removal marker: %w", err)
+	}
+	if !os.SameFile(info, opened) {
+		return errors.New("workspace: removal marker changed while opening")
+	}
+	if err := removeOwnedRecordPath(
+		root,
+		name,
+		file,
+		removalMarkerDiscardName(record),
+		func(candidate *os.File) error {
+			return validateRemovalMarkerFile(candidate, record)
+		},
+		nil,
+	); err != nil {
+		return fmt.Errorf("workspace: remove removal marker: %w", err)
 	}
 	return nil
 }
