@@ -451,6 +451,39 @@ func TestWriteResumeErrorMapsUnavailableHookAuthority(t *testing.T) {
 	}
 }
 
+func TestWriteStopErrorMapsOnlyUnknownAgentToNotFound(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{
+			name:       "unknown agent",
+			err:        fmt.Errorf("wrapped: %w", session.ErrUnknownAgent),
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "runtime failure",
+			err:        errors.New("close PTY"),
+			wantStatus: http.StatusInternalServerError,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			writeStopError(response, test.err)
+			if response.Code != test.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d; body=%s",
+					response.Code,
+					test.wantStatus,
+					response.Body.String(),
+				)
+			}
+		})
+	}
+}
+
 func TestHandleExplainReturnsAttachedTypedResponse(t *testing.T) {
 	server, manager, _ := newTestServer(t)
 	status, err := manager.Start(context.Background(), session.StartRequest{

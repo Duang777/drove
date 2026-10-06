@@ -412,8 +412,8 @@ func TestStopRestoredStoppedAgentIsIdempotent(t *testing.T) {
 	if err := result.Manager.Stop("agent-1"); err != nil {
 		t.Fatalf("stop restored agent: %v", err)
 	}
-	if err := result.Manager.Stop("missing"); err == nil {
-		t.Fatal("stop unknown agent succeeded")
+	if err := result.Manager.Stop("missing"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("stop unknown agent error = %v, want ErrUnknownAgent", err)
 	}
 	if _, err := result.Manager.SendInput("agent-1", []byte("input")); !errors.Is(err, ErrNotAttached) {
 		t.Fatalf("send input to restored agent error = %v, want ErrNotAttached", err)

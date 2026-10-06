@@ -1001,7 +1001,7 @@ func (m *Manager) Close() error {
 func (m *Manager) Stop(id agent.ID) error {
 	a, ok := m.agent(id)
 	if !ok {
-		return fmt.Errorf("session: unknown agent %q", id)
+		return fmt.Errorf("%w: %q", ErrUnknownAgent, id)
 	}
 
 	m.mu.RLock()
