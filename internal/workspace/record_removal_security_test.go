@@ -1,8 +1,11 @@
 package workspace
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -112,4 +115,71 @@ func TestRemoveWorkspaceRecordPreservesReplacementAfterValidation(t *testing.T) 
 	if string(gotOriginal) != string(original) {
 		t.Fatal("original sidecar changed")
 	}
+}
+
+func TestAcknowledgedRecordRemovalPreservesQuarantineReplacement(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+
+	recordPath := workspaceRecordPath(prepared.Path)
+	recordContents, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("read removal record: %v", err)
+	}
+	prefix := recordAcknowledgementPrefix(
+		prepared.AgentID,
+		result.Removal.operationID,
+	)
+	var quarantinePath, originalPath string
+	err = manager.removeAcknowledgedWorkspaceRecordAfterQuarantine(
+		result.Removal,
+		func() error {
+			entries, err := os.ReadDir(filepath.Dir(recordPath))
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), prefix) {
+					quarantinePath = filepath.Join(
+						filepath.Dir(recordPath),
+						entry.Name(),
+					)
+					break
+				}
+			}
+			if quarantinePath == "" {
+				return errors.New("acknowledgement quarantine is missing")
+			}
+			originalPath = quarantinePath + ".original"
+			if err := os.Rename(quarantinePath, originalPath); err != nil {
+				return err
+			}
+			return os.WriteFile(quarantinePath, recordContents, 0o600)
+		},
+	)
+	if err == nil {
+		t.Fatal("acknowledgement removed a replacement quarantine")
+	}
+	assertFileContents(t, originalPath, string(recordContents))
+	assertFileContents(t, quarantinePath, string(recordContents))
 }

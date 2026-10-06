@@ -987,11 +987,8 @@ func (m *Manager) removeAcknowledgedWorkspaceRecordWithHooks(
 	if err != nil {
 		return fmt.Errorf("workspace: open removal record %q: %w", recordPath, err)
 	}
-	fileOpen := true
 	defer func() {
-		if fileOpen {
-			result = errors.Join(result, file.Close())
-		}
+		result = errors.Join(result, file.Close())
 	}()
 	opened, err := m.verifyRemovalRecordFile(
 		file,
@@ -1058,14 +1055,6 @@ func (m *Manager) removeAcknowledgedWorkspaceRecordWithHooks(
 			restoreErr,
 		)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf(
-			"workspace: close quarantined removal record %q: %w",
-			recordPath,
-			err,
-		)
-	}
-	fileOpen = false
 	if afterQuarantine != nil {
 		if err := afterQuarantine(); err != nil {
 			return fmt.Errorf(
@@ -1074,11 +1063,12 @@ func (m *Manager) removeAcknowledgedWorkspaceRecordWithHooks(
 			)
 		}
 	}
-	return m.removeRecordAcknowledgementQuarantine(
+	return m.removeRecordAcknowledgementQuarantineWithFile(
 		bucket,
 		quarantineName,
 		recordPath,
 		removal,
+		file,
 	)
 }
 
@@ -1468,6 +1458,22 @@ func (m *Manager) removeRecordAcknowledgementQuarantine(
 	defer func() {
 		result = errors.Join(result, file.Close())
 	}()
+	return m.removeRecordAcknowledgementQuarantineWithFile(
+		bucket,
+		name,
+		recordPath,
+		removal,
+		file,
+	)
+}
+
+func (m *Manager) removeRecordAcknowledgementQuarantineWithFile(
+	bucket *os.Root,
+	name string,
+	recordPath string,
+	removal Removal,
+	file *os.File,
+) error {
 	deleteName := recordAcknowledgementPrefix(
 		removal.Workspace.AgentID,
 		removal.operationID,
