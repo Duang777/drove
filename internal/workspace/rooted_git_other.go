@@ -16,7 +16,6 @@ func rootedGitCommand(
 	_ *os.Root,
 	_ string,
 	_ *os.Root,
-	_ *os.Root,
 	_ []string,
 ) (*exec.Cmd, func() error, error) {
 	return nil, nil, errors.New(
@@ -63,6 +62,7 @@ func rootedPreparedWorktreeGitCommand(
 	_ string,
 	_ *os.Root,
 	_ string,
+	_ *os.Root,
 	_ *os.Root,
 	_ []string,
 ) (*exec.Cmd, func() error, error) {
