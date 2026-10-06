@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -31,6 +33,29 @@ import (
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/workspace"
 )
+
+func TestRootContextCancelsOnSIGTERM(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not deliver POSIX SIGTERM")
+	}
+	ctx, stop := newRootContext()
+	defer stop()
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("find test process: %v", err)
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("root context error = %v, want context canceled", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SIGTERM did not cancel the root context")
+	}
+}
 
 func TestSessionStartRequestMapsRunMode(t *testing.T) {
 	tests := []struct {

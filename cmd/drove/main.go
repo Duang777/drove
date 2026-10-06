@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -59,7 +60,7 @@ func main() {
 	// CLI 静默日志，避免污染输出。
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := newRootContext()
 	defer stop()
 	root := newRootCmd()
 	root.SetContext(ctx)
@@ -67,6 +68,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "drove:", err)
 		os.Exit(commandExitCode(err))
 	}
+}
+
+func newRootContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 }
 
 func executeRoot(root *cobra.Command, args []string) error {
