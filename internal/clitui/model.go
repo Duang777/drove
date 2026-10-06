@@ -500,6 +500,10 @@ func filterProjectedFleet(rows []fleetRow, filter fleetFilter) []fleetRow {
 }
 
 func (m *model) replacePreview(agentID string) {
+	row, selected := m.selectedRow()
+	if !selected || row.AgentID != agentID || row.PID <= 0 {
+		agentID = ""
+	}
 	m.previewTarget.Generation++
 	m.previewTarget.AgentID = agentID
 	m.previewSnapshot = nil
