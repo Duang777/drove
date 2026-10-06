@@ -1652,6 +1652,70 @@ func TestPrepareSkipsIncludeTrackedByTargetBranch(t *testing.T) {
 	}
 }
 
+func TestPrepareSkipsCaseAliasTrackedByTargetBranch(t *testing.T) {
+	repository := newTestRepository(t)
+	runGit(t, repository, "config", "core.ignoreCase", "true")
+	if err := os.WriteFile(
+		filepath.Join(repository, "Secret.local"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write tracked target file: %v", err)
+	}
+	runGit(t, repository, "add", "Secret.local")
+	runGit(t, repository, "commit", "-m", "track target local file")
+	runGit(t, repository, "branch", "target-with-case-alias")
+	runGit(t, repository, "rm", "Secret.local")
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local files on source")
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte("secret.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, "secret.local"),
+		[]byte("source local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source local file: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"target-with-case-alias",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare target branch: %v", err)
+	}
+	assertFileContents(t, filepath.Join(prepared.Path, "Secret.local"), "tracked\n")
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if len(record.IncludedPaths) != 0 {
+		t.Fatalf("protected include paths = %q, want none", record.IncludedPaths)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard target branch worktree: %v", err)
+	}
+}
+
 func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {
 	repository := newTestRepository(t)
 	source := filepath.Join(t.TempDir(), "source-worktree")

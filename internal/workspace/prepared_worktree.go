@@ -338,11 +338,12 @@ func (m *Manager) initializePreparedWorktree(
 		)
 	}
 	if len(includedPaths) > 0 {
-		target.trackedPaths, err = m.worktreeTrackedPaths(
-			ctx,
-			prepared.path,
-			privateRepository,
-		)
+		target.trackedPaths, target.trackedIgnoreCase, err =
+			m.worktreeTrackedPaths(
+				ctx,
+				prepared.path,
+				privateRepository,
+			)
 		if err != nil {
 			return err
 		}

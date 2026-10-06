@@ -55,6 +55,7 @@ type Workspace struct {
 	protectionKnown    bool
 	includedPaths      []string
 	trackedPaths       map[string]struct{}
+	trackedIgnoreCase  bool
 	preparation        *preparationLease
 	repositoryEvidence *repositoryEvidence
 }
@@ -458,6 +459,7 @@ func (m *Manager) prepare(
 		includeSelection,
 	)
 	result.trackedPaths = nil
+	result.trackedIgnoreCase = false
 	if err != nil {
 		return Workspace{}, err
 	}

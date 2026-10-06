@@ -10,12 +10,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -129,7 +132,8 @@ func (m *Manager) copyIncludedFiles(
 	}
 	copiedPaths := make([]string, 0, len(paths))
 	for _, relative := range paths {
-		if _, tracked := target.trackedPaths[filepath.ToSlash(relative)]; tracked {
+		key := trackedPathKey(relative, target.trackedIgnoreCase)
+		if _, tracked := target.trackedPaths[key]; tracked {
 			continue
 		}
 		if err := copyIncludedPath(
@@ -176,7 +180,11 @@ func (m *Manager) worktreeTrackedPaths(
 	ctx context.Context,
 	path string,
 	repository repositoryCapability,
-) (map[string]struct{}, error) {
+) (map[string]struct{}, bool, error) {
+	ignoreCase, err := repositoryIgnoreCase(ctx, path, repository)
+	if err != nil {
+		return nil, false, err
+	}
 	output, err := repository.runPrivateGitAt(
 		ctx,
 		path,
@@ -188,7 +196,7 @@ func (m *Manager) worktreeTrackedPaths(
 		"-z",
 	)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, false, fmt.Errorf(
 			"workspace: inspect target tracked paths: %w",
 			err,
 		)
@@ -196,10 +204,56 @@ func (m *Manager) worktreeTrackedPaths(
 	tracked := make(map[string]struct{})
 	for _, rawPath := range strings.Split(string(output), "\x00") {
 		if rawPath != "" {
-			tracked[rawPath] = struct{}{}
+			tracked[trackedPathKey(rawPath, ignoreCase)] = struct{}{}
 		}
 	}
-	return tracked, nil
+	return tracked, ignoreCase, nil
+}
+
+func repositoryIgnoreCase(
+	ctx context.Context,
+	path string,
+	repository repositoryCapability,
+) (bool, error) {
+	output, err := repository.runPrivateGitAt(
+		ctx,
+		path,
+		"",
+		"config",
+		"--type=bool",
+		"--get",
+		"core.ignoreCase",
+	)
+	if isExitCode(err, 1) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: inspect repository path case setting: %w",
+			err,
+		)
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New(
+			"workspace: repository path case setting is invalid",
+		)
+	}
+}
+
+func trackedPathKey(path string, ignoreCase bool) string {
+	key := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	if ignoreCase || runtime.GOOS == "windows" {
+		key = cases.Fold().String(key)
+	}
+	if runtime.GOOS == "darwin" {
+		key = norm.NFD.String(key)
+	}
+	return key
 }
 
 func (m *Manager) includedPaths(
