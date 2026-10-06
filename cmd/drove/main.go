@@ -80,13 +80,14 @@ func executeRoot(root *cobra.Command, args []string) error {
 		if err != nil {
 			return markUsageError(err)
 		}
+		afterTerminator := len(remaining) > 0 && remaining[0] == "--"
 		if len(remaining) > 0 && remaining[0] == "--" {
 			remaining = remaining[1:]
 		}
 		if command.HasSubCommands() &&
 			!command.Runnable() &&
 			len(remaining) > 0 &&
-			!strings.HasPrefix(remaining[0], "-") {
+			(afterTerminator || !strings.HasPrefix(remaining[0], "-")) {
 			return markUsageError(fmt.Errorf(
 				"unknown command %q for %q",
 				remaining[0],
@@ -224,6 +225,7 @@ func newInitCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
 		Short: "初始化配置与数据目录",
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg := config.Defaults()
 			path := config.DefaultPath()
@@ -309,6 +311,7 @@ func newPSCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ps",
 		Short: "列出全部 Agent 会话",
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			c, err := newClient(ctx)
@@ -1179,6 +1182,7 @@ func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "输出版本信息",
+		Args:  usageArgs(cobra.NoArgs),
 		Run: func(_ *cobra.Command, _ []string) {
 			fmt.Printf("drove %s (commit=%s, built=%s)\n", version.Version, version.Commit, version.Date)
 		},

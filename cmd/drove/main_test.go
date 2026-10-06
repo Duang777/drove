@@ -16,6 +16,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/spf13/cobra"
+
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/cliattach"
@@ -269,12 +271,38 @@ func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
 		{"worktree", "unknown"},
 		{"--", "unknown"},
 		{"worktree", "--", "unknown"},
+		{"--", "--bogus"},
+		{"worktree", "--", "--bogus"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, "/"), func(t *testing.T) {
 			err := executeRoot(newRootCmd(), args)
 			if err == nil || !strings.Contains(err.Error(), "unknown command") {
 				t.Fatalf("execute %v error = %v", args, err)
+			}
+			if got := commandExitCode(err); got != exitUsage {
+				t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+			}
+		})
+	}
+}
+
+func TestZeroArgumentCommandsRejectArguments(t *testing.T) {
+	for _, command := range []*cobra.Command{
+		newInitCmd(),
+		newPSCmd(),
+		newVersionCmd(),
+	} {
+		t.Run(command.Name(), func(t *testing.T) {
+			if command.Args == nil {
+				t.Fatal("argument validator is nil")
+			}
+			if err := command.Args(command, nil); err != nil {
+				t.Fatalf("validate no arguments: %v", err)
+			}
+			err := command.Args(command, []string{"unexpected"})
+			if err == nil {
+				t.Fatal("accepted an unexpected argument")
 			}
 			if got := commandExitCode(err); got != exitUsage {
 				t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
