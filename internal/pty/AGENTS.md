@@ -30,8 +30,9 @@
 - 进程退出回调通过 `ExitInfo.CleanupErr` 暴露进程组清理失败；直接子进程退出成功
   不得掩盖仍存活但当前用户无权终止的后代。
 - PTY master 只在直接子进程已回收后关闭；`Close` 幂等，并等待读取、进程退出和
-  全部回调及 writer 完成。自然退出仍在读取结束后关闭 master，并与主动关闭共享
-  唯一的 master close。
+  全部回调及 writer 完成。健康的自然退出先排空读取再关闭 master；进程组清理失败时
+  先关闭 master 打断继承 slave 的不可清理后代，再等待读取结束。两条路径共享唯一的
+  master close。
 - 进程退出码经 `WaitCh` 返回，供状态机迁移到 `Stopped`/`Done`。
 
 ## 约束

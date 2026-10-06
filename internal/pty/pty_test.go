@@ -639,6 +639,100 @@ func TestCloseReportsInaccessibleProcessGroup(t *testing.T) {
 	}
 }
 
+func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
+	const grace = time.Millisecond
+	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
+	childReadyPath := filepath.Join(t.TempDir(), "child.ready")
+	exits := make(chan ExitInfo, 1)
+
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create inherited output pipe: %v", err)
+	}
+	command := exec.Command(
+		os.Args[0],
+		ptyHelperArgs(
+			"natural-group-leader",
+			childPIDPath,
+			childReadyPath,
+		)...,
+	)
+	command.Env = append(os.Environ(), "DROVE_PTY_HELPER=1")
+	command.Stdout = writer
+	command.Stderr = writer
+	if err := command.Start(); err != nil {
+		_ = reader.Close()
+		_ = writer.Close()
+		t.Fatalf("start process helper: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		_ = command.Process.Kill()
+		_ = reader.Close()
+		t.Fatalf("close parent output writer: %v", err)
+	}
+
+	sess := &Session{
+		cmd:         command,
+		ptmx:        reader,
+		grace:       grace,
+		groupSignal: func(_ int, _ syscall.Signal) error { return syscall.EPERM },
+		onExit: func(info ExitInfo) {
+			exits <- info
+		},
+		readDone:      make(chan struct{}),
+		processExited: make(chan struct{}),
+		done:          make(chan struct{}),
+		WaitCh:        make(chan ExitInfo, 1),
+	}
+	go sess.readLoop()
+	go sess.waitLoop()
+
+	select {
+	case <-sess.processExited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("direct child did not exit")
+	}
+	rawPID, err := os.ReadFile(childPIDPath)
+	if err != nil {
+		t.Fatalf("read child pid: %v", err)
+	}
+	childPID, err := strconv.Atoi(string(rawPID))
+	if err != nil {
+		t.Fatalf("parse child pid %q: %v", rawPID, err)
+	}
+	childNeedsCleanup := true
+	t.Cleanup(func() {
+		if childNeedsCleanup {
+			_ = syscall.Kill(childPID, syscall.SIGKILL)
+		}
+	})
+
+	select {
+	case <-sess.done:
+	case <-time.After(2 * time.Second):
+		_ = syscall.Kill(childPID, syscall.SIGKILL)
+		childNeedsCleanup = false
+		<-sess.done
+		t.Fatal("session waited for an inaccessible descendant to close the PTY")
+	}
+	if err := syscall.Kill(childPID, 0); err != nil {
+		t.Fatalf("descendant exited before PTY cleanup completed: %v", err)
+	}
+	if closeErr := sess.Close(); !errors.Is(closeErr, syscall.EPERM) {
+		t.Fatalf("close error = %v, want EPERM", closeErr)
+	}
+	if exit := waitExit(t, exits); !errors.Is(exit.CleanupErr, syscall.EPERM) {
+		t.Fatalf("exit cleanup error = %v, want EPERM", exit.CleanupErr)
+	}
+
+	if err := syscall.Kill(childPID, syscall.SIGKILL); err != nil &&
+		!errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("kill descendant: %v", err)
+	}
+	childNeedsCleanup = false
+	waitForProcessNotRunning(t, childPID)
+}
+
 func TestCloseSuppressesTermPermissionErrorAfterProcessGroupExits(t *testing.T) {
 	const grace = time.Second
 	var signalsMu sync.Mutex

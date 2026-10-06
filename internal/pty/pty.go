@@ -286,6 +286,12 @@ func (s *Session) waitLoop() {
 	s.beginClose()
 	close(s.processExited)
 	s.closeProcessGroup()
+	s.mu.Lock()
+	info.CleanupErr = s.groupCloseErr
+	s.mu.Unlock()
+	if info.CleanupErr != nil {
+		s.closeMaster()
+	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -295,9 +301,6 @@ func (s *Session) waitLoop() {
 	} else {
 		info.Code = 0
 	}
-	s.mu.Lock()
-	info.CleanupErr = s.groupCloseErr
-	s.mu.Unlock()
 	if s.onExit != nil {
 		s.onExit(info)
 	}
