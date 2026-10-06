@@ -305,25 +305,3 @@ func rootedPreparedWorktreeGitCommand(
 	}
 	return command, cleanup, nil
 }
-
-func rootedRepairWorktreeGitCommand(
-	ctx context.Context,
-	git string,
-	worktreePath string,
-	_ *os.Root,
-	gitPath string,
-	gitRoot *os.Root,
-	commonPath string,
-	commonRoot *os.Root,
-) (*exec.Cmd, func() error, error) {
-	return rootedPrivateGitCommand(
-		ctx,
-		git,
-		worktreePath,
-		gitPath,
-		gitRoot,
-		commonPath,
-		commonRoot,
-		[]string{"worktree", "repair", worktreePath},
-	)
-}

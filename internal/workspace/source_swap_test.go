@@ -259,13 +259,26 @@ func TestPrepareRemovesPrecreatedTargetWhenWorktreeAddFails(t *testing.T) {
 	invoked := filepath.Join(parent, "worktree-add-invoked")
 	wrapper := filepath.Join(parent, "git-wrapper-add-failure")
 	script := `#!/bin/sh
+command_root=
+next_root=
 next_target=
 for argument in "$@"; do
+  if [ -n "$next_root" ]; then
+    command_root=$argument
+    next_root=
+    continue
+  fi
   if [ -n "$next_target" ]; then
     test -d "$argument" || exit 98
-    printf '%s' "$PWD" > "$DROVE_TEST_INVOKED"
+    if [ -n "$command_root" ]; then
+      target=$(CDPATH= cd -- "$command_root/$argument" && pwd -P) || exit 99
+    else
+      target=$(CDPATH= cd -- "$argument" && pwd -P) || exit 99
+    fi
+    printf '%s' "$target" > "$DROVE_TEST_INVOKED"
     exit 97
   fi
+  [ "$argument" = "-C" ] && next_root=1
   [ "$argument" = "--no-checkout" ] && next_target=1
 done
 exec "$DROVE_TEST_REAL_GIT" "$@"
@@ -332,13 +345,25 @@ func TestPreparePreservesReplacedPrecreatedTarget(t *testing.T) {
 	}
 	wrapper := filepath.Join(parent, "git-wrapper-target-swap")
 	script := `#!/bin/sh
+command_root=
+next_root=
 target=
 next_target=
 for argument in "$@"; do
+  if [ -n "$next_root" ]; then
+    command_root=$argument
+    next_root=
+    continue
+  fi
   if [ -n "$next_target" ]; then
-    target=$PWD
+    if [ -n "$command_root" ]; then
+      target=$(CDPATH= cd -- "$command_root/$argument" && pwd -P) || exit 90
+    else
+      target=$(CDPATH= cd -- "$argument" && pwd -P) || exit 90
+    fi
     next_target=
   fi
+  [ "$argument" = "-C" ] && next_root=1
   [ "$argument" = "--no-checkout" ] && next_target=1
 done
 "$DROVE_TEST_REAL_GIT" "$@"
@@ -432,17 +457,28 @@ func TestPrepareDoesNotWriteThroughReplacedStagingPath(t *testing.T) {
 	}
 	wrapper := filepath.Join(parent, "git-wrapper-replace-staging")
 	script := `#!/bin/sh
+command_root=
+next_root=
 target=
 next_target=
 for argument in "$@"; do
+  if [ -n "$next_root" ]; then
+    command_root=$argument
+    next_root=
+    continue
+  fi
   if [ -n "$next_target" ]; then
-    target=$argument
+    if [ -n "$command_root" ]; then
+      target=$(CDPATH= cd -- "$command_root/$argument" && pwd -P) || exit 90
+    else
+      target=$(CDPATH= cd -- "$argument" && pwd -P) || exit 90
+    fi
     next_target=
   fi
+  [ "$argument" = "-C" ] && next_root=1
   [ "$argument" = "--no-checkout" ] && next_target=1
 done
 if [ -n "$target" ]; then
-  target=$PWD
   mv "$target" "$target-opened" || exit 91
   ln -s "$DROVE_TEST_OUTSIDE" "$target" || exit 92
 fi
@@ -475,9 +511,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
-func TestPreparePruneFailurePreservesRecoveryRecord(t *testing.T) {
+func TestPrepareCheckoutAndPruneFailuresPreserveRecoveryRecord(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("BSD promotion does not invoke git worktree repair")
+		t.Skip("BSD checkout uses a different implementation")
 	}
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
@@ -500,13 +536,13 @@ func TestPreparePruneFailurePreservesRecoveryRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find Git: %v", err)
 	}
-	repairFailed := filepath.Join(parent, "repair-failed")
+	checkoutFailed := filepath.Join(parent, "checkout-failed")
 	pruneFailed := filepath.Join(parent, "prune-failed")
-	wrapper := filepath.Join(parent, "git-wrapper-repair-prune-failure")
+	wrapper := filepath.Join(parent, "git-wrapper-checkout-prune-failure")
 	script := `#!/bin/sh
 case " $* " in
-  *" worktree repair "*)
-    : > "$DROVE_TEST_REPAIR_FAILED"
+  *" read-tree "*)
+    : > "$DROVE_TEST_CHECKOUT_FAILED"
     exit 91
     ;;
   *" worktree prune "*)
@@ -519,7 +555,7 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
 		t.Fatalf("write Git wrapper: %v", err)
 	}
-	t.Setenv("DROVE_TEST_REPAIR_FAILED", repairFailed)
+	t.Setenv("DROVE_TEST_CHECKOUT_FAILED", checkoutFailed)
 	t.Setenv("DROVE_TEST_PRUNE_FAILED", pruneFailed)
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 	manager.git = wrapper
@@ -530,10 +566,10 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 		"",
 		testAgentID,
 	); err == nil {
-		t.Fatal("prepare succeeded after repair and prune failures")
+		t.Fatal("prepare succeeded after checkout and prune failures")
 	}
-	if _, err := os.Lstat(repairFailed); err != nil {
-		t.Fatalf("repair failure was not reached: %v", err)
+	if _, err := os.Lstat(checkoutFailed); err != nil {
+		t.Fatalf("checkout failure was not reached: %v", err)
 	}
 	if _, err := os.Lstat(pruneFailed); err != nil {
 		t.Fatalf("prune failure was not reached: %v", err)
@@ -2526,9 +2562,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
-func TestPrepareProtectsPromotedWorktreePointerDuringRepair(t *testing.T) {
+func TestPrepareDoesNotUsePublicWorktreeRepair(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("BSD promotion rewrites the bound private pointer directly")
+		t.Skip("Linux promotion rewrites the bound private pointer directly")
 	}
 	parent := t.TempDir()
 	repository := filepath.Join(parent, "repository")
@@ -2543,25 +2579,14 @@ func TestPrepareProtectsPromotedWorktreePointerDuringRepair(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find Git: %v", err)
 	}
-	swapResult := filepath.Join(parent, "repair-swap-result")
-	wrapper := filepath.Join(parent, "git-wrapper-swap-repair-pointer")
+	repairResult := filepath.Join(parent, "worktree-repair-result")
+	wrapper := filepath.Join(parent, "git-wrapper-reject-worktree-repair")
 	script := `#!/bin/sh
 saw_worktree=
 for argument in "$@"; do
-  if [ "$saw_worktree" = "1" ] && [ "$argument" = "repair" ] &&
-     [ ! -e "$DROVE_TEST_SWAP_RESULT" ]; then
-    target=${GIT_WORK_TREE:-$(pwd -P)}
-    original="$target/.git.drove-original"
-    if mv "$target/.git" "$original" 2>/dev/null; then
-      cp "$DROVE_TEST_SIBLING_POINTER" "$target/.git" || exit 90
-      "$DROVE_TEST_REAL_GIT" "$@"
-      status=$?
-      rm -f "$target/.git" || exit 91
-      mv "$original" "$target/.git" || exit 92
-      printf swapped > "$DROVE_TEST_SWAP_RESULT"
-      exit "$status"
-    fi
-    printf blocked > "$DROVE_TEST_SWAP_RESULT"
+  if [ "$saw_worktree" = "1" ] && [ "$argument" = "repair" ]; then
+    printf invoked > "$DROVE_TEST_REPAIR_RESULT"
+    exit 94
   fi
   [ "$argument" = "worktree" ] && saw_worktree=1
 done
@@ -2570,8 +2595,7 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
 		t.Fatalf("write Git wrapper: %v", err)
 	}
-	t.Setenv("DROVE_TEST_SIBLING_POINTER", filepath.Join(sibling, ".git"))
-	t.Setenv("DROVE_TEST_SWAP_RESULT", swapResult)
+	t.Setenv("DROVE_TEST_REPAIR_RESULT", repairResult)
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 
 	manager, err := New(filepath.Join(parent, "data"))
@@ -2579,35 +2603,23 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 		t.Fatalf("new manager: %v", err)
 	}
 	manager.git = wrapper
-	_, err = manager.Prepare(
+	prepared, err := manager.Prepare(
 		context.Background(),
 		repository,
 		"",
 		testAgentID,
 	)
-	if err == nil || !strings.Contains(err.Error(), "registration") {
-		t.Fatalf("prepare through repair pointer swap error = %v", err)
-	}
-	result, err := os.ReadFile(swapResult)
 	if err != nil {
-		t.Fatalf("read repair swap result: %v", err)
+		t.Fatalf("prepare without public worktree repair: %v", err)
 	}
-	if string(result) != "swapped" {
-		t.Fatalf("repair pointer swap result = %q, want swapped", result)
-	}
-	canonicalRepository, err := resolvePath(repository)
-	if err != nil {
-		t.Fatalf("resolve repository: %v", err)
+	if _, err := os.Lstat(repairResult); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worktree repair was invoked: %v", err)
 	}
 	assertGitWorktreeRegistration(
 		t,
 		filepath.Join(repository, ".git"),
-		filepath.Join(
-			manager.root,
-			repositoryHash(canonicalRepository),
-			testAgentID,
-		),
-		false,
+		prepared.Path,
+		true,
 	)
 	registered, err := manager.worktreeRegistered(
 		context.Background(),
@@ -2621,6 +2633,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 			err,
 			runGit(t, repository, "worktree", "list", "--porcelain"),
 		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard prepared worktree: %v", err)
 	}
 }
 

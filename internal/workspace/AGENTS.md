@@ -155,10 +155,11 @@
 ## 约束
 
 - 禁止直接读取或修改 `.git` 内部结构；仓库事实必须通过 Git 命令查询。唯一例外是
-  macOS/BSD 创建 linked worktree 时，可在已打开且身份已复核的 target root 与 private
+  linked worktree 创建和提升期间，可在已打开且身份已复核的 target root 与 private
   Git root 内原子改写 target `.git` 和 private `gitdir` 两个指针文件；该例外不得用于
   查询 branch、HEAD、index 或其他仓库事实，也不得把指针中的公开路径当作 mutation
-  authority。
+  authority。Linux、Windows 与 macOS/BSD 均不得为提升后的路径调用公开路径版
+  `git worktree repair`。
 - 删除路径必须先证明位于 Drove worktree 根目录内，禁止接受任意路径。
 - 不自动 merge、rebase、push 或删除已交付会话的分支。
 - 导出类型：`Manager`、`Workspace`、`Removal`、`RemovalState`、`RemovalResult`、
