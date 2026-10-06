@@ -2299,6 +2299,7 @@ func newTestRepository(t *testing.T) string {
 		t.Fatalf("create repository: %v", err)
 	}
 	runGit(t, repository, "init", "--initial-branch=main")
+	runGit(t, repository, "config", "core.autocrlf", "false")
 	runGit(t, repository, "config", "user.name", "Drove Test")
 	runGit(t, repository, "config", "user.email", "drove@example.invalid")
 	files := map[string]string{
@@ -2334,6 +2335,7 @@ func initTestRepositoryAt(t *testing.T, path string) {
 		t.Fatalf("create repository: %v", err)
 	}
 	runGit(t, path, "init", "--initial-branch=main")
+	runGit(t, path, "config", "core.autocrlf", "false")
 	runGit(t, path, "config", "user.name", "Drove Test")
 	runGit(t, path, "config", "user.email", "drove@example.invalid")
 	if err := os.WriteFile(
