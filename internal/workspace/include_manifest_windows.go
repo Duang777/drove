@@ -33,7 +33,7 @@ func configureIncludeManifestCommand(
 	}
 	handle, err := windows.CreateFile(
 		name,
-		windows.FILE_READ_ATTRIBUTES|windows.SYNCHRONIZE,
+		windows.FILE_GENERIC_READ,
 		windows.FILE_SHARE_READ,
 		nil,
 		windows.OPEN_EXISTING,
