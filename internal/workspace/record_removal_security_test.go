@@ -6,6 +6,52 @@ import (
 	"testing"
 )
 
+func TestRemoveRecordPathPreservesReplacementAfterValidation(t *testing.T) {
+	rootPath := t.TempDir()
+	recordPath := filepath.Join(rootPath, "temporary")
+	if err := os.WriteFile(
+		recordPath,
+		[]byte("original\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write temporary record: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open record root: %v", err)
+	}
+	defer root.Close()
+	expected, err := root.Open("temporary")
+	if err != nil {
+		t.Fatalf("open temporary record: %v", err)
+	}
+	defer expected.Close()
+	originalPath := recordPath + ".original"
+
+	err = removeRecordPathIfSameAfterValidation(
+		root,
+		"temporary",
+		expected,
+		func() {
+			if err := os.Rename(recordPath, originalPath); err != nil {
+				t.Fatalf("move validated temporary record: %v", err)
+			}
+			if err := os.WriteFile(
+				recordPath,
+				[]byte("replacement\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("install replacement temporary record: %v", err)
+			}
+		},
+	)
+	if err == nil {
+		t.Fatal("temporary record removal accepted a replacement path")
+	}
+	assertFileContents(t, recordPath, "replacement\n")
+	assertFileContents(t, originalPath, "original\n")
+}
+
 func TestRemoveWorkspaceRecordPreservesReplacementAfterValidation(t *testing.T) {
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {

@@ -355,6 +355,63 @@ func TestAcknowledgeRemovalRejectsReplacedRepositoryBucket(t *testing.T) {
 	}
 }
 
+func TestAcknowledgedRecordRemovalDetectsBucketReplacementAfterOpening(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare worktree: %v", err)
+	}
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		true,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove workspace = %+v, %v", result, err)
+	}
+
+	bucketPath := filepath.Dir(prepared.Path)
+	openedBucketPath := bucketPath + "-opened"
+	replacementSentinel := filepath.Join(bucketPath, "must-remain")
+	t.Cleanup(func() {
+		_ = os.RemoveAll(bucketPath)
+		_ = os.Rename(openedBucketPath, bucketPath)
+	})
+	err = manager.removeAcknowledgedWorkspaceRecordAfterValidation(
+		result.Removal,
+		func() {
+			if err := os.Rename(bucketPath, openedBucketPath); err != nil {
+				t.Fatalf("move opened repository bucket: %v", err)
+			}
+			if err := os.Mkdir(bucketPath, 0o700); err != nil {
+				t.Fatalf("create replacement repository bucket: %v", err)
+			}
+			if err := os.WriteFile(
+				replacementSentinel,
+				[]byte("replacement\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("write replacement sentinel: %v", err)
+			}
+		},
+	)
+	if err == nil {
+		t.Fatal("acknowledged record removal missed a replaced repository bucket")
+	}
+	assertFileContents(t, replacementSentinel, "replacement\n")
+}
+
 func TestAcknowledgeRemovalPreservesRecordWhenRepositoryDisappears(
 	t *testing.T,
 ) {

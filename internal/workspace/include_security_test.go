@@ -181,7 +181,8 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 			repositoryHash(repository),
 			testAgentID,
 		),
-		Branch: "pinned-source",
+		Branch:       "pinned-source",
+		trackedPaths: map[string]struct{}{},
 	}
 	if err := os.Mkdir(target.Path, 0o700); err != nil {
 		t.Fatalf("create destination: %v", err)
@@ -215,7 +216,6 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	}
 
 	if _, err := manager.copyIncludedFiles(
-		context.Background(),
 		source,
 		target,
 		[]string{"secret"},
@@ -262,7 +262,8 @@ func TestCopyIncludedFilesRejectsReplacementTargetIdentity(t *testing.T) {
 			repositoryHash(repository),
 			testAgentID,
 		),
-		Branch: "replacement-target",
+		Branch:       "replacement-target",
+		trackedPaths: map[string]struct{}{},
 	}
 	if err := os.Mkdir(target.Path, 0o700); err != nil {
 		t.Fatalf("create destination: %v", err)
@@ -286,7 +287,6 @@ func TestCopyIncludedFilesRejectsReplacementTargetIdentity(t *testing.T) {
 	}
 
 	if _, err := manager.copyIncludedFiles(
-		context.Background(),
 		source,
 		target,
 		[]string{"secret"},
@@ -704,4 +704,132 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 			name+"\n",
 		)
 	}
+}
+
+func TestPrepareSnapshotsTrackedPathsFromPrivateGitDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	parent := t.TempDir()
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local files")
+
+	replacement := filepath.Join(parent, "replacement")
+	runGit(t, repository, "branch", "tracked-replacement", "HEAD")
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"--quiet",
+		replacement,
+		"tracked-replacement",
+	)
+	const includedPath = "secret.local"
+	if err := os.WriteFile(
+		filepath.Join(replacement, includedPath),
+		[]byte("tracked replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement tracked file: %v", err)
+	}
+	runGit(t, replacement, "add", "-f", includedPath)
+	runGit(t, replacement, "commit", "-m", "track replacement local file")
+
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte(includedPath+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, includedPath),
+		[]byte("source local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source included file: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	marker := filepath.Join(parent, "tracked-path-swap-ran")
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+saw_ls=
+saw_cached=
+saw_full_name=
+for argument in "$@"; do
+  [ "$argument" = "ls-files" ] && saw_ls=1
+  [ "$argument" = "--cached" ] && saw_cached=1
+  [ "$argument" = "--full-name" ] && saw_full_name=1
+done
+if [ -n "$saw_ls" ] && [ -n "$saw_cached" ] &&
+   [ -n "$saw_full_name" ]; then
+  worktree=$GIT_WORK_TREE
+  if [ -z "$worktree" ]; then
+    if [ -d /proc/self/fd/3 ]; then
+      worktree=$(readlink /proc/self/fd/3) || exit 90
+    else
+      worktree=$(pwd -P) || exit 91
+    fi
+  fi
+  pointer="$worktree/.git"
+  opened="$worktree/.git.drove-test-original"
+  mv "$pointer" "$opened" || exit 92
+  cp "$DROVE_TEST_REPLACEMENT_POINTER" "$pointer" || exit 93
+  "$DROVE_TEST_REAL_GIT" "$@"
+  status=$?
+  rm -f "$pointer" || exit 94
+  mv "$opened" "$pointer" || exit 95
+  : > "$DROVE_TEST_MARKER"
+  exit "$status"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv(
+		"DROVE_TEST_REPLACEMENT_POINTER",
+		filepath.Join(replacement, ".git"),
+	)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_MARKER", marker)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = manager.Discard(context.Background(), prepared)
+	})
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("tracked-path pointer swap did not run: %v", err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, includedPath),
+		"source local\n",
+	)
 }

@@ -30,6 +30,27 @@ func moveRecordFile(
 	)
 }
 
+func unlinkRecordPath(
+	_ *os.File,
+	_ *os.File,
+	_ string,
+) error {
+	return errors.New(
+		"identity-preserving record unlink is unsupported",
+	)
+}
+
+func unlinkRecordPathAfterValidation(
+	_ *os.File,
+	_ *os.File,
+	_ string,
+	_ func(),
+) error {
+	return errors.New(
+		"identity-preserving record unlink is unsupported",
+	)
+}
+
 func openRecordDirectory(root *os.Root) (*os.File, error) {
 	return root.Open(".")
 }

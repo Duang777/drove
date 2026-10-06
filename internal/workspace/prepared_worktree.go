@@ -197,6 +197,7 @@ func (m *Manager) initializePreparedWorktree(
 	target *Workspace,
 	prepared *preparedWorktreeTarget,
 	repository repositoryCapability,
+	includedPaths []string,
 ) (result error) {
 	root := prepared.root
 	directoryIdentity, err := openedDirectoryIdentity(root)
@@ -334,6 +335,16 @@ func (m *Manager) initializePreparedWorktree(
 		return errors.New(
 			"workspace: prepared index does not match expected tree",
 		)
+	}
+	if len(includedPaths) > 0 {
+		target.trackedPaths, err = m.worktreeTrackedPaths(
+			ctx,
+			prepared.path,
+			privateRepository,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	if err := repository.verifyPreparationRefs(ctx, *target, true); err != nil {
 		return err

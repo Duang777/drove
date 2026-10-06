@@ -71,6 +71,76 @@ func moveRecordFile(
 	)
 }
 
+func unlinkRecordPath(
+	directory *os.File,
+	expected *os.File,
+	name string,
+) error {
+	return unlinkRecordPathAfterValidation(
+		directory,
+		expected,
+		name,
+		nil,
+	)
+}
+
+func unlinkRecordPathAfterValidation(
+	directory *os.File,
+	expected *os.File,
+	name string,
+	afterValidation func(),
+) (result error) {
+	deleting, err := openRecordForRename(directory, name)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, deleting.Close())
+	}()
+	expectedInfo, err := expected.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect opened record: %w", err)
+	}
+	deletingInfo, err := deleting.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect record path %q: %w", name, err)
+	}
+	if !deletingInfo.Mode().IsRegular() ||
+		!os.SameFile(expectedInfo, deletingInfo) {
+		return fmt.Errorf("record path %q changed identity", name)
+	}
+	if afterValidation != nil {
+		afterValidation()
+	}
+
+	current, err := openRecordForRename(directory, name)
+	if err != nil {
+		return fmt.Errorf("reopen record path %q: %w", name, err)
+	}
+	currentInfo, statErr := current.Stat()
+	closeErr := current.Close()
+	if err := errors.Join(statErr, closeErr); err != nil {
+		return fmt.Errorf("reinspect record path %q: %w", name, err)
+	}
+	if !currentInfo.Mode().IsRegular() ||
+		!os.SameFile(expectedInfo, currentInfo) {
+		return fmt.Errorf("record path %q changed identity", name)
+	}
+
+	deleteFile := byte(1)
+	var status windows.IO_STATUS_BLOCK
+	if err := windows.NtSetInformationFile(
+		windows.Handle(deleting.Fd()),
+		&status,
+		&deleteFile,
+		1,
+		windows.FileDispositionInformation,
+	); err != nil {
+		return fmt.Errorf("remove record path %q: %w", name, err)
+	}
+	return nil
+}
+
 func renameWindowsHandle(
 	directory *os.File,
 	renaming *os.File,

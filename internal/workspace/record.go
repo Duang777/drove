@@ -342,24 +342,40 @@ func removeRecordPathIfSame(
 	name string,
 	expected *os.File,
 ) error {
-	current, err := root.Lstat(name)
+	return removeRecordPathIfSameAfterValidation(
+		root,
+		name,
+		expected,
+		nil,
+	)
+}
+
+func removeRecordPathIfSameAfterValidation(
+	root *os.Root,
+	name string,
+	expected *os.File,
+	afterValidation func(),
+) (result error) {
+	_, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	opened, err := expected.Stat()
+	directory, err := openRecordDirectory(root)
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(opened, current) {
-		return fmt.Errorf(
-			"workspace: temporary path %q changed identity",
-			name,
-		)
-	}
-	return root.Remove(name)
+	defer func() {
+		result = errors.Join(result, directory.Close())
+	}()
+	return unlinkRecordPathAfterValidation(
+		directory,
+		expected,
+		name,
+		afterValidation,
+	)
 }
 
 func isolateRecordPathIfSame(
@@ -898,6 +914,16 @@ func (m *Manager) removeWorkspaceRecordAfterValidation(
 
 func (m *Manager) removeAcknowledgedWorkspaceRecord(
 	removal Removal,
+) error {
+	return m.removeAcknowledgedWorkspaceRecordAfterValidation(
+		removal,
+		nil,
+	)
+}
+
+func (m *Manager) removeAcknowledgedWorkspaceRecordAfterValidation(
+	removal Removal,
+	afterValidation func(),
 ) (result error) {
 	recordPath := workspaceRecordPath(removal.Workspace.Path)
 	bucket, agentID, err := m.openRecordBucket(removal.Workspace.Path)
@@ -912,8 +938,15 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 		)
 	}
 	defer func() {
-		result = errors.Join(result, bucket.Close())
+		result = errors.Join(
+			result,
+			m.verifyRecordBucket(removal.Workspace.Path, bucket),
+			bucket.Close(),
+		)
 	}()
+	if afterValidation != nil {
+		afterValidation()
+	}
 
 	quarantineName, exists, err := findRecordAcknowledgementQuarantine(
 		bucket,

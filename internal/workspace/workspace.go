@@ -54,6 +54,7 @@ type Workspace struct {
 	directoryIdentity  string
 	protectionKnown    bool
 	includedPaths      []string
+	trackedPaths       map[string]struct{}
 	preparation        *preparationLease
 	repositoryEvidence *repositoryEvidence
 }
@@ -429,6 +430,7 @@ func (m *Manager) prepare(
 		&result,
 		preparedTarget,
 		sourceRepository,
+		includedPaths,
 	); err != nil {
 		return Workspace{}, err
 	}
@@ -454,6 +456,7 @@ func (m *Manager) prepare(
 		result,
 		includeSelection,
 	)
+	result.trackedPaths = nil
 	if err != nil {
 		return Workspace{}, err
 	}

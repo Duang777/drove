@@ -46,7 +46,6 @@ func (m *Manager) copyIncludedSelection(
 		return nil, err
 	}
 	copiedPaths, err := m.copyIncludedFiles(
-		ctx,
 		sourceRoot,
 		target,
 		selection.paths,
@@ -67,7 +66,6 @@ func (m *Manager) copyIncludedSelection(
 }
 
 func (m *Manager) copyIncludedFiles(
-	ctx context.Context,
 	source *os.Root,
 	target Workspace,
 	paths []string,
@@ -123,20 +121,14 @@ func (m *Manager) copyIncludedFiles(
 		)
 	}
 
-	trackedPaths := map[string]struct{}{}
-	if len(paths) > 0 {
-		trackedPaths, err = m.worktreeTrackedPaths(
-			ctx,
-			target.Path,
-			destination,
+	if len(paths) > 0 && target.trackedPaths == nil {
+		return nil, errors.New(
+			"workspace: target tracked-path snapshot is unavailable",
 		)
-		if err != nil {
-			return nil, err
-		}
 	}
 	copiedPaths := make([]string, 0, len(paths))
 	for _, relative := range paths {
-		if _, tracked := trackedPaths[filepath.ToSlash(relative)]; tracked {
+		if _, tracked := target.trackedPaths[filepath.ToSlash(relative)]; tracked {
 			continue
 		}
 		if err := copyIncludedPath(
@@ -182,12 +174,12 @@ func (m *Manager) copyIncludedFiles(
 func (m *Manager) worktreeTrackedPaths(
 	ctx context.Context,
 	path string,
-	root *os.Root,
+	repository repositoryCapability,
 ) (map[string]struct{}, error) {
-	output, err := m.runRootedGit(
+	output, err := repository.runPrivateGitAt(
 		ctx,
 		path,
-		root,
+		"",
 		"--literal-pathspecs",
 		"ls-files",
 		"--cached",
