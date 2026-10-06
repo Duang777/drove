@@ -536,13 +536,15 @@ func (m *Manager) repairPreparedWorktreeRegistration(
 		gitRoot,
 	)
 	runRepair := func() error {
-		command, cleanup, err := privateRepository.worktreeCommandAt(
+		command, cleanup, err := rootedRepairWorktreeGitCommand(
 			ctx,
+			m.git,
 			target.Path,
 			prepared.root,
-			"worktree",
-			"repair",
-			".",
+			privateRepository.gitPath,
+			privateRepository.gitRoot,
+			privateRepository.commonPath,
+			privateRepository.commonRoot,
 		)
 		if err != nil {
 			return err

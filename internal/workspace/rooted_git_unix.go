@@ -91,7 +91,7 @@ func rootedPrivateGitCommand(
 	ctx context.Context,
 	git string,
 	worktreePath string,
-	gitPath string,
+	_ string,
 	gitRoot *os.Root,
 	commonPath string,
 	commonRoot *os.Root,
@@ -132,15 +132,10 @@ func rootedPrivateGitCommand(
 	helperArguments = append(helperArguments, arguments...)
 	command := exec.CommandContext(ctx, executable, helperArguments...)
 	command.ExtraFiles = []*os.File{directory}
-	commonDirectory := commonPath
-	if commonPath == gitPath {
-		commonDirectory = "."
-	}
-	command.Env = boundGitEnvironmentWithCommon(
+	command.Env = boundGitEnvironment(
 		command.Environ(),
 		".",
 		worktreePath,
-		commonDirectory,
 	)
 	cleanup := func() error {
 		return errors.Join(
@@ -285,4 +280,26 @@ func rootedPreparedWorktreeGitCommand(
 		)
 	}
 	return command, cleanup, nil
+}
+
+func rootedRepairWorktreeGitCommand(
+	ctx context.Context,
+	git string,
+	worktreePath string,
+	_ *os.Root,
+	gitPath string,
+	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
+) (*exec.Cmd, func() error, error) {
+	return rootedPrivateGitCommand(
+		ctx,
+		git,
+		worktreePath,
+		gitPath,
+		gitRoot,
+		commonPath,
+		commonRoot,
+		[]string{"worktree", "repair", worktreePath},
+	)
 }
