@@ -646,6 +646,14 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 				"workspace: quarantined removal has not been started",
 			)
 		}
+		if record.Version >= workspaceRecordVersion &&
+			record.Removal.Started &&
+			!record.Removal.Quarantined &&
+			!record.Removal.PathAbsent {
+			return errors.New(
+				"workspace: started removal has no quarantined or absent path",
+			)
+		}
 		if record.Removal.ContentsCleared &&
 			(!record.Removal.Started || !record.Removal.Quarantined) {
 			return errors.New(

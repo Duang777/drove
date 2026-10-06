@@ -793,6 +793,9 @@ func (m *Manager) persistRemovalStart(
 	started := *record.Removal
 	started.Started = true
 	started.Quarantined = started.Quarantined || quarantined
+	if !quarantined {
+		started.PathAbsent = true
+	}
 	upgradeWorkspaceRecord(&record)
 	record.Removal = &started
 	_, err := m.replaceWorkspaceRecordState(record)
@@ -1004,6 +1007,40 @@ func (m *Manager) removeRemovalQuarantine(
 		false,
 	); err != nil {
 		return err
+	}
+	if err := verifyRootEntryUnchanged(bucket, name, opened); err != nil {
+		return err
+	}
+	openedInfo, err := opened.Stat(".")
+	if err != nil {
+		return err
+	}
+	deleteName := removalQuarantinePrefix(record) + uuid.NewString()
+	directory, err := openRecordDirectory(bucket)
+	if err != nil {
+		return err
+	}
+	moved, renameErr := renameDirectoryNoReplace(
+		directory,
+		openedInfo,
+		name,
+		removalQuarantineIsolationName(deleteName),
+		deleteName,
+	)
+	closeDirectoryErr := directory.Close()
+	if moved {
+		name = deleteName
+	}
+	if err := errors.Join(renameErr, closeDirectoryErr); err != nil {
+		return fmt.Errorf(
+			"workspace: isolate cleared removal quarantine: %w",
+			err,
+		)
+	}
+	if !moved {
+		return errors.New(
+			"workspace: cleared removal quarantine was not isolated",
+		)
 	}
 	if err := verifyRootEntryUnchanged(bucket, name, opened); err != nil {
 		return err

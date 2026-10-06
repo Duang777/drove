@@ -1909,6 +1909,7 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 		OperationID:    "12121212-1212-4212-8212-121212121212",
 		DirectoryToken: "13131313-1313-4313-8313-131313131313",
 		Started:        true,
+		Quarantined:    true,
 	}
 	root, err := openRealPathRoot(prepared.Path)
 	if err != nil {
@@ -1921,11 +1922,18 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 	if err := root.Close(); err != nil {
 		t.Fatalf("close prepared workspace: %v", err)
 	}
+	quarantinePath := filepath.Join(
+		filepath.Dir(prepared.Path),
+		removalQuarantinePrefix(record)+"14141414-1414-4414-8414-141414141414",
+	)
+	if err := os.Rename(prepared.Path, quarantinePath); err != nil {
+		t.Fatalf("quarantine prepared workspace: %v", err)
+	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write started removal: %v", err)
 	}
 	if err := os.WriteFile(
-		filepath.Join(prepared.Path, "tracked.txt"),
+		filepath.Join(quarantinePath, "tracked.txt"),
 		[]byte("changed after physical removal started\n"),
 		0o600,
 	); err != nil {
@@ -1942,6 +1950,9 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 	}
 	if _, err := os.Lstat(prepared.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("started removal retained path or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("started removal retained quarantine or inspect failed: %v", err)
 	}
 	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
 		t.Fatalf("acknowledge started removal: %v", err)

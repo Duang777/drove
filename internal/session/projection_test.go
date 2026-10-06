@@ -508,6 +508,20 @@ func TestRecoveryProjectorDoesNotResumeDoneStartupResume(t *testing.T) {
 	if plan.ResumeOnStart["agent-1"] {
 		t.Fatal("completed startup resume remained eligible without completion marker")
 	}
+	rows = append(rows, plan.Reconciliation...)
+	restarted := newRecoveryProjector()
+	for _, row := range rows {
+		if err := restarted.Apply(row); err != nil {
+			t.Fatalf("apply restarted seq %d: %v", row.Seq, err)
+		}
+	}
+	restartedPlan, err := restarted.Finish(base.Add(2 * time.Hour))
+	if err != nil {
+		t.Fatalf("finish restarted projection: %v", err)
+	}
+	if restartedPlan.ResumeOnStart["agent-1"] {
+		t.Fatal("completed startup resume became eligible after reconciliation")
+	}
 }
 
 func TestRecoveryProjectorRequiresDurableCompletionToConsumeStartupResume(

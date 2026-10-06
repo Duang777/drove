@@ -2282,34 +2282,89 @@ exit "$status"
 	}
 }
 
-func TestPrepareRejectsCheckoutThroughTransientPrivateGitReplacement(
+func TestPrepareIgnoresTransientPrivateGitReplacementDuringCheckout(
 	t *testing.T,
 ) {
-	if runtime.GOOS == "linux" {
-		t.Skip("Linux binds the private Git directory through /proc/self/fd")
+	switch runtime.GOOS {
+	case "darwin", "dragonfly", "freebsd", "netbsd", "openbsd":
+	default:
+		t.Skip("test covers descriptor-rooted BSD checkout")
 	}
 	parent := t.TempDir()
 	source := filepath.Join(parent, "source")
 	initSourceSwapRepository(t, source)
+	if err := os.WriteFile(
+		filepath.Join(source, ".gitattributes"),
+		[]byte("tracked.txt filter=review\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write attributes: %v", err)
+	}
+	runGit(t, source, "add", ".gitattributes")
+	runGit(t, source, "commit", "-m", "add checkout filter attributes")
 	realGit, err := exec.LookPath("git")
 	if err != nil {
 		t.Fatalf("find Git: %v", err)
 	}
+	sentinel := filepath.Join(parent, "replacement-filter-ran")
+	filter := filepath.Join(parent, "replacement-filter")
+	filterScript := "#!/bin/sh\nprintf ran > \"$DROVE_TEST_SENTINEL\"\ncat\n"
+	if err := os.WriteFile(filter, []byte(filterScript), 0o700); err != nil {
+		t.Fatalf("write replacement filter: %v", err)
+	}
+	maliciousCommon := filepath.Join(parent, "malicious-common")
+	if err := os.CopyFS(maliciousCommon, os.DirFS(filepath.Join(source, ".git"))); err != nil {
+		t.Fatalf("copy malicious common Git directory: %v", err)
+	}
+	for _, arguments := range [][]string{
+		{"--git-dir=" + maliciousCommon, "config", "filter.review.smudge", filter},
+		{"--git-dir=" + maliciousCommon, "config", "filter.review.clean", "cat"},
+		{"--git-dir=" + maliciousCommon, "config", "filter.review.required", "true"},
+	} {
+		command := exec.Command(realGit, arguments...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf(
+				"configure malicious common Git directory: %v\n%s",
+				err,
+				output,
+			)
+		}
+	}
 	marker := filepath.Join(parent, "swapped-private-git")
+	gitPath := filepath.Join(parent, "prepared-private-git-path")
 	wrapper := filepath.Join(parent, "git-wrapper-transient-private-git")
 	script := `#!/bin/sh
-matched=
+worktree=
+add=
+no_checkout=
+checkout=
 for argument in "$@"; do
-  [ "$argument" = "read-tree" ] && matched=1
+  [ "$argument" = "worktree" ] && worktree=1
+  [ "$argument" = "add" ] && add=1
+  [ "$argument" = "--no-checkout" ] && no_checkout=1
+  [ "$argument" = "read-tree" ] && checkout=1
 done
-if [ -n "$matched" ] && [ ! -e "$DROVE_TEST_MARKER" ]; then
-  original="$GIT_DIR.drove-original"
-  mv "$GIT_DIR" "$original" || exit 91
-  cp -R "$original" "$GIT_DIR" || exit 92
+if [ -n "$worktree" ] && [ -n "$add" ] && [ -n "$no_checkout" ]; then
   "$DROVE_TEST_REAL_GIT" "$@"
   status=$?
-  rm -rf "$GIT_DIR" || exit 93
-  mv "$original" "$GIT_DIR" || exit 94
+  if [ "$status" -eq 0 ]; then
+    sed 's/^gitdir: //' .git > "$DROVE_TEST_GIT_PATH" || exit 90
+  fi
+  exit "$status"
+fi
+if [ -n "$checkout" ] && [ -s "$DROVE_TEST_GIT_PATH" ] && [ ! -e "$DROVE_TEST_MARKER" ]; then
+  public=$(cat "$DROVE_TEST_GIT_PATH") || exit 91
+  original="$public.drove-original"
+  mv "$public" "$original" || exit 92
+  cp -R "$original" "$public" || exit 93
+  printf '%s\n' "$DROVE_TEST_MALICIOUS_COMMON" > "$public/commondir" || exit 94
+  "$DROVE_TEST_REAL_GIT" "$@"
+  status=$?
+  if [ "$GIT_DIR" != "." ] && [ -f "$public/index" ]; then
+    cp "$public/index" "$original/index" || exit 95
+  fi
+  rm -rf "$public" || exit 96
+  mv "$original" "$public" || exit 97
   : > "$DROVE_TEST_MARKER"
   exit "$status"
 fi
@@ -2320,6 +2375,9 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 	t.Setenv("DROVE_TEST_MARKER", marker)
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_GIT_PATH", gitPath)
+	t.Setenv("DROVE_TEST_MALICIOUS_COMMON", maliciousCommon)
+	t.Setenv("DROVE_TEST_SENTINEL", sentinel)
 
 	manager, err := New(filepath.Join(parent, "data"))
 	if err != nil {
@@ -2331,9 +2389,20 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 		source,
 		"",
 		testAgentID,
-	); err == nil ||
-		!strings.Contains(err.Error(), "prepared index does not match") {
-		t.Fatalf("prepare through transient private Git replacement error = %v", err)
+	); err == nil || !strings.Contains(
+		err.Error(),
+		"working-tree filter",
+	) {
+		t.Fatalf(
+			"prepare through transient private Git replacement error = %v",
+			err,
+		)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("transient private Git replacement did not run: %v", err)
+	}
+	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement checkout filter ran: %v", err)
 	}
 }
 

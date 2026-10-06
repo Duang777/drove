@@ -39,13 +39,31 @@ func openRepositoryGuard(
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		windows.FILE_FLAG_BACKUP_SEMANTICS|
+			windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		0,
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"workspace: lock rooted Git directory: %w",
 			err,
+		)
+	}
+	var handleInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(
+		handle,
+		&handleInfo,
+	); err != nil {
+		_ = windows.CloseHandle(handle)
+		return nil, fmt.Errorf(
+			"workspace: inspect rooted Git directory handle: %w",
+			err,
+		)
+	}
+	if handleInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		_ = windows.CloseHandle(handle)
+		return nil, errors.New(
+			"workspace: rooted Git directory is a reparse point",
 		)
 	}
 	lock := os.NewFile(uintptr(handle), path)

@@ -37,8 +37,20 @@ func TestConfigureIncludeManifestCommandLocksManifestIdentity(t *testing.T) {
 		_ = cleanup()
 		t.Fatal("manifest could be replaced while command guard was held")
 	}
+	if file, err := os.OpenFile(path, os.O_WRONLY, 0); err == nil {
+		_ = file.Close()
+		_ = cleanup()
+		t.Fatal("manifest could be rewritten while command guard was held")
+	}
 	if err := cleanup(); err != nil {
 		t.Fatalf("release manifest guard: %v", err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open manifest for writing after releasing guard: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close writable manifest: %v", err)
 	}
 	if err := os.Rename(path, movedPath); err != nil {
 		t.Fatalf("rename manifest after releasing guard: %v", err)

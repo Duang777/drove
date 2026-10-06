@@ -296,14 +296,11 @@ func (m *Manager) initializePreparedWorktree(
 	if err := repository.verifyPreparationRefs(ctx, *target, true); err != nil {
 		return err
 	}
-	if _, err := privateRepository.runWorktreeAt(
+	if err := checkoutPreparedWorktree(
 		ctx,
+		privateRepository,
 		prepared.path,
 		root,
-		"",
-		"read-tree",
-		"--reset",
-		"-u",
 		target.expectedHeadOID,
 	); err != nil {
 		return fmt.Errorf("workspace: checkout prepared worktree: %w", err)

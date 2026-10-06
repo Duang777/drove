@@ -397,7 +397,11 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		from != agent.StateDone &&
 		from != agent.StateStopped &&
 		row.Reason == restartStopReason
-	draft.restartStopped = draft.restartStopped || isRestartStop
+	if to == agent.StateDone {
+		draft.restartStopped = false
+	} else {
+		draft.restartStopped = draft.restartStopped || isRestartStop
+	}
 	if known {
 		draft.lastTransition = evidence
 	}

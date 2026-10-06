@@ -1805,6 +1805,59 @@ func TestReconcileContentsClearedRemovalRejectsUnexpectedEntry(t *testing.T) {
 	assertFileContents(t, unexpected, "preserve\n")
 }
 
+func TestPersistRemovalStartRecordsAbsentPath(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
+	}
+	record.Removal = &workspaceRemovalRecord{
+		OperationID:    "59595959-5959-4959-8959-595959595959",
+		DirectoryToken: "60606060-6060-4060-8060-606060606060",
+	}
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("persist removal intent: %v", err)
+	}
+	savedPath := filepath.Join(t.TempDir(), "saved-worktree")
+	if err := os.Rename(prepared.Path, savedPath); err != nil {
+		t.Fatalf("move workspace out of managed path: %v", err)
+	}
+	started, err := manager.persistRemovalStart(record, false)
+	if err != nil {
+		t.Fatalf("persist absent-path removal start: %v", err)
+	}
+	if !started.Removal.Started || !started.Removal.PathAbsent {
+		t.Fatalf("started removal = %+v", started.Removal)
+	}
+	if err := os.Rename(savedPath, prepared.Path); err != nil {
+		t.Fatalf("restore workspace path: %v", err)
+	}
+	if _, err := manager.ReconcileRemovals(
+		context.Background(),
+	); err == nil || !strings.Contains(err.Error(), "appeared after removal began") {
+		t.Fatalf("reconcile restored absent path error = %v", err)
+	}
+	if _, err := os.Lstat(prepared.Path); err != nil {
+		t.Fatalf("restored workspace was removed: %v", err)
+	}
+}
+
 func TestReconcileAbsentPathRemovalPreservesReplacementPath(t *testing.T) {
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
@@ -2142,6 +2195,7 @@ func TestStaleAcknowledgementPreservesNewWorkspaceRecord(t *testing.T) {
 		DirectoryToken: "90909090-9090-4090-8090-909090909090",
 		Force:          true,
 		Started:        true,
+		PathAbsent:     true,
 	}
 	if err := manager.installWorkspaceRecord(replacement, true); err != nil {
 		t.Fatalf("install replacement record: %v", err)

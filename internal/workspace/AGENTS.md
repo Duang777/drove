@@ -25,8 +25,12 @@
   各自固定一侧的视角交叉验证。
   `git worktree add` 使用 `--no-checkout`，只接收 bucket 内随机且与 Agent ID 同前缀的
   staging 目录，禁止接触公开 Agent 路径。新 worktree 打开后先核对预先持久化的
-  文件系统目录身份，再持久化 Git 私有目录并从固定目标根执行 `git reset --hard`；
-  初始化完成后把 staging 目录 no-replace 原子提升到公开路径，再从固定 worktree 根执行
+  文件系统目录身份，再持久化 Git 私有目录。Linux 和 Windows 从同时固定的目标根与
+  Git 根执行 `read-tree --reset -u`；macOS/BSD 只从固定私有 Git 根更新 index，
+  用 `checkout-index --temp` 导出，并由 Drove 通过固定目标根安装普通文件、符号链接
+  和 gitlink。macOS/BSD 遇到普通文件的 `filter` 属性必须 fail-stop，因为 filter
+  无法同时取得固定 worktree cwd 与描述符绑定的私有 Git 上下文。初始化完成后把
+  staging 目录 no-replace 原子提升到公开路径，再从固定 worktree 根执行
   `git worktree repair .`。仓库根目录的
   `.worktreeinclude` 使用 gitignore 语义，并从已打开文件读取一次。Unix 通过继承的
   只读文件描述符交给 Git，其余平台通过受复核的私有临时副本交给 Git，禁止 Git 再按

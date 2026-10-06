@@ -224,11 +224,59 @@ func (r repositoryCapability) runPrivateGit(
 	input string,
 	arguments ...string,
 ) ([]byte, error) {
-	command, cleanup, err := r.privateGitCommand(ctx, arguments...)
+	return r.runPrivateGitAt(ctx, r.path, input, arguments...)
+}
+
+func (r repositoryCapability) runPrivateGitAt(
+	ctx context.Context,
+	worktreePath string,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	return r.runPrivateGitAtWithOutputPolicy(
+		ctx,
+		worktreePath,
+		input,
+		false,
+		arguments...,
+	)
+}
+
+func (r repositoryCapability) runPrivateGitAtKeepingOutput(
+	ctx context.Context,
+	worktreePath string,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	return r.runPrivateGitAtWithOutputPolicy(
+		ctx,
+		worktreePath,
+		input,
+		true,
+		arguments...,
+	)
+}
+
+func (r repositoryCapability) runPrivateGitAtWithOutputPolicy(
+	ctx context.Context,
+	worktreePath string,
+	input string,
+	keepOutputOnError bool,
+	arguments ...string,
+) ([]byte, error) {
+	command, cleanup, err := r.privateGitCommandAt(
+		ctx,
+		worktreePath,
+		arguments...,
+	)
 	if err != nil {
 		return nil, err
 	}
-	output, commandErr := runGitCommand(command, input)
+	run := runGitCommand
+	if keepOutputOnError {
+		run = runGitCommandKeepingOutput
+	}
+	output, commandErr := run(command, input)
 	return output, errors.Join(commandErr, cleanup())
 }
 
@@ -394,11 +442,19 @@ func (r repositoryCapability) privateGitCommand(
 	ctx context.Context,
 	arguments ...string,
 ) (*exec.Cmd, func() error, error) {
+	return r.privateGitCommandAt(ctx, r.path, arguments...)
+}
+
+func (r repositoryCapability) privateGitCommandAt(
+	ctx context.Context,
+	worktreePath string,
+	arguments ...string,
+) (*exec.Cmd, func() error, error) {
 	if r.root != nil && r.gitRoot != nil {
 		return rootedPrivateGitCommand(
 			ctx,
 			r.manager.git,
-			r.path,
+			worktreePath,
 			r.gitPath,
 			r.gitRoot,
 			arguments,
