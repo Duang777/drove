@@ -5,11 +5,14 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestPreparedCheckoutMaterializesTrackedEntryTypes(t *testing.T) {
@@ -155,6 +158,160 @@ func TestPreparedCheckoutRejectsWorkingTreeFilter(t *testing.T) {
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("rejected smudge filter ran: %v", err)
 	}
+}
+
+func TestRemovePreparedCheckoutTempsPreservesReplacement(t *testing.T) {
+	path := t.TempDir()
+	const (
+		name     = ".merge_file_owned"
+		original = ".merge_file_owned.original"
+		content  = "trusted\n"
+	)
+	if err := os.WriteFile(
+		filepath.Join(path, name),
+		[]byte(content),
+		0o600,
+	); err != nil {
+		t.Fatalf("write prepared checkout temporary: %v", err)
+	}
+	root, err := os.OpenRoot(path)
+	if err != nil {
+		t.Fatalf("open temporary root: %v", err)
+	}
+	defer root.Close()
+	temp := &preparedCheckoutTemp{name: name}
+	if err := openPreparedCheckoutTemp(root, temp); err != nil {
+		t.Fatalf("open prepared checkout temporary: %v", err)
+	}
+	temps := []*preparedCheckoutTemp{temp}
+	closed := false
+	defer func() {
+		if !closed {
+			for _, temp := range temps {
+				_ = temp.file.Close()
+			}
+		}
+	}()
+	entry := &preparedCheckoutEntry{
+		mode: preparedCheckoutRegularMode,
+		oid:  "3136b9e8f996037b1178065c3d107c5053690d7f",
+		path: "tracked.txt",
+		temp: temps[0],
+	}
+	if err := verifyPreparedCheckoutTemp(entry); err != nil {
+		t.Fatalf("verify prepared checkout temporary: %v", err)
+	}
+	if err := os.Rename(
+		filepath.Join(path, name),
+		filepath.Join(path, original),
+	); err != nil {
+		t.Fatalf("rename original temporary: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(path, name),
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement temporary: %v", err)
+	}
+	err = removePreparedCheckoutTemps(root, temps)
+	closed = true
+	if err == nil || !strings.Contains(err.Error(), "changed identity") {
+		t.Fatalf("remove replaced prepared checkout temporary error = %v", err)
+	}
+	assertFileContents(t, filepath.Join(path, name), "replacement\n")
+	assertFileContents(t, filepath.Join(path, original), content)
+}
+
+func TestPreparedCheckoutKeepsOpenFilesBounded(t *testing.T) {
+	var original unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &original); err != nil {
+		t.Skipf("read open file limit: %v", err)
+	}
+	if original.Cur < 64 {
+		t.Skipf("open file limit %d is already below test limit", original.Cur)
+	}
+	limited := original
+	limited.Cur = 64
+	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &limited); err != nil {
+		t.Skipf("lower open file limit: %v", err)
+	}
+	defer func() {
+		if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &original); err != nil {
+			t.Errorf("restore open file limit: %v", err)
+		}
+	}()
+
+	repository := newTestRepository(t)
+	for index := range 96 {
+		name := filepath.Join(repository, fmt.Sprintf("tracked-%03d.txt", index))
+		if err := os.WriteFile(name, []byte("tracked\n"), 0o600); err != nil {
+			t.Fatalf("write tracked file %d: %v", index, err)
+		}
+	}
+	runGit(t, repository, "add", "--all")
+	runGit(t, repository, "commit", "-m", "add many tracked files")
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	if _, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	); err != nil {
+		t.Fatalf("prepare worktree with bounded open files: %v", err)
+	}
+}
+
+func TestPreparedCheckoutSupportsSHA256Objects(t *testing.T) {
+	repository := filepath.Join(t.TempDir(), "repository")
+	if err := os.MkdirAll(repository, 0o700); err != nil {
+		t.Fatalf("create SHA-256 repository: %v", err)
+	}
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"init",
+		"--object-format=sha256",
+		"--initial-branch=main",
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("Git does not support SHA-256 repositories: %v\n%s", err, output)
+	}
+	runGit(t, repository, "config", "user.name", "Drove Test")
+	runGit(t, repository, "config", "user.email", "drove@example.invalid")
+	if err := os.WriteFile(
+		filepath.Join(repository, "tracked.txt"),
+		[]byte("sha256\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write SHA-256 tracked file: %v", err)
+	}
+	runGit(t, repository, "add", "tracked.txt")
+	runGit(t, repository, "commit", "-m", "initial")
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare SHA-256 worktree: %v", err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, "tracked.txt"),
+		"sha256\n",
+	)
 }
 
 func TestParsePreparedCheckoutIndexRejectsInvalidEntries(t *testing.T) {

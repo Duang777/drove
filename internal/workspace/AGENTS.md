@@ -28,7 +28,10 @@
   文件系统目录身份，再持久化 Git 私有目录。Linux 和 Windows 从同时固定的目标根与
   Git 根执行 `read-tree --reset -u`；macOS/BSD 只从固定私有 Git 根更新 index，
   用 `checkout-index --temp` 导出，并由 Drove 通过固定目标根安装普通文件、符号链接
-  和 gitlink。macOS/BSD 遇到普通文件的 `filter` 属性必须 fail-stop，因为 filter
+  和 gitlink。普通文件临时项必须逐个固定已打开文件身份并按 index object ID 校验，
+  复制期间持续使用同一文件句柄，不能让打开的描述符数量随 tracked 文件数增长；清理时
+  只能按该身份删除，禁止仅凭临时文件名删除。
+  macOS/BSD 遇到普通文件的 `filter` 属性必须 fail-stop，因为 filter
   无法同时取得固定 worktree cwd 与描述符绑定的私有 Git 上下文。初始化完成后把
   staging 目录 no-replace 原子提升到公开路径，再从固定 worktree 根执行
   `git worktree repair .`。私有 `gitdir` 指针替换中断后，重启恢复必须先从绑定私有

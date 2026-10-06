@@ -5,10 +5,12 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -29,7 +31,14 @@ type preparedCheckoutEntry struct {
 	mode string
 	oid  string
 	path string
-	temp string
+	temp *preparedCheckoutTemp
+}
+
+type preparedCheckoutTemp struct {
+	name     string
+	file     *os.File
+	info     os.FileInfo
+	verified bool
 }
 
 func checkoutPreparedWorktree(
@@ -71,7 +80,8 @@ func checkoutPreparedWorktree(
 
 	var paths strings.Builder
 	for _, entry := range entries {
-		if entry.mode == preparedCheckoutGitlinkMode {
+		if entry.mode != preparedCheckoutRegularMode &&
+			entry.mode != preparedCheckoutExecutableMode {
 			continue
 		}
 		paths.WriteString(entry.path)
@@ -87,13 +97,6 @@ func checkoutPreparedWorktree(
 			"--stdin",
 			"-z",
 		)
-		tempNames := preparedCheckoutTempNames(output)
-		defer func() {
-			result = errors.Join(
-				result,
-				removePreparedCheckoutTemps(repository.gitRoot, tempNames),
-			)
-		}()
 		if checkoutErr != nil {
 			return checkoutErr
 		}
@@ -312,32 +315,70 @@ func validatePreparedCheckoutPath(path string) (string, error) {
 	return clean, nil
 }
 
-func preparedCheckoutTempNames(raw []byte) []string {
-	seen := make(map[string]struct{})
-	var names []string
-	for _, record := range bytes.Split(raw, []byte{0}) {
-		rawName, _, ok := bytes.Cut(record, []byte{'\t'})
-		if !ok {
-			continue
-		}
-		name := string(rawName)
-		if !validPreparedCheckoutTempName(name) {
-			continue
-		}
-		if _, exists := seen[name]; exists {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	return names
-}
-
 func validPreparedCheckoutTempName(name string) bool {
 	return filepath.Base(name) == name &&
 		name != "." &&
-		(strings.HasPrefix(name, ".merge_file_") ||
-			strings.HasPrefix(name, ".merge_link_"))
+		strings.HasPrefix(name, ".merge_file_")
+}
+
+func openPreparedCheckoutTemp(
+	root *os.Root,
+	temp *preparedCheckoutTemp,
+) error {
+	if temp == nil || temp.file != nil ||
+		!validPreparedCheckoutTempName(temp.name) {
+		return errors.New(
+			"workspace: prepared checkout temporary handle is invalid",
+		)
+	}
+	info, err := root.Lstat(temp.name)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect prepared checkout temporary path %q: %w",
+			temp.name,
+			err,
+		)
+	}
+	if !info.Mode().IsRegular() ||
+		info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf(
+			"workspace: prepared checkout temporary path %q is not a regular file",
+			temp.name,
+		)
+	}
+	file, err := root.Open(temp.name)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open prepared checkout temporary path %q: %w",
+			temp.name,
+			err,
+		)
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		return errors.Join(
+			fmt.Errorf(
+				"workspace: inspect opened prepared checkout temporary path %q: %w",
+				temp.name,
+				err,
+			),
+			file.Close(),
+		)
+	}
+	if !opened.Mode().IsRegular() ||
+		opened.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(info, opened) {
+		return errors.Join(
+			fmt.Errorf(
+				"workspace: prepared checkout temporary path %q changed while opening",
+				temp.name,
+			),
+			file.Close(),
+		)
+	}
+	temp.file = file
+	temp.info = opened
+	return nil
 }
 
 func bindPreparedCheckoutTemps(
@@ -351,7 +392,10 @@ func bindPreparedCheckoutTemps(
 	}
 	byPath := make(map[string]*preparedCheckoutEntry, len(entries))
 	for _, entry := range entries {
-		byPath[entry.path] = entry
+		if entry.mode == preparedCheckoutRegularMode ||
+			entry.mode == preparedCheckoutExecutableMode {
+			byPath[entry.path] = entry
+		}
 	}
 	seenTemps := make(map[string]struct{}, len(entries))
 	for _, record := range bytes.Split(raw[:len(raw)-1], []byte{0}) {
@@ -378,36 +422,24 @@ func bindPreparedCheckoutTemps(
 			return err
 		}
 		entry, exists := byPath[path]
-		if !exists || entry.mode == preparedCheckoutGitlinkMode {
+		if !exists {
 			return fmt.Errorf(
 				"workspace: prepared checkout returned unexpected path %q",
 				path,
 			)
 		}
-		if entry.temp != "" {
+		if entry.temp != nil {
 			return fmt.Errorf(
 				"workspace: prepared checkout returned path %q twice",
 				path,
 			)
 		}
-		if entry.mode == preparedCheckoutSymlinkMode &&
-			!strings.HasPrefix(temp, ".merge_link_") {
-			return fmt.Errorf(
-				"workspace: prepared checkout path %q is not a symlink",
-				path,
-			)
-		}
-		if entry.mode != preparedCheckoutSymlinkMode &&
-			!strings.HasPrefix(temp, ".merge_file_") {
-			return fmt.Errorf(
-				"workspace: prepared checkout path %q is not a regular file",
-				path,
-			)
-		}
-		entry.temp = temp
+		entry.temp = &preparedCheckoutTemp{name: temp}
 	}
 	for _, entry := range entries {
-		if entry.mode != preparedCheckoutGitlinkMode && entry.temp == "" {
+		if (entry.mode == preparedCheckoutRegularMode ||
+			entry.mode == preparedCheckoutExecutableMode) &&
+			entry.temp == nil {
 			return fmt.Errorf(
 				"workspace: prepared checkout omitted path %q",
 				entry.path,
@@ -417,28 +449,149 @@ func bindPreparedCheckoutTemps(
 	return nil
 }
 
-func removePreparedCheckoutTemps(root *os.Root, names []string) error {
+func verifyPreparedCheckoutTemp(entry *preparedCheckoutEntry) error {
+	if entry.temp == nil || entry.temp.file == nil {
+		return fmt.Errorf(
+			"workspace: prepared checkout source for %q is not open",
+			entry.path,
+		)
+	}
+	oid, err := preparedCheckoutTempBlobOID(
+		entry.temp,
+		entry.path,
+		entry.oid,
+	)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(oid, entry.oid) {
+		return fmt.Errorf(
+			"workspace: prepared checkout source for %q does not match the index",
+			entry.path,
+		)
+	}
+	entry.temp.verified = true
+	return nil
+}
+
+func preparedCheckoutTempBlobOID(
+	temp *preparedCheckoutTemp,
+	path string,
+	expectedOID string,
+) (string, error) {
+	before, err := temp.file.Stat()
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: inspect prepared checkout source for %q: %w",
+			path,
+			err,
+		)
+	}
+	if !samePreparedCheckoutTempState(temp.info, before) {
+		return "", fmt.Errorf(
+			"workspace: prepared checkout source for %q changed before reading",
+			path,
+		)
+	}
+	if _, err := temp.file.Seek(0, io.SeekStart); err != nil {
+		return "", fmt.Errorf(
+			"workspace: rewind prepared checkout source for %q: %w",
+			path,
+			err,
+		)
+	}
+	digest, err := newPreparedCheckoutBlobHash(expectedOID, before.Size())
+	if err != nil {
+		return "", err
+	}
+	read, err := io.Copy(digest, temp.file)
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: hash prepared checkout source for %q: %w",
+			path,
+			err,
+		)
+	}
+	after, err := temp.file.Stat()
+	if err != nil {
+		return "", fmt.Errorf(
+			"workspace: inspect prepared checkout source for %q after reading: %w",
+			path,
+			err,
+		)
+	}
+	if read != before.Size() ||
+		!samePreparedCheckoutTempState(before, after) ||
+		!samePreparedCheckoutTempState(temp.info, after) {
+		return "", fmt.Errorf(
+			"workspace: prepared checkout source for %q changed while reading",
+			path,
+		)
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func newPreparedCheckoutBlobHash(
+	expectedOID string,
+	size int64,
+) (hash.Hash, error) {
+	var digest hash.Hash
+	switch len(expectedOID) {
+	case sha1.Size * 2:
+		digest = sha1.New()
+	case sha256.Size * 2:
+		digest = sha256.New()
+	default:
+		return nil, errors.New(
+			"workspace: prepared checkout object ID uses an unsupported hash",
+		)
+	}
+	header := fmt.Sprintf("blob %d\x00", size)
+	if _, err := io.WriteString(digest, header); err != nil {
+		return nil, fmt.Errorf(
+			"workspace: initialize prepared checkout blob hash: %w",
+			err,
+		)
+	}
+	return digest, nil
+}
+
+func samePreparedCheckoutTempState(
+	expected os.FileInfo,
+	current os.FileInfo,
+) bool {
+	return expected.Mode().IsRegular() &&
+		current.Mode().IsRegular() &&
+		expected.Mode()&os.ModeSymlink == 0 &&
+		current.Mode()&os.ModeSymlink == 0 &&
+		os.SameFile(expected, current) &&
+		expected.Size() == current.Size() &&
+		expected.Mode() == current.Mode() &&
+		expected.ModTime().Equal(current.ModTime())
+}
+
+func removePreparedCheckoutTemps(
+	root *os.Root,
+	temps []*preparedCheckoutTemp,
+) error {
 	var result error
-	for _, name := range names {
-		info, err := root.Lstat(name)
-		switch {
-		case errors.Is(err, os.ErrNotExist):
-			continue
-		case err != nil:
-			result = errors.Join(result, err)
-			continue
-		case !info.Mode().IsRegular() &&
-			info.Mode()&os.ModeSymlink == 0:
-			result = errors.Join(
-				result,
-				fmt.Errorf(
-					"workspace: prepared checkout temporary path %q changed type",
-					name,
-				),
-			)
+	for _, temp := range temps {
+		if temp == nil || temp.file == nil {
 			continue
 		}
-		result = errors.Join(result, root.Remove(name))
+		if temp.verified {
+			result = errors.Join(
+				result,
+				removeOwnedRecordPathIfSame(
+					root,
+					temp.name,
+					temp.file,
+					".drove-checkout-temp-"+uuid.NewString(),
+					nil,
+				),
+			)
+		}
+		result = errors.Join(result, temp.file.Close())
 	}
 	return result
 }
@@ -448,7 +601,29 @@ func installPreparedCheckoutFile(
 	worktreeRoot *os.Root,
 	entry *preparedCheckoutEntry,
 ) (result error) {
-	sourceInfo, err := gitRoot.Lstat(entry.temp)
+	if entry.temp == nil {
+		return fmt.Errorf(
+			"workspace: prepared checkout source for %q is unavailable",
+			entry.path,
+		)
+	}
+	if err := openPreparedCheckoutTemp(gitRoot, entry.temp); err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(
+			result,
+			removePreparedCheckoutTemps(
+				gitRoot,
+				[]*preparedCheckoutTemp{entry.temp},
+			),
+		)
+	}()
+	if err := verifyPreparedCheckoutTemp(entry); err != nil {
+		return err
+	}
+	input := entry.temp.file
+	sourceInfo, err := input.Stat()
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: inspect prepared checkout source for %q: %w",
@@ -456,32 +631,9 @@ func installPreparedCheckoutFile(
 			err,
 		)
 	}
-	if !sourceInfo.Mode().IsRegular() ||
-		sourceInfo.Mode()&os.ModeSymlink != 0 {
+	if !samePreparedCheckoutTempState(entry.temp.info, sourceInfo) {
 		return fmt.Errorf(
-			"workspace: prepared checkout source for %q is not a regular file",
-			entry.path,
-		)
-	}
-	input, err := gitRoot.Open(entry.temp)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: open prepared checkout source for %q: %w",
-			entry.path,
-			err,
-		)
-	}
-	defer func() {
-		result = errors.Join(result, input.Close())
-	}()
-	openedInfo, err := input.Stat()
-	if err != nil {
-		return err
-	}
-	if !openedInfo.Mode().IsRegular() ||
-		!os.SameFile(sourceInfo, openedInfo) {
-		return fmt.Errorf(
-			"workspace: prepared checkout source for %q changed while opening",
+			"workspace: prepared checkout source for %q changed before copying",
 			entry.path,
 		)
 	}
@@ -535,7 +687,20 @@ func installPreparedCheckoutFile(
 		}
 	}()
 
-	copiedDigest := sha256.New()
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf(
+			"workspace: rewind prepared checkout source for %q: %w",
+			entry.path,
+			err,
+		)
+	}
+	copiedDigest, err := newPreparedCheckoutBlobHash(
+		entry.oid,
+		sourceInfo.Size(),
+	)
+	if err != nil {
+		return err
+	}
 	copied, err := io.Copy(io.MultiWriter(output, copiedDigest), input)
 	if err != nil {
 		return fmt.Errorf(
@@ -548,34 +713,28 @@ func installPreparedCheckoutFile(
 	if err != nil {
 		return err
 	}
-	if copied != openedInfo.Size() ||
-		afterCopy.Size() != openedInfo.Size() ||
-		afterCopy.Mode() != openedInfo.Mode() ||
-		!afterCopy.ModTime().Equal(openedInfo.ModTime()) {
+	copiedOID := hex.EncodeToString(copiedDigest.Sum(nil))
+	if copied != sourceInfo.Size() ||
+		!samePreparedCheckoutTempState(sourceInfo, afterCopy) ||
+		!samePreparedCheckoutTempState(entry.temp.info, afterCopy) ||
+		!strings.EqualFold(copiedOID, entry.oid) {
 		return fmt.Errorf(
-			"workspace: prepared checkout source for %q changed while copying",
+			"workspace: prepared checkout source for %q changed or did not match the index while copying",
 			entry.path,
 		)
 	}
-	if _, err := input.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	verifiedDigest := sha256.New()
-	verified, err := io.Copy(verifiedDigest, input)
+	verifiedOID, err := preparedCheckoutTempBlobOID(
+		entry.temp,
+		entry.path,
+		entry.oid,
+	)
 	if err != nil {
 		return err
 	}
-	afterVerification, err := input.Stat()
-	if err != nil {
-		return err
-	}
-	if verified != openedInfo.Size() ||
-		afterVerification.Size() != openedInfo.Size() ||
-		afterVerification.Mode() != openedInfo.Mode() ||
-		!afterVerification.ModTime().Equal(openedInfo.ModTime()) ||
-		!bytes.Equal(copiedDigest.Sum(nil), verifiedDigest.Sum(nil)) {
+	if !strings.EqualFold(verifiedOID, entry.oid) ||
+		!strings.EqualFold(verifiedOID, copiedOID) {
 		return fmt.Errorf(
-			"workspace: prepared checkout source for %q changed while verifying",
+			"workspace: prepared checkout source for %q did not match the index while verifying",
 			entry.path,
 		)
 	}
@@ -616,17 +775,6 @@ func installPreparedCheckoutSymlink(
 	worktreeRoot *os.Root,
 	entry *preparedCheckoutEntry,
 ) (result error) {
-	tempInfo, err := repository.gitRoot.Lstat(entry.temp)
-	if err != nil {
-		return err
-	}
-	if !tempInfo.Mode().IsRegular() &&
-		tempInfo.Mode()&os.ModeSymlink == 0 {
-		return fmt.Errorf(
-			"workspace: prepared checkout source for %q has an invalid type",
-			entry.path,
-		)
-	}
 	target, err := repository.runPrivateGitAt(
 		ctx,
 		".",
