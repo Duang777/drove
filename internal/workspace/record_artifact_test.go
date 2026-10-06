@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,6 +35,69 @@ func TestRecoverWorkspaceRecordTemporaryArtifact(t *testing.T) {
 		t.Fatalf("temporary record remains: %v", err)
 	}
 	_ = manager
+}
+
+func TestRecoverWorkspaceRecordTemporaryDebrisBesideCanonical(
+	t *testing.T,
+) {
+	for _, test := range []struct {
+		name    string
+		content func([]byte) []byte
+	}{
+		{
+			name: "complete separate inode",
+			content: func(canonical []byte) []byte {
+				return append([]byte(nil), canonical...)
+			},
+		},
+		{
+			name: "partial write",
+			content: func([]byte) []byte {
+				return []byte("{")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, target, _, dataDir := newRecordArtifactFixture(t)
+			recordPath := workspaceRecordPath(target.Path)
+			canonical, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatalf("read canonical record: %v", err)
+			}
+			temporaryPath := filepath.Join(
+				filepath.Dir(recordPath),
+				workspaceRecordTemporaryName(filepath.Base(recordPath)),
+			)
+			if err := os.WriteFile(
+				temporaryPath,
+				test.content(canonical),
+				0o600,
+			); err != nil {
+				t.Fatalf("write temporary record debris: %v", err)
+			}
+
+			restarted, err := New(dataDir)
+			if err != nil {
+				t.Fatalf("restart manager: %v", err)
+			}
+			if err := restarted.recoverRecordAcknowledgements(); err != nil {
+				t.Fatalf("recover record artifacts: %v", err)
+			}
+			current, err := os.ReadFile(recordPath)
+			if err != nil {
+				t.Fatalf("read recovered canonical record: %v", err)
+			}
+			if !bytes.Equal(current, canonical) {
+				t.Fatal("temporary debris changed the canonical record")
+			}
+			if _, err := os.Lstat(temporaryPath); !errors.Is(
+				err,
+				os.ErrNotExist,
+			) {
+				t.Fatalf("temporary record debris remains: %v", err)
+			}
+		})
+	}
 }
 
 func TestRecoverWorkspaceRecordRemovalArtifact(t *testing.T) {

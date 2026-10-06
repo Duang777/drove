@@ -199,6 +199,24 @@ func (m *Manager) recoverWorkspaceRecordArtifact(
 	}
 	worktreePath := filepath.Join(m.root, bucketName, artifact.agentID)
 	recordPath := workspaceRecordPath(worktreePath)
+	if artifact.kind == workspaceRecordTemporaryArtifact {
+		return removeOwnedRecordPath(
+			bucket,
+			artifact.name,
+			file,
+			workspaceRecordTemporaryName(
+				artifact.agentID+workspaceRecordSuffix,
+			),
+			nil,
+			nil,
+		)
+	}
+	if artifact.kind != workspaceRecordRemovalArtifact {
+		return fmt.Errorf(
+			"workspace: record artifact %q has an invalid kind",
+			artifact.name,
+		)
+	}
 	record, err := m.decodeWorkspaceRecordFile(
 		file,
 		recordPath,
@@ -213,45 +231,24 @@ func (m *Manager) recoverWorkspaceRecordArtifact(
 			artifact.name,
 		)
 	}
-	if artifact.kind == workspaceRecordRemovalArtifact {
-		expectedOperation := "none"
-		if record.Removal != nil {
-			expectedOperation = record.Removal.OperationID
-		}
-		if artifact.operationID != expectedOperation {
-			return fmt.Errorf(
-				"workspace: record artifact %q has the wrong operation",
-				artifact.name,
-			)
-		}
+	expectedOperation := "none"
+	if record.Removal != nil {
+		expectedOperation = record.Removal.OperationID
+	}
+	if artifact.operationID != expectedOperation {
+		return fmt.Errorf(
+			"workspace: record artifact %q has the wrong operation",
+			artifact.name,
+		)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
-	}
-	if artifact.kind == workspaceRecordTemporaryArtifact {
-		canonicalName := artifact.agentID + workspaceRecordSuffix
-		canonical, err := bucket.Lstat(canonicalName)
-		if err == nil && !os.SameFile(opened, canonical) {
-			return fmt.Errorf(
-				"workspace: temporary record artifact %q conflicts with its canonical record",
-				artifact.name,
-			)
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	nextName := workspaceRecordTemporaryName(
-		artifact.agentID + workspaceRecordSuffix,
-	)
-	if artifact.kind == workspaceRecordRemovalArtifact {
-		nextName = workspaceRecordRemovalName(record)
 	}
 	return removeOwnedRecordPath(
 		bucket,
 		artifact.name,
 		file,
-		nextName,
+		workspaceRecordRemovalName(record),
 		func(candidate *os.File) error {
 			if _, err := candidate.Seek(0, io.SeekStart); err != nil {
 				return err
@@ -269,16 +266,14 @@ func (m *Manager) recoverWorkspaceRecordArtifact(
 					"workspace: record artifact changed ownership",
 				)
 			}
-			if artifact.kind == workspaceRecordRemovalArtifact {
-				currentOperation := "none"
-				if current.Removal != nil {
-					currentOperation = current.Removal.OperationID
-				}
-				if currentOperation != artifact.operationID {
-					return errors.New(
-						"workspace: record artifact changed operation",
-					)
-				}
+			currentOperation := "none"
+			if current.Removal != nil {
+				currentOperation = current.Removal.OperationID
+			}
+			if currentOperation != artifact.operationID {
+				return errors.New(
+					"workspace: record artifact changed operation",
+				)
 			}
 			return nil
 		},
