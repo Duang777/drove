@@ -106,6 +106,46 @@ func TestCleanupRemovalAcknowledgementReservationsRecoversRenamePhase(
 	}
 }
 
+func TestCleanupRemovalAcknowledgementReservationsRecoversMarkerDiscard(
+	t *testing.T,
+) {
+	bucketPath := t.TempDir()
+	bucket, err := os.OpenRoot(bucketPath)
+	if err != nil {
+		t.Fatalf("open bucket: %v", err)
+	}
+	defer bucket.Close()
+	record := removalAcknowledgementTestRecord(bucketPath)
+	name := removalAcknowledgementReservationPrefix(record) +
+		"91919191-9191-4191-8191-919191919191"
+	createRemovalAcknowledgementReservationFixture(
+		t,
+		bucket,
+		record,
+		name,
+	)
+	reservationPath := filepath.Join(bucketPath, name)
+	if err := os.Rename(
+		filepath.Join(reservationPath, removalMarkerName(record)),
+		filepath.Join(reservationPath, removalMarkerDiscardName(record)),
+	); err != nil {
+		t.Fatalf("isolate removal marker: %v", err)
+	}
+
+	if err := cleanupRemovalAcknowledgementReservations(
+		bucket,
+		record,
+	); err != nil {
+		t.Fatalf("cleanup reservation: %v", err)
+	}
+	if _, err := os.Lstat(reservationPath); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("reservation remains: %v", err)
+	}
+}
+
 func TestCleanupRemovalAcknowledgementReservationsRejectsAmbiguousPhases(
 	t *testing.T,
 ) {

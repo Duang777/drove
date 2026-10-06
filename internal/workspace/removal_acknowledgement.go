@@ -354,6 +354,12 @@ func cleanupRemovalAcknowledgementReservations(
 func cleanupIsolatedRemovalAcknowledgementReservation(
 	reservation *removalAcknowledgementReservation,
 ) error {
+	if err := cleanupRemovalMarkerTemps(
+		reservation.root,
+		reservation.record,
+	); err != nil {
+		return err
+	}
 	if err := validateClearedRemovalDirectory(
 		reservation.root,
 		reservation.record,
