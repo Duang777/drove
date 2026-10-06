@@ -46,6 +46,13 @@ func workspaceForRemoval(record workspaceRecord) Workspace {
 }
 
 // Remove removes one managed worktree and preserves its branch.
+//
+// The caller must first stop every process that can write through the worktree
+// path or a retained file or directory handle. A successful removal is
+// logically ordered at the identity-bound rename from the managed path to its
+// private quarantine. The non-force checks reject changes visible before that
+// point; operating systems do not provide a portable way to revoke stale
+// handles after the rename.
 func (m *Manager) Remove(
 	ctx context.Context,
 	agentID string,
@@ -197,7 +204,9 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 }
 
 // AcknowledgeRemoval removes a sidecar after its session tombstone is durable.
-func (m *Manager) AcknowledgeRemoval(removal Removal) error {
+func (m *Manager) AcknowledgeRemoval(
+	removal Removal,
+) (result error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -226,24 +235,68 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 			"workspace: removal acknowledgement record is missing",
 		)
 	}
-	record := newWorkspaceRecord(removal.Workspace, nil)
-	record.Removal = &workspaceRemovalRecord{
-		OperationID: removal.operationID,
-		Started:     true,
-		Quarantined: true,
+	if err := m.recoverRecordAcknowledgements(); err != nil {
+		return err
 	}
-	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	facts, err := m.removalFacts(inspectCtx, record)
+	record, exists, err := m.readWorkspaceRecord(removal.Workspace.Path)
 	if err != nil {
 		return err
 	}
-	if facts.pathExists ||
-		facts.quarantineName != "" ||
-		facts.registered {
+	if !exists {
+		return errors.New(
+			"workspace: removal acknowledgement record is missing",
+		)
+	}
+	if !sameWorkspace(record.workspace(), removal.Workspace) ||
+		record.Removal == nil ||
+		record.Removal.OperationID != removal.operationID {
+		return m.removeAcknowledgedWorkspaceRecord(removal)
+	}
+	reservation, err := m.reserveRemovalAcknowledgementPath(record)
+	if err != nil {
+		return err
+	}
+	reservationOwned := true
+	defer func() {
+		if reservationOwned {
+			result = errors.Join(result, reservation.release())
+		}
+	}()
+	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	repository, closeRepository, err := m.removalRepository(inspectCtx, record)
+	if err != nil {
+		return err
+	}
+	bucket := reservation.bucket
+	quarantineName, _, quarantineErr := findRemovalQuarantine(bucket, record)
+	_, registered, registrationErr := repository.worktreeRegistration(
+		inspectCtx,
+		record.Path,
+	)
+	verifyErr := reservation.verify()
+	closeRepositoryErr := closeRepository()
+	if err := errors.Join(
+		quarantineErr,
+		registrationErr,
+		verifyErr,
+		closeRepositoryErr,
+	); err != nil {
+		return err
+	}
+	if quarantineName != "" || registered {
 		return errors.New("workspace: cannot acknowledge an incomplete removal")
 	}
-	if err := m.removeAcknowledgedWorkspaceRecord(removal); err != nil {
+	if err := m.removeAcknowledgedWorkspaceRecordAfterQuarantine(
+		removal,
+		func() error {
+			err := reservation.release()
+			if err == nil {
+				reservationOwned = false
+			}
+			return err
+		},
+	); err != nil {
 		return err
 	}
 	m.acknowledgedRemovals[receipt] = struct{}{}
@@ -399,6 +452,18 @@ func (m *Manager) removalFacts(
 			"workspace: managed path %q is not a real directory",
 			record.Path,
 		)
+	}
+	if pathExists {
+		reserved, err := removalPathIsAcknowledgementReservation(bucket, record)
+		if err != nil {
+			return removalFacts{}, fmt.Errorf(
+				"workspace: inspect removal acknowledgement reservation: %w",
+				err,
+			)
+		}
+		if reserved {
+			pathExists = false
+		}
 	}
 	var quarantineName string
 	if record.Removal != nil {

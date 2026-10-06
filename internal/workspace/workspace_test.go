@@ -1688,6 +1688,61 @@ func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {
 	}
 }
 
+func TestPrepareFromSeparateGitDirectoryUsesWorktreeIdentity(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	gitDirectory := filepath.Join(parent, "metadata", "repository.git")
+	if err := os.MkdirAll(filepath.Dir(gitDirectory), 0o700); err != nil {
+		t.Fatalf("create metadata directory: %v", err)
+	}
+	runGit(
+		t,
+		parent,
+		"init",
+		"--separate-git-dir="+gitDirectory,
+		repository,
+	)
+	runGit(t, repository, "config", "user.email", "drove@example.com")
+	runGit(t, repository, "config", "user.name", "Drove Test")
+	if err := os.WriteFile(
+		filepath.Join(repository, "tracked.txt"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	runGit(t, repository, "add", "tracked.txt")
+	runGit(t, repository, "commit", "-m", "initial")
+	repository, err := resolvePath(repository)
+	if err != nil {
+		t.Fatalf("resolve worktree path: %v", err)
+	}
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"separate-git-directory",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare from separate Git directory: %v", err)
+	}
+	if prepared.Repository != repository {
+		t.Fatalf(
+			"repository = %q, want worktree %q",
+			prepared.Repository,
+			repository,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard separate Git directory worktree: %v", err)
+	}
+}
+
 func TestPrepareFromLinkedWorktreeUsesSourceIndexForIncludes(t *testing.T) {
 	repository := newTestRepository(t)
 	const includedPath = "linked-local.env"

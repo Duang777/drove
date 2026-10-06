@@ -915,8 +915,9 @@ func (m *Manager) removeWorkspaceRecordAfterValidation(
 func (m *Manager) removeAcknowledgedWorkspaceRecord(
 	removal Removal,
 ) error {
-	return m.removeAcknowledgedWorkspaceRecordAfterValidation(
+	return m.removeAcknowledgedWorkspaceRecordWithHooks(
 		removal,
+		nil,
 		nil,
 	)
 }
@@ -924,6 +925,29 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 func (m *Manager) removeAcknowledgedWorkspaceRecordAfterValidation(
 	removal Removal,
 	afterValidation func(),
+) error {
+	return m.removeAcknowledgedWorkspaceRecordWithHooks(
+		removal,
+		afterValidation,
+		nil,
+	)
+}
+
+func (m *Manager) removeAcknowledgedWorkspaceRecordAfterQuarantine(
+	removal Removal,
+	afterQuarantine func() error,
+) error {
+	return m.removeAcknowledgedWorkspaceRecordWithHooks(
+		removal,
+		nil,
+		afterQuarantine,
+	)
+}
+
+func (m *Manager) removeAcknowledgedWorkspaceRecordWithHooks(
+	removal Removal,
+	afterValidation func(),
+	afterQuarantine func() error,
 ) (result error) {
 	recordPath := workspaceRecordPath(removal.Workspace.Path)
 	bucket, agentID, err := m.openRecordBucket(removal.Workspace.Path)
@@ -1064,6 +1088,14 @@ func (m *Manager) removeAcknowledgedWorkspaceRecordAfterValidation(
 		)
 	}
 	fileOpen = false
+	if afterQuarantine != nil {
+		if err := afterQuarantine(); err != nil {
+			return fmt.Errorf(
+				"workspace: release removal acknowledgement reservation: %w",
+				err,
+			)
+		}
+	}
 	return m.removeRecordAcknowledgementQuarantine(
 		bucket,
 		quarantineName,

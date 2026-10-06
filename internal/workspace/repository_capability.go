@@ -372,11 +372,26 @@ func resolveExistingDirectory(path string) (string, error) {
 func (r repositoryCapability) headOID(
 	ctx context.Context,
 ) (string, error) {
-	output, err := r.runPrivateGit(ctx, "", "rev-parse", "--verify", "HEAD")
+	if sameRegisteredWorktreePath(r.gitPath, r.commonPath) {
+		output, err := r.run(ctx, "", "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("workspace: resolve branch start: %w", err)
+		}
+		return validateHeadOID(strings.TrimSpace(string(output)))
+	}
+	registered, exists, err := r.worktreeRegistration(ctx, r.path)
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve branch start: %w", err)
 	}
-	oid := strings.TrimSpace(string(output))
+	if !exists {
+		return "", errors.New(
+			"workspace: source worktree registration is missing",
+		)
+	}
+	return validateHeadOID(registered.head)
+}
+
+func validateHeadOID(oid string) (string, error) {
 	if oid == "" || strings.ContainsAny(oid, " \t\r\n") {
 		return "", errors.New(
 			"workspace: source HEAD returned an invalid object ID",
@@ -608,7 +623,7 @@ func (r repositoryCapability) pruneWorktrees(
 }
 
 func (r repositoryCapability) verifyPreparedWorktree(
-	ctx context.Context,
+	_ context.Context,
 	target Workspace,
 	gitDirectory string,
 	registered registeredWorktree,
@@ -627,90 +642,19 @@ func (r repositoryCapability) verifyPreparedWorktree(
 	); err != nil {
 		return err
 	}
-	head, err := r.run(
-		ctx,
-		"",
-		"--git-dir="+gitDirectory,
-		"rev-parse",
-		"--verify",
-		"HEAD",
-	)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: inspect prepared worktree HEAD: %w",
-			err,
-		)
-	}
-	if strings.TrimSpace(string(head)) != registered.head {
-		return errors.New(
-			"workspace: prepared worktree HEAD does not match registration",
-		)
-	}
-	branch, err := r.run(
-		ctx,
-		"",
-		"--git-dir="+gitDirectory,
-		"symbolic-ref",
-		"--quiet",
-		"HEAD",
-	)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: inspect prepared worktree branch: %w",
-			err,
-		)
-	}
-	if strings.TrimSpace(string(branch)) != registered.branch {
-		return errors.New(
-			"workspace: prepared worktree branch does not match registration",
-		)
-	}
 	return nil
 }
 
 func (r repositoryCapability) verifyBoundPreparedWorktree(
-	ctx context.Context,
+	_ context.Context,
 	target Workspace,
 	registered registeredWorktree,
 ) error {
-	if err := r.verifyPreparedWorktreeRegistration(
+	return r.verifyPreparedWorktreeRegistration(
 		target,
 		registered,
 		target.expectedHeadOID,
-	); err != nil {
-		return err
-	}
-	head, err := r.runPrivateGit(ctx, "", "rev-parse", "--verify", "HEAD")
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: inspect prepared worktree HEAD: %w",
-			err,
-		)
-	}
-	if strings.TrimSpace(string(head)) != registered.head {
-		return errors.New(
-			"workspace: prepared worktree HEAD does not match registration",
-		)
-	}
-	branch, err := r.runPrivateGit(
-		ctx,
-		"",
-		"symbolic-ref",
-		"--quiet",
-		"HEAD",
 	)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: inspect prepared worktree branch: %w",
-			err,
-		)
-	}
-	if strings.TrimSpace(string(branch)) != registered.branch {
-		return errors.New(
-			"workspace: prepared worktree branch does not match registration",
-		)
-	}
-	return nil
 }
 
 func (r repositoryCapability) verifyPreparationRefs(

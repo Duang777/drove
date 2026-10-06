@@ -12,9 +12,10 @@ import (
 )
 
 type preparedWorktreeTarget struct {
-	root *os.Root
-	name string
-	path string
+	root         *os.Root
+	name         string
+	path         string
+	gitDirectory string
 }
 
 func preparedWorktreeStagingName(
@@ -404,6 +405,7 @@ func (m *Manager) initializePreparedWorktree(
 	if err != nil {
 		return fmt.Errorf("workspace: persist worktree identity: %w", err)
 	}
+	prepared.gitDirectory = gitDirectory
 	return nil
 }
 
@@ -411,6 +413,7 @@ func (m *Manager) promotePreparedWorktreeTarget(
 	ctx context.Context,
 	target Workspace,
 	prepared *preparedWorktreeTarget,
+	repository repositoryCapability,
 ) (result error) {
 	bucket, err := m.openManagedBucketRoot(target)
 	if err != nil {
@@ -448,6 +451,7 @@ func (m *Manager) promotePreparedWorktreeTarget(
 	if err != nil {
 		return err
 	}
+	stagingPath := prepared.path
 	moved, renameErr := renameDirectoryNoReplace(
 		directory,
 		opened,
@@ -477,24 +481,216 @@ func (m *Manager) promotePreparedWorktreeTarget(
 	); err != nil {
 		return err
 	}
-	if _, err := m.runRootedGit(
+	if err := m.repairPreparedWorktreeRegistration(
 		ctx,
-		target.Path,
-		prepared.root,
-		"worktree",
-		"repair",
-		".",
+		target,
+		prepared,
+		repository,
+		stagingPath,
 	); err != nil {
-		return fmt.Errorf(
-			"workspace: repair promoted worktree registration: %w",
-			err,
-		)
+		return err
 	}
 	return verifyRootEntryUnchanged(
 		bucket,
 		target.AgentID,
 		prepared.root,
 	)
+}
+
+func (m *Manager) repairPreparedWorktreeRegistration(
+	ctx context.Context,
+	target Workspace,
+	prepared *preparedWorktreeTarget,
+	repository repositoryCapability,
+	stalePath string,
+) (result error) {
+	if prepared.gitDirectory == "" {
+		return errors.New(
+			"workspace: prepared private Git directory is unavailable",
+		)
+	}
+	gitRoot, err := openRealPathRoot(prepared.gitDirectory)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open prepared private Git directory: %w",
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, gitRoot.Close())
+	}()
+	gitGuard, err := openRepositoryGuard(prepared.gitDirectory, gitRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(result, gitGuard.Close())
+	}()
+	before, err := repository.registeredWorktrees(ctx)
+	if err != nil {
+		return err
+	}
+	privateRepository := repository.withPrivateGitBinding(
+		prepared.gitDirectory,
+		gitRoot,
+	)
+	runRepair := func() error {
+		command, cleanup, err := privateRepository.worktreeCommandAt(
+			ctx,
+			target.Path,
+			prepared.root,
+			"worktree",
+			"repair",
+			".",
+		)
+		if err != nil {
+			return err
+		}
+		_, commandErr := runGitCommand(command, "")
+		return errors.Join(commandErr, cleanup())
+	}
+	restore := func() error {
+		arguments := []string{"worktree", "repair"}
+		for _, registered := range before {
+			if sameRegisteredWorktreePath(registered.path, stalePath) {
+				continue
+			}
+			if _, err := os.Lstat(registered.path); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					continue
+				}
+				return err
+			}
+			arguments = append(arguments, registered.path)
+		}
+		arguments = append(arguments, target.Path)
+		_, err := repository.run(ctx, "", arguments...)
+		return err
+	}
+	commandErr := runRepair()
+	if err := errors.Join(
+		repository.verifyBinding(ctx),
+		verifyRealPathRoot(prepared.gitDirectory, gitRoot),
+	); err != nil {
+		return errors.Join(err, restore())
+	}
+	after, err := repository.registeredWorktrees(ctx)
+	if err != nil {
+		return errors.Join(commandErr, err, restore())
+	}
+	transitionErr := validatePreparedRegistrationTransition(
+		before,
+		after,
+		target,
+		stalePath,
+		privateRepository,
+	)
+	if err := errors.Join(commandErr, transitionErr); err != nil {
+		restoreErr := restore()
+		restored, verifyErr := repository.registeredWorktrees(ctx)
+		if verifyErr == nil {
+			verifyErr = validatePreparedRegistrationTransition(
+				before,
+				restored,
+				target,
+				stalePath,
+				privateRepository,
+			)
+		}
+		return fmt.Errorf(
+			"workspace: repair promoted worktree registration: %w",
+			errors.Join(err, restoreErr, verifyErr),
+		)
+	}
+	return nil
+}
+
+func validatePreparedRegistrationTransition(
+	before []registeredWorktree,
+	after []registeredWorktree,
+	target Workspace,
+	stalePath string,
+	repository repositoryCapability,
+) error {
+	if len(after) != len(before) {
+		return errors.New(
+			"workspace: worktree registration set changed during repair",
+		)
+	}
+	var (
+		stale        registeredWorktree
+		staleFound   bool
+		targetRecord registeredWorktree
+		targetFound  bool
+	)
+	for _, registered := range before {
+		if sameRegisteredWorktreePath(registered.path, stalePath) {
+			stale = registered
+			staleFound = true
+			break
+		}
+	}
+	if !staleFound {
+		return errors.New(
+			"workspace: stale prepared worktree registration is missing",
+		)
+	}
+	for _, registered := range after {
+		if sameRegisteredWorktreePath(registered.path, stalePath) {
+			return errors.New(
+				"workspace: stale prepared worktree registration remains after repair",
+			)
+		}
+		if sameRegisteredWorktreePath(registered.path, target.Path) {
+			targetRecord = registered
+			targetFound = true
+		}
+	}
+	if !targetFound {
+		return errors.New(
+			"workspace: repaired worktree registration is missing",
+		)
+	}
+	if err := repository.verifyPreparedWorktreeRegistration(
+		target,
+		targetRecord,
+		target.expectedHeadOID,
+	); err != nil {
+		return err
+	}
+	for _, expected := range before {
+		if sameRegisteredWorktreePath(expected.path, stalePath) {
+			continue
+		}
+		var matched bool
+		for _, actual := range after {
+			if !sameRegisteredWorktreePath(expected.path, actual.path) {
+				continue
+			}
+			if expected.head != actual.head ||
+				expected.branch != actual.branch ||
+				expected.detached != actual.detached {
+				return errors.New(
+					"workspace: unrelated worktree registration changed during repair",
+				)
+			}
+			matched = true
+			break
+		}
+		if !matched {
+			return errors.New(
+				"workspace: unrelated worktree registration disappeared during repair",
+			)
+		}
+	}
+	if stale.head != targetRecord.head ||
+		stale.branch != targetRecord.branch ||
+		stale.detached != targetRecord.detached {
+		return errors.New(
+			"workspace: repaired worktree registration changed identity",
+		)
+	}
+	return nil
 }
 
 func (m *Manager) cleanupPreparedWorktreeTarget(

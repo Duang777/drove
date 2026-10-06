@@ -438,6 +438,7 @@ func (m *Manager) prepare(
 		ctx,
 		result,
 		preparedTarget,
+		sourceRepository,
 	); err != nil {
 		return Workspace{}, err
 	}
@@ -630,6 +631,39 @@ func (m *Manager) listRepositoryBucket(
 				path,
 				err,
 			)
+		}
+		if hasRecord {
+			reserved, reservationErr :=
+				openedRemovalPathIsAcknowledgementReservation(
+					bucket,
+					workspaceRoot,
+					record,
+				)
+			if reserved {
+				closeErr := workspaceRoot.Close()
+				if err := errors.Join(
+					reservationErr,
+					closeErr,
+				); err != nil {
+					return nil, err
+				}
+				missing := record.workspace()
+				missing.Missing = true
+				missing.protectionKnown = record.ProtectionKnown
+				missing.includedPaths = append(
+					[]string(nil),
+					record.IncludedPaths...,
+				)
+				result = append(result, missing)
+				continue
+			}
+			if reservationErr != nil {
+				_ = workspaceRoot.Close()
+				return nil, fmt.Errorf(
+					"workspace: inspect removal acknowledgement reservation: %w",
+					reservationErr,
+				)
+			}
 		}
 		if err := m.pinDataDirectory(); err != nil {
 			_ = workspaceRoot.Close()
@@ -1353,7 +1387,35 @@ func (m *Manager) repositoryRootWith(
 		return "", fmt.Errorf("workspace: inspect configured worktree: %w", err)
 	}
 
-	root := filepath.Dir(commonPath)
+	worktreesOutput, err := run(
+		"worktree",
+		"list",
+		"--porcelain",
+		"-z",
+	)
+	if err != nil {
+		return "", fmt.Errorf("workspace: list repository worktrees: %w", err)
+	}
+	worktrees, err := parseRegisteredWorktrees(worktreesOutput)
+	if err != nil {
+		return "", err
+	}
+	if len(worktrees) == 0 {
+		return "", errors.New("workspace: repository has no registered worktree")
+	}
+	root := worktrees[0].path
+	if sameRegisteredWorktreePath(root, commonPath) {
+		topLevelOutput, err := run("rev-parse", "--show-toplevel")
+		if err != nil {
+			return "", fmt.Errorf("workspace: inspect repository worktree: %w", err)
+		}
+		root = trimGitLineTerminator(topLevelOutput)
+		if !filepath.IsAbs(root) {
+			return "", errors.New(
+				"workspace: repository worktree is not absolute",
+			)
+		}
+	}
 	resolved, err := resolvePath(root)
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve repository root: %w", err)

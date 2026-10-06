@@ -194,19 +194,6 @@ func (m *Manager) repairPromotedPreparedWorktree(
 			"workspace: promoted worktree directory identity changed",
 		)
 	}
-	currentRepository, err := m.repositoryRootAtRoot(
-		ctx,
-		target.Path,
-		opened,
-	)
-	if err != nil {
-		return false, err
-	}
-	if currentRepository != record.Repository {
-		return false, errors.New(
-			"workspace: promoted worktree repository changed",
-		)
-	}
 	gitDirectory, err := m.worktreeGitDirectoryAtRoot(
 		ctx,
 		target.Path,
@@ -227,18 +214,20 @@ func (m *Manager) repairPromotedPreparedWorktree(
 	); err != nil {
 		return false, err
 	}
-	if _, err := m.runRootedGit(
+	prepared := &preparedWorktreeTarget{
+		root:         opened,
+		name:         target.AgentID,
+		path:         target.Path,
+		gitDirectory: record.GitDirectory,
+	}
+	if err := m.repairPreparedWorktreeRegistration(
 		ctx,
-		target.Path,
-		opened,
-		"worktree",
-		"repair",
-		".",
+		target,
+		prepared,
+		repository,
+		stagingPath,
 	); err != nil {
-		return false, fmt.Errorf(
-			"workspace: repair promoted worktree registration: %w",
-			err,
-		)
+		return false, err
 	}
 	if err := verifyRootEntryUnchanged(
 		bucket,
@@ -246,33 +235,6 @@ func (m *Manager) repairPromotedPreparedWorktree(
 		opened,
 	); err != nil {
 		return false, err
-	}
-	current, exists, err := repository.worktreeRegistration(ctx, target.Path)
-	if err != nil {
-		return false, err
-	}
-	if !exists {
-		return false, errors.New(
-			"workspace: repaired worktree registration is missing",
-		)
-	}
-	if err := repository.verifyPreparedWorktree(
-		ctx,
-		target,
-		record.GitDirectory,
-		current,
-	); err != nil {
-		return false, err
-	}
-	if _, exists, err := repository.worktreeRegistration(
-		ctx,
-		stagingPath,
-	); err != nil {
-		return false, err
-	} else if exists {
-		return false, errors.New(
-			"workspace: stale staging registration remains after repair",
-		)
 	}
 	return true, nil
 }

@@ -1785,7 +1785,7 @@ func TestDiscardUsesRetainedCommonGitDirectoryAfterReplacement(
 	)
 }
 
-func TestIncludedPathsUsesRetainedCommonGitDirectoryAfterReplacement(
+func TestIncludedPathsRejectsReplacedCommonGitDirectory(
 	t *testing.T,
 ) {
 	parent := t.TempDir()
@@ -1865,17 +1865,14 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
 	manager.git = wrapper
 
-	paths, err := manager.includedPaths(
+	_, err = manager.includedPaths(
 		context.Background(),
 		source,
 		sourceRoot,
 		lease.repository,
 	)
-	if err != nil {
-		t.Fatalf("evaluate include manifest through retained repository: %v", err)
-	}
-	if len(paths) != 1 || paths[0] != includedPath {
-		t.Fatalf("included paths = %q, want [%s]", paths, includedPath)
+	if err == nil || !strings.Contains(err.Error(), "changed while in use") {
+		t.Fatalf("replaced common Git directory error = %v", err)
 	}
 }
 
@@ -2403,6 +2400,206 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 	if _, err := os.Stat(sentinel); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("replacement checkout filter ran: %v", err)
+	}
+}
+
+func TestPreparationHeadUsesPinnedWorktreeRegistration(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, repository)
+	runGit(t, repository, "worktree", "add", "-b", "source-branch", source)
+	sourceOID := strings.TrimSpace(runGit(t, source, "rev-parse", "HEAD"))
+	if err := os.WriteFile(
+		filepath.Join(repository, "second.txt"),
+		[]byte("second\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write second commit file: %v", err)
+	}
+	runGit(t, repository, "add", "second.txt")
+	runGit(t, repository, "commit", "-m", "second")
+	replacementOID := strings.TrimSpace(runGit(t, repository, "rev-parse", "HEAD"))
+	if replacementOID == sourceOID {
+		t.Fatal("source and replacement OIDs unexpectedly match")
+	}
+
+	maliciousCommon := filepath.Join(parent, "malicious-common")
+	if err := os.CopyFS(
+		maliciousCommon,
+		os.DirFS(filepath.Join(repository, ".git")),
+	); err != nil {
+		t.Fatalf("copy malicious common Git directory: %v", err)
+	}
+	runGit(
+		t,
+		parent,
+		"--git-dir="+maliciousCommon,
+		"update-ref",
+		"refs/heads/source-branch",
+		replacementOID,
+	)
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	marker := filepath.Join(parent, "head-commondir-swapped")
+	wrapper := filepath.Join(parent, "git-wrapper-head-commondir")
+	script := `#!/bin/sh
+matched=
+has_rev_parse=
+has_verify=
+has_head=
+for argument in "$@"; do
+  [ "$argument" = "rev-parse" ] && has_rev_parse=1
+  [ "$argument" = "--verify" ] && has_verify=1
+  [ "$argument" = "HEAD" ] && has_head=1
+done
+if [ -n "$has_rev_parse" ] && [ -n "$has_verify" ] && [ -n "$has_head" ] &&
+   [ "$GIT_WORK_TREE" = "$DROVE_TEST_SOURCE" ] &&
+   [ ! -e "$DROVE_TEST_MARKER" ]; then
+  private=$("$DROVE_TEST_REAL_GIT" rev-parse --absolute-git-dir) || exit 90
+  original=$(cat "$private/commondir") || exit 91
+  printf '%s\n' "$DROVE_TEST_MALICIOUS_COMMON" > "$private/commondir" || exit 92
+  "$DROVE_TEST_REAL_GIT" "$@"
+  status=$?
+  printf '%s\n' "$original" > "$private/commondir" || exit 93
+  : > "$DROVE_TEST_MARKER"
+  exit "$status"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_SOURCE", source)
+	t.Setenv("DROVE_TEST_MARKER", marker)
+	t.Setenv("DROVE_TEST_MALICIOUS_COMMON", maliciousCommon)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	root, err := openRealPathRoot(source)
+	if err != nil {
+		t.Fatalf("open source worktree: %v", err)
+	}
+	lease, err := newPreparationLease(
+		context.Background(),
+		manager,
+		source,
+		root,
+	)
+	if err != nil {
+		t.Fatalf("open preparation lease: %v", err)
+	}
+	if lease.repository.startOID != sourceOID {
+		t.Fatalf(
+			"preparation start OID = %q, want registered %q",
+			lease.repository.startOID,
+			sourceOID,
+		)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+}
+
+func TestPrepareProtectsPromotedWorktreePointerDuringRepair(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	sibling := filepath.Join(parent, "sibling")
+	initSourceSwapRepository(t, repository)
+	runGit(t, repository, "worktree", "add", "-b", "sibling", sibling)
+	sibling, err := resolvePath(sibling)
+	if err != nil {
+		t.Fatalf("resolve sibling worktree: %v", err)
+	}
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	swapResult := filepath.Join(parent, "repair-swap-result")
+	wrapper := filepath.Join(parent, "git-wrapper-swap-repair-pointer")
+	script := `#!/bin/sh
+saw_worktree=
+for argument in "$@"; do
+  if [ "$saw_worktree" = "1" ] && [ "$argument" = "repair" ] &&
+     [ ! -e "$DROVE_TEST_SWAP_RESULT" ]; then
+    target=${GIT_WORK_TREE:-$(pwd -P)}
+    original="$target/.git.drove-original"
+    if mv "$target/.git" "$original" 2>/dev/null; then
+      cp "$DROVE_TEST_SIBLING_POINTER" "$target/.git" || exit 90
+      "$DROVE_TEST_REAL_GIT" "$@"
+      status=$?
+      rm -f "$target/.git" || exit 91
+      mv "$original" "$target/.git" || exit 92
+      printf swapped > "$DROVE_TEST_SWAP_RESULT"
+      exit "$status"
+    fi
+    printf blocked > "$DROVE_TEST_SWAP_RESULT"
+  fi
+  [ "$argument" = "worktree" ] && saw_worktree=1
+done
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_SIBLING_POINTER", filepath.Join(sibling, ".git"))
+	t.Setenv("DROVE_TEST_SWAP_RESULT", swapResult)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	_, err = manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err == nil || !strings.Contains(err.Error(), "registration") {
+		t.Fatalf("prepare through repair pointer swap error = %v", err)
+	}
+	result, err := os.ReadFile(swapResult)
+	if err != nil {
+		t.Fatalf("read repair swap result: %v", err)
+	}
+	if string(result) != "swapped" {
+		t.Fatalf("repair pointer swap result = %q, want swapped", result)
+	}
+	canonicalRepository, err := resolvePath(repository)
+	if err != nil {
+		t.Fatalf("resolve repository: %v", err)
+	}
+	assertGitWorktreeRegistration(
+		t,
+		filepath.Join(repository, ".git"),
+		filepath.Join(
+			manager.root,
+			repositoryHash(canonicalRepository),
+			testAgentID,
+		),
+		false,
+	)
+	registered, err := manager.worktreeRegistered(
+		context.Background(),
+		repository,
+		sibling,
+	)
+	if err != nil || !registered {
+		t.Fatalf(
+			"sibling registration restored = %v, err=%v\n%s",
+			registered,
+			err,
+			runGit(t, repository, "worktree", "list", "--porcelain"),
+		)
 	}
 }
 

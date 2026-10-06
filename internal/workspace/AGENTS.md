@@ -81,6 +81,11 @@
   和修复目录已丢失但 Git 注册仍存在的情况。路径存在时必须同时匹配记录中的 Git
   私有目录和文件系统目录身份，复制或替换同名目录必须 fail-stop。
 - `Remove` 默认拒绝 dirty、detached HEAD 和保护来源未知的 version 1 sidecar；
+  调用方必须先停止所有可通过 worktree 路径或既有文件/目录句柄写入的进程；session
+  层在 Agent 为 Done/Stopped、无 attached/resuming session 且持有 cleanup reservation
+  时才调用。成功删除以绑定目录身份的 canonical 到 quarantine 原子 rename 为逻辑
+  线性化点；非强制 dirty 检查只保护该点前可观察到的改动，因为各平台都无法可移植地
+  撤销 rename 前已被其他进程持有的 cwd、dirfd 或可写文件句柄。
   `force` 可显式放宽这些检查。删除前必须先原子持久化带 operation ID 的 removal
   intent。物理删除完成后保留 sidecar，直到 session tombstone durable 后由
   `AcknowledgeRemoval` 校验 token 并删除。`ReconcileRemovals` 在重启时收敛 path 与
@@ -115,8 +120,13 @@
   任一中间实目录或 symlink 被替换时必须 fail-stop。List 与 record scan 全程持有固定
   root/bucket 句柄。sidecar 的原子写、确认读取和删除必须在受约束 bucket 句柄内完成。
   初次 sidecar 安装必须使用 no-replace 原语；removal acknowledgement 先把匹配 token 的
+  空 marker 目录从私有 staging 名 no-replace 提升到 canonical Agent 路径，持有该
+  namespace reservation 复核 quarantine 与 Git registration 均缺失，再把匹配 token 的
   sidecar 原子移动到 operation ID 隔离名，校验后再移动到同格式的新随机私有名并按已打开
-  文件身份删除，崩溃后从任一隔离名恢复。sidecar 与确认隔离名均缺失时必须 fail-closed；
+  文件身份删除；sidecar 进入隔离名后才把 reservation 原子移回私有名并删除，崩溃后从任一
+  隔离名或 canonical marker reservation 恢复。List 与 removal reconciliation 必须把
+  匹配 sidecar token 的 reservation 视为缺失 worktree，其他同名对象一律 fail-stop。
+  sidecar 与确认隔离名均缺失时必须 fail-closed；
   只有当前 Manager 已成功删除同一 Agent ID 与 operation ID 的 sidecar 后，进程内重复确认
   才可幂等成功。
   sidecar 安装在原子改名前后都要确认已打开的 repository bucket 仍位于规范 hash 路径，

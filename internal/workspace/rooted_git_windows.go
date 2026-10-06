@@ -119,6 +119,12 @@ func rootedWorktreeGitCommand(
 			closeWorktree(),
 		)
 	}
+	command.Env = boundGitEnvironmentWithCommon(
+		command.Environ(),
+		gitPath,
+		path,
+		commonPath,
+	)
 	cleanup := func() error {
 		return errors.Join(
 			commonGuard.Close(),
