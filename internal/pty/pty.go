@@ -289,9 +289,6 @@ func (s *Session) waitLoop() {
 	s.mu.Lock()
 	info.CleanupErr = s.groupCloseErr
 	s.mu.Unlock()
-	if info.CleanupErr != nil {
-		s.closeMaster()
-	}
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
@@ -301,7 +298,15 @@ func (s *Session) waitLoop() {
 	} else {
 		info.Code = 0
 	}
-	if s.onExit != nil {
+	exitNotified := false
+	if info.CleanupErr != nil && s.onExit != nil {
+		s.onExit(info)
+		exitNotified = true
+	}
+	if info.CleanupErr != nil {
+		s.closeMaster()
+	}
+	if !exitNotified && s.onExit != nil {
 		s.onExit(info)
 	}
 	select {

@@ -17,7 +17,9 @@
   正常块不拆分合法 UTF-8 码点，EOF 原样送出无效或不完整尾部字节。
 - `Config.OnOutputEnd` 在最后一个输出块后调用一次；它与 `Config.OnExit` 没有顺序保证。
 - `Config.OnOutput`、`Config.OnOutputEnd` 与 `Config.OnExit` 在读取和等待
-  goroutine 启动前固定，运行中不得替换。
+  goroutine 启动前固定，运行中不得替换。正常退出时 `OnOutputEnd` 与 `OnExit`
+  没有顺序保证；进程组清理失败时必须先调用 `OnExit` 建立进程退出 fence，再关闭
+  master 触发 `OnOutputEnd`。
 - `creack/pty` 为子进程创建独立 session；主动停止先向 PID 对应的进程组发送
   SIGTERM，等待 `Config.TerminationGrace`，超时再发送 SIGKILL。默认宽限 5 秒。
 - 直接子进程自然退出后也通过同一个幂等步骤清理仍存活的进程组后代，避免遗留

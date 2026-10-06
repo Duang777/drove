@@ -644,6 +644,9 @@ func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
 	childPIDPath := filepath.Join(t.TempDir(), "child.pid")
 	childReadyPath := filepath.Join(t.TempDir(), "child.ready")
 	exits := make(chan ExitInfo, 1)
+	exitStarted := make(chan struct{})
+	releaseExit := make(chan struct{})
+	outputEnded := make(chan struct{})
 
 	reader, writer, err := os.Pipe()
 	if err != nil {
@@ -676,7 +679,12 @@ func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
 		ptmx:        reader,
 		grace:       grace,
 		groupSignal: func(_ int, _ syscall.Signal) error { return syscall.EPERM },
+		onOutputEnd: func(uint64) {
+			close(outputEnded)
+		},
 		onExit: func(info ExitInfo) {
+			close(exitStarted)
+			<-releaseExit
 			exits <- info
 		},
 		readDone:      make(chan struct{}),
@@ -699,6 +707,21 @@ func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
 	childPID, err := strconv.Atoi(string(rawPID))
 	if err != nil {
 		t.Fatalf("parse child pid %q: %v", rawPID, err)
+	}
+	select {
+	case <-exitStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("exit callback did not start")
+	}
+	outputPassedExitFence := false
+	select {
+	case <-outputEnded:
+		outputPassedExitFence = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseExit)
+	if outputPassedExitFence {
+		t.Fatal("output end ran before the cleanup-failure exit callback")
 	}
 	childNeedsCleanup := true
 	t.Cleanup(func() {
