@@ -738,14 +738,21 @@ type attachCommand struct {
 	run     attachRunner
 	agentID string
 	options cliattach.Options
+	stderr  io.Writer
 }
 
 func (c *attachCommand) Run() error {
 	return c.run(c.ctx, c.agentID, c.options)
 }
 
-func (*attachCommand) SetStdin(io.Reader) {}
+func (c *attachCommand) SetStdin(stdin io.Reader) {
+	c.options.Stdin = stdin
+}
 
-func (*attachCommand) SetStdout(io.Writer) {}
+func (c *attachCommand) SetStdout(stdout io.Writer) {
+	c.options.Stdout = stdout
+}
 
-func (*attachCommand) SetStderr(io.Writer) {}
+func (c *attachCommand) SetStderr(stderr io.Writer) {
+	c.stderr = stderr
+}

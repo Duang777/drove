@@ -87,6 +87,24 @@ func TestAttachTTYRejectsNonTerminalBeforeSetup(t *testing.T) {
 	}
 }
 
+func TestTerminalStreamsUseInjectedTerminalAndOutput(t *testing.T) {
+	input := fakeInputTerminal{}
+	var output bytes.Buffer
+	stdin, stdout, err := terminalStreams(Options{
+		Stdin:  input,
+		Stdout: &output,
+	})
+	if err != nil {
+		t.Fatalf("resolve terminal streams: %v", err)
+	}
+	if stdin != input {
+		t.Fatalf("stdin = %T, want injected terminal", stdin)
+	}
+	if stdout != &output {
+		t.Fatalf("stdout = %T, want injected output", stdout)
+	}
+}
+
 func TestAttachCleanupAfterPumpFailure(t *testing.T) {
 	stream := newFakeTerminalStream()
 	stream.messages <- client.TerminalOutput{

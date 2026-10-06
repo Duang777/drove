@@ -7,8 +7,9 @@ stdin/stdout pumps、resize signal 和退出清理。Cobra 只解析参数并调
 
 ## 关键设计
 
-- `Run` 只接受具体 `client.Client`；测试通过包内 runner dependencies 替换 stream、
-  TTY、cancel reader 和 signal source。
+- `Run` 只接受具体 `client.Client`；`Options` 可携带调用方已经租用的 stdin/stdout，
+  未指定时使用进程标准流。测试通过包内 runner dependencies 替换 stream、TTY、
+  cancel reader 和 signal source。
 - stdin 必须是终端。runner 保存原状态、进入 raw mode，并在所有退出路径恢复一次。
 - stdin 每次最多读取 32 KiB；UTF-8 不完整后缀跨读取保留，发送请求保持合法 UTF-8
   且不超过 session 的 64 KiB 上限。

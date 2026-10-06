@@ -3,7 +3,6 @@ package clitui
 import (
 	"context"
 	"errors"
-	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -449,10 +448,10 @@ func TestAttachUsesExecModesAndPreservesSelection(t *testing.T) {
 
 	var (
 		options []cliattach.Options
-		stdin   io.Reader
-		stdout  io.Writer
-		stderr  io.Writer
 	)
+	stdin := strings.NewReader("terminal input")
+	stdout := &strings.Builder{}
+	stderr := &strings.Builder{}
 	attachErr := errors.New("attach failed")
 	preview := newRecordingPreview()
 	m := newModelWithDependencies(context.Background(), modelDependencies{
@@ -462,7 +461,16 @@ func TestAttachUsesExecModesAndPreservesSelection(t *testing.T) {
 			if id != "agent-1" {
 				t.Fatalf("attached agent = %q, want agent-1", id)
 			}
-			options = append(options, option)
+			if option.Stdin != stdin || option.Stdout != stdout {
+				t.Fatalf(
+					"attach streams = (%T, %T), want Bubble Tea streams",
+					option.Stdin,
+					option.Stdout,
+				)
+			}
+			options = append(options, cliattach.Options{
+				ReadOnly: option.ReadOnly,
+			})
 			if option.ReadOnly {
 				return attachErr
 			}

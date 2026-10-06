@@ -12,7 +12,8 @@
 - 只有选中的 Agent 持有 snapshot 订阅；preview actor 独占 stream 和 `Next` 调用，
   切换目标时先取消并等待旧 generation 退出。
 - Bubble Tea 负责总览终端状态与 resize；attach 通过 `tea.Exec` 暂停总览，并把
-  raw mode、输入输出 pump、SIGWINCH 和 Ctrl-Q 交给 `cliattach.Run`。
+  它注入的终端 stdin/stdout 交给 `cliattach.Run`，后者接管 raw mode、输入输出
+  pump、SIGWINCH 和 Ctrl-Q。
 - 同时最多执行一个 send、stop 或 explain；选择的进程代次变化时取消旧操作并要求
   用户重新确认。attach 返回不得覆盖用户在终端恢复后做出的新选择。
 - 退出总览只清理本地请求、stream 和 worker，不停止远端 Agent。
