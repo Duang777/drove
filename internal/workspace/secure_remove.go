@@ -282,7 +282,8 @@ func removalMarkerName(record workspaceRecord) string {
 }
 
 func removalMarkerTemporaryPrefix(record workspaceRecord) string {
-	return removalMarkerName(record) + ".install-"
+	return removalMarkerName(record) + ".install-" +
+		record.Removal.DirectoryToken + "-"
 }
 
 func removalMarkerTemporaryName(record workspaceRecord) string {
@@ -290,7 +291,8 @@ func removalMarkerTemporaryName(record workspaceRecord) string {
 }
 
 func removalMarkerDiscardPrefix(record workspaceRecord) string {
-	return removalMarkerName(record) + ".discard-"
+	return removalMarkerName(record) + ".discard-" +
+		record.Removal.DirectoryToken + "-"
 }
 
 func removalMarkerDiscardName(record workspaceRecord) string {
@@ -388,7 +390,7 @@ func installRemovalMarker(
 	name string,
 	token string,
 ) (result error) {
-	temporaryName := name + ".install-" + uuid.NewString()
+	temporaryName := name + ".install-" + token + "-" + uuid.NewString()
 	file, err := root.OpenFile(
 		temporaryName,
 		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
@@ -406,7 +408,7 @@ func installRemovalMarker(
 					root,
 					temporaryName,
 					file,
-					name+".install-"+uuid.NewString(),
+					name+".install-"+token+"-"+uuid.NewString(),
 					nil,
 				),
 				syncRecordBucket(root, temporaryName),
