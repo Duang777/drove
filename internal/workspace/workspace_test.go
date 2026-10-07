@@ -1348,7 +1348,7 @@ func TestReconcileNonForceRemovalPreservesMissingDetachedRegistration(t *testing
 		t.Fatalf("reconcile missing detached worktree error = %v, want ErrDirty", err)
 	}
 	porcelain := runGit(t, repository, "worktree", "list", "--porcelain")
-	if !strings.Contains(porcelain, prepared.Path) ||
+	if !strings.Contains(porcelain, filepath.ToSlash(prepared.Path)) ||
 		!strings.Contains(porcelain, detachedHead) ||
 		!strings.Contains(porcelain, "detached") {
 		t.Fatalf("detached registration was not preserved:\n%s", porcelain)
