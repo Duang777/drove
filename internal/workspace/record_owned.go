@@ -96,7 +96,7 @@ func removeOwnedRecordPath(
 	); err != nil {
 		return err
 	}
-	if err := syncRecordDirectory(directory); err != nil {
+	if err := syncOwnedRecordDirectoryAfterUnlink(directory); err != nil {
 		return fmt.Errorf(
 			"workspace: sync removed owned record path %q: %w",
 			name,

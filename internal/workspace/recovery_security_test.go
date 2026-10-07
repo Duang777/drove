@@ -2330,6 +2330,9 @@ func TestAcknowledgeRemovalRejectsWrongTokenForQuarantinedRecord(
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
 	if err != nil || result.State != RemovalComplete {
 		t.Fatalf("remove workspace = %+v, %v", result, err)

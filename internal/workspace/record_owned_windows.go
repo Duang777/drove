@@ -2,7 +2,12 @@
 
 package workspace
 
-import "os"
+import (
+	"errors"
+	"os"
+
+	"golang.org/x/sys/windows"
+)
 
 func unlinkOwnedRecordPath(
 	directory *os.File,
@@ -10,4 +15,12 @@ func unlinkOwnedRecordPath(
 	name string,
 ) error {
 	return unlinkRecordPath(directory, expected, name)
+}
+
+func syncOwnedRecordDirectoryAfterUnlink(directory *os.File) error {
+	err := syncRecordDirectory(directory)
+	if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
+		return nil
+	}
+	return err
 }

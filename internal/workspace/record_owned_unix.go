@@ -13,3 +13,7 @@ func unlinkOwnedRecordPath(
 ) error {
 	return unlinkRecordPath(directory, expected, name)
 }
+
+func syncOwnedRecordDirectoryAfterUnlink(directory *os.File) error {
+	return syncRecordDirectory(directory)
+}

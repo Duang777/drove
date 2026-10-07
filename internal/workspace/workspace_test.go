@@ -493,6 +493,9 @@ func TestCleanupRepairsMissingWorktreeRegistration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	if err := os.RemoveAll(prepared.Path); err != nil {
 		t.Fatalf("remove worktree directory externally: %v", err)
 	}
@@ -853,6 +856,9 @@ func TestVersionOneRecordRequiresForceEvenWhenPathIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	legacy, err := json.Marshal(struct {
 		Version    int    `json:"version"`
 		AgentID    string `json:"agent_id"`
@@ -1083,6 +1089,9 @@ func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1203,6 +1212,9 @@ func TestReconcileRemovalDeletesPresentUnregisteredPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1265,6 +1277,9 @@ func TestReconcileNonForceRemovalPreservesPresentUnregisteredPath(t *testing.T) 
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1316,6 +1331,9 @@ func TestReconcileNonForceRemovalPreservesMissingDetachedRegistration(t *testing
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	runGit(t, prepared.Path, "checkout", "--detach")
 	if err := os.WriteFile(
@@ -1377,6 +1395,9 @@ func TestReconcilePendingRemovalRequiresGit(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
@@ -1461,6 +1482,9 @@ func TestRemoveRecordsInitiallyAbsentPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
 
 	result, err := manager.Remove(
@@ -1502,6 +1526,9 @@ func TestReconcileClearsUnsafeNonForceIntent(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
@@ -2051,6 +2078,9 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {

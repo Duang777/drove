@@ -16,3 +16,7 @@ func unlinkOwnedRecordPath(
 		"workspace: owned record removal is unsupported on this platform",
 	)
 }
+
+func syncOwnedRecordDirectoryAfterUnlink(directory *os.File) error {
+	return syncRecordDirectory(directory)
+}
