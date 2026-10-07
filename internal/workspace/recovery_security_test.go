@@ -1666,6 +1666,9 @@ func TestReconcileQuarantinedRemovalPreservesReplacementPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
