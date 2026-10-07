@@ -39,13 +39,20 @@ type RemovalResult struct {
 
 func workspaceForRemoval(record workspaceRecord) Workspace {
 	target := record.workspace()
-	if record.Version < workspaceRecordVersion {
+	if record.Version < removalWorkspaceRecordVersion {
 		target.repositoryEvidence = nil
 	}
 	return target
 }
 
 // Remove removes one managed worktree and preserves its branch.
+//
+// The caller must first stop every process that can write through the worktree
+// path or a retained file or directory handle. A successful removal is
+// logically ordered at the identity-bound rename from the managed path to its
+// private quarantine. The non-force checks reject changes visible before that
+// point; operating systems do not provide a portable way to revoke stale
+// handles after the rename.
 func (m *Manager) Remove(
 	ctx context.Context,
 	agentID string,
@@ -86,6 +93,12 @@ func (m *Manager) remove(
 		}
 	}
 
+	if record.Removal == nil {
+		record, err = m.ensureRemovalRepositoryEvidence(ctx, record)
+		if err != nil {
+			return RemovalResult{}, err
+		}
+	}
 	removal := Removal{Workspace: workspaceForRemoval(record)}
 	if record.Removal != nil {
 		removal.operationID = record.Removal.OperationID
@@ -191,7 +204,9 @@ func (m *Manager) ReconcileRemovals(ctx context.Context) ([]Removal, error) {
 }
 
 // AcknowledgeRemoval removes a sidecar after its session tombstone is durable.
-func (m *Manager) AcknowledgeRemoval(removal Removal) error {
+func (m *Manager) AcknowledgeRemoval(
+	removal Removal,
+) (result error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -204,32 +219,87 @@ func (m *Manager) AcknowledgeRemoval(removal Removal) error {
 			"workspace: removal acknowledgement token is invalid",
 		)
 	}
-	record := newWorkspaceRecord(removal.Workspace, nil)
-	record.Removal = &workspaceRemovalRecord{
-		OperationID: removal.operationID,
-		Started:     true,
-		Quarantined: true,
+	receipt := removalAcknowledgementReceipt{
+		agentID:     removal.Workspace.AgentID,
+		operationID: removal.operationID,
 	}
-	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	facts, err := m.removalFacts(inspectCtx, record)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	pending, err := m.removalAcknowledgementPending(removal)
 	if err != nil {
 		return err
 	}
-	if facts.pathExists ||
-		facts.quarantineName != "" ||
-		facts.registered {
+	if !pending {
+		if _, acknowledged := m.acknowledgedRemovals[receipt]; acknowledged {
+			return nil
+		}
+		return errors.New(
+			"workspace: removal acknowledgement record is missing",
+		)
+	}
+	if err := m.recoverRecordAcknowledgements(); err != nil {
+		return err
+	}
+	record, exists, err := m.readWorkspaceRecord(removal.Workspace.Path)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New(
+			"workspace: removal acknowledgement record is missing",
+		)
+	}
+	if !sameWorkspace(record.workspace(), removal.Workspace) ||
+		record.Removal == nil ||
+		record.Removal.OperationID != removal.operationID {
+		return m.removeAcknowledgedWorkspaceRecord(removal)
+	}
+	reservation, err := m.reserveRemovalAcknowledgementPath(record)
+	if err != nil {
+		return err
+	}
+	reservationOwned := true
+	defer func() {
+		if reservationOwned {
+			result = errors.Join(result, reservation.release())
+		}
+	}()
+	inspectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	repository, closeRepository, err := m.removalRepository(inspectCtx, record)
+	if err != nil {
+		return err
+	}
+	bucket := reservation.bucket
+	quarantineName, _, quarantineErr := findRemovalQuarantine(bucket, record)
+	_, registered, registrationErr := repository.worktreeRegistration(
+		inspectCtx,
+		record.Path,
+	)
+	verifyErr := reservation.verify()
+	closeRepositoryErr := closeRepository()
+	if err := errors.Join(
+		quarantineErr,
+		registrationErr,
+		verifyErr,
+		closeRepositoryErr,
+	); err != nil {
+		return err
+	}
+	if quarantineName != "" || registered {
 		return errors.New("workspace: cannot acknowledge an incomplete removal")
 	}
-	if err := m.removeAcknowledgedWorkspaceRecord(removal); err != nil {
+	if err := m.removeAcknowledgedWorkspaceRecordAfterQuarantine(
+		removal,
+		func() error {
+			err := reservation.release()
+			if err == nil {
+				reservationOwned = false
+			}
+			return err
+		},
+	); err != nil {
 		return err
 	}
-	if err := m.removeManagedBucketIfEmpty(removal.Workspace); err != nil {
-		return err
-	}
+	m.acknowledgedRemovals[receipt] = struct{}{}
 	return nil
 }
 
@@ -244,17 +314,109 @@ func (m *Manager) removalRepository(
 	ctx context.Context,
 	record workspaceRecord,
 ) (repositoryCapability, func() error, error) {
-	if record.Version < workspaceRecordVersion ||
+	if record.Version < removalWorkspaceRecordVersion ||
 		record.RepositoryEvidence == nil {
-		return pathRepositoryCapability(m, record.Repository),
-			func() error { return nil },
-			nil
+		return repositoryCapability{}, nil, errors.New(
+			"workspace: pending removal has no repository identity evidence",
+		)
 	}
 	lease, err := openRecordedPreparationLease(ctx, m, record)
 	if err != nil {
 		return repositoryCapability{}, nil, err
 	}
 	return lease.repository, lease.Close, nil
+}
+
+func (m *Manager) ensureRemovalRepositoryEvidence(
+	ctx context.Context,
+	record workspaceRecord,
+) (_ workspaceRecord, result error) {
+	if record.Version >= removalWorkspaceRecordVersion &&
+		record.RepositoryEvidence != nil {
+		return record, nil
+	}
+	if record.Removal != nil {
+		return workspaceRecord{}, errors.New(
+			"workspace: pending removal has no repository identity evidence",
+		)
+	}
+	sourcePath := record.Repository
+	var legacyEvidence *repositoryEvidence
+	if record.Version == repositoryWorkspaceRecordVersion &&
+		record.RepositoryEvidence != nil {
+		legacyEvidence = cloneRepositoryEvidence(record.RepositoryEvidence)
+		if err := validateLegacyRepositoryEvidence(*legacyEvidence); err != nil {
+			return workspaceRecord{}, err
+		}
+		sourcePath = legacyEvidence.SourcePath
+	}
+	root, err := openRealPathRoot(sourcePath)
+	if err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: open removal repository: %w",
+			err,
+		)
+	}
+	rootOwned := true
+	defer func() {
+		if rootOwned {
+			result = errors.Join(result, root.Close())
+		}
+	}()
+	repository, err := m.repositoryRootAtRoot(
+		ctx,
+		sourcePath,
+		root,
+	)
+	if err != nil {
+		return workspaceRecord{}, err
+	}
+	if repository != record.Repository {
+		return workspaceRecord{}, errors.New(
+			"workspace: removal repository changed while opening",
+		)
+	}
+	lease, err := newPreparationLease(
+		ctx,
+		m,
+		sourcePath,
+		root,
+	)
+	if err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: retain removal repository: %w",
+			err,
+		)
+	}
+	rootOwned = false
+	defer func() {
+		result = errors.Join(result, lease.Close())
+	}()
+	if legacyEvidence != nil &&
+		(legacyEvidence.SourcePath != lease.evidence.SourcePath ||
+			legacyEvidence.SourceDirectoryIdentity !=
+				lease.evidence.SourceDirectoryIdentity ||
+			legacyEvidence.CommonGitDirectory !=
+				lease.evidence.CommonGitDirectory ||
+			legacyEvidence.CommonGitDirectoryIdentity !=
+				lease.evidence.CommonGitDirectoryIdentity) {
+		return workspaceRecord{}, errors.New(
+			"workspace: legacy removal repository identity evidence changed",
+		)
+	}
+
+	upgradeWorkspaceRecord(&record)
+	record.RepositoryEvidence = cloneRepositoryEvidence(&lease.evidence)
+	if record.IncludedPaths == nil {
+		record.IncludedPaths = []string{}
+	}
+	if err := m.replaceWorkspaceRecord(record); err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: persist removal repository identity: %w",
+			err,
+		)
+	}
+	return record, nil
 }
 
 func (m *Manager) removalFacts(
@@ -290,6 +452,18 @@ func (m *Manager) removalFacts(
 			"workspace: managed path %q is not a real directory",
 			record.Path,
 		)
+	}
+	if pathExists {
+		reserved, err := removalPathIsAcknowledgementReservation(bucket, record)
+		if err != nil {
+			return removalFacts{}, fmt.Errorf(
+				"workspace: inspect removal acknowledgement reservation: %w",
+				err,
+			)
+		}
+		if reserved {
+			pathExists = false
+		}
 	}
 	var quarantineName string
 	if record.Removal != nil {
@@ -481,10 +655,11 @@ func (m *Manager) resumePendingRemoval(
 			filepath.Dir(record.Path),
 			facts.quarantineName,
 		)
-		identityErr := m.validateRemovalIdentity(
+		identityErr := m.validateRemovalQuarantineIdentity(
 			ctx,
 			record,
 			quarantinePath,
+			quarantined,
 		)
 		var markerErr error
 		if identityErr == nil {
@@ -683,12 +858,42 @@ func (m *Manager) persistRemovalStart(
 	started := *record.Removal
 	started.Started = true
 	started.Quarantined = started.Quarantined || quarantined
+	if !quarantined {
+		started.PathAbsent = true
+	}
 	upgradeWorkspaceRecord(&record)
 	record.Removal = &started
 	_, err := m.replaceWorkspaceRecordState(record)
 	if err != nil {
 		return workspaceRecord{}, fmt.Errorf(
 			"workspace: persist physical removal phase: %w",
+			err,
+		)
+	}
+	return record, nil
+}
+
+func (m *Manager) persistRemovalContentsCleared(
+	record workspaceRecord,
+) (workspaceRecord, error) {
+	if record.Removal == nil ||
+		!record.Removal.Started ||
+		!record.Removal.Quarantined {
+		return workspaceRecord{}, errors.New(
+			"workspace: removal quarantine is not ready to clear contents",
+		)
+	}
+	if record.Removal.ContentsCleared {
+		return record, nil
+	}
+	cleared := *record.Removal
+	cleared.ContentsCleared = true
+	upgradeWorkspaceRecord(&record)
+	record.Removal = &cleared
+	_, err := m.replaceWorkspaceRecordState(record)
+	if err != nil {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: persist cleared removal contents: %w",
 			err,
 		)
 	}
@@ -759,6 +964,38 @@ func validateRemovalMarkerPath(
 	return verifyRemovalMarker(root, record)
 }
 
+func (m *Manager) validateRemovalQuarantineIdentity(
+	ctx context.Context,
+	record workspaceRecord,
+	path string,
+	root *os.Root,
+) error {
+	identity, err := openedDirectoryIdentity(root)
+	if err != nil {
+		return err
+	}
+	if record.DirectoryIdentity == "" ||
+		identity != record.DirectoryIdentity {
+		return errors.New(
+			"workspace: removal quarantine directory identity changed",
+		)
+	}
+	if record.Removal != nil && record.Removal.ContentsCleared {
+		return validateClearedRemovalDirectory(root, record, false)
+	}
+	onlyMarker, err := removalDirectoryContainsOnlyMarker(root, record)
+	if err != nil {
+		return err
+	}
+	if onlyMarker &&
+		record.Removal != nil &&
+		record.Removal.Started &&
+		record.Removal.Quarantined {
+		return nil
+	}
+	return m.validateRemovalIdentity(ctx, record, path)
+}
+
 func (m *Manager) removeRemovalQuarantine(
 	ctx context.Context,
 	record workspaceRecord,
@@ -783,14 +1020,105 @@ func (m *Manager) removeRemovalQuarantine(
 	}()
 	path := filepath.Join(filepath.Dir(record.Path), name)
 	if err := errors.Join(
-		m.validateRemovalIdentity(ctx, record, path),
-		verifyRemovalMarker(opened, record),
+		m.validateRemovalQuarantineIdentity(ctx, record, path, opened),
+		validateRemovalMarkerPhase(opened, record),
 		verifyRootEntryUnchanged(bucket, name, opened),
 	); err != nil {
 		return err
 	}
+	if !record.Removal.ContentsCleared {
+		onlyMarker, err := removalDirectoryContainsOnlyMarker(opened, record)
+		if err != nil {
+			return err
+		}
+		if !onlyMarker {
+			entries, err := readRootDirectory(opened)
+			if err != nil {
+				return err
+			}
+			if err := removeRootEntriesExcept(
+				opened,
+				entries,
+				removalMarkerName(record),
+			); err != nil {
+				return err
+			}
+			if err := validateClearedRemovalDirectory(
+				opened,
+				record,
+				true,
+			); err != nil {
+				return err
+			}
+		}
+		record, err = m.persistRemovalContentsCleared(record)
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateClearedRemovalDirectory(
+		opened,
+		record,
+		false,
+	); err != nil {
+		return err
+	}
+	if err := removeRemovalMarkerIfPresent(opened, record); err != nil {
+		return err
+	}
+	if err := validateClearedRemovalDirectory(
+		opened,
+		record,
+		false,
+	); err != nil {
+		return err
+	}
+	if err := verifyRootEntryUnchanged(bucket, name, opened); err != nil {
+		return err
+	}
+	openedInfo, err := opened.Stat(".")
+	if err != nil {
+		return err
+	}
+	deleteName := removalQuarantinePrefix(record) + uuid.NewString()
+	directory, err := openRecordDirectory(bucket)
+	if err != nil {
+		return err
+	}
+	moved, renameErr := renameDirectoryNoReplace(
+		directory,
+		openedInfo,
+		name,
+		removalQuarantineIsolationName(deleteName),
+		deleteName,
+	)
+	closeDirectoryErr := directory.Close()
+	if moved {
+		name = deleteName
+	}
+	if err := errors.Join(renameErr, closeDirectoryErr); err != nil {
+		return fmt.Errorf(
+			"workspace: isolate cleared removal quarantine: %w",
+			err,
+		)
+	}
+	if !moved {
+		return errors.New(
+			"workspace: cleared removal quarantine was not isolated",
+		)
+	}
+	if err := verifyRootEntryUnchanged(bucket, name, opened); err != nil {
+		return err
+	}
+	closeErr := opened.Close()
 	openedOwned = false
-	return removeOpenedDirectoryFromRoot(bucket, name, opened)
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := bucket.Remove(name); err != nil {
+		return err
+	}
+	return syncRecordBucket(bucket, name)
 }
 
 func (m *Manager) rejectQuarantinedRemoval(

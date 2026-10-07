@@ -14,6 +14,7 @@ func renameDirectoryNoReplace(
 	directory *os.File,
 	expected os.FileInfo,
 	sourceName string,
+	_ string,
 	targetName string,
 ) (moved bool, result error) {
 	renaming, err := openDirectoryForRename(directory, sourceName)
@@ -62,7 +63,7 @@ func openDirectoryForRename(
 		&status,
 		nil,
 		windows.FILE_ATTRIBUTE_NORMAL,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
 		windows.FILE_OPEN,
 		windows.FILE_SYNCHRONOUS_IO_NONALERT|
 			windows.FILE_DIRECTORY_FILE|

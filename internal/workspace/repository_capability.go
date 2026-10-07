@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+const maxPrivateGitCommonDirectorySize = 64 * 1024
 
 type repositoryCapability struct {
 	manager    *Manager
@@ -56,6 +59,15 @@ func (r repositoryCapability) withRepositoryBinding(
 	r.commonPath = commonPath
 	r.commonRoot = commonRoot
 	r.startOID = startOID
+	return r
+}
+
+func (r repositoryCapability) withPrivateGitBinding(
+	gitPath string,
+	gitRoot *os.Root,
+) repositoryCapability {
+	r.gitPath = gitPath
+	r.gitRoot = gitRoot
 	return r
 }
 
@@ -158,12 +170,201 @@ func (r repositoryCapability) runForward(
 	return r.run(ctx, input, arguments...)
 }
 
+func (r repositoryCapability) addPreparedWorktree(
+	ctx context.Context,
+	target Workspace,
+	prepared *preparedWorktreeTarget,
+	branch string,
+	expectedHeadOID string,
+) ([]byte, error) {
+	path := prepared.path
+	root := prepared.root
+	verifyBranch := func() error {
+		oid, exists, err := r.refOID(ctx, "refs/heads/"+branch)
+		if err != nil {
+			return err
+		}
+		if !exists || oid != expectedHeadOID {
+			return errors.New(
+				"workspace: prepared branch moved from its expected HEAD",
+			)
+		}
+		return nil
+	}
+	if err := errors.Join(r.verifyBinding(ctx), verifyBranch()); err != nil {
+		return nil, err
+	}
+	stagePrepared, err := preparePreparedWorktreeAdd(
+		target,
+		prepared,
+		r,
+	)
+	if err != nil {
+		return nil, err
+	}
+	command, cleanup, err := rootedPreparedWorktreeGitCommand(
+		ctx,
+		r.manager.git,
+		r.path,
+		r.root,
+		r.commonPath,
+		r.commonRoot,
+		path,
+		root,
+		prepared.registrationStageRoot,
+		[]string{
+			"worktree",
+			"add",
+			"--quiet",
+			"--no-checkout",
+			".",
+			branch,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	output, commandErr := runGitCommand(command, "")
+	finalizeErr := finalizePreparedWorktreeAdd(
+		ctx,
+		r,
+		target,
+		prepared,
+		commandErr == nil,
+	)
+	var clearStageErr error
+	if stagePrepared && finalizeErr == nil {
+		clearStageErr = r.clearPreparedWorktreeStageIdentity(target)
+	}
+	verifyErr := errors.Join(
+		r.verifyBinding(ctx),
+		verifyRealPathRoot(path, root),
+		verifyBranch(),
+	)
+	return output, errors.Join(
+		commandErr,
+		finalizeErr,
+		clearStageErr,
+		verifyErr,
+		cleanup(),
+	)
+}
+
+func (r repositoryCapability) clearPreparedWorktreeStageIdentity(
+	target Workspace,
+) error {
+	record, exists, err := r.manager.readWorkspaceRecord(target.Path)
+	if err == nil && !exists {
+		err = errors.New("workspace: preparation record is missing")
+	}
+	if err != nil {
+		return err
+	}
+	if record.PreparedStageDirectoryIdentity == "" {
+		return errors.New(
+			"workspace: prepared stage directory identity is missing",
+		)
+	}
+	if target.branchOperationID == "" ||
+		record.BranchOperationID != target.branchOperationID ||
+		!sameWorkspace(record.workspace(), target) {
+		return errors.New(
+			"workspace: preparation record changed while clearing stage identity",
+		)
+	}
+	record.PreparedStageDirectoryIdentity = ""
+	if err := r.manager.replaceWorkspaceRecord(record); err != nil {
+		return fmt.Errorf(
+			"workspace: clear prepared stage directory identity: %w",
+			err,
+		)
+	}
+	persisted, exists, err := r.manager.readWorkspaceRecord(target.Path)
+	if err != nil {
+		return err
+	}
+	if !exists || persisted.PreparedStageDirectoryIdentity != "" {
+		return errors.New(
+			"workspace: prepared stage directory identity was not cleared",
+		)
+	}
+	return nil
+}
+
 func (r repositoryCapability) runPrivateGit(
 	ctx context.Context,
 	input string,
 	arguments ...string,
 ) ([]byte, error) {
-	command, cleanup, err := r.privateGitCommand(ctx, arguments...)
+	return r.runPrivateGitAt(ctx, r.path, input, arguments...)
+}
+
+func (r repositoryCapability) runPrivateGitAt(
+	ctx context.Context,
+	worktreePath string,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	return r.runPrivateGitAtWithOutputPolicy(
+		ctx,
+		worktreePath,
+		input,
+		false,
+		arguments...,
+	)
+}
+
+func (r repositoryCapability) runPrivateGitAtKeepingOutput(
+	ctx context.Context,
+	worktreePath string,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	return r.runPrivateGitAtWithOutputPolicy(
+		ctx,
+		worktreePath,
+		input,
+		true,
+		arguments...,
+	)
+}
+
+func (r repositoryCapability) runPrivateGitAtWithOutputPolicy(
+	ctx context.Context,
+	worktreePath string,
+	input string,
+	keepOutputOnError bool,
+	arguments ...string,
+) ([]byte, error) {
+	command, cleanup, err := r.privateGitCommandAt(
+		ctx,
+		worktreePath,
+		arguments...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	run := runGitCommand
+	if keepOutputOnError {
+		run = runGitCommandKeepingOutput
+	}
+	output, commandErr := run(command, input)
+	return output, errors.Join(commandErr, cleanup())
+}
+
+func (r repositoryCapability) runWorktreeAt(
+	ctx context.Context,
+	worktreePath string,
+	worktreeRoot *os.Root,
+	input string,
+	arguments ...string,
+) ([]byte, error) {
+	command, cleanup, err := r.worktreeCommandAt(
+		ctx,
+		worktreePath,
+		worktreeRoot,
+		arguments...,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -188,49 +389,81 @@ func (r repositoryCapability) repositoryDirectories(
 			err,
 		)
 	}
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-	if len(lines) != 2 {
+	return parseRepositoryDirectories(output)
+}
+
+func parseRepositoryDirectories(output []byte) (string, string, error) {
+	raw := trimGitLineTerminator(output)
+	type directoryPair struct {
+		git    string
+		common string
+	}
+	var candidates []directoryPair
+	for index := strings.IndexByte(raw, '\n'); index >= 0; {
+		gitPath := raw[:index]
+		commonPath := raw[index+1:]
+		if filepath.IsAbs(gitPath) && filepath.IsAbs(commonPath) {
+			resolvedGit, gitErr := resolveExistingDirectory(gitPath)
+			resolvedCommon, commonErr := resolveExistingDirectory(commonPath)
+			if gitErr == nil && commonErr == nil {
+				candidates = append(candidates, directoryPair{
+					git:    resolvedGit,
+					common: resolvedCommon,
+				})
+			}
+		}
+		next := strings.IndexByte(raw[index+1:], '\n')
+		if next < 0 {
+			break
+		}
+		index += next + 1
+	}
+	if len(candidates) != 1 {
 		return "", "", errors.New(
 			"workspace: Git directory query returned an invalid response",
 		)
 	}
-	resolve := func(kind string, path string) (string, error) {
-		path = strings.TrimSpace(path)
-		if !filepath.IsAbs(path) {
-			return "", fmt.Errorf(
-				"workspace: %s Git directory is not absolute",
-				kind,
-			)
-		}
-		resolved, resolveErr := resolvePath(path)
-		if resolveErr != nil {
-			return "", fmt.Errorf(
-				"workspace: resolve %s Git directory: %w",
-				kind,
-				resolveErr,
-			)
-		}
-		return resolved, nil
-	}
-	gitPath, err := resolve("source", lines[0])
+	return candidates[0].git, candidates[0].common, nil
+}
+
+func resolveExistingDirectory(path string) (string, error) {
+	resolved, err := resolvePath(path)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	commonPath, err := resolve("common", lines[1])
+	root, err := openRealPathRoot(resolved)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	return gitPath, commonPath, nil
+	if err := root.Close(); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 func (r repositoryCapability) headOID(
 	ctx context.Context,
 ) (string, error) {
-	output, err := r.runPrivateGit(ctx, "", "rev-parse", "--verify", "HEAD")
+	if sameRegisteredWorktreePath(r.gitPath, r.commonPath) {
+		output, err := r.run(ctx, "", "rev-parse", "--verify", "HEAD")
+		if err != nil {
+			return "", fmt.Errorf("workspace: resolve branch start: %w", err)
+		}
+		return validateHeadOID(strings.TrimSpace(string(output)))
+	}
+	registered, exists, err := r.worktreeRegistration(ctx, r.path)
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve branch start: %w", err)
 	}
-	oid := strings.TrimSpace(string(output))
+	if !exists {
+		return "", errors.New(
+			"workspace: source worktree registration is missing",
+		)
+	}
+	return validateHeadOID(registered.head)
+}
+
+func validateHeadOID(oid string) (string, error) {
 	if oid == "" || strings.ContainsAny(oid, " \t\r\n") {
 		return "", errors.New(
 			"workspace: source HEAD returned an invalid object ID",
@@ -267,14 +500,25 @@ func (r repositoryCapability) worktreeCommand(
 	ctx context.Context,
 	arguments ...string,
 ) (*exec.Cmd, func() error, error) {
+	return r.worktreeCommandAt(ctx, r.path, r.root, arguments...)
+}
+
+func (r repositoryCapability) worktreeCommandAt(
+	ctx context.Context,
+	worktreePath string,
+	worktreeRoot *os.Root,
+	arguments ...string,
+) (*exec.Cmd, func() error, error) {
 	if r.root != nil && r.gitRoot != nil {
 		return rootedWorktreeGitCommand(
 			ctx,
 			r.manager.git,
-			r.path,
-			r.root,
+			worktreePath,
+			worktreeRoot,
 			r.gitPath,
 			r.gitRoot,
+			r.commonPath,
+			r.commonRoot,
 			arguments,
 		)
 	}
@@ -285,13 +529,28 @@ func (r repositoryCapability) privateGitCommand(
 	ctx context.Context,
 	arguments ...string,
 ) (*exec.Cmd, func() error, error) {
+	return r.privateGitCommandAt(ctx, r.path, arguments...)
+}
+
+func (r repositoryCapability) privateGitCommandAt(
+	ctx context.Context,
+	worktreePath string,
+	arguments ...string,
+) (*exec.Cmd, func() error, error) {
 	if r.root != nil && r.gitRoot != nil {
+		if r.commonPath == "" || r.commonRoot == nil {
+			return nil, nil, errors.New(
+				"workspace: private Git binding has no common directory",
+			)
+		}
 		return rootedPrivateGitCommand(
 			ctx,
 			r.manager.git,
-			r.path,
+			worktreePath,
 			r.gitPath,
 			r.gitRoot,
+			r.commonPath,
+			r.commonRoot,
 			arguments,
 		)
 	}
@@ -412,7 +671,7 @@ func (r repositoryCapability) worktreeRegistration(
 	}
 	path = filepath.Clean(path)
 	for _, registered := range worktrees {
-		if registered.path == path {
+		if sameRegisteredWorktreePath(registered.path, path) {
 			return registered, true, nil
 		}
 	}
@@ -436,18 +695,11 @@ func (r repositoryCapability) pruneWorktrees(
 }
 
 func (r repositoryCapability) verifyPreparedWorktree(
-	ctx context.Context,
+	_ context.Context,
 	target Workspace,
 	gitDirectory string,
 	registered registeredWorktree,
 ) error {
-	if err := r.verifyPreparedWorktreeRegistration(
-		target,
-		registered,
-		"",
-	); err != nil {
-		return err
-	}
 	gitDirectory, err := r.boundGitDirectory(
 		gitDirectory,
 		target.AgentID,
@@ -455,42 +707,260 @@ func (r repositoryCapability) verifyPreparedWorktree(
 	if err != nil {
 		return err
 	}
-	head, err := r.run(
-		ctx,
-		"",
-		"--git-dir="+gitDirectory,
-		"rev-parse",
-		"--verify",
-		"HEAD",
-	)
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		target.expectedHeadOID,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r repositoryCapability) verifyBoundPreparedWorktree(
+	_ context.Context,
+	target Workspace,
+	registered registeredWorktree,
+) error {
+	if err := r.verifyPrivateGitCommonDirectory(); err != nil {
+		return err
+	}
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		target.expectedHeadOID,
+	); err != nil {
+		return err
+	}
+	return r.verifyPrivateGitCommonDirectory()
+}
+
+func (r repositoryCapability) verifyPrivateGitCommonDirectory() (
+	result error,
+) {
+	if r.gitRoot == nil ||
+		r.commonRoot == nil ||
+		r.gitPath == "" ||
+		r.commonPath == "" {
+		return errors.New(
+			"workspace: private Git common directory binding is incomplete",
+		)
+	}
+	if err := verifyRealPathRoot(r.gitPath, r.gitRoot); err != nil {
+		return err
+	}
+	if err := verifyRealPathRoot(r.commonPath, r.commonRoot); err != nil {
+		return err
+	}
+
+	const name = "commondir"
+	pathInfo, err := r.gitRoot.Lstat(name)
 	if err != nil {
 		return fmt.Errorf(
-			"workspace: inspect prepared worktree HEAD: %w",
+			"workspace: inspect private Git common directory pointer: %w",
 			err,
 		)
 	}
-	if strings.TrimSpace(string(head)) != registered.head {
+	if !pathInfo.Mode().IsRegular() ||
+		pathInfo.Mode()&os.ModeSymlink != 0 {
 		return errors.New(
-			"workspace: prepared worktree HEAD does not match registration",
+			"workspace: private Git common directory pointer is not a regular file",
 		)
 	}
-	branch, err := r.run(
-		ctx,
-		"",
-		"--git-dir="+gitDirectory,
-		"symbolic-ref",
-		"--quiet",
-		"HEAD",
-	)
+	file, err := r.gitRoot.Open(name)
 	if err != nil {
 		return fmt.Errorf(
-			"workspace: inspect prepared worktree branch: %w",
+			"workspace: open private Git common directory pointer: %w",
 			err,
 		)
 	}
-	if strings.TrimSpace(string(branch)) != registered.branch {
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	before, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect opened private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if !before.Mode().IsRegular() ||
+		before.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(pathInfo, before) {
 		return errors.New(
-			"workspace: prepared worktree branch does not match registration",
+			"workspace: private Git common directory pointer changed while opening",
+		)
+	}
+	raw, err := io.ReadAll(
+		io.LimitReader(file, maxPrivateGitCommonDirectorySize+1),
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: read private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if len(raw) > maxPrivateGitCommonDirectorySize {
+		return errors.New(
+			"workspace: private Git common directory pointer is too large",
+		)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: reinspect private Git common directory pointer: %w",
+			err,
+		)
+	}
+	current, err := r.gitRoot.Lstat(name)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: reinspect private Git common directory pointer path: %w",
+			err,
+		)
+	}
+	if !after.Mode().IsRegular() ||
+		after.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(before, after) ||
+		before.Size() != after.Size() ||
+		before.Mode() != after.Mode() ||
+		!before.ModTime().Equal(after.ModTime()) ||
+		!current.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(before, current) {
+		return errors.New(
+			"workspace: private Git common directory pointer changed while reading",
+		)
+	}
+
+	value := strings.TrimSuffix(string(raw), "\n")
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New(
+			"workspace: private Git common directory pointer is invalid",
+		)
+	}
+	commonPath := value
+	if !filepath.IsAbs(commonPath) {
+		commonPath = filepath.Join(r.gitPath, commonPath)
+	}
+	commonPath, err = resolvePath(commonPath)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: resolve private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if commonPath != r.commonPath {
+		return errors.New(
+			"workspace: private Git common directory binding changed",
+		)
+	}
+	commonRoot, err := openRealPathRoot(commonPath)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open private Git common directory target: %w",
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, commonRoot.Close())
+	}()
+	expectedIdentity, err := openedDirectoryIdentity(r.commonRoot)
+	if err != nil {
+		return err
+	}
+	currentIdentity, err := openedDirectoryIdentity(commonRoot)
+	if err != nil {
+		return err
+	}
+	if currentIdentity != expectedIdentity {
+		return errors.New(
+			"workspace: private Git common directory identity changed",
+		)
+	}
+	return errors.Join(
+		verifyRealPathRoot(r.gitPath, r.gitRoot),
+		verifyRealPathRoot(r.commonPath, r.commonRoot),
+		verifyRealPathRoot(commonPath, commonRoot),
+	)
+}
+
+func (r repositoryCapability) derivePreparedWorktreeExpectedHead(
+	ctx context.Context,
+	target Workspace,
+) (string, error) {
+	if err := r.verifyBinding(ctx); err != nil {
+		return "", err
+	}
+	registered, exists, err := r.worktreeRegistration(ctx, target.Path)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", errors.New(
+			"workspace: prepared worktree registration disappeared",
+		)
+	}
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		"",
+	); err != nil {
+		return "", err
+	}
+	branchOID, exists, err := r.refOID(
+		ctx,
+		"refs/heads/"+target.Branch,
+	)
+	if err != nil {
+		return "", err
+	}
+	if !exists || branchOID != registered.head {
+		return "", errors.New(
+			"workspace: prepared branch does not match worktree registration",
+		)
+	}
+	if err := r.verifyBinding(ctx); err != nil {
+		return "", err
+	}
+	return branchOID, nil
+}
+
+func (r repositoryCapability) verifyPreparationRefs(
+	ctx context.Context,
+	target Workspace,
+	requireOwnershipMarker bool,
+) error {
+	if target.expectedHeadOID == "" {
+		return errors.New(
+			"workspace: prepared worktree expected HEAD is unavailable",
+		)
+	}
+	branchOID, exists, err := r.refOID(
+		ctx,
+		"refs/heads/"+target.Branch,
+	)
+	if err != nil {
+		return err
+	}
+	if !exists || branchOID != target.expectedHeadOID {
+		return errors.New(
+			"workspace: prepared branch moved from its expected HEAD",
+		)
+	}
+	if !target.createdBranch || !requireOwnershipMarker {
+		return nil
+	}
+	markerOID, exists, err := r.refOID(
+		ctx,
+		branchOwnershipRef(target.branchOperationID),
+	)
+	if err != nil {
+		return err
+	}
+	if !exists || markerOID != target.expectedHeadOID {
+		return errors.New(
+			"workspace: prepared branch ownership marker changed",
 		)
 	}
 	return nil
@@ -501,7 +971,7 @@ func (repositoryCapability) verifyPreparedWorktreeRegistration(
 	registered registeredWorktree,
 	expectedHeadOID string,
 ) error {
-	if registered.path != target.Path ||
+	if !sameRegisteredWorktreePath(registered.path, target.Path) ||
 		registered.detached ||
 		registered.branch != "refs/heads/"+target.Branch ||
 		registered.head == "" ||
@@ -518,6 +988,17 @@ func (repositoryCapability) verifyPreparedWorktreeRegistration(
 	return nil
 }
 
+func sameRegisteredWorktreePath(left string, right string) bool {
+	left = filepath.Clean(left)
+	right = filepath.Clean(right)
+	if left == right {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
+}
+
 func (r repositoryCapability) boundGitDirectory(
 	path string,
 	agentID string,
@@ -531,12 +1012,19 @@ func (r repositoryCapability) boundGitDirectory(
 	if strings.HasPrefix(name, agentID) && len(name) > len(agentID) {
 		validName = strings.Trim(name[len(agentID):], "0123456789") == ""
 	}
+	if name == "-" ||
+		(strings.HasPrefix(name, "-") &&
+			strings.Trim(name[1:], "0123456789") == "") {
+		validName = true
+	}
 	if err != nil ||
 		!filepath.IsAbs(path) ||
 		filepath.Dir(name) != "." ||
 		!validName {
-		return "", errors.New(
-			"workspace: prepared Git directory does not match the managed worktree",
+		return "", fmt.Errorf(
+			"workspace: prepared Git directory %q does not match agent %q",
+			path,
+			agentID,
 		)
 	}
 	return filepath.Join("worktrees", name), nil

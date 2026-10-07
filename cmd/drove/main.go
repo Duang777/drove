@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -59,7 +60,7 @@ func main() {
 	// CLI 静默日志，避免污染输出。
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})))
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, stop := newRootContext()
 	defer stop()
 	root := newRootCmd()
 	root.SetContext(ctx)
@@ -69,28 +70,87 @@ func main() {
 	}
 }
 
+func newRootContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+}
+
 func executeRoot(root *cobra.Command, args []string) error {
 	root.InitDefaultHelpCmd()
 	root.InitDefaultCompletionCmd()
-	command, remaining, err := root.Find(args)
-	if err != nil {
-		return markUsageError(err)
+	if err := validateDefaultHelpArgs(root, args); err != nil {
+		return err
 	}
-	if len(remaining) > 0 && remaining[0] == "--" {
-		remaining = remaining[1:]
-	}
-	if command.HasSubCommands() &&
-		!command.Runnable() &&
-		len(remaining) > 0 &&
-		!strings.HasPrefix(remaining[0], "-") {
-		return markUsageError(fmt.Errorf(
-			"unknown command %q for %q",
-			remaining[0],
-			command.CommandPath(),
-		))
+	if !isCompletionRequest(args) {
+		command, remaining, err := root.Find(args)
+		if err != nil {
+			return markUsageError(err)
+		}
+		afterTerminator := len(remaining) > 0 && remaining[0] == "--"
+		if len(remaining) > 0 && remaining[0] == "--" {
+			remaining = remaining[1:]
+		}
+		if command.HasSubCommands() &&
+			!command.Runnable() &&
+			len(remaining) > 0 &&
+			(afterTerminator || !strings.HasPrefix(remaining[0], "-")) {
+			return markUsageError(fmt.Errorf(
+				"unknown command %q for %q",
+				remaining[0],
+				command.CommandPath(),
+			))
+		}
 	}
 	root.SetArgs(args)
-	return root.Execute()
+	err := root.Execute()
+	if err != nil && len(args) > 0 && args[0] == "completion" {
+		return markUsageError(err)
+	}
+	return err
+}
+
+func validateDefaultHelpArgs(root *cobra.Command, args []string) error {
+	if len(args) < 2 || args[0] != "help" {
+		return nil
+	}
+	topic := make([]string, 0, len(args)-1)
+	afterTerminator := false
+	for _, argument := range args[1:] {
+		if afterTerminator {
+			topic = append(topic, argument)
+			continue
+		}
+		if argument == "--" {
+			afterTerminator = true
+			continue
+		}
+		if argument == "-h" || argument == "--help" {
+			return nil
+		}
+		if strings.HasPrefix(argument, "-") {
+			continue
+		}
+		topic = append(topic, argument)
+	}
+	if len(topic) == 0 {
+		return nil
+	}
+	_, remaining, err := root.Find(topic)
+	if err == nil && len(remaining) == 0 {
+		return nil
+	}
+	return markUsageError(fmt.Errorf(
+		"unknown help topic %q",
+		strings.Join(topic, " "),
+	))
+}
+
+func isCompletionRequest(args []string) bool {
+	return len(args) > 0 &&
+		(args[0] == "__complete" || args[0] == "__completeNoDesc")
 }
 
 func commandExitCode(err error) int {
@@ -174,6 +234,7 @@ func newInitCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "init",
 		Short: "初始化配置与数据目录",
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg := config.Defaults()
 			path := config.DefaultPath()
@@ -259,6 +320,7 @@ func newPSCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ps",
 		Short: "列出全部 Agent 会话",
+		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx := cmd.Context()
 			c, err := newClient(ctx)
@@ -1129,6 +1191,7 @@ func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "输出版本信息",
+		Args:  usageArgs(cobra.NoArgs),
 		Run: func(_ *cobra.Command, _ []string) {
 			fmt.Printf("drove %s (commit=%s, built=%s)\n", version.Version, version.Commit, version.Date)
 		},

@@ -519,6 +519,42 @@ func TestCleanupWorkspacePreventsConcurrentResume(t *testing.T) {
 	}
 }
 
+func TestCleanupWorkspaceRejectsUnresolvedProcessGroupCleanup(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("11111111-1111-4111-8111-111111111111")
+	managed := addStoppedAgent(t, manager, id, "claude", "vendor-session")
+	managed.setProcessGroupCleanupPending(4242)
+	manager.processGroupAlive = func(pid int) (bool, error) {
+		if pid != 4242 {
+			t.Fatalf("process group PID = %d, want 4242", pid)
+		}
+		return true, nil
+	}
+	workspaces := &fakeWorkspaceLifecycle{}
+	manager.workspaces = workspaces
+
+	if _, err := manager.CleanupWorkspace(
+		context.Background(),
+		string(id),
+		true,
+	); !errors.Is(err, ErrWorkspaceInUse) {
+		t.Fatalf("cleanup with unresolved process group = %v", err)
+	}
+	if workspaces.cleanupCount != 0 {
+		t.Fatalf(
+			"unresolved process group reached workspace cleanup %d times",
+			workspaces.cleanupCount,
+		)
+	}
+	status, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status with unresolved process group: %v", err)
+	}
+	if status.Resumable {
+		t.Fatalf("status with unresolved process group = %+v", status)
+	}
+}
+
 func TestCleanupWorkspaceAcceptsCompletedRemovalWithCommandError(t *testing.T) {
 	manager, _ := newTestManager(t)
 	id := "11111111-1111-4111-8111-111111111111"

@@ -3,7 +3,7 @@ BIN := bin
 MODULE := github.com/Duang777/drove
 VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo dev)
 
-.PHONY: all build build-cli build-daemon test vet lint fmt clean install help
+.PHONY: all build build-cli build-daemon test test-workspace-platforms vet lint fmt clean install help
 
 all: build
 
@@ -20,6 +20,10 @@ build-daemon:
 test:
 	$(GO) test ./... -race -coverprofile=coverage.out
 	$(GO) tool cover -func=coverage.out | tail -n 1
+
+## test-workspace-platforms: 编译 workspace 的全部平台实现与测试
+test-workspace-platforms:
+	GO=$(GO) scripts/check-workspace-platforms.sh
 
 ## vet: 静态检查
 vet:

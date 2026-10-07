@@ -49,23 +49,32 @@ type Workspace struct {
 
 	createdBranch      bool
 	branchOperationID  string
+	expectedHeadOID    string
 	gitDirectory       string
 	directoryIdentity  string
 	protectionKnown    bool
 	includedPaths      []string
+	trackedPaths       map[string]struct{}
+	trackedIgnoreCase  bool
 	preparation        *preparationLease
 	repositoryEvidence *repositoryEvidence
 }
 
 // Manager owns worktrees below one Drove data directory.
 type Manager struct {
-	root         string
-	git          string
-	dataDirInfo  os.FileInfo
-	worktreeInfo os.FileInfo
-	bucketInfo   map[string]os.FileInfo
-	rootErr      error
-	mu           *sync.Mutex
+	root                 string
+	git                  string
+	dataDirInfo          os.FileInfo
+	worktreeInfo         os.FileInfo
+	bucketInfo           map[string]os.FileInfo
+	acknowledgedRemovals map[removalAcknowledgementReceipt]struct{}
+	rootErr              error
+	mu                   *sync.Mutex
+}
+
+type removalAcknowledgementReceipt struct {
+	agentID     string
+	operationID string
 }
 
 // New creates a worktree manager without changing the filesystem.
@@ -120,13 +129,14 @@ func New(dataDir string) (*Manager, error) {
 		rootErr = fmt.Errorf("workspace: inspect worktree root: %w", err)
 	}
 	manager := &Manager{
-		root:         rootPath,
-		git:          "git",
-		dataDirInfo:  dataDirInfo,
-		worktreeInfo: worktreeInfo,
-		bucketInfo:   bucketInfo,
-		rootErr:      rootErr,
-		mu:           workspaceManagerLock(rootPath),
+		root:                 rootPath,
+		git:                  "git",
+		dataDirInfo:          dataDirInfo,
+		worktreeInfo:         worktreeInfo,
+		bucketInfo:           bucketInfo,
+		acknowledgedRemovals: make(map[removalAcknowledgementReceipt]struct{}),
+		rootErr:              rootErr,
+		mu:                   workspaceManagerLock(rootPath),
 	}
 	if worktreeInfo == nil || rootErr != nil {
 		return manager, nil
@@ -270,6 +280,22 @@ func (m *Manager) prepare(
 		return Workspace{}, err
 	}
 	createdBranch := !exists
+	expectedHeadOID := sourceRepository.startOID
+	if exists {
+		var branchExists bool
+		expectedHeadOID, branchExists, err = sourceRepository.refOID(
+			ctx,
+			"refs/heads/"+branch,
+		)
+		if err != nil {
+			return Workspace{}, err
+		}
+		if !branchExists {
+			return Workspace{}, errors.New(
+				"workspace: branch disappeared while preparing",
+			)
+		}
+	}
 	branchOperationID := uuid.NewString()
 	result := Workspace{
 		AgentID:           agentID,
@@ -277,6 +303,7 @@ func (m *Manager) prepare(
 		Path:              path,
 		Branch:            branch,
 		branchOperationID: branchOperationID,
+		expectedHeadOID:   expectedHeadOID,
 		repositoryEvidence: cloneRepositoryEvidence(
 			&lease.evidence,
 		),
@@ -299,10 +326,7 @@ func (m *Manager) prepare(
 		)
 		defer cancel()
 		if !recordInstalled {
-			return Workspace{}, errors.Join(
-				err,
-				m.removeManagedBucketIfEmpty(result),
-			)
+			return Workspace{}, err
 		}
 		cleanupTarget := result
 		cleanupTarget.createdBranch = false
@@ -311,7 +335,8 @@ func (m *Manager) prepare(
 			m.discard(cleanupCtx, cleanupTarget),
 		)
 	}
-	if err := m.createPreparedWorktreeTarget(&result); err != nil {
+	preparedTarget, err := m.createPreparedWorktreeTarget(&result)
+	if err != nil {
 		cleanupCtx, cancel := context.WithTimeout(
 			context.Background(),
 			10*time.Second,
@@ -319,6 +344,7 @@ func (m *Manager) prepare(
 		defer cancel()
 		return Workspace{}, errors.Join(
 			err,
+			m.cleanupPreparedWorktreeTarget(result, preparedTarget),
 			m.discardWithRepository(
 				cleanupCtx,
 				result,
@@ -327,29 +353,48 @@ func (m *Manager) prepare(
 			),
 		)
 	}
+	defer func() {
+		if resultErr != nil {
+			cleanupCtx, cancel := context.WithTimeout(
+				context.Background(),
+				10*time.Second,
+			)
+			defer cancel()
+			cleanupErr := m.cleanupPreparedWorktreeTarget(
+				result,
+				preparedTarget,
+			)
+			var pruneErr, discardErr error
+			if cleanupErr == nil {
+				pruneErr = sourceRepository.pruneWorktrees(cleanupCtx)
+				if pruneErr == nil {
+					discardErr = m.discardWithRepository(
+						cleanupCtx,
+						result,
+						sourceRepository,
+						true,
+					)
+				}
+			}
+			resultErr = errors.Join(
+				resultErr,
+				cleanupErr,
+				pruneErr,
+				discardErr,
+			)
+		}
+		resultErr = errors.Join(resultErr, preparedTarget.Close())
+	}()
 	if createdBranch {
 		if err := sourceRepository.createOwnedBranch(
 			ctx,
 			branch,
 			branchOperationID,
 		); err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: create branch %q: %w",
-					branch,
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: create branch %q: %w",
+				branch,
+				err,
 			)
 		}
 		result.createdBranch = true
@@ -358,96 +403,51 @@ func (m *Manager) prepare(
 			err = errors.New("workspace: branch ownership record is missing")
 		}
 		if err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: read branch ownership record: %w",
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: read branch ownership record: %w",
+				err,
 			)
 		}
 		record.CreatedBranch = true
 		if err := m.replaceWorkspaceRecord(record); err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: confirm branch ownership: %w",
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: confirm branch ownership: %w",
+				err,
 			)
 		}
 	}
-	arguments := []string{"worktree", "add", "--quiet", "--no-checkout"}
-	arguments = append(arguments, path, branch)
-	if _, err := sourceRepository.runForward(
+	if _, err := sourceRepository.addPreparedWorktree(
 		ctx,
-		"",
-		arguments...,
+		result,
+		preparedTarget,
+		result.Branch,
+		expectedHeadOID,
 	); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: create worktree: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+		return Workspace{}, fmt.Errorf("workspace: create worktree: %w", err)
 	}
 
-	if err := m.initializePreparedWorktree(ctx, &result); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			err,
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+	if err := m.initializePreparedWorktree(
+		ctx,
+		&result,
+		preparedTarget,
+		sourceRepository,
+		includedPaths,
+	); err != nil {
+		return Workspace{}, err
+	}
+	if err := m.promotePreparedWorktreeTarget(
+		ctx,
+		result,
+		preparedTarget,
+		sourceRepository,
+	); err != nil {
+		return Workspace{}, err
 	}
 
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Second,
-		)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: source repository changed: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
+		return Workspace{}, fmt.Errorf(
+			"workspace: source repository changed: %w",
+			err,
 		)
 	}
 	copiedPaths, err := m.copyIncludedSelection(
@@ -458,18 +458,10 @@ func (m *Manager) prepare(
 		result,
 		includeSelection,
 	)
+	result.trackedPaths = nil
+	result.trackedIgnoreCase = false
 	if err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			err,
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
-		)
+		return Workspace{}, err
 	}
 	if len(copiedPaths) != len(includedPaths) {
 		record, exists, err := m.readWorkspaceRecord(result.Path)
@@ -481,36 +473,16 @@ func (m *Manager) prepare(
 			err = m.replaceWorkspaceRecord(record)
 		}
 		if err != nil {
-			cleanupCtx, cancel := context.WithTimeout(
-				context.Background(),
-				10*time.Second,
-			)
-			defer cancel()
-			return Workspace{}, errors.Join(
-				fmt.Errorf(
-					"workspace: persist copied include paths: %w",
-					err,
-				),
-				m.discardWithRepository(
-					cleanupCtx,
-					result,
-					sourceRepository,
-					true,
-				),
+			return Workspace{}, fmt.Errorf(
+				"workspace: persist copied include paths: %w",
+				err,
 			)
 		}
 	}
 	if err := verifyRealPathRoot(sourcePath, sourceRoot); err != nil {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return Workspace{}, errors.Join(
-			fmt.Errorf("workspace: source repository changed: %w", err),
-			m.discardWithRepository(
-				cleanupCtx,
-				result,
-				sourceRepository,
-				true,
-			),
+		return Workspace{}, fmt.Errorf(
+			"workspace: source repository changed: %w",
+			err,
 		)
 	}
 	result.protectionKnown = true
@@ -521,7 +493,8 @@ func (m *Manager) prepare(
 }
 
 func workspaceManagerLock(root string) *sync.Mutex {
-	lock, _ := managerLocks.LoadOrStore(root, &sync.Mutex{})
+	key := workspaceManagerLockKey(root)
+	lock, _ := managerLocks.LoadOrStore(key, &sync.Mutex{})
 	return lock.(*sync.Mutex)
 }
 
@@ -661,6 +634,39 @@ func (m *Manager) listRepositoryBucket(
 				err,
 			)
 		}
+		if hasRecord {
+			reserved, reservationErr :=
+				openedRemovalPathIsAcknowledgementReservation(
+					bucket,
+					workspaceRoot,
+					record,
+				)
+			if reserved {
+				closeErr := workspaceRoot.Close()
+				if err := errors.Join(
+					reservationErr,
+					closeErr,
+				); err != nil {
+					return nil, err
+				}
+				missing := record.workspace()
+				missing.Missing = true
+				missing.protectionKnown = record.ProtectionKnown
+				missing.includedPaths = append(
+					[]string(nil),
+					record.IncludedPaths...,
+				)
+				result = append(result, missing)
+				continue
+			}
+			if reservationErr != nil {
+				_ = workspaceRoot.Close()
+				return nil, fmt.Errorf(
+					"workspace: inspect removal acknowledgement reservation: %w",
+					reservationErr,
+				)
+			}
+		}
 		if err := m.pinDataDirectory(); err != nil {
 			_ = workspaceRoot.Close()
 			return nil, err
@@ -669,7 +675,12 @@ func (m *Manager) listRepositoryBucket(
 		if hasRecord {
 			recorded = &record
 		}
-		current, inspectErr := m.inspect(ctx, path, recorded)
+		current, inspectErr := m.inspectAtRoot(
+			ctx,
+			path,
+			workspaceRoot,
+			recorded,
+		)
 		verifyErr := verifyRootEntryUnchanged(
 			bucket,
 			agentID,
@@ -702,8 +713,8 @@ func (m *Manager) discard(
 	target Workspace,
 ) (result error) {
 	lease := target.preparation
-	temporaryLease := false
-	if lease == nil {
+	liveLease := lease != nil && !lease.isClosed()
+	if !liveLease {
 		record, exists, err := m.readWorkspaceRecord(target.Path)
 		if err != nil {
 			return err
@@ -722,23 +733,19 @@ func (m *Manager) discard(
 		if err != nil {
 			return err
 		}
-		temporaryLease = true
-		defer func() {
-			result = errors.Join(result, lease.Close())
-		}()
 	}
+	defer func() {
+		result = errors.Join(result, lease.Close())
+	}()
 	if err := m.discardWithRepository(
 		ctx,
 		target,
 		lease.repository,
-		target.preparation != nil,
+		liveLease,
 	); err != nil {
 		return err
 	}
-	if temporaryLease {
-		return nil
-	}
-	return lease.Close()
+	return nil
 }
 
 func (m *Manager) discardWithRepository(
@@ -767,38 +774,85 @@ func (m *Manager) discardWithRepository(
 			"workspace: preparation record does not match discard request",
 		)
 	}
-	var result error
+	if err := cleanupPreparedWorktreeAddDebris(
+		ctx,
+		repository,
+		target,
+		record,
+	); err != nil {
+		return fmt.Errorf(
+			"workspace: clean prepared worktree registration stage: %w",
+			err,
+		)
+	}
+	stagingPath, stagingRegistrationPath, stagingExists, err :=
+		m.preparedWorktreeStagingPaths(target, record)
+	if err != nil {
+		return err
+	}
 	_, pathErr := os.Lstat(target.Path)
 	pathExists := pathErr == nil
-	pathMissing := errors.Is(pathErr, os.ErrNotExist)
 	if pathErr != nil && !errors.Is(pathErr, os.ErrNotExist) {
-		result = errors.Join(
-			result,
-			fmt.Errorf("workspace: inspect discarded worktree: %w", pathErr),
+		return fmt.Errorf(
+			"workspace: inspect discarded worktree: %w",
+			pathErr,
 		)
+	}
+	if pathExists && stagingExists {
+		return errors.New(
+			"workspace: preparation has both public and staging worktree paths",
+		)
+	}
+	activePath := target.Path
+	if stagingExists {
+		activePath = stagingPath
+		pathExists = true
 	}
 	if pathExists &&
 		(record.DirectoryIdentity == "" ||
 			(record.GitDirectory == "" && !allowIncompleteGitIdentity)) {
-		return errors.Join(
-			result,
-			errors.New(
-				"workspace: preparation record has incomplete worktree identity",
-			),
+		return errors.New(
+			"workspace: preparation record has incomplete worktree identity",
 		)
 	}
-	registered, err := repository.worktreeRegistered(
-		ctx,
-		target.Path,
-	)
+	registrationPaths := []string{target.Path}
+	if stagingRegistrationPath != target.Path {
+		registrationPaths = append(
+			registrationPaths,
+			stagingRegistrationPath,
+		)
+	}
+	anyRegistered := func() (bool, error) {
+		for _, path := range registrationPaths {
+			registered, err := repository.worktreeRegistered(ctx, path)
+			if err != nil {
+				return false, err
+			}
+			if registered {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	registered, err := anyRegistered()
+	var result error
 	worktreeRemoved := false
 	if err != nil {
 		result = errors.Join(result, err)
 	} else {
-		pathRemoved := pathMissing
+		pathRemoved := !pathExists
 		if pathExists {
 			var removeErr error
-			if repository.root != nil {
+			if activePath != target.Path {
+				removeErr = m.removeStagedPreparedWorktree(
+					ctx,
+					target,
+					record,
+					activePath,
+					stagingRegistrationPath,
+					repository,
+				)
+			} else if repository.root != nil {
 				removeErr = m.removePreparedWorktreeAtRoot(
 					ctx,
 					target,
@@ -822,6 +876,12 @@ func (m *Manager) discardWithRepository(
 					),
 				)
 			} else {
+				if !registered {
+					registered, removeErr = anyRegistered()
+					if removeErr != nil {
+						result = errors.Join(result, removeErr)
+					}
+				}
 				pathRemoved = true
 			}
 		}
@@ -835,10 +895,7 @@ func (m *Manager) discardWithRepository(
 			}
 		}
 		if pathRemoved {
-			stillRegistered, err := repository.worktreeRegistered(
-				ctx,
-				target.Path,
-			)
+			stillRegistered, err := anyRegistered()
 			if err != nil {
 				result = errors.Join(result, err)
 			} else if stillRegistered {
@@ -865,16 +922,8 @@ func (m *Manager) discardWithRepository(
 			branchCleaned = true
 		}
 	}
-	recordRemoved := false
 	if worktreeRemoved && branchCleaned {
 		if err := m.removeWorkspaceRecord(target.Path); err != nil {
-			result = errors.Join(result, err)
-		} else {
-			recordRemoved = true
-		}
-	}
-	if recordRemoved {
-		if err := m.removeManagedBucketIfEmpty(target); err != nil {
 			result = errors.Join(result, err)
 		}
 	}
@@ -903,7 +952,12 @@ func (m *Manager) removeDiscardedPath(
 			result = errors.Join(result, opened.Close())
 		}
 	}()
-	current, inspectErr := m.inspect(ctx, target.Path, &record)
+	current, inspectErr := m.inspectAtRoot(
+		ctx,
+		target.Path,
+		opened,
+		&record,
+	)
 	verifyErr := verifyRootEntryUnchanged(
 		bucket,
 		target.AgentID,
@@ -953,9 +1007,27 @@ func (m *Manager) inspect(
 	ctx context.Context,
 	path string,
 	recorded *workspaceRecord,
+) (_ Workspace, result error) {
+	root, err := openRealPathRoot(path)
+	if err != nil {
+		return Workspace{}, err
+	}
+	defer func() {
+		result = errors.Join(result, root.Close())
+	}()
+	current, err := m.inspectAtRoot(ctx, path, root, recorded)
+	verifyErr := verifyRealPathRoot(path, root)
+	return current, errors.Join(err, verifyErr)
+}
+
+func (m *Manager) inspectAtRoot(
+	ctx context.Context,
+	path string,
+	root *os.Root,
+	recorded *workspaceRecord,
 ) (Workspace, error) {
 	agentID := filepath.Base(path)
-	directoryIdentity, err := worktreeDirectoryIdentity(path)
+	directoryIdentity, err := openedDirectoryIdentity(root)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -967,7 +1039,7 @@ func (m *Manager) inspect(
 			path,
 		)
 	}
-	repository, err := m.repositoryRoot(ctx, path)
+	repository, err := m.repositoryRootAtRoot(ctx, path, root)
 	if err != nil {
 		return Workspace{}, fmt.Errorf("workspace: inspect repository for %q: %w", path, err)
 	}
@@ -977,7 +1049,7 @@ func (m *Manager) inspect(
 			path,
 		)
 	}
-	gitDirectory, err := m.worktreeGitDirectory(ctx, path)
+	gitDirectory, err := m.worktreeGitDirectoryAtRoot(ctx, path, root)
 	if err != nil {
 		return Workspace{}, err
 	}
@@ -989,8 +1061,26 @@ func (m *Manager) inspect(
 			path,
 		)
 	}
+	if err := verifyRealPathRoot(path, root); err != nil {
+		return Workspace{}, err
+	}
+	if err := cleanupRecordDeletionNamespace(root); err != nil {
+		return Workspace{}, fmt.Errorf(
+			"workspace: recover internal deletions for %q: %w",
+			path,
+			err,
+		)
+	}
 
-	branchOutput, err := m.run(ctx, "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	branchOutput, err := m.runRootedGit(
+		ctx,
+		path,
+		root,
+		"symbolic-ref",
+		"--quiet",
+		"--short",
+		"HEAD",
+	)
 	detached := false
 	branch := strings.TrimSpace(string(branchOutput))
 	if isExitCode(err, 1) {
@@ -998,7 +1088,14 @@ func (m *Manager) inspect(
 		if recorded != nil {
 			branch = recorded.Branch
 		} else {
-			head, headErr := m.run(ctx, "-C", path, "rev-parse", "--short", "HEAD")
+			head, headErr := m.runRootedGit(
+				ctx,
+				path,
+				root,
+				"rev-parse",
+				"--short",
+				"HEAD",
+			)
 			if headErr != nil {
 				return Workspace{}, fmt.Errorf(
 					"workspace: inspect detached HEAD for %q: %w",
@@ -1011,10 +1108,10 @@ func (m *Manager) inspect(
 	} else if err != nil {
 		return Workspace{}, fmt.Errorf("workspace: inspect branch for %q: %w", path, err)
 	}
-	status, err := m.run(
+	status, err := m.runRootedGit(
 		ctx,
-		"-C",
 		path,
+		root,
 		"status",
 		"--porcelain=v1",
 		"--untracked-files=all",
@@ -1028,7 +1125,7 @@ func (m *Manager) inspect(
 	if recorded != nil {
 		includedPaths = append([]string(nil), recorded.IncludedPaths...)
 		for _, relative := range includedPaths {
-			_, pathErr := os.Lstat(filepath.Join(path, relative))
+			_, pathErr := root.Lstat(relative)
 			switch {
 			case pathErr == nil:
 				includedDirty = true
@@ -1060,23 +1157,34 @@ func workspaceStatusDirty(
 	status []byte,
 	recorded *workspaceRecord,
 ) bool {
-	ignored := ""
-	if recorded != nil &&
-		recorded.Removal != nil &&
-		recorded.Removal.DirectoryToken != "" {
-		ignored = "?? " + removalMarkerName(*recorded)
-	}
 	for _, line := range strings.Split(
 		strings.TrimSpace(string(status)),
 		"\n",
 	) {
 		line = strings.TrimSuffix(line, "\r")
-		if line == "" || line == ignored {
+		if line == "" || isRemovalInternalStatus(line, recorded) {
 			continue
 		}
 		return true
 	}
 	return false
+}
+
+func isRemovalInternalStatus(
+	line string,
+	recorded *workspaceRecord,
+) bool {
+	if recorded == nil ||
+		recorded.Removal == nil ||
+		recorded.Removal.DirectoryToken == "" {
+		return false
+	}
+	name, found := strings.CutPrefix(line, "?? ")
+	if !found {
+		return false
+	}
+	return name == removalMarkerName(*recorded) ||
+		isRemovalMarkerTemporaryName(*recorded, name)
 }
 
 func (m *Manager) worktreeGitDirectory(
@@ -1097,7 +1205,7 @@ func (m *Manager) worktreeGitDirectory(
 			err,
 		)
 	}
-	gitDirectory := strings.TrimSpace(string(output))
+	gitDirectory := trimGitLineTerminator(output)
 	if !filepath.IsAbs(gitDirectory) {
 		return "", fmt.Errorf(
 			"workspace: Git directory for %q is not absolute",
@@ -1183,7 +1291,7 @@ func (m *Manager) repositoryPaths(
 			err,
 		)
 	}
-	sourcePath := strings.TrimSpace(string(output))
+	sourcePath := trimGitLineTerminator(output)
 	sourcePath, err = filepath.EvalSymlinks(sourcePath)
 	if err != nil {
 		return "", "", fmt.Errorf(
@@ -1203,12 +1311,17 @@ func (m *Manager) repositoryPaths(
 
 func (m *Manager) validateBranch(ctx context.Context, branch string) error {
 	if branch == "" ||
+		branch == "HEAD" ||
 		strings.HasPrefix(branch, "-") ||
 		strings.ContainsRune(branch, '\x00') {
 		return fmt.Errorf("%w: %q", ErrInvalidBranch, branch)
 	}
-	if _, err := m.run(ctx, "check-ref-format", "refs/heads/"+branch); err != nil {
-		if isExitCode(err, 1) {
+	if _, err := m.run(
+		ctx,
+		"check-ref-format",
+		"refs/heads/"+branch,
+	); err != nil {
+		if isExitCode(err, 1) || isExitCode(err, 128) {
 			return errors.Join(
 				fmt.Errorf("%w: %q", ErrInvalidBranch, branch),
 				err,
@@ -1277,7 +1390,7 @@ func (m *Manager) repositoryRootWith(
 	if err != nil {
 		return "", fmt.Errorf("workspace: inspect common Git directory: %w", err)
 	}
-	commonPath := strings.TrimSpace(string(commonOutput))
+	commonPath := trimGitLineTerminator(commonOutput)
 	if !filepath.IsAbs(commonPath) {
 		commonPath = filepath.Join(worktreePath, commonPath)
 	}
@@ -1296,7 +1409,7 @@ func (m *Manager) repositoryRootWith(
 		"core.worktree",
 	)
 	if err == nil {
-		configured := strings.TrimSpace(string(worktreeOutput))
+		configured := trimGitLineTerminator(worktreeOutput)
 		if !filepath.IsAbs(configured) {
 			configured = filepath.Join(commonPath, configured)
 		}
@@ -1313,7 +1426,35 @@ func (m *Manager) repositoryRootWith(
 		return "", fmt.Errorf("workspace: inspect configured worktree: %w", err)
 	}
 
-	root := filepath.Dir(commonPath)
+	worktreesOutput, err := run(
+		"worktree",
+		"list",
+		"--porcelain",
+		"-z",
+	)
+	if err != nil {
+		return "", fmt.Errorf("workspace: list repository worktrees: %w", err)
+	}
+	worktrees, err := parseRegisteredWorktrees(worktreesOutput)
+	if err != nil {
+		return "", err
+	}
+	if len(worktrees) == 0 {
+		return "", errors.New("workspace: repository has no registered worktree")
+	}
+	root := worktrees[0].path
+	if sameRegisteredWorktreePath(root, commonPath) {
+		topLevelOutput, err := run("rev-parse", "--show-toplevel")
+		if err != nil {
+			return "", fmt.Errorf("workspace: inspect repository worktree: %w", err)
+		}
+		root = trimGitLineTerminator(topLevelOutput)
+		if !filepath.IsAbs(root) {
+			return "", errors.New(
+				"workspace: repository worktree is not absolute",
+			)
+		}
+	}
 	resolved, err := resolvePath(root)
 	if err != nil {
 		return "", fmt.Errorf("workspace: resolve repository root: %w", err)
@@ -1392,7 +1533,7 @@ func (m *Manager) worktreeRegistration(
 	}
 	path = filepath.Clean(path)
 	for _, registered := range worktrees {
-		if registered.path == path {
+		if sameRegisteredWorktreePath(registered.path, path) {
 			return registered, true, nil
 		}
 	}
@@ -1571,6 +1712,10 @@ func isExitCode(err error, code int) bool {
 	return errors.As(err, &exitErr) && exitErr.ExitCode() == code
 }
 
+func trimGitLineTerminator(output []byte) string {
+	return strings.TrimSuffix(string(output), "\n")
+}
+
 func resolvePath(path string) (string, error) {
 	path = filepath.Clean(path)
 	var suffix []string
@@ -1618,20 +1763,6 @@ func validRepositoryHash(value string) bool {
 		}
 	}
 	return true
-}
-
-func ensureDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return fmt.Errorf("workspace: create directory %q: %w", path, err)
-	}
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("workspace: inspect directory %q: %w", path, err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("workspace: path %q is not a real directory", path)
-	}
-	return nil
 }
 
 func ensureAbsent(path string) error {

@@ -403,6 +403,7 @@ func (m *model) handleSendKey(message tea.KeyMsg) tea.Cmd {
 		m.focus = focusFleet
 		return m.startSend(id, payload)
 	default:
+		m.notice = ""
 		var command tea.Cmd
 		m.input, command = m.input.Update(message)
 		return command
@@ -499,6 +500,10 @@ func filterProjectedFleet(rows []fleetRow, filter fleetFilter) []fleetRow {
 }
 
 func (m *model) replacePreview(agentID string) {
+	row, selected := m.selectedRow()
+	if !selected || row.AgentID != agentID || row.PID <= 0 {
+		agentID = ""
+	}
 	m.previewTarget.Generation++
 	m.previewTarget.AgentID = agentID
 	m.previewSnapshot = nil
@@ -737,14 +742,21 @@ type attachCommand struct {
 	run     attachRunner
 	agentID string
 	options cliattach.Options
+	stderr  io.Writer
 }
 
 func (c *attachCommand) Run() error {
 	return c.run(c.ctx, c.agentID, c.options)
 }
 
-func (*attachCommand) SetStdin(io.Reader) {}
+func (c *attachCommand) SetStdin(stdin io.Reader) {
+	c.options.Stdin = stdin
+}
 
-func (*attachCommand) SetStdout(io.Writer) {}
+func (c *attachCommand) SetStdout(stdout io.Writer) {
+	c.options.Stdout = stdout
+}
 
-func (*attachCommand) SetStderr(io.Writer) {}
+func (c *attachCommand) SetStderr(stderr io.Writer) {
+	c.stderr = stderr
+}

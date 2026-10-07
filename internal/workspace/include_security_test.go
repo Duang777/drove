@@ -11,6 +11,27 @@ import (
 	"testing"
 )
 
+func TestTrackedPathKeyPreservesCaseForCaseSensitiveRepository(t *testing.T) {
+	got := trackedPathKey("Directory/Secret.local", false)
+	if got != "Directory/Secret.local" {
+		t.Fatalf("tracked path key = %q, want case preserved", got)
+	}
+}
+
+func TestTrackedPathKeyFoldsCaseForCaseInsensitiveRepository(t *testing.T) {
+	got := trackedPathKey("Directory/Secret.local", true)
+	if got != "directory/secret.local" {
+		t.Fatalf("tracked path key = %q, want folded case", got)
+	}
+}
+
+func TestValidateIncludedPathRejectsInvalidUTF8(t *testing.T) {
+	path := string([]byte{'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 0xff})
+	if _, err := validateIncludedPath(path); err == nil {
+		t.Fatal("included path validation accepted invalid UTF-8")
+	}
+}
+
 func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source")
 	if err := os.Mkdir(sourcePath, 0o700); err != nil {
@@ -47,18 +68,21 @@ func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 	defer destination.Close()
 
 	openedSourcePath := sourcePath + "-opened"
-	if err := os.Rename(sourcePath, openedSourcePath); err != nil {
-		t.Fatalf("move opened source: %v", err)
+	renameErr := os.Rename(sourcePath, openedSourcePath)
+	if renameErr != nil && runtime.GOOS != "windows" {
+		t.Fatalf("move opened source: %v", renameErr)
 	}
-	if err := os.Mkdir(sourcePath, 0o700); err != nil {
-		t.Fatalf("replace source directory: %v", err)
-	}
-	if err := os.WriteFile(
-		filepath.Join(sourcePath, "secret"),
-		[]byte("replacement\n"),
-		0o600,
-	); err != nil {
-		t.Fatalf("write replacement source: %v", err)
+	if renameErr == nil {
+		if err := os.Mkdir(sourcePath, 0o700); err != nil {
+			t.Fatalf("replace source directory: %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(sourcePath, "secret"),
+			[]byte("replacement\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write replacement source: %v", err)
+		}
 	}
 
 	if err := copyIncludedPath(
@@ -75,6 +99,73 @@ func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 		filepath.Join(destinationPath, "secret"),
 		"original\n",
 	)
+}
+
+func TestCopyIncludedPathRejectsSameSizeRewriteDuringCopy(t *testing.T) {
+	sourcePath := t.TempDir()
+	sourceFile := filepath.Join(sourcePath, "secret")
+	if err := os.WriteFile(sourceFile, []byte("before\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	sourceInfo, err := os.Stat(sourceFile)
+	if err != nil {
+		t.Fatalf("inspect source: %v", err)
+	}
+	destinationPath := t.TempDir()
+	source, err := openRealPathRoot(sourcePath)
+	if err != nil {
+		t.Fatalf("open source root: %v", err)
+	}
+	defer source.Close()
+	destinationBucket, err := openRealPathRoot(filepath.Dir(destinationPath))
+	if err != nil {
+		t.Fatalf("open destination bucket: %v", err)
+	}
+	defer destinationBucket.Close()
+	destination, err := openRealRootFromRoot(
+		destinationBucket,
+		filepath.Base(destinationPath),
+	)
+	if err != nil {
+		t.Fatalf("open destination root: %v", err)
+	}
+	defer destination.Close()
+
+	err = copyIncludedPathAfterCopy(
+		source,
+		destinationBucket,
+		destination,
+		filepath.Base(destinationPath),
+		"secret",
+		func() {
+			if err := os.WriteFile(
+				sourceFile,
+				[]byte("after!\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("rewrite source: %v", err)
+			}
+			if err := os.Chtimes(
+				sourceFile,
+				sourceInfo.ModTime(),
+				sourceInfo.ModTime(),
+			); err != nil {
+				t.Fatalf("restore source modification time: %v", err)
+			}
+		},
+	)
+	if err == nil ||
+		!strings.Contains(
+			err.Error(),
+			"source changed while verifying copied contents",
+		) {
+		t.Fatalf("same-size source rewrite error = %v", err)
+	}
+	if _, err := os.Lstat(
+		filepath.Join(destinationPath, "secret"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rejected source rewrite installed destination: %v", err)
+	}
 }
 
 func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
@@ -114,7 +205,8 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 			repositoryHash(repository),
 			testAgentID,
 		),
-		Branch: "pinned-source",
+		Branch:       "pinned-source",
+		trackedPaths: map[string]struct{}{},
 	}
 	if err := os.Mkdir(target.Path, 0o700); err != nil {
 		t.Fatalf("create destination: %v", err)
@@ -133,22 +225,24 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	}
 
 	openedSourcePath := sourcePath + "-opened"
-	if err := os.Rename(sourcePath, openedSourcePath); err != nil {
-		t.Fatalf("move opened source: %v", err)
+	renameErr := os.Rename(sourcePath, openedSourcePath)
+	if renameErr != nil && runtime.GOOS != "windows" {
+		t.Fatalf("move opened source: %v", renameErr)
 	}
-	if err := os.Mkdir(sourcePath, 0o700); err != nil {
-		t.Fatalf("replace source directory: %v", err)
-	}
-	if err := os.WriteFile(
-		filepath.Join(sourcePath, "secret"),
-		[]byte("replacement\n"),
-		0o600,
-	); err != nil {
-		t.Fatalf("write replacement source: %v", err)
+	if renameErr == nil {
+		if err := os.Mkdir(sourcePath, 0o700); err != nil {
+			t.Fatalf("replace source directory: %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(sourcePath, "secret"),
+			[]byte("replacement\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write replacement source: %v", err)
+		}
 	}
 
 	if _, err := manager.copyIncludedFiles(
-		context.Background(),
 		source,
 		target,
 		[]string{"secret"},
@@ -156,8 +250,12 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 		t.Fatalf("copy included files: %v", err)
 	}
 	assertFileContents(t, filepath.Join(target.Path, "secret"), "original\n")
-	if err := verifyRealPathRoot(sourcePath, source); err == nil {
+	verifyErr := verifyRealPathRoot(sourcePath, source)
+	if renameErr == nil && verifyErr == nil {
 		t.Fatal("source replacement passed final identity verification")
+	}
+	if renameErr != nil && verifyErr != nil {
+		t.Fatalf("locked source failed final identity verification: %v", verifyErr)
 	}
 }
 
@@ -195,7 +293,8 @@ func TestCopyIncludedFilesRejectsReplacementTargetIdentity(t *testing.T) {
 			repositoryHash(repository),
 			testAgentID,
 		),
-		Branch: "replacement-target",
+		Branch:       "replacement-target",
+		trackedPaths: map[string]struct{}{},
 	}
 	if err := os.Mkdir(target.Path, 0o700); err != nil {
 		t.Fatalf("create destination: %v", err)
@@ -219,7 +318,6 @@ func TestCopyIncludedFilesRejectsReplacementTargetIdentity(t *testing.T) {
 	}
 
 	if _, err := manager.copyIncludedFiles(
-		context.Background(),
 		source,
 		target,
 		[]string{"secret"},
@@ -548,4 +646,221 @@ func TestPrepareCopiesIncludedLiteralPathspecName(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(prepared.Path, includedPath)); err != nil {
 		t.Fatalf("included literal path was not copied: %v", err)
 	}
+}
+
+func TestPrepareReadsTargetTrackedPathsOnce(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local files")
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	for _, name := range []string{"first.local", "second.local", "third.local"} {
+		if err := os.WriteFile(
+			filepath.Join(repository, name),
+			[]byte(name+"\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write include candidate %q: %v", name, err)
+		}
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	countPath := filepath.Join(t.TempDir(), "tracked-count")
+	wrapper := filepath.Join(t.TempDir(), "git-wrapper")
+	script := `#!/bin/sh
+saw_ls=
+saw_cached=
+for argument in "$@"; do
+  [ "$argument" = "ls-files" ] && saw_ls=1
+  [ "$argument" = "--cached" ] && saw_cached=1
+  [ "$argument" = "--error-unmatch" ] && exit 97
+done
+if [ -n "$saw_ls" ] && [ -n "$saw_cached" ]; then
+  printf 'x\n' >> "$DROVE_TEST_COUNT"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv("DROVE_TEST_COUNT", countPath)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = manager.Discard(context.Background(), prepared)
+	})
+	count, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("read tracked-path query count: %v", err)
+	}
+	if string(count) != "x\n" {
+		t.Fatalf("target tracked-path queries = %q, want one", count)
+	}
+	for _, name := range []string{"first.local", "second.local", "third.local"} {
+		assertFileContents(
+			t,
+			filepath.Join(prepared.Path, name),
+			name+"\n",
+		)
+	}
+}
+
+func TestPrepareSnapshotsTrackedPathsFromPrivateGitDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test requires a POSIX shell")
+	}
+	parent := t.TempDir()
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local files")
+
+	replacement := filepath.Join(parent, "replacement")
+	runGit(t, repository, "branch", "tracked-replacement", "HEAD")
+	runGit(
+		t,
+		repository,
+		"worktree",
+		"add",
+		"--quiet",
+		replacement,
+		"tracked-replacement",
+	)
+	const includedPath = "secret.local"
+	if err := os.WriteFile(
+		filepath.Join(replacement, includedPath),
+		[]byte("tracked replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write replacement tracked file: %v", err)
+	}
+	runGit(t, replacement, "add", "-f", includedPath)
+	runGit(t, replacement, "commit", "-m", "track replacement local file")
+
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte(includedPath+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, includedPath),
+		[]byte("source local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source included file: %v", err)
+	}
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("find Git: %v", err)
+	}
+	marker := filepath.Join(parent, "tracked-path-swap-ran")
+	wrapper := filepath.Join(parent, "git-wrapper")
+	script := `#!/bin/sh
+saw_ls=
+saw_cached=
+saw_full_name=
+for argument in "$@"; do
+  [ "$argument" = "ls-files" ] && saw_ls=1
+  [ "$argument" = "--cached" ] && saw_cached=1
+  [ "$argument" = "--full-name" ] && saw_full_name=1
+done
+if [ -n "$saw_ls" ] && [ -n "$saw_cached" ] &&
+   [ -n "$saw_full_name" ]; then
+  worktree=$GIT_WORK_TREE
+  if [ -z "$worktree" ]; then
+    if [ -d /proc/self/fd/3 ]; then
+      worktree=$(readlink /proc/self/fd/3) || exit 90
+    else
+      worktree=$(pwd -P) || exit 91
+    fi
+  fi
+  pointer="$worktree/.git"
+  opened="$worktree/.git.drove-test-original"
+  mv "$pointer" "$opened" || exit 92
+  cp "$DROVE_TEST_REPLACEMENT_POINTER" "$pointer" || exit 93
+  "$DROVE_TEST_REAL_GIT" "$@"
+  status=$?
+  rm -f "$pointer" || exit 94
+  mv "$opened" "$pointer" || exit 95
+  : > "$DROVE_TEST_MARKER"
+  exit "$status"
+fi
+exec "$DROVE_TEST_REAL_GIT" "$@"
+`
+	if err := os.WriteFile(wrapper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write Git wrapper: %v", err)
+	}
+	t.Setenv(
+		"DROVE_TEST_REPLACEMENT_POINTER",
+		filepath.Join(replacement, ".git"),
+	)
+	t.Setenv("DROVE_TEST_REAL_GIT", realGit)
+	t.Setenv("DROVE_TEST_MARKER", marker)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	manager.git = wrapper
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = manager.Discard(context.Background(), prepared)
+	})
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("tracked-path pointer swap did not run: %v", err)
+	}
+	assertFileContents(
+		t,
+		filepath.Join(prepared.Path, includedPath),
+		"source local\n",
+	)
 }

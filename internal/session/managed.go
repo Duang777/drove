@@ -14,6 +14,9 @@ type managedAgent struct {
 
 	workspaceMu sync.RWMutex
 	workspace   workspaceRuntimeState
+
+	processGroupMu      sync.Mutex
+	processGroupCleanup processGroupCleanupState
 }
 
 type workspaceRuntimeState struct {
@@ -21,6 +24,11 @@ type workspaceRuntimeState struct {
 	resumeOnStart  bool
 	removalPending bool
 	removed        bool
+}
+
+type processGroupCleanupState struct {
+	pending bool
+	pid     int
 }
 
 func newManagedAgent(target *agent.Agent) *managedAgent {
@@ -78,6 +86,13 @@ func (m *managedAgent) applyWorkspaceRemoved() {
 }
 
 func (m *managedAgent) shouldResumeOnStart() bool {
+	if m.processGroupCleanupPending() {
+		return false
+	}
+	return m.hasResumeOnStart()
+}
+
+func (m *managedAgent) hasResumeOnStart() bool {
 	m.workspaceMu.RLock()
 	defer m.workspaceMu.RUnlock()
 	return m.workspace.resumeOnStart &&
@@ -85,8 +100,46 @@ func (m *managedAgent) shouldResumeOnStart() bool {
 		!m.workspace.removed
 }
 
-func (m *managedAgent) consumeResumeOnStart() {
+func (m *managedAgent) completeResumeOnStart(
+	commit func() (commitReceipt, error),
+) (bool, error) {
 	m.workspaceMu.Lock()
+	defer m.workspaceMu.Unlock()
+	if !m.workspace.resumeOnStart ||
+		m.workspace.removalPending ||
+		m.workspace.removed {
+		return false, nil
+	}
+	receipt, err := commit()
+	if receipt.Durable {
+		m.workspace.resumeOnStart = false
+	}
+	return true, err
+}
+
+func (m *managedAgent) cancelResumeOnStartAfter(
+	commit func(pending bool) error,
+) error {
+	m.workspaceMu.Lock()
+	defer m.workspaceMu.Unlock()
+	if err := commit(m.workspace.resumeOnStart); err != nil {
+		return err
+	}
 	m.workspace.resumeOnStart = false
-	m.workspaceMu.Unlock()
+	return nil
+}
+
+func (m *managedAgent) setProcessGroupCleanupPending(pid int) {
+	m.processGroupMu.Lock()
+	m.processGroupCleanup = processGroupCleanupState{
+		pending: true,
+		pid:     pid,
+	}
+	m.processGroupMu.Unlock()
+}
+
+func (m *managedAgent) processGroupCleanupPending() bool {
+	m.processGroupMu.Lock()
+	defer m.processGroupMu.Unlock()
+	return m.processGroupCleanup.pending
 }

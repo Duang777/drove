@@ -4,6 +4,7 @@ package pty
 
 import (
 	"errors"
+	"fmt"
 	"syscall"
 )
 
@@ -43,6 +44,14 @@ func killProcessGroupWith(
 
 func processGroupAlive(pid int) (bool, error) {
 	return processGroupAliveWith(unixProcessGroupSignal, pid)
+}
+
+// ProcessGroupAlive reports whether the process group remains reachable.
+func ProcessGroupAlive(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, fmt.Errorf("pty: process group PID must be positive")
+	}
+	return processGroupAlive(pid)
 }
 
 func processGroupAliveWith(signal processGroupSignalFunc, pid int) (bool, error) {

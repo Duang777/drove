@@ -2,8 +2,10 @@ package workspace
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,7 +17,8 @@ import (
 
 func TestReconcilePreparationsAdoptsDurableAndDiscardsOrphan(t *testing.T) {
 	repository := newTestRepository(t)
-	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -37,15 +40,27 @@ func TestReconcilePreparationsAdoptsDurableAndDiscardsOrphan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare orphan workspace: %v", err)
 	}
+	if err := durable.preparation.Close(); err != nil {
+		t.Fatalf("close durable preparation lease: %v", err)
+	}
+	durable.preparation = nil
+	if err := orphan.preparation.Close(); err != nil {
+		t.Fatalf("close orphan preparation lease: %v", err)
+	}
+	orphan.preparation = nil
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
 
-	if err := manager.ReconcilePreparations(
+	if err := restarted.ReconcilePreparations(
 		context.Background(),
 		[]Workspace{durable},
 	); err != nil {
 		t.Fatalf("reconcile preparations: %v", err)
 	}
 
-	record, exists, err := manager.readWorkspaceRecord(durable.Path)
+	record, exists, err := restarted.readWorkspaceRecord(durable.Path)
 	if err != nil || !exists || !record.PreparationCommitted {
 		t.Fatalf(
 			"durable preparation record = %+v, exists=%v err=%v",
@@ -149,6 +164,495 @@ func TestReconcilePreparationsDiscardsPendingAfterRestart(t *testing.T) {
 	}
 }
 
+func TestReconcilePreparationsAcceptsVersionFiveEvidence(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || record.RepositoryEvidence == nil {
+		t.Fatalf(
+			"read preparation record: exists=%v err=%v record=%+v",
+			exists,
+			err,
+			record,
+		)
+	}
+	expectedHeadOID := record.ExpectedHeadOID
+	record.Version = removalWorkspaceRecordVersion
+	record.ExpectedHeadOID = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write version 5 preparation record: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{{
+			AgentID:    prepared.AgentID,
+			Repository: prepared.Repository,
+			Path:       prepared.Path,
+			Branch:     prepared.Branch,
+		}},
+	); err != nil {
+		t.Fatalf("adopt version 5 preparation: %v", err)
+	}
+	adopted, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf(
+			"read adopted preparation: exists=%v err=%v",
+			exists,
+			err,
+		)
+	}
+	if adopted.Version != workspaceRecordVersion ||
+		!adopted.PreparationCommitted ||
+		adopted.ExpectedHeadOID != expectedHeadOID ||
+		adopted.BranchOperationID != "" ||
+		adopted.RepositoryEvidence == nil {
+		t.Fatalf("adopted version 5 preparation = %+v", adopted)
+	}
+}
+
+func TestAcknowledgePreparationMigratesCommittedVersionFiveRecord(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	expectedHeadOID := record.ExpectedHeadOID
+	record.Version = removalWorkspaceRecordVersion
+	record.ExpectedHeadOID = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write committed version 5 preparation record: %v", err)
+	}
+
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("migrate committed version 5 preparation: %v", err)
+	}
+	migrated, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf(
+			"read migrated preparation: exists=%v err=%v",
+			exists,
+			err,
+		)
+	}
+	if migrated.Version != workspaceRecordVersion ||
+		!migrated.PreparationCommitted ||
+		migrated.ExpectedHeadOID != expectedHeadOID ||
+		migrated.BranchOperationID != "" ||
+		migrated.RepositoryEvidence == nil {
+		t.Fatalf("migrated version 5 preparation = %+v", migrated)
+	}
+}
+
+func TestReconcilePreparationsAcceptsCommittedBranchAdvance(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "advanced.txt"),
+		[]byte("advanced\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write committed workspace change: %v", err)
+	}
+	runGit(t, prepared.Path, "add", "advanced.txt")
+	runGit(t, prepared.Path, "commit", "-m", "advance managed branch")
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	recovered := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{recovered},
+	); err != nil {
+		t.Fatalf("adopt advanced committed preparation: %v", err)
+	}
+	record, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || !record.PreparationCommitted {
+		t.Fatalf(
+			"advanced committed record = %+v, exists=%v err=%v",
+			record,
+			exists,
+			err,
+		)
+	}
+}
+
+func TestReconcilePreparationsDiscardsPromotePendingStagingWorktree(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(prepared.Path), stagingName)
+	if err := os.Rename(prepared.Path, stagingPath); err != nil {
+		t.Fatalf("restore promote-pending staging path: %v", err)
+	}
+	runGit(t, stagingPath, "worktree", "repair", ".")
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile staging preparation: %v", err)
+	}
+	for _, path := range []string{
+		prepared.Path,
+		stagingPath,
+		workspaceRecordPath(prepared.Path),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reconciled path %q remains: %v", path, err)
+		}
+	}
+	if strings.Contains(
+		runGit(t, repository, "worktree", "list", "--porcelain"),
+		stagingPath,
+	) {
+		t.Fatal("staging worktree registration remains")
+	}
+}
+
+func TestReconcilePreparationsDiscardsRenameIsolatedStagingWorktree(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	parent := filepath.Dir(prepared.Path)
+	stagingPath := filepath.Join(parent, stagingName)
+	isolationPath := filepath.Join(
+		parent,
+		preparedWorktreeIsolationName(stagingName),
+	)
+	if err := os.Rename(prepared.Path, stagingPath); err != nil {
+		t.Fatalf("restore staging path: %v", err)
+	}
+	runGit(t, stagingPath, "worktree", "repair", ".")
+	if err := os.Rename(stagingPath, isolationPath); err != nil {
+		t.Fatalf("isolate staging path: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile isolated preparation: %v", err)
+	}
+	for _, path := range []string{
+		prepared.Path,
+		stagingPath,
+		isolationPath,
+		workspaceRecordPath(prepared.Path),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reconciled path %q remains: %v", path, err)
+		}
+	}
+	listing := runGit(t, repository, "worktree", "list", "--porcelain")
+	if strings.Contains(listing, prepared.Path) ||
+		strings.Contains(listing, stagingPath) ||
+		strings.Contains(listing, isolationPath) {
+		t.Fatalf("reconciled worktree registration remains:\n%s", listing)
+	}
+}
+
+func TestReconcilePreparationsRepairsPromotionBeforeDiscard(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(prepared.Path), stagingName)
+	if err := os.Rename(prepared.Path, stagingPath); err != nil {
+		t.Fatalf("move worktree to staging path: %v", err)
+	}
+	runGit(t, stagingPath, "worktree", "repair", ".")
+	if err := os.Rename(stagingPath, prepared.Path); err != nil {
+		t.Fatalf("promote worktree without repairing registration: %v", err)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile promote-pending preparation: %v", err)
+	}
+	for _, path := range []string{
+		prepared.Path,
+		stagingPath,
+		workspaceRecordPath(prepared.Path),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reconciled path %q remains: %v", path, err)
+		}
+	}
+	listing := runGit(t, repository, "worktree", "list", "--porcelain")
+	if strings.Contains(listing, prepared.Path) ||
+		strings.Contains(listing, stagingPath) {
+		t.Fatalf("reconciled worktree registration remains:\n%s", listing)
+	}
+}
+
+func TestReconcilePreparationsRecoversIsolatedPrivateGitPointer(
+	t *testing.T,
+) {
+	switch runtime.GOOS {
+	case "darwin", "dragonfly", "freebsd", "linux",
+		"netbsd", "openbsd", "windows":
+	default:
+		t.Skip("bound Git pointer recovery is unsupported")
+	}
+
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		prepared.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		t.Fatalf("derive staging name: %v", err)
+	}
+	stagingPath := filepath.Join(filepath.Dir(prepared.Path), stagingName)
+	privatePointerPath := filepath.Join(record.GitDirectory, "gitdir")
+	stalePointer := filepath.ToSlash(filepath.Join(stagingPath, ".git")) + "\n"
+	if err := os.WriteFile(
+		privatePointerPath,
+		[]byte(stalePointer),
+		0o600,
+	); err != nil {
+		t.Fatalf("restore stale private Git pointer: %v", err)
+	}
+	digest := sha256.Sum256(
+		[]byte(filepath.Base(record.GitDirectory) + "\x00gitdir"),
+	)
+	backupName := fmt.Sprintf(
+		".drove-git-pointer-%x-old-%s",
+		digest[:8],
+		"78787878-7878-4787-8787-787878787878",
+	)
+	backupPath := filepath.Join(record.GitDirectory, backupName)
+	if err := os.Rename(privatePointerPath, backupPath); err != nil {
+		t.Fatalf("isolate stale private Git pointer: %v", err)
+	}
+	if _, err := os.Lstat(privatePointerPath); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("private Git pointer still exists: %v", err)
+	}
+	listing := runGit(t, repository, "worktree", "list", "--porcelain")
+	if strings.Contains(listing, prepared.Path) ||
+		strings.Contains(listing, stagingPath) {
+		t.Fatalf("isolated private pointer remained registered:\n%s", listing)
+	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		nil,
+	); err != nil {
+		t.Fatalf("reconcile isolated private pointer: %v", err)
+	}
+	for _, path := range []string{
+		prepared.Path,
+		stagingPath,
+		workspaceRecordPath(prepared.Path),
+	} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reconciled path %q remains: %v", path, err)
+		}
+	}
+	listing = runGit(t, repository, "worktree", "list", "--porcelain")
+	if strings.Contains(listing, prepared.Path) ||
+		strings.Contains(listing, stagingPath) {
+		t.Fatalf("reconciled worktree registration remains:\n%s", listing)
+	}
+	command := exec.Command(
+		"git",
+		"-C",
+		repository,
+		"show-ref",
+		"--verify",
+		"--quiet",
+		"refs/heads/"+prepared.Branch,
+	)
+	if err := command.Run(); !isExitCode(err, 1) {
+		t.Fatalf("pending branch remains after recovery: %v", err)
+	}
+}
+
 func TestReconcilePreparationWithIncompleteGitIdentityFailsClosed(
 	t *testing.T,
 ) {
@@ -210,8 +714,11 @@ func TestReconcilePreparationWithIncompleteGitIdentityFailsClosed(
 func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 	t *testing.T,
 ) {
+	if runtime.GOOS != "linux" {
+		t.Skip("BSD registration rejects deterministic admin collisions")
+	}
 	repository := newTestRepository(t)
-	stalePath := filepath.Join(t.TempDir(), testAgentID)
+	stalePath := filepath.Join(t.TempDir(), "-")
 	runGit(
 		t,
 		repository,
@@ -241,7 +748,7 @@ func TestReconcilePreparationsDiscardsGitSuffixedWorktreeAfterRestart(
 		t.Fatalf("prepare workspace: %v", err)
 	}
 	gitDirectoryName := filepath.Base(prepared.gitDirectory)
-	suffix := strings.TrimPrefix(gitDirectoryName, testAgentID)
+	suffix := strings.TrimPrefix(gitDirectoryName, "-")
 	if suffix == "" || strings.Trim(suffix, "0123456789") != "" {
 		t.Fatalf(
 			"prepared Git directory %q has no collision suffix",
@@ -575,6 +1082,9 @@ func TestAcknowledgePreparationClearsBranchOwnershipMarker(t *testing.T) {
 	}
 	if !record.PreparationCommitted || record.BranchOperationID != "" {
 		t.Fatalf("acknowledged record = %+v", record)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("repeat acknowledgement: %v", err)
 	}
 }
 

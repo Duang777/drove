@@ -3,7 +3,6 @@ package clitui
 import (
 	"context"
 	"errors"
-	"io"
 	"reflect"
 	"strings"
 	"sync"
@@ -31,9 +30,9 @@ func TestModelSelectionFilterAndPreviewGeneration(t *testing.T) {
 	_, _ = m.Update(fleetResultMsg{
 		RequestID: 1,
 		Statuses: []*session.Status{
-			newFleetStatus("pending", agent.StatePending, time.Now()),
-			newFleetStatus("blocked", agent.StateBlocked, time.Now()),
-			newFleetStatus("working", agent.StateWorking, time.Now()),
+			newAttachedFleetStatus("pending", agent.StatePending),
+			newAttachedFleetStatus("blocked", agent.StateBlocked),
+			newAttachedFleetStatus("working", agent.StateWorking),
 		},
 	})
 
@@ -230,6 +229,33 @@ func TestPollReplacesPreviewWhenSelectedAgentProcessChanges(t *testing.T) {
 	}) {
 		t.Fatalf("replacement target = %+v", got)
 	}
+
+	stopped := newFleetStatus("agent-1", agent.StateStopped, time.Now())
+	m.fleetInFlight = true
+	m.fleetRequestID = 3
+	_, _ = m.Update(fleetResultMsg{
+		RequestID: 3,
+		Statuses:  []*session.Status{stopped},
+	})
+	if got := preview.lastReplacement(t); got != (previewTarget{
+		Generation: 3,
+	}) {
+		t.Fatalf("stopped target = %+v, want canceled preview", got)
+	}
+
+	restarted := newAttachedFleetStatus("agent-1", agent.StateStarting)
+	m.fleetInFlight = true
+	m.fleetRequestID = 4
+	_, _ = m.Update(fleetResultMsg{
+		RequestID: 4,
+		Statuses:  []*session.Status{restarted},
+	})
+	if got := preview.lastReplacement(t); got != (previewTarget{
+		AgentID:    "agent-1",
+		Generation: 4,
+	}) {
+		t.Fatalf("restarted target = %+v", got)
+	}
 }
 
 func TestActionSendAddsExactlyOneNewlineAndEnforcesByteLimit(t *testing.T) {
@@ -276,6 +302,17 @@ func TestActionSendAddsExactlyOneNewlineAndEnforcesByteLimit(t *testing.T) {
 	}
 	if !strings.Contains(m.notice, "maximum") || m.focus != focusSend {
 		t.Fatalf("oversized input notice=%q focus=%d", m.notice, m.focus)
+	}
+	if view := m.View(); !strings.Contains(view, "maximum") {
+		t.Fatalf("oversized input notice is not visible:\n%s", view)
+	}
+
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	if m.notice != "" {
+		t.Fatalf("editing oversized input retained notice %q", m.notice)
+	}
+	if view := m.View(); !strings.Contains(view, "SEND agent-1") {
+		t.Fatalf("send editor did not return after editing:\n%s", view)
 	}
 }
 
@@ -438,10 +475,10 @@ func TestAttachUsesExecModesAndPreservesSelection(t *testing.T) {
 
 	var (
 		options []cliattach.Options
-		stdin   io.Reader
-		stdout  io.Writer
-		stderr  io.Writer
 	)
+	stdin := strings.NewReader("terminal input")
+	stdout := &strings.Builder{}
+	stderr := &strings.Builder{}
 	attachErr := errors.New("attach failed")
 	preview := newRecordingPreview()
 	m := newModelWithDependencies(context.Background(), modelDependencies{
@@ -451,7 +488,16 @@ func TestAttachUsesExecModesAndPreservesSelection(t *testing.T) {
 			if id != "agent-1" {
 				t.Fatalf("attached agent = %q, want agent-1", id)
 			}
-			options = append(options, option)
+			if option.Stdin != stdin || option.Stdout != stdout {
+				t.Fatalf(
+					"attach streams = (%T, %T), want Bubble Tea streams",
+					option.Stdin,
+					option.Stdout,
+				)
+			}
+			options = append(options, cliattach.Options{
+				ReadOnly: option.ReadOnly,
+			})
 			if option.ReadOnly {
 				return attachErr
 			}
@@ -650,11 +696,18 @@ func seedModel(m *model, ids ...string) {
 			Name:       id,
 			Vendor:     "generic",
 			State:      agent.StateWorking,
+			PID:        index + 1,
 			HookStatus: detect.HookOff,
 			UpdatedAt:  time.Now(),
 		}
 	}
 	m.rebuildVisibleRows()
+}
+
+func newAttachedFleetStatus(id string, state agent.State) *session.Status {
+	status := newFleetStatus(id, state, time.Now())
+	status.PID = 1
+	return status
 }
 
 func keyMessage(key string) tea.KeyMsg {

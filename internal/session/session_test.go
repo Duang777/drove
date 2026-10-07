@@ -206,6 +206,121 @@ func TestBootstrapRestoresLegacySessionIdempotently(t *testing.T) {
 	}
 }
 
+func TestBootstrapRestoresProcessGroupCleanupFence(t *testing.T) {
+	st := newTestStore(t)
+	base := time.Date(2026, time.October, 6, 15, 30, 0, 0, time.UTC)
+	rows := []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload: `{"version":2,"name":"agent","vendor":"claude",` +
+				`"mode":"interactive","hook_policy":"off"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeAgentSignal),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "hook",
+			Payload: `{"version":1,"source":"hook","kind":"observed","vendor":"claude",` +
+				`"vendor_event":"Notification","scope":"root","vendor_session_ref":"resume-ref",` +
+				`"confidence":1,"received_at":"2026-10-06T15:30:01Z",` +
+				`"delivery_id":"550e8400-e29b-41d4-a716-446655440001","outcome":"observed"}`,
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "starting",
+		},
+		{
+			Seq:       4,
+			Timestamp: base.Add(3 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "starting",
+			To:        "working",
+		},
+		{
+			Seq:       5,
+			Timestamp: base.Add(4 * time.Second),
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    processGroupCleanupFailed,
+			Payload:   `{"version":1,"pid":4242}`,
+		},
+		{
+			Seq:       6,
+			Timestamp: base.Add(5 * time.Second),
+			Type:      string(event.TypeError),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Payload:   "process group remains",
+		},
+		{
+			Seq:       7,
+			Timestamp: base.Add(6 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "working",
+			To:        "stopped",
+		},
+	}
+	if _, err := st.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("seed cleanup failure history: %v", err)
+	}
+
+	result, err := Bootstrap(context.Background(), adapter.NewRegistry(), st)
+	if err != nil {
+		t.Fatalf("bootstrap cleanup failure: %v", err)
+	}
+	defer result.Manager.Close()
+	result.Manager.processGroupAlive = func(pid int) (bool, error) {
+		if pid != 4242 {
+			t.Fatalf("process group PID = %d, want 4242", pid)
+		}
+		return true, nil
+	}
+	status, err := result.Manager.Status("agent-1")
+	if err != nil {
+		t.Fatalf("restored status: %v", err)
+	}
+	if status.State != agent.StateStopped || status.Resumable {
+		t.Fatalf("restored status = %+v", status)
+	}
+	if _, err := result.Manager.Resume(
+		context.Background(),
+		"agent-1",
+	); !errors.Is(err, ErrResumeConflict) {
+		t.Fatalf("resume restored cleanup fence = %v", err)
+	}
+
+	result.Manager.processGroupAlive = func(int) (bool, error) {
+		return false, nil
+	}
+	result.Manager.startPTY = func(pty.Config) (launchedSession, error) {
+		return &fakeProcessSession{}, nil
+	}
+	resumed, err := result.Manager.Resume(context.Background(), "agent-1")
+	if err != nil {
+		t.Fatalf("resume after restored process group disappeared: %v", err)
+	}
+	if resumed.State != agent.StateWorking {
+		t.Fatalf("resumed status = %+v", resumed)
+	}
+}
+
 func TestBootstrapAcceptsPreUpgradeUnicodeVendorSessionID(t *testing.T) {
 	st := newTestStore(t)
 	base := time.Date(2026, time.October, 3, 6, 0, 0, 0, time.UTC)
@@ -412,8 +527,8 @@ func TestStopRestoredStoppedAgentIsIdempotent(t *testing.T) {
 	if err := result.Manager.Stop("agent-1"); err != nil {
 		t.Fatalf("stop restored agent: %v", err)
 	}
-	if err := result.Manager.Stop("missing"); err == nil {
-		t.Fatal("stop unknown agent succeeded")
+	if err := result.Manager.Stop("missing"); !errors.Is(err, ErrUnknownAgent) {
+		t.Fatalf("stop unknown agent error = %v, want ErrUnknownAgent", err)
 	}
 	if _, err := result.Manager.SendInput("agent-1", []byte("input")); !errors.Is(err, ErrNotAttached) {
 		t.Fatalf("send input to restored agent error = %v, want ErrNotAttached", err)
@@ -1164,6 +1279,236 @@ func TestResumeOnStartRunsEligibleAgentsInCreationOrderOnce(t *testing.T) {
 	}
 }
 
+func TestResumeOnStartRetriesFailedCandidate(t *testing.T) {
+	manager, _ := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	attempts := 0
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, errors.New("exec unavailable")
+		}
+		return &fakeProcessSession{}, nil
+	}
+
+	first := manager.ResumeOnStart(context.Background())
+	if len(first) != 1 ||
+		first[0].AgentID != managed.agent.ID() ||
+		first[0].Err == nil {
+		t.Fatalf("first startup resume results = %+v", first)
+	}
+	if !managed.shouldResumeOnStart() {
+		t.Fatal("failed startup resume consumed candidate")
+	}
+
+	second := manager.ResumeOnStart(context.Background())
+	if len(second) != 1 ||
+		second[0].AgentID != managed.agent.ID() ||
+		second[0].Err != nil {
+		t.Fatalf("second startup resume results = %+v", second)
+	}
+	if managed.shouldResumeOnStart() {
+		t.Fatal("successful startup resume retained candidate")
+	}
+	if third := manager.ResumeOnStart(context.Background()); len(third) != 0 {
+		t.Fatalf("third startup resume results = %+v, want none", third)
+	}
+}
+
+func TestResumeOnStartPersistsCompletionAfterContextCancellation(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		cancel()
+		return &fakeProcessSession{}, nil
+	}
+
+	results := manager.ResumeOnStart(ctx)
+	if len(results) != 1 ||
+		results[0].AgentID != managed.agent.ID() ||
+		results[0].Err != nil {
+		t.Fatalf("startup resume results = %+v", results)
+	}
+	if managed.shouldResumeOnStart() {
+		t.Fatal("durably completed startup resume retained candidate")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay startup resume: %v", err)
+	}
+	last := rows[len(rows)-1]
+	if last.Type != string(event.TypeSessionLifecycle) ||
+		last.Reason != startupResumeCompletedReason ||
+		last.Payload != `{"version":1}` {
+		t.Fatalf("startup resume completion = %+v", last)
+	}
+}
+
+func TestManualResumeCompletesStartupResumeIntent(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	manager.committer.Close()
+	commitStore := &resumeReservationCommitStore{
+		commitStore: st,
+		manager:     manager,
+		id:          managed.agent.ID(),
+	}
+	manager.committer = newCommitter(0, commitStore, manager.hub)
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		return &fakeProcessSession{}, nil
+	}
+
+	status, err := manager.Resume(context.Background(), managed.agent.ID())
+	if err != nil {
+		t.Fatalf("manual resume: %v", err)
+	}
+	if status.State != agent.StateWorking {
+		t.Fatalf("manual resume status = %+v", status)
+	}
+	if managed.shouldResumeOnStart() {
+		t.Fatal("manual resume retained startup resume intent")
+	}
+	if !commitStore.observedCompletion {
+		t.Fatal("startup resume completion was not committed")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay manual resume: %v", err)
+	}
+	last := rows[len(rows)-1]
+	if last.Type != string(event.TypeSessionLifecycle) ||
+		last.Reason != startupResumeCompletedReason ||
+		last.Payload != `{"version":1}` {
+		t.Fatalf("startup resume completion = %+v", last)
+	}
+}
+
+func TestUserStopConsumesLiveStartupResumeIntent(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	if _, err := manager.Resume(
+		context.Background(),
+		managed.agent.ID(),
+	); err != nil {
+		t.Fatalf("resume agent: %v", err)
+	}
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	manager.mu.RLock()
+	running := manager.sessions[managed.agent.ID()]
+	manager.mu.RUnlock()
+	if running == nil {
+		t.Fatal("resumed session is missing")
+	}
+	manager.requestStop(managed.agent.ID(), running, stopCauseUser)
+	started.OnExit(pty.ExitInfo{PID: 1, Code: 0})
+	started.OnOutputEnd(0)
+
+	if managed.hasResumeOnStart() {
+		t.Fatal("durable user stop retained the live startup resume intent")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay stopped resume: %v", err)
+	}
+	for _, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) &&
+			row.Reason == startupResumeCompletedReason {
+			t.Fatalf("user-stopped resume committed stale completion: %+v", row)
+		}
+	}
+}
+
+func TestUserStopWithCleanupFailureCancelsStartupResumeIntent(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	if _, err := manager.Resume(
+		context.Background(),
+		managed.agent.ID(),
+	); err != nil {
+		t.Fatalf("resume agent: %v", err)
+	}
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	manager.mu.RLock()
+	running := manager.sessions[managed.agent.ID()]
+	manager.mu.RUnlock()
+	if running == nil {
+		t.Fatal("resumed session is missing")
+	}
+	manager.requestStop(managed.agent.ID(), running, stopCauseUser)
+	started.OnExit(pty.ExitInfo{
+		PID:        4242,
+		CleanupErr: errors.New("process group remains"),
+	})
+	started.OnOutputEnd(0)
+
+	if managed.hasResumeOnStart() {
+		t.Fatal("cleanup failure retained the live startup resume intent")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay stopped resume: %v", err)
+	}
+	cancellationIndex := -1
+	cleanupIndex := -1
+	stoppedIndex := -1
+	for index, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) {
+			switch row.Reason {
+			case startupResumeCancelledReason:
+				cancellationIndex = index
+				if row.Payload != `{"version":1}` {
+					t.Fatalf("startup resume cancellation = %+v", row)
+				}
+			case processGroupCleanupFailed:
+				cleanupIndex = index
+			}
+		}
+		if row.Type == string(event.TypeStateChanged) &&
+			row.To == string(agent.StateStopped) {
+			stoppedIndex = index
+		}
+	}
+	if cleanupIndex < 0 ||
+		cancellationIndex <= cleanupIndex ||
+		stoppedIndex <= cancellationIndex {
+		t.Fatalf(
+			"cleanup index = %d, cancellation index = %d, stopped index = %d, rows = %+v",
+			cleanupIndex,
+			cancellationIndex,
+			stoppedIndex,
+			rows,
+		)
+	}
+}
+
 func TestNormalizeRunMode(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -1893,6 +2238,7 @@ func TestProcessGroupCleanupFailurePersistsErrorAndStopsOneshot(t *testing.T) {
 
 			cleanupErr := errors.New("process group remains after permission error")
 			manager.onExit(id, running, pty.ExitInfo{
+				PID:        4242,
 				Code:       test.code,
 				Err:        test.processErr,
 				CleanupErr: cleanupErr,
@@ -1924,8 +2270,20 @@ func TestProcessGroupCleanupFailurePersistsErrorAndStopsOneshot(t *testing.T) {
 				t.Fatalf("replay: %v", err)
 			}
 			errorIndex := -1
+			cleanupIndex := -1
 			stoppedIndex := -1
 			for index, row := range rows {
+				if row.Type == string(event.TypeSessionLifecycle) &&
+					row.Reason == processGroupCleanupFailed {
+					cleanupIndex = index
+					var payload processGroupCleanupPayload
+					if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+						t.Fatalf("decode cleanup failure payload: %v", err)
+					}
+					if payload.Version != 1 || payload.PID != 4242 {
+						t.Fatalf("cleanup failure payload = %+v", payload)
+					}
+				}
 				if row.Type == string(event.TypeError) &&
 					strings.Contains(row.Payload, cleanupErr.Error()) {
 					errorIndex = index
@@ -1935,15 +2293,140 @@ func TestProcessGroupCleanupFailurePersistsErrorAndStopsOneshot(t *testing.T) {
 					stoppedIndex = index
 				}
 			}
-			if errorIndex < 0 || stoppedIndex < 0 || errorIndex >= stoppedIndex {
+			if cleanupIndex < 0 ||
+				errorIndex < 0 ||
+				stoppedIndex < 0 ||
+				cleanupIndex >= errorIndex ||
+				errorIndex >= stoppedIndex {
 				t.Fatalf(
-					"error index = %d, stopped index = %d, rows = %+v",
+					"cleanup index = %d, error index = %d, stopped index = %d, rows = %+v",
+					cleanupIndex,
 					errorIndex,
 					stoppedIndex,
 					rows,
 				)
 			}
 		})
+	}
+}
+
+func TestProcessGroupCleanupFenceBlocksAndThenAllowsResume(t *testing.T) {
+	manager, _ := newTestManager(t)
+	id := agent.ID("cleanup-resume")
+	target := agent.New(
+		id,
+		agent.WithName(string(id)),
+		agent.WithVendor("claude"),
+		agent.WithRunMode(agent.RunModeInteractive),
+		agent.WithHookPolicy(agent.HooksOff),
+	)
+	managed := newManagedAgent(target)
+	managed.setVendorSessionReference("vendor-ref")
+	manager.mu.Lock()
+	manager.agents[id] = managed
+	manager.mu.Unlock()
+	commitTestState(t, manager, target, agent.StateStarting, "test start")
+	commitTestState(t, manager, target, agent.StateWorking, "test working")
+	running := attachTestRuntime(t, manager, target, manager.reg.For("claude"))
+
+	manager.processGroupAlive = func(pid int) (bool, error) {
+		if pid != 4242 {
+			t.Fatalf("process group PID = %d, want 4242", pid)
+		}
+		return true, nil
+	}
+	manager.onExit(id, running, pty.ExitInfo{
+		PID:        4242,
+		CleanupErr: errors.New("process group remains"),
+	})
+	manager.markOutputDrained(id, running)
+
+	status, err := manager.Status(id)
+	if err != nil {
+		t.Fatalf("status after cleanup failure: %v", err)
+	}
+	if status.State != agent.StateStopped || status.Resumable {
+		t.Fatalf("status after cleanup failure = %+v", status)
+	}
+	if _, err := manager.Resume(context.Background(), id); !errors.Is(
+		err,
+		ErrResumeConflict,
+	) {
+		t.Fatalf("resume while process group is alive = %v", err)
+	}
+
+	manager.processGroupAlive = func(pid int) (bool, error) {
+		if pid != 4242 {
+			t.Fatalf("process group PID = %d, want 4242", pid)
+		}
+		return false, nil
+	}
+	manager.startPTY = func(pty.Config) (launchedSession, error) {
+		return &fakeProcessSession{}, nil
+	}
+	resumed, err := manager.Resume(context.Background(), id)
+	if err != nil {
+		t.Fatalf("resume after process group disappeared: %v", err)
+	}
+	if resumed.State != agent.StateWorking || resumed.Resumable {
+		t.Fatalf("resumed status = %+v", resumed)
+	}
+
+	rows, err := manager.Replay(string(id))
+	if err != nil {
+		t.Fatalf("replay cleanup fence: %v", err)
+	}
+	completedIndex := -1
+	resumedIndex := -1
+	for index, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) &&
+			row.Reason == processGroupCleanupCompleted {
+			completedIndex = index
+		}
+		if row.Type == string(event.TypeAgentResumed) {
+			resumedIndex = index
+		}
+	}
+	if completedIndex < 0 ||
+		resumedIndex < 0 ||
+		completedIndex >= resumedIndex {
+		t.Fatalf(
+			"cleanup completion index = %d, resume index = %d, rows = %+v",
+			completedIndex,
+			resumedIndex,
+			rows,
+		)
+	}
+}
+
+func TestStartupResumeReportsUnresolvedProcessGroupCleanup(t *testing.T) {
+	manager, _ := newTestManager(t)
+	managed := addStoppedAgent(
+		t,
+		manager,
+		"cleanup-startup-resume",
+		"claude",
+		"vendor-ref",
+	)
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+	managed.setProcessGroupCleanupPending(4242)
+	manager.processGroupAlive = func(pid int) (bool, error) {
+		if pid != 4242 {
+			t.Fatalf("process group PID = %d, want 4242", pid)
+		}
+		return true, nil
+	}
+
+	if managed.shouldResumeOnStart() {
+		t.Fatal("cleanup fence did not block startup resume eligibility")
+	}
+	results := manager.ResumeOnStart(context.Background())
+	if len(results) != 1 ||
+		results[0].AgentID != managed.agent.ID() ||
+		!errors.Is(results[0].Err, ErrResumeConflict) {
+		t.Fatalf("startup resume results = %+v", results)
 	}
 }
 
@@ -2388,6 +2871,36 @@ type cancelAfterAppendStore struct {
 	commitStore
 	cancel context.CancelFunc
 	once   sync.Once
+}
+
+type resumeReservationCommitStore struct {
+	commitStore
+	manager            *Manager
+	id                 agent.ID
+	observedCompletion bool
+}
+
+func (s *resumeReservationCommitStore) AppendEvents(
+	ctx context.Context,
+	expectedLastSeq uint64,
+	rows []store.EventRow,
+) (uint64, error) {
+	for _, row := range rows {
+		if row.Type != string(event.TypeSessionLifecycle) ||
+			row.Reason != startupResumeCompletedReason {
+			continue
+		}
+		s.manager.mu.RLock()
+		_, reserved := s.manager.resuming[s.id]
+		s.manager.mu.RUnlock()
+		if !reserved {
+			return expectedLastSeq, errors.New(
+				"startup resume completion committed without reservation",
+			)
+		}
+		s.observedCompletion = true
+	}
+	return s.commitStore.AppendEvents(ctx, expectedLastSeq, rows)
 }
 
 func (s *cancelAfterAppendStore) AppendEvents(

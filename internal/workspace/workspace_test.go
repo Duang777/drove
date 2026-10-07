@@ -250,6 +250,9 @@ func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(prepared.Path, "ignored.key")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unlisted ignored file exists or inspect failed: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 
 	listed, err := manager.List(context.Background())
 	if err != nil {
@@ -371,6 +374,9 @@ func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare first worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(first); err != nil {
+		t.Fatalf("acknowledge first preparation: %v", err)
+	}
 	second, err := manager.Prepare(
 		context.Background(),
 		repository,
@@ -379,6 +385,9 @@ func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare second worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(second); err != nil {
+		t.Fatalf("acknowledge second preparation: %v", err)
 	}
 
 	if err := os.WriteFile(
@@ -433,6 +442,9 @@ func TestListAndCleanupDetachedWorktree(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	runGit(t, prepared.Path, "checkout", "--detach")
 	if err := os.WriteFile(
@@ -489,6 +501,9 @@ func TestCleanupRepairsMissingWorktreeRegistration(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	if err := os.RemoveAll(prepared.Path); err != nil {
 		t.Fatalf("remove worktree directory externally: %v", err)
@@ -664,6 +679,9 @@ func TestDiscardPreservesWorkspaceWhenRegistrationCheckFails(t *testing.T) {
 	cancel()
 	if err := manager.Discard(ctx, prepared); err == nil {
 		t.Fatal("discard succeeded with a canceled registration check")
+	}
+	if !prepared.preparation.isClosed() {
+		t.Fatal("failed discard retained its preparation lease")
 	}
 	if _, err := os.Lstat(prepared.Path); err != nil {
 		t.Fatalf("failed discard removed worktree: %v", err)
@@ -847,6 +865,9 @@ func TestVersionOneRecordRequiresForceEvenWhenPathIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	legacy, err := json.Marshal(struct {
 		Version    int    `json:"version"`
 		AgentID    string `json:"agent_id"`
@@ -953,13 +974,42 @@ func TestRemoveUpgradesCommittedVersionFourRecord(t *testing.T) {
 		t.Fatalf("read upgraded removal record: exists=%v err=%v", exists, err)
 	}
 	if upgraded.Version != workspaceRecordVersion ||
-		upgraded.RepositoryEvidence != nil ||
+		upgraded.RepositoryEvidence == nil ||
 		upgraded.BranchOperationID != "" ||
 		upgraded.Removal == nil {
 		t.Fatalf("upgraded removal record = %+v", upgraded)
 	}
 	if err := restarted.AcknowledgeRemoval(result.Removal); err != nil {
 		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
+func TestUpgradeVersionFiveRecordPreservesRecoveryEvidence(t *testing.T) {
+	evidence := &repositoryEvidence{
+		SourcePath:                 "/source",
+		SourceDirectoryIdentity:    "source-identity",
+		GitDirectory:               "/source/.git",
+		GitDirectoryIdentity:       "git-identity",
+		CommonGitDirectory:         "/source/.git",
+		CommonGitDirectoryIdentity: "common-identity",
+	}
+	record := workspaceRecord{
+		Version:              removalWorkspaceRecordVersion,
+		PreparationCommitted: true,
+		BranchOperationID:    "11111111-1111-4111-8111-111111111111",
+		ExpectedHeadOID:      "expected-head",
+		RepositoryEvidence:   evidence,
+	}
+
+	upgradeWorkspaceRecord(&record)
+
+	if record.Version != workspaceRecordVersion ||
+		record.BranchOperationID !=
+			"11111111-1111-4111-8111-111111111111" ||
+		record.ExpectedHeadOID != "expected-head" ||
+		record.RepositoryEvidence != evidence ||
+		record.PreparedStageDirectoryIdentity != "" {
+		t.Fatalf("upgraded version 5 record = %+v", record)
 	}
 }
 
@@ -1048,6 +1098,9 @@ func TestRemoveRevalidatesExistingNonForceIntent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1112,6 +1165,9 @@ func TestRemoveUpgradesExistingIntentToForce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1167,6 +1223,9 @@ func TestReconcileRemovalDeletesPresentUnregisteredPath(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
@@ -1230,6 +1289,9 @@ func TestReconcileNonForceRemovalPreservesPresentUnregisteredPath(t *testing.T) 
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1282,6 +1344,9 @@ func TestReconcileNonForceRemovalPreservesMissingDetachedRegistration(t *testing
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	runGit(t, prepared.Path, "checkout", "--detach")
 	if err := os.WriteFile(
 		filepath.Join(prepared.Path, "detached-only.txt"),
@@ -1316,7 +1381,7 @@ func TestReconcileNonForceRemovalPreservesMissingDetachedRegistration(t *testing
 		t.Fatalf("reconcile missing detached worktree error = %v, want ErrDirty", err)
 	}
 	porcelain := runGit(t, repository, "worktree", "list", "--porcelain")
-	if !strings.Contains(porcelain, prepared.Path) ||
+	if !strings.Contains(porcelain, filepath.ToSlash(prepared.Path)) ||
 		!strings.Contains(porcelain, detachedHead) ||
 		!strings.Contains(porcelain, "detached") {
 		t.Fatalf("detached registration was not preserved:\n%s", porcelain)
@@ -1342,6 +1407,9 @@ func TestReconcilePendingRemovalRequiresGit(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
@@ -1385,6 +1453,9 @@ func TestReconcileRemovalReturnsAlreadyAbsentWorkspace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1425,6 +1496,9 @@ func TestRemoveRecordsInitiallyAbsentPath(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	runGit(t, repository, "worktree", "remove", "--force", prepared.Path)
 
@@ -1467,6 +1541,9 @@ func TestReconcileClearsUnsafeNonForceIntent(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
@@ -1518,6 +1595,9 @@ func TestAcknowledgeRemovalValidatesTokenAndIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
 	if err != nil || result.State != RemovalComplete {
 		t.Fatalf("remove workspace = %+v, %v", result, err)
@@ -1555,6 +1635,35 @@ func TestPrepareUsesExistingBranchAndDiscardPreservesIt(t *testing.T) {
 		t.Fatalf("discard existing branch worktree: %v", err)
 	}
 	runGit(t, repository, "show-ref", "--verify", "refs/heads/existing")
+}
+
+func TestPrepareRejectsBranchCheckedOutInSourceWorktree(t *testing.T) {
+	repository := newTestRepository(t)
+	branch := strings.TrimSpace(
+		runGit(t, repository, "symbolic-ref", "--short", "HEAD"),
+	)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	if prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		branch,
+		testAgentID,
+	); err == nil {
+		_ = manager.Discard(context.Background(), prepared)
+		t.Fatal("prepare reused the source worktree branch")
+	}
+	if got := strings.TrimSpace(
+		runGit(t, repository, "symbolic-ref", "--short", "HEAD"),
+	); got != branch {
+		t.Fatalf("source branch = %q, want %q", got, branch)
+	}
+	if status := runGit(t, repository, "status", "--porcelain"); status != "" {
+		t.Fatalf("source worktree changed after rejected prepare:\n%s", status)
+	}
 }
 
 func TestPrepareSkipsIncludeTrackedByTargetBranch(t *testing.T) {
@@ -1620,6 +1729,70 @@ func TestPrepareSkipsIncludeTrackedByTargetBranch(t *testing.T) {
 	}
 }
 
+func TestPrepareSkipsCaseAliasTrackedByTargetBranch(t *testing.T) {
+	repository := newTestRepository(t)
+	runGit(t, repository, "config", "core.ignoreCase", "true")
+	if err := os.WriteFile(
+		filepath.Join(repository, "Secret.local"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write tracked target file: %v", err)
+	}
+	runGit(t, repository, "add", "Secret.local")
+	runGit(t, repository, "commit", "-m", "track target local file")
+	runGit(t, repository, "branch", "target-with-case-alias")
+	runGit(t, repository, "rm", "Secret.local")
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitignore"),
+		[]byte("*.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write gitignore: %v", err)
+	}
+	runGit(t, repository, "add", ".gitignore")
+	runGit(t, repository, "commit", "-m", "ignore local files on source")
+	if err := os.WriteFile(
+		filepath.Join(repository, worktreeIncludeFile),
+		[]byte("secret.local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write include manifest: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(repository, "secret.local"),
+		[]byte("source local\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source local file: %v", err)
+	}
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"target-with-case-alias",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare target branch: %v", err)
+	}
+	assertFileContents(t, filepath.Join(prepared.Path, "Secret.local"), "tracked\n")
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	if len(record.IncludedPaths) != 0 {
+		t.Fatalf("protected include paths = %q, want none", record.IncludedPaths)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard target branch worktree: %v", err)
+	}
+}
+
 func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {
 	repository := newTestRepository(t)
 	source := filepath.Join(t.TempDir(), "source-worktree")
@@ -1653,6 +1826,61 @@ func TestPrepareFromLinkedWorktreeUsesCommonRepositoryIdentity(t *testing.T) {
 	}
 	if err := manager.Discard(context.Background(), prepared); err != nil {
 		t.Fatalf("discard nested worktree: %v", err)
+	}
+}
+
+func TestPrepareFromSeparateGitDirectoryUsesWorktreeIdentity(t *testing.T) {
+	parent := t.TempDir()
+	repository := filepath.Join(parent, "repository")
+	gitDirectory := filepath.Join(parent, "metadata", "repository.git")
+	if err := os.MkdirAll(filepath.Dir(gitDirectory), 0o700); err != nil {
+		t.Fatalf("create metadata directory: %v", err)
+	}
+	runGit(
+		t,
+		parent,
+		"init",
+		"--separate-git-dir="+gitDirectory,
+		repository,
+	)
+	runGit(t, repository, "config", "user.email", "drove@example.com")
+	runGit(t, repository, "config", "user.name", "Drove Test")
+	if err := os.WriteFile(
+		filepath.Join(repository, "tracked.txt"),
+		[]byte("tracked\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write tracked file: %v", err)
+	}
+	runGit(t, repository, "add", "tracked.txt")
+	runGit(t, repository, "commit", "-m", "initial")
+	repository, err := resolvePath(repository)
+	if err != nil {
+		t.Fatalf("resolve worktree path: %v", err)
+	}
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"separate-git-directory",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare from separate Git directory: %v", err)
+	}
+	if prepared.Repository != repository {
+		t.Fatalf(
+			"repository = %q, want worktree %q",
+			prepared.Repository,
+			repository,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard separate Git directory worktree: %v", err)
 	}
 }
 
@@ -1869,6 +2097,9 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1877,6 +2108,7 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 		OperationID:    "12121212-1212-4212-8212-121212121212",
 		DirectoryToken: "13131313-1313-4313-8313-131313131313",
 		Started:        true,
+		Quarantined:    true,
 	}
 	root, err := openRealPathRoot(prepared.Path)
 	if err != nil {
@@ -1889,11 +2121,18 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 	if err := root.Close(); err != nil {
 		t.Fatalf("close prepared workspace: %v", err)
 	}
+	quarantinePath := filepath.Join(
+		filepath.Dir(prepared.Path),
+		removalQuarantinePrefix(record)+"14141414-1414-4414-8414-141414141414",
+	)
+	if err := os.Rename(prepared.Path, quarantinePath); err != nil {
+		t.Fatalf("quarantine prepared workspace: %v", err)
+	}
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write started removal: %v", err)
 	}
 	if err := os.WriteFile(
-		filepath.Join(prepared.Path, "tracked.txt"),
+		filepath.Join(quarantinePath, "tracked.txt"),
 		[]byte("changed after physical removal started\n"),
 		0o600,
 	); err != nil {
@@ -1910,6 +2149,9 @@ func TestReconcileStartedRemovalDoesNotRollbackAfterWorkspaceBecomesDirty(
 	}
 	if _, err := os.Lstat(prepared.Path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("started removal retained path or inspect failed: %v", err)
+	}
+	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("started removal retained quarantine or inspect failed: %v", err)
 	}
 	if err := manager.AcknowledgeRemoval(removals[0]); err != nil {
 		t.Fatalf("acknowledge started removal: %v", err)
@@ -1974,6 +2216,78 @@ exec "$DROVE_TEST_REAL_GIT" "$@"
 	}
 }
 
+func TestPreparePreservesTrailingSpaceInRepositoryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows paths cannot end in a space")
+	}
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve repository parent: %v", err)
+	}
+	repository := filepath.Join(parent, "repository ")
+	initTestRepositoryAt(t, repository)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare trailing-space repository: %v", err)
+	}
+	if prepared.Repository != repository {
+		t.Fatalf(
+			"prepared repository = %q, want %q",
+			prepared.Repository,
+			repository,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard trailing-space repository: %v", err)
+	}
+}
+
+func TestPrepareSupportsNewlineInRepositoryPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows paths cannot contain a newline")
+	}
+	parent, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve repository parent: %v", err)
+	}
+	repository := filepath.Join(parent, "repository\nline")
+	initTestRepositoryAt(t, repository)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare newline repository: %v", err)
+	}
+	if prepared.Repository != repository {
+		t.Fatalf(
+			"prepared repository = %q, want %q",
+			prepared.Repository,
+			repository,
+		)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard newline repository: %v", err)
+	}
+}
+
 func TestPrepareRejectsMissingRepositoryWithoutRunningGit(t *testing.T) {
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {
@@ -2015,6 +2329,35 @@ func TestValidateBranchPreservesRuntimeGitFailure(t *testing.T) {
 	}
 }
 
+func TestValidateBranchRejectsHEAD(t *testing.T) {
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	err = manager.validateBranch(context.Background(), "HEAD")
+	if !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf("validate HEAD error = %v, want ErrInvalidBranch", err)
+	}
+}
+
+func TestValidateBranchRejectsPreviousCheckoutExpression(t *testing.T) {
+	repository := newTestRepository(t)
+	runGit(t, repository, "checkout", "-b", "current")
+	t.Chdir(repository)
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	err = manager.validateBranch(context.Background(), "@{-1}")
+	if !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf(
+			"validate previous checkout expression error = %v, want ErrInvalidBranch",
+			err,
+		)
+	}
+}
+
 func newTestRepository(t *testing.T) string {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -2025,6 +2368,8 @@ func newTestRepository(t *testing.T) string {
 		t.Fatalf("create repository: %v", err)
 	}
 	runGit(t, repository, "init", "--initial-branch=main")
+	runGit(t, repository, "config", "core.autocrlf", "false")
+	runGit(t, repository, "config", "core.longpaths", "true")
 	runGit(t, repository, "config", "user.name", "Drove Test")
 	runGit(t, repository, "config", "user.email", "drove@example.invalid")
 	files := map[string]string{
@@ -2060,6 +2405,7 @@ func initTestRepositoryAt(t *testing.T, path string) {
 		t.Fatalf("create repository: %v", err)
 	}
 	runGit(t, path, "init", "--initial-branch=main")
+	runGit(t, path, "config", "core.autocrlf", "false")
 	runGit(t, path, "config", "user.name", "Drove Test")
 	runGit(t, path, "config", "user.email", "drove@example.invalid")
 	if err := os.WriteFile(

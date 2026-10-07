@@ -3,6 +3,8 @@ package workspace
 import (
 	"context"
 	"errors"
+	"fmt"
+	"path/filepath"
 )
 
 func (m *Manager) removePreparedWorktreeAtRoot(
@@ -17,12 +19,40 @@ func (m *Manager) removePreparedWorktreeAtRoot(
 			"workspace: prepared worktree identity is incomplete",
 		)
 	}
+	if err := cleanupPreparedWorktreeAddDebris(
+		ctx,
+		repository,
+		target,
+		record,
+	); err != nil {
+		return err
+	}
 	registered, exists, err := repository.worktreeRegistration(
 		ctx,
 		target.Path,
 	)
 	if err != nil {
 		return err
+	}
+	if record.GitDirectory != "" && !exists {
+		repaired, repairErr := m.repairPromotedPreparedWorktree(
+			ctx,
+			target,
+			record,
+			repository,
+		)
+		if repairErr != nil {
+			return repairErr
+		}
+		if repaired {
+			registered, exists, err = repository.worktreeRegistration(
+				ctx,
+				target.Path,
+			)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	switch {
 	case record.GitDirectory != "" && !exists:
@@ -112,4 +142,109 @@ func (m *Manager) removePreparedWorktreeAtRoot(
 		target.AgentID,
 		opened,
 	)
+}
+
+func (m *Manager) repairPromotedPreparedWorktree(
+	ctx context.Context,
+	target Workspace,
+	record workspaceRecord,
+	repository repositoryCapability,
+) (result bool, resultErr error) {
+	if record.BranchOperationID == "" {
+		return false, nil
+	}
+	stagingName, err := preparedWorktreeStagingName(
+		target.AgentID,
+		record.BranchOperationID,
+	)
+	if err != nil {
+		return false, err
+	}
+	stagingPath := filepath.Join(filepath.Dir(target.Path), stagingName)
+	stale, exists, err := repository.worktreeRegistration(ctx, stagingPath)
+	if err != nil {
+		return false, err
+	}
+	if exists {
+		stagingTarget := target
+		stagingTarget.Path = stagingPath
+		if err := repository.verifyPreparedWorktree(
+			ctx,
+			stagingTarget,
+			record.GitDirectory,
+			stale,
+		); err != nil {
+			return false, fmt.Errorf(
+				"workspace: verify promoted worktree staging registration: %w",
+				err,
+			)
+		}
+	}
+
+	bucket, err := m.openManagedBucketRoot(target)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, bucket.Close())
+	}()
+	opened, err := openRealRootFromRoot(bucket, target.AgentID)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, opened.Close())
+	}()
+	identity, err := openedDirectoryIdentity(opened)
+	if err != nil {
+		return false, err
+	}
+	if identity != record.DirectoryIdentity {
+		return false, errors.New(
+			"workspace: promoted worktree directory identity changed",
+		)
+	}
+	gitDirectory, err := m.worktreeGitDirectoryAtRoot(
+		ctx,
+		target.Path,
+		opened,
+	)
+	if err != nil {
+		return false, err
+	}
+	if gitDirectory != record.GitDirectory {
+		return false, errors.New(
+			"workspace: promoted worktree Git directory changed",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	); err != nil {
+		return false, err
+	}
+	prepared := &preparedWorktreeTarget{
+		root:         opened,
+		name:         target.AgentID,
+		path:         target.Path,
+		gitDirectory: record.GitDirectory,
+	}
+	if err := m.repairPreparedWorktreeRegistration(
+		ctx,
+		target,
+		prepared,
+		repository,
+		stagingPath,
+	); err != nil {
+		return false, err
+	}
+	if err := verifyRootEntryUnchanged(
+		bucket,
+		target.AgentID,
+		opened,
+	); err != nil {
+		return false, err
+	}
+	return true, nil
 }

@@ -91,9 +91,26 @@ type inputAuditPayload struct {
 const MaxInputBytes = 64 * 1024
 
 const (
-	initialTerminalRows    = 40
-	initialTerminalColumns = 120
+	initialTerminalRows          = 40
+	initialTerminalColumns       = 120
+	startupResumeCompletedReason = "startup_resume_completed"
+	startupResumeCancelledReason = "startup_resume_cancelled"
+	processGroupCleanupFailed    = "process_group_cleanup_failed"
+	processGroupCleanupCompleted = "process_group_cleanup_completed"
 )
+
+type startupResumeCompletedPayload struct {
+	Version int `json:"version"`
+}
+
+type startupResumeCancelledPayload struct {
+	Version int `json:"version"`
+}
+
+type processGroupCleanupPayload struct {
+	Version int `json:"version"`
+	PID     int `json:"pid"`
+}
 
 var (
 	// ErrUnknownAgent 表示目标 Agent 不存在。
@@ -117,7 +134,10 @@ var (
 	// ErrInputAudit 表示输入已送达，但审计事件持久化失败。
 	ErrInputAudit = errors.New("session: input delivered but audit failed")
 	// ErrResumeConflict means the Agent cannot begin a native resume now.
-	ErrResumeConflict = errors.New("session: agent cannot be resumed")
+	ErrResumeConflict             = errors.New("session: agent cannot be resumed")
+	errProcessGroupCleanupPending = errors.New(
+		"session: process group cleanup remains unresolved",
+	)
 )
 
 type stopCause uint8
@@ -174,21 +194,22 @@ type Manager struct {
 	committer *committer
 	archive   *recording.Archive
 
-	signalOrigin     string
-	originConfigured bool
-	detectConfig     detect.Config
-	clock            observationClock
-	newCredential    signalCredentialSource
-	startPTY         func(pty.Config) (launchedSession, error)
-	terminationGrace time.Duration
-	injectionEnabled bool
-	injectionDataDir string
-	injectionRelay   string
-	injectionModes   map[string]agent.SignalInjectionMode
-	injectionFS      signalInjectionFS
-	signalSocketPath string
-	workspaces       workspaceLifecycle
-	workspaceErr     error
+	signalOrigin      string
+	originConfigured  bool
+	detectConfig      detect.Config
+	clock             observationClock
+	newCredential     signalCredentialSource
+	startPTY          func(pty.Config) (launchedSession, error)
+	processGroupAlive func(int) (bool, error)
+	terminationGrace  time.Duration
+	injectionEnabled  bool
+	injectionDataDir  string
+	injectionRelay    string
+	injectionModes    map[string]agent.SignalInjectionMode
+	injectionFS       signalInjectionFS
+	signalSocketPath  string
+	workspaces        workspaceLifecycle
+	workspaceErr      error
 
 	mu       sync.RWMutex
 	agents   map[agent.ID]*managedAgent
@@ -248,7 +269,8 @@ func NewManager(
 		startPTY: func(config pty.Config) (launchedSession, error) {
 			return pty.Start(config)
 		},
-		injectionFS: defaultSignalInjectionFS(),
+		processGroupAlive: pty.ProcessGroupAlive,
+		injectionFS:       defaultSignalInjectionFS(),
 	}
 	for _, option := range options {
 		option(manager)
@@ -287,6 +309,9 @@ func Bootstrap(
 			resumeOnStart: plan.ResumeOnStart[string(snapshot.ID)],
 			removed:       plan.WorkspaceRemoved[string(snapshot.ID)],
 		})
+		if pid := plan.ProcessGroupCleanup[string(snapshot.ID)]; pid > 0 {
+			managed.setProcessGroupCleanupPending(pid)
+		}
 		restoredAgents[snapshot.ID] = managed
 	}
 
@@ -683,11 +708,11 @@ func (m *Manager) Resume(ctx context.Context, id agent.ID) (*Status, error) {
 	}
 	defer m.endStart()
 
-	managed, entry, ref, err := m.reserveResume(id)
+	managed, entry, ref, startupResume, err := m.reserveResume(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	return m.resumeReserved(ctx, id, managed, entry, ref)
+	return m.resumeReserved(ctx, id, managed, entry, ref, startupResume)
 }
 
 func (m *Manager) resumeReserved(
@@ -696,13 +721,9 @@ func (m *Manager) resumeReserved(
 	managed *managedAgent,
 	entry adapter.Entry,
 	ref string,
+	startupResume bool,
 ) (*Status, error) {
-	reserved := true
-	defer func() {
-		if reserved {
-			m.releaseResume(id)
-		}
-	}()
+	defer m.releaseResume(id)
 
 	target := managed.agent
 	command, err := entry.ResumeCommand(
@@ -791,9 +812,7 @@ func (m *Manager) resumeReserved(
 
 	m.mu.Lock()
 	m.sessions[id] = running
-	delete(m.resuming, id)
 	m.mu.Unlock()
-	reserved = false
 
 	if err := m.activate(ctx, activation{
 		id:           id,
@@ -808,6 +827,11 @@ func (m *Manager) resumeReserved(
 		outputOffset: initialOutputOffset,
 	}); err != nil {
 		return nil, err
+	}
+	if startupResume {
+		if err := m.completeStartupResume(id, managed); err != nil {
+			return nil, err
+		}
 	}
 	return m.Status(id)
 }
@@ -827,11 +851,38 @@ func closePreparedRuntime(running *runningSession) error {
 }
 
 func (m *Manager) reserveResume(
+	ctx context.Context,
 	id agent.ID,
-) (*managedAgent, adapter.Entry, string, error) {
+) (*managedAgent, adapter.Entry, string, bool, error) {
+	managed, ok := m.managed(id)
+	if !ok {
+		return nil, adapter.Entry{}, "", false, fmt.Errorf(
+			"%w: %q",
+			ErrUnknownAgent,
+			id,
+		)
+	}
+	pending, err := m.resolveProcessGroupCleanup(ctx, id, managed)
+	if err != nil {
+		return nil, adapter.Entry{}, "", false, errors.Join(
+			ErrResumeConflict,
+			err,
+		)
+	}
+	if pending {
+		return nil, adapter.Entry{}, "", false, fmt.Errorf(
+			"%w: agent %q process group cleanup remains unresolved",
+			ErrResumeConflict,
+			id,
+		)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.reserveResumeLocked(id)
+	managed, entry, ref, err := m.reserveResumeLocked(id)
+	if err != nil {
+		return nil, adapter.Entry{}, "", false, err
+	}
+	return managed, entry, ref, managed.hasResumeOnStart(), nil
 }
 
 func (m *Manager) reserveResumeLocked(
@@ -873,6 +924,13 @@ func (m *Manager) reserveResumeLocked(
 	if workspaceState.removed {
 		return nil, adapter.Entry{}, "", fmt.Errorf(
 			"%w: agent %q workspace was removed",
+			ErrResumeConflict,
+			id,
+		)
+	}
+	if managed.processGroupCleanupPending() {
+		return nil, adapter.Entry{}, "", fmt.Errorf(
+			"%w: agent %q process group cleanup remains unresolved",
 			ErrResumeConflict,
 			id,
 		)
@@ -999,7 +1057,7 @@ func (m *Manager) Close() error {
 func (m *Manager) Stop(id agent.ID) error {
 	a, ok := m.agent(id)
 	if !ok {
-		return fmt.Errorf("session: unknown agent %q", id)
+		return fmt.Errorf("%w: %q", ErrUnknownAgent, id)
 	}
 
 	m.mu.RLock()
@@ -1054,6 +1112,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		!cleaning &&
 		!workspaceState.removalPending &&
 		!workspaceState.removed &&
+		!managed.processGroupCleanupPending() &&
 		ref != "" &&
 		exactVendor &&
 		entry.SupportsResume()
@@ -1121,7 +1180,7 @@ func (m *Manager) ResumeOnStart(ctx context.Context) []StartupResumeResult {
 	m.mu.RLock()
 	candidates := make([]candidate, 0)
 	for id, managed := range m.agents {
-		if !managed.shouldResumeOnStart() {
+		if !managed.hasResumeOnStart() {
 			continue
 		}
 		candidates = append(candidates, candidate{
@@ -1169,7 +1228,7 @@ func (m *Manager) resumeOnStart(
 
 		m.mu.Lock()
 		managed, exists := m.agents[id]
-		if !exists || !managed.shouldResumeOnStart() {
+		if !exists || !managed.hasResumeOnStart() {
 			m.mu.Unlock()
 			m.endStart()
 			return false, nil
@@ -1188,20 +1247,77 @@ func (m *Manager) resumeOnStart(
 				)
 			}
 		}
-		managed, entry, ref, err := m.reserveResumeLocked(id)
-		if err == nil {
-			managed.consumeResumeOnStart()
+		m.mu.Unlock()
+
+		pending, err := m.resolveProcessGroupCleanup(ctx, id, managed)
+		if err != nil {
+			m.endStart()
+			return true, errors.Join(ErrResumeConflict, err)
 		}
+		if pending {
+			m.endStart()
+			return true, fmt.Errorf(
+				"%w: agent %q process group cleanup remains unresolved",
+				ErrResumeConflict,
+				id,
+			)
+		}
+
+		m.mu.Lock()
+		current, exists := m.agents[id]
+		if !exists || current != managed || !managed.shouldResumeOnStart() {
+			m.mu.Unlock()
+			m.endStart()
+			return false, nil
+		}
+		managed, entry, ref, err := m.reserveResumeLocked(id)
 		m.mu.Unlock()
 		if err != nil {
 			m.endStart()
 			return false, err
 		}
 
-		_, err = m.resumeReserved(ctx, id, managed, entry, ref)
+		_, err = m.resumeReserved(ctx, id, managed, entry, ref, true)
+		if err != nil {
+			m.endStart()
+			return true, err
+		}
 		m.endStart()
-		return true, err
+		return true, nil
 	}
+}
+
+func (m *Manager) completeStartupResume(
+	id agent.ID,
+	managed *managedAgent,
+) error {
+	payload, err := json.Marshal(startupResumeCompletedPayload{Version: 1})
+	if err != nil {
+		return fmt.Errorf(
+			"session: encode startup resume completion: %w",
+			err,
+		)
+	}
+	_, commitErr := managed.completeResumeOnStart(
+		func() (commitReceipt, error) {
+			return m.committer.CommitEvents(
+				context.Background(),
+				[]event.Draft{event.NewSessionLifecycleDraft(
+					string(id),
+					string(id),
+					startupResumeCompletedReason,
+					string(payload),
+				)},
+			)
+		},
+	)
+	if commitErr != nil {
+		return fmt.Errorf(
+			"session: persist startup resume completion: %w",
+			commitErr,
+		)
+	}
+	return nil
 }
 
 // Replay 返回某会话的事件流（来自 store，按 seq 升序）。
@@ -1504,6 +1620,19 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	}
 	defer m.markExitHandled(id, running)
 	defer m.finalizeSignalInjection(id, running)
+	cleanupPending := info.CleanupErr != nil
+	cleanupPID := info.PID
+	if cleanupPending && cleanupPID <= 0 && running.process != nil {
+		cleanupPID = running.process.PID()
+	}
+	defer func() {
+		if !cleanupPending {
+			return
+		}
+		if managed, exists := m.managed(id); exists {
+			managed.setProcessGroupCleanupPending(cleanupPID)
+		}
+	}()
 	if running.observer == nil {
 		return
 	}
@@ -1512,6 +1641,7 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	exitKind := detect.ExitFailure
 	reason := ""
 	errorMessage := ""
+	var lifecycleDrafts []event.Draft
 	switch {
 	case info.CleanupErr != nil:
 		exitErr := info.CleanupErr
@@ -1519,6 +1649,33 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 			exitErr = errors.Join(info.Err, info.CleanupErr)
 		}
 		errorMessage = exitErr.Error()
+		if cleanupPID <= 0 {
+			m.committer.Fail(fmt.Errorf(
+				"session: process group cleanup failed for agent %q without a valid PID",
+				id,
+			))
+			break
+		}
+		payload, err := json.Marshal(processGroupCleanupPayload{
+			Version: 1,
+			PID:     cleanupPID,
+		})
+		if err != nil {
+			m.committer.Fail(fmt.Errorf(
+				"session: encode process group cleanup failure: %w",
+				err,
+			))
+			break
+		}
+		lifecycleDrafts = append(
+			lifecycleDrafts,
+			event.NewSessionLifecycleDraft(
+				string(id),
+				string(id),
+				processGroupCleanupFailed,
+				string(payload),
+			),
+		)
 	case cause == stopCauseUser:
 		exitKind = detect.ExitStopped
 		reason = "user stop"
@@ -1546,7 +1703,34 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	if err != nil {
 		return
 	}
-	_ = running.observer.Terminate(observation)
+	terminate := func(cancelStartupResume bool) error {
+		drafts := append([]event.Draft(nil), lifecycleDrafts...)
+		if cancelStartupResume && info.CleanupErr != nil {
+			payload, err := json.Marshal(startupResumeCancelledPayload{
+				Version: 1,
+			})
+			if err != nil {
+				return fmt.Errorf(
+					"session: encode startup resume cancellation: %w",
+					err,
+				)
+			}
+			drafts = append(drafts, event.NewSessionLifecycleDraft(
+				string(id),
+				string(id),
+				startupResumeCancelledReason,
+				string(payload),
+			))
+		}
+		return running.observer.terminate(observation, drafts)
+	}
+	if cause == stopCauseUser {
+		if managed, exists := m.managed(id); exists {
+			_ = managed.cancelResumeOnStartAfter(terminate)
+			return
+		}
+	}
+	_ = terminate(false)
 }
 
 func processObservation(

@@ -180,6 +180,44 @@ func TestCleanupWorktreeKeepsCurrentDaemonNotFoundAsUserError(t *testing.T) {
 	}
 }
 
+func TestStopClassifiesOnlyNotFoundAsUserError(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		statusCode int
+		wantUser   bool
+	}{
+		{
+			name:       "unknown agent",
+			statusCode: http.StatusNotFound,
+			wantUser:   true,
+		},
+		{
+			name:       "runtime failure",
+			statusCode: http.StatusInternalServerError,
+			wantUser:   false,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(
+				w http.ResponseWriter,
+				_ *http.Request,
+			) {
+				http.Error(w, `{"error":"stop failed"}`, test.statusCode)
+			}))
+			defer server.Close()
+
+			client := New(strings.TrimPrefix(server.URL, "http://"))
+			err := client.Stop(context.Background(), "agent-1")
+			if err == nil {
+				t.Fatal("stop succeeded")
+			}
+			if got := IsUserError(err); got != test.wantUser {
+				t.Fatalf("IsUserError(%v) = %v, want %v", err, got, test.wantUser)
+			}
+		})
+	}
+}
+
 func TestStartUsesDedicatedWorktreeEndpointWithoutClientTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(
 		w http.ResponseWriter,
@@ -594,6 +632,9 @@ func TestFrameReturnsTypedOutputExpiry(t *testing.T) {
 	var expired *recording.OutputExpiredError
 	if !errors.As(err, &expired) {
 		t.Fatalf("frame error = %v, want OutputExpiredError", err)
+	}
+	if !IsUserError(err) {
+		t.Fatalf("frame expiry was not classified as a user error: %v", err)
 	}
 	if expired.SessionID != "agent-1" ||
 		len(expired.Missing) != 1 ||

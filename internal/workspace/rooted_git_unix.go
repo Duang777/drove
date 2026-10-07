@@ -93,8 +93,16 @@ func rootedPrivateGitCommand(
 	worktreePath string,
 	_ string,
 	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
+	if err := verifyRealPathRoot(commonPath, commonRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify rooted common Git directory: %w",
+			err,
+		)
+	}
 	directory, err := gitRoot.Open(".")
 	if err != nil {
 		return nil, nil, fmt.Errorf(
@@ -129,7 +137,13 @@ func rootedPrivateGitCommand(
 		".",
 		worktreePath,
 	)
-	return command, directory.Close, nil
+	cleanup := func() error {
+		return errors.Join(
+			verifyRealPathRoot(commonPath, commonRoot),
+			directory.Close(),
+		)
+	}
+	return command, cleanup, nil
 }
 
 func rootedWorktreeGitCommand(
@@ -139,11 +153,19 @@ func rootedWorktreeGitCommand(
 	root *os.Root,
 	gitPath string,
 	gitRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
 	arguments []string,
 ) (*exec.Cmd, func() error, error) {
 	if err := verifyRealPathRoot(gitPath, gitRoot); err != nil {
 		return nil, nil, fmt.Errorf(
 			"workspace: verify rooted private Git directory: %w",
+			err,
+		)
+	}
+	if err := verifyRealPathRoot(commonPath, commonRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify rooted common Git directory: %w",
 			err,
 		)
 	}
@@ -184,6 +206,114 @@ func rootedWorktreeGitCommand(
 	cleanup := func() error {
 		return errors.Join(
 			verifyRealPathRoot(gitPath, gitRoot),
+			verifyRealPathRoot(commonPath, commonRoot),
+			directory.Close(),
+		)
+	}
+	return command, cleanup, nil
+}
+
+func rootedPreparedWorktreeGitCommand(
+	ctx context.Context,
+	git string,
+	repositoryPath string,
+	repositoryRoot *os.Root,
+	commonPath string,
+	commonRoot *os.Root,
+	worktreePath string,
+	worktreeRoot *os.Root,
+	stageRoot *os.Root,
+	arguments []string,
+) (*exec.Cmd, func() error, error) {
+	if err := verifyRealPathRoot(repositoryPath, repositoryRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify rooted source repository: %w",
+			err,
+		)
+	}
+	if err := verifyRealPathRoot(worktreePath, worktreeRoot); err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: verify prepared worktree target: %w",
+			err,
+		)
+	}
+	stageName, err := bsdPreparedWorktreeStageName(worktreePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if stageRoot == nil {
+		return nil, nil, errors.New(
+			"workspace: prepared registration stage is unavailable",
+		)
+	}
+	if err := verifyRootEntryUnchanged(
+		commonRoot,
+		stageName,
+		stageRoot,
+	); err != nil {
+		return nil, nil, err
+	}
+	entries, err := readRootDirectory(stageRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(entries) != 0 {
+		return nil, nil, errors.New(
+			"workspace: prepared registration stage is not empty",
+		)
+	}
+	if len(arguments) < 2 || arguments[len(arguments)-2] != "." {
+		return nil, nil, errors.New(
+			"workspace: prepared worktree command has an unexpected target",
+		)
+	}
+	directory, err := stageRoot.Open(".")
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"workspace: open rooted prepared registration stage: %w",
+			err,
+		)
+	}
+	commonGuard, err := openRepositoryGuard(commonPath, commonRoot)
+	if err != nil {
+		_ = directory.Close()
+		return nil, nil, err
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		_ = commonGuard.Close()
+		_ = directory.Close()
+		return nil, nil, fmt.Errorf(
+			"workspace: locate rooted Git helper: %w",
+			err,
+		)
+	}
+	git, err = exec.LookPath(git)
+	if err != nil {
+		_ = commonGuard.Close()
+		_ = directory.Close()
+		return nil, nil, err
+	}
+	helperArguments := []string{
+		rootedGitHelperArgument,
+		git,
+		"-c",
+		"core.hooksPath=/dev/null",
+	}
+	helperArguments = append(helperArguments, arguments...)
+	command := exec.CommandContext(ctx, executable, helperArguments...)
+	command.ExtraFiles = []*os.File{directory}
+	command.Env = boundGitEnvironment(
+		command.Environ(),
+		"..",
+		"..",
+	)
+	cleanup := func() error {
+		return errors.Join(
+			verifyRealPathRoot(repositoryPath, repositoryRoot),
+			verifyRealPathRoot(commonPath, commonRoot),
+			verifyRealPathRoot(worktreePath, worktreeRoot),
+			commonGuard.Close(),
 			directory.Close(),
 		)
 	}

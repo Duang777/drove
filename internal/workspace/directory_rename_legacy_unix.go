@@ -12,6 +12,7 @@ func renameDirectoryNoReplace(
 	_ os.FileInfo,
 	_ string,
 	_ string,
+	_ string,
 ) (bool, error) {
 	return false, errors.New(
 		"atomic no-replace directory rename is unsupported",

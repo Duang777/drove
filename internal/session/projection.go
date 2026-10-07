@@ -60,19 +60,23 @@ type sessionDraft struct {
 	workingDir             string
 	workspace              *workspaceMetadata
 	workspaceRemoved       bool
+	processGroupCleanupPID int
+	restartStopped         bool
+	startupResumePending   bool
 	hasCreated             bool
 	hasState               bool
 }
 
 type recoveryPlan struct {
-	Snapshots         []agent.RestoreSnapshot
-	VendorSessionRefs map[string]string
-	WorkingDirs       map[string]string
-	Workspaces        map[string]workspaceMetadata
-	ResumeOnStart     map[string]bool
-	WorkspaceRemoved  map[string]bool
-	Reconciliation    []store.EventRow
-	Report            RecoveryReport
+	Snapshots           []agent.RestoreSnapshot
+	VendorSessionRefs   map[string]string
+	WorkingDirs         map[string]string
+	Workspaces          map[string]workspaceMetadata
+	ResumeOnStart       map[string]bool
+	WorkspaceRemoved    map[string]bool
+	ProcessGroupCleanup map[string]int
+	Reconciliation      []store.EventRow
+	Report              RecoveryReport
 }
 
 func newRecoveryProjector() *recoveryProjector {
@@ -165,8 +169,16 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 	switch row.Reason {
 	case "created":
 		return p.applyCreated(row)
+	case startupResumeCompletedReason:
+		return p.applyStartupResumeCompleted(row)
+	case startupResumeCancelledReason:
+		return p.applyStartupResumeCancelled(row)
 	case workspaceRemovedReason:
 		return p.applyWorkspaceRemoved(row)
+	case processGroupCleanupFailed:
+		return p.applyProcessGroupCleanupFailed(row)
+	case processGroupCleanupCompleted:
+		return p.applyProcessGroupCleanupCompleted(row)
 	default:
 		return projectionError(row, "unknown lifecycle reason %q", row.Reason)
 	}
@@ -282,6 +294,78 @@ func (p *recoveryProjector) applyCreated(row store.EventRow) error {
 	return nil
 }
 
+func (p *recoveryProjector) applyStartupResumeCompleted(
+	row store.EventRow,
+) error {
+	draft := p.draft(row)
+	if !draft.hasCreated && !draft.hasState {
+		return projectionError(
+			row,
+			"startup resume completion has no session history",
+		)
+	}
+	var payload startupResumeCompletedPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return projectionWrapError(
+			row,
+			"decode startup resume completion",
+			err,
+		)
+	}
+	if payload.Version != 1 {
+		return projectionError(
+			row,
+			"unsupported startup resume completion version %d",
+			payload.Version,
+		)
+	}
+	if !draft.startupResumePending {
+		return projectionError(
+			row,
+			"startup resume completion has no restart resume candidate",
+		)
+	}
+	draft.restartStopped = false
+	draft.startupResumePending = false
+	return nil
+}
+
+func (p *recoveryProjector) applyStartupResumeCancelled(
+	row store.EventRow,
+) error {
+	draft := p.draft(row)
+	if !draft.hasCreated && !draft.hasState {
+		return projectionError(
+			row,
+			"startup resume cancellation has no session history",
+		)
+	}
+	var payload startupResumeCancelledPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return projectionWrapError(
+			row,
+			"decode startup resume cancellation",
+			err,
+		)
+	}
+	if payload.Version != 1 {
+		return projectionError(
+			row,
+			"unsupported startup resume cancellation version %d",
+			payload.Version,
+		)
+	}
+	if !draft.startupResumePending {
+		return projectionError(
+			row,
+			"startup resume cancellation has no restart resume candidate",
+		)
+	}
+	draft.restartStopped = false
+	draft.startupResumePending = false
+	return nil
+}
+
 func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 	draft := p.draft(row)
 	if !draft.hasCreated && !draft.hasState {
@@ -289,6 +373,12 @@ func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 	}
 	if draft.workspaceRemoved {
 		return projectionError(row, "duplicate workspace removal")
+	}
+	if draft.processGroupCleanupPID != 0 {
+		return projectionError(
+			row,
+			"workspace removal precedes process group cleanup completion",
+		)
 	}
 	var payload workspaceRemovedPayload
 	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
@@ -302,8 +392,89 @@ func (p *recoveryProjector) applyWorkspaceRemoved(row store.EventRow) error {
 		)
 	}
 	draft.workspaceRemoved = true
-	draft.updatedAt = row.Timestamp
+	draft.restartStopped = false
+	draft.startupResumePending = false
 	return nil
+}
+
+func (p *recoveryProjector) applyProcessGroupCleanupFailed(
+	row store.EventRow,
+) error {
+	draft := p.draft(row)
+	if !draft.hasCreated && !draft.hasState {
+		return projectionError(
+			row,
+			"process group cleanup failure has no session history",
+		)
+	}
+	if draft.workspaceRemoved {
+		return projectionError(
+			row,
+			"process group cleanup failure follows workspace removal",
+		)
+	}
+	if draft.processGroupCleanupPID != 0 {
+		return projectionError(row, "duplicate process group cleanup failure")
+	}
+	payload, err := decodeProcessGroupCleanupPayload(row)
+	if err != nil {
+		return err
+	}
+	draft.processGroupCleanupPID = payload.PID
+	return nil
+}
+
+func (p *recoveryProjector) applyProcessGroupCleanupCompleted(
+	row store.EventRow,
+) error {
+	draft := p.draft(row)
+	if draft.processGroupCleanupPID == 0 {
+		return projectionError(
+			row,
+			"process group cleanup completion has no pending failure",
+		)
+	}
+	payload, err := decodeProcessGroupCleanupPayload(row)
+	if err != nil {
+		return err
+	}
+	if payload.PID != draft.processGroupCleanupPID {
+		return projectionError(
+			row,
+			"process group cleanup completion PID %d does not match pending PID %d",
+			payload.PID,
+			draft.processGroupCleanupPID,
+		)
+	}
+	draft.processGroupCleanupPID = 0
+	return nil
+}
+
+func decodeProcessGroupCleanupPayload(
+	row store.EventRow,
+) (processGroupCleanupPayload, error) {
+	var payload processGroupCleanupPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return processGroupCleanupPayload{}, projectionWrapError(
+			row,
+			"decode process group cleanup lifecycle",
+			err,
+		)
+	}
+	if payload.Version != 1 {
+		return processGroupCleanupPayload{}, projectionError(
+			row,
+			"unsupported process group cleanup version %d",
+			payload.Version,
+		)
+	}
+	if payload.PID <= 0 {
+		return processGroupCleanupPayload{}, projectionError(
+			row,
+			"process group cleanup PID must be positive",
+		)
+	}
+	return payload, nil
 }
 
 func (p *recoveryProjector) applyState(row store.EventRow) error {
@@ -323,6 +494,13 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		return projectionError(row, "invalid to state %q", row.To)
 	}
 	isResume := from == agent.StateStopped && to == agent.StateStarting
+	draft := p.draft(row)
+	if isResume && draft.processGroupCleanupPID != 0 {
+		return projectionError(
+			row,
+			"stopped -> starting precedes process group cleanup completion",
+		)
+	}
 	if isResume &&
 		(p.lastResumeSeq+1 != row.Seq || p.lastResumeID != row.SessionID) {
 		return projectionError(
@@ -341,7 +519,6 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		p.report.UnknownStateEvidenceVersions++
 	}
 
-	draft := p.draft(row)
 	if !draft.hasState {
 		draft.state = from
 	} else if draft.state != from {
@@ -357,6 +534,19 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		p.report.PartialHistory++
 	}
 	draft.state = to
+	isRestartStop := to == agent.StateStopped &&
+		from != agent.StateDone &&
+		from != agent.StateStopped &&
+		row.Reason == restartStopReason
+	if isRestartStop {
+		draft.restartStopped = true
+		draft.startupResumePending = true
+	} else if to == agent.StateStopped && row.Reason == "user stop" {
+		draft.restartStopped = false
+		draft.startupResumePending = false
+	} else if to == agent.StateDone {
+		draft.restartStopped = false
+	}
 	if known {
 		draft.lastTransition = evidence
 	}
@@ -656,13 +846,14 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 	})
 
 	plan := recoveryPlan{
-		Snapshots:         make([]agent.RestoreSnapshot, 0, len(drafts)),
-		VendorSessionRefs: make(map[string]string),
-		WorkingDirs:       make(map[string]string),
-		Workspaces:        make(map[string]workspaceMetadata),
-		ResumeOnStart:     make(map[string]bool),
-		WorkspaceRemoved:  make(map[string]bool),
-		Report:            p.report,
+		Snapshots:           make([]agent.RestoreSnapshot, 0, len(drafts)),
+		VendorSessionRefs:   make(map[string]string),
+		WorkingDirs:         make(map[string]string),
+		Workspaces:          make(map[string]workspaceMetadata),
+		ResumeOnStart:       make(map[string]bool),
+		WorkspaceRemoved:    make(map[string]bool),
+		ProcessGroupCleanup: make(map[string]int),
+		Report:              p.report,
 	}
 	nextSeq := p.lastSeq
 	for _, draft := range drafts {
@@ -683,7 +874,8 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			plan.ResumeOnStart[draft.id] =
 				!draft.workspaceRemoved &&
 					state != agent.StateDone &&
-					state != agent.StateStopped
+					(state != agent.StateStopped ||
+						draft.restartStopped)
 		}
 		workingDir := draft.workingDir
 		if draft.workspaceRemoved {
@@ -695,6 +887,10 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 		}
 		if draft.workspace != nil {
 			plan.Workspaces[draft.id] = *draft.workspace
+		}
+		if draft.processGroupCleanupPID != 0 {
+			plan.ProcessGroupCleanup[draft.id] =
+				draft.processGroupCleanupPID
 		}
 		lastError := draft.lastError
 		updatedAt := draft.updatedAt

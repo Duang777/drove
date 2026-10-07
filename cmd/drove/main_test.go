@@ -11,10 +11,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/spf13/cobra"
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
@@ -29,6 +33,29 @@ import (
 	"github.com/Duang777/drove/internal/store"
 	"github.com/Duang777/drove/internal/workspace"
 )
+
+func TestRootContextCancelsOnSIGTERM(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not deliver POSIX SIGTERM")
+	}
+	ctx, stop := newRootContext()
+	defer stop()
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("find test process: %v", err)
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("send SIGTERM: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Fatalf("root context error = %v, want context canceled", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SIGTERM did not cancel the root context")
+	}
+}
 
 func TestSessionStartRequestMapsRunMode(t *testing.T) {
 	tests := []struct {
@@ -269,6 +296,8 @@ func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
 		{"worktree", "unknown"},
 		{"--", "unknown"},
 		{"worktree", "--", "unknown"},
+		{"--", "--bogus"},
+		{"worktree", "--", "--bogus"},
 	}
 	for _, args := range tests {
 		t.Run(strings.Join(args, "/"), func(t *testing.T) {
@@ -278,6 +307,57 @@ func TestExecuteRootTreatsUnknownCommandsAsUsageErrors(t *testing.T) {
 			}
 			if got := commandExitCode(err); got != exitUsage {
 				t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+			}
+		})
+	}
+}
+
+func TestZeroArgumentCommandsRejectArguments(t *testing.T) {
+	for _, command := range []*cobra.Command{
+		newInitCmd(),
+		newPSCmd(),
+		newVersionCmd(),
+	} {
+		t.Run(command.Name(), func(t *testing.T) {
+			if command.Args == nil {
+				t.Fatal("argument validator is nil")
+			}
+			if err := command.Args(command, nil); err != nil {
+				t.Fatalf("validate no arguments: %v", err)
+			}
+			err := command.Args(command, []string{"unexpected"})
+			if err == nil {
+				t.Fatal("accepted an unexpected argument")
+			}
+			if got := commandExitCode(err); got != exitUsage {
+				t.Fatalf("exit code = %d, want %d for %v", got, exitUsage, err)
+			}
+		})
+	}
+}
+
+func TestExecuteRootTreatsDefaultCommandArgumentErrorsAsUsageErrors(
+	t *testing.T,
+) {
+	tests := [][]string{
+		{"help", "definitely-not-a-command"},
+		{"help", "--", "definitely-not-a-command"},
+		{"help", "worktree", "--", "definitely-not-a-command"},
+		{"completion", "bash", "extra"},
+	}
+	for _, args := range tests {
+		t.Run(strings.Join(args, "/"), func(t *testing.T) {
+			err := executeRoot(newRootCmd(), args)
+			if err == nil {
+				t.Fatalf("execute %v succeeded", args)
+			}
+			if got := commandExitCode(err); got != exitUsage {
+				t.Fatalf(
+					"exit code = %d, want %d for %v",
+					got,
+					exitUsage,
+					err,
+				)
 			}
 		})
 	}
@@ -295,9 +375,48 @@ func TestExecuteRootSupportsDefaultCommands(t *testing.T) {
 			wantOutput: "Usage:",
 		},
 		{
+			name:       "help command flag",
+			args:       []string{"help", "--help"},
+			wantOutput: "Usage:",
+		},
+		{
+			name:       "help target flag",
+			args:       []string{"help", "worktree", "--help"},
+			wantOutput: "Usage:",
+		},
+		{
+			name: "help flag overrides invalid topic",
+			args: []string{
+				"help",
+				"--help",
+				"definitely-not-a-command",
+			},
+			wantOutput: "Usage:",
+		},
+		{
+			name: "target help flag overrides invalid topic",
+			args: []string{
+				"help",
+				"worktree",
+				"-h",
+				"definitely-not-a-command",
+			},
+			wantOutput: "Usage:",
+		},
+		{
 			name:       "completion",
 			args:       []string{"completion", "bash"},
 			wantOutput: "__start_drove",
+		},
+		{
+			name:       "completion request",
+			args:       []string{"__complete", "workt"},
+			wantOutput: "worktree",
+		},
+		{
+			name:       "completion request without descriptions",
+			args:       []string{"__completeNoDesc", "workt"},
+			wantOutput: "worktree",
 		},
 	}
 	for _, test := range tests {

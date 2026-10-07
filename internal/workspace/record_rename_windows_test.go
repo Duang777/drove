@@ -8,6 +8,111 @@ import (
 	"testing"
 )
 
+func TestOpenRecordDirectoryProvidesSyncableWindowsHandle(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		t.Fatalf("open syncable directory: %v", err)
+	}
+	defer directory.Close()
+	if err := syncRecordDirectory(directory); err != nil {
+		t.Fatalf("sync directory handle: %v", err)
+	}
+}
+
+func TestWindowsRenameHandlesBlockCanonicalReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		make func(string) error
+		open func(*os.File, string) (*os.File, error)
+	}{
+		{
+			name: "record",
+			make: func(path string) error {
+				return os.WriteFile(path, []byte("record\n"), 0o600)
+			},
+			open: openRecordForMutation,
+		},
+		{
+			name: "directory",
+			make: func(path string) error {
+				return os.Mkdir(path, 0o700)
+			},
+			open: openDirectoryForRename,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootPath := t.TempDir()
+			sourcePath := filepath.Join(rootPath, "source")
+			if err := test.make(sourcePath); err != nil {
+				t.Fatalf("create source: %v", err)
+			}
+			directory, err := os.Open(rootPath)
+			if err != nil {
+				t.Fatalf("open parent directory: %v", err)
+			}
+			defer directory.Close()
+			renaming, err := test.open(directory, "source")
+			if err != nil {
+				t.Fatalf("open source for rename: %v", err)
+			}
+			targetPath := filepath.Join(rootPath, "moved")
+			if err := os.Rename(sourcePath, targetPath); err == nil {
+				_ = renaming.Close()
+				t.Fatal("canonical source was renamed while protected")
+			}
+			if err := renaming.Close(); err != nil {
+				t.Fatalf("close protected source: %v", err)
+			}
+			if err := os.Rename(sourcePath, targetPath); err != nil {
+				t.Fatalf("rename source after releasing protection: %v", err)
+			}
+		})
+	}
+}
+
+func TestUnlinkRecordUsesCompatibleIdentityHandle(t *testing.T) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	expected, err := root.Open("source")
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		t.Fatalf("open syncable parent directory: %v", err)
+	}
+	defer directory.Close()
+	if err := syncRecordDirectory(directory); err != nil {
+		t.Fatalf("sync parent before unlink: %v", err)
+	}
+
+	if err := unlinkRecordPath(directory, expected, "source"); err != nil {
+		t.Fatalf("unlink source while mutation handle is held: %v", err)
+	}
+	if _, err := os.Lstat(sourcePath); !os.IsNotExist(err) {
+		t.Fatalf("source remains while identity handle is held: %v", err)
+	}
+	if err := syncOwnedRecordDirectoryAfterUnlink(directory); err != nil {
+		t.Fatalf("sync parent after unlink: %v", err)
+	}
+	if err := expected.Close(); err != nil {
+		t.Fatalf("close identity handle: %v", err)
+	}
+}
+
 func TestInstallAndReplaceWorkspaceRecordOnWindows(t *testing.T) {
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {
@@ -117,6 +222,7 @@ func TestNoReplaceRenamesPreserveWindowsTargets(t *testing.T) {
 		directory,
 		sourceInfo,
 		"source-dir",
+		"source-dir-isolated",
 		"target-dir",
 	)
 	closeErr = directory.Close()
@@ -175,6 +281,47 @@ func TestRenameWindowsHandleAcceptsReadOnlyFile(t *testing.T) {
 			"read-only rename = installed %v, rename %v, close %v",
 			installed,
 			renameErr,
+			closeErr,
+		)
+	}
+	assertFileContents(t, filepath.Join(rootPath, "target"), "source\n")
+}
+
+func TestMoveRecordFileAcceptsReadOnlySourceHandle(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := os.WriteFile(
+		filepath.Join(rootPath, "source"),
+		[]byte("source\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	source, err := root.Open("source")
+	if err != nil {
+		t.Fatalf("open read-only source: %v", err)
+	}
+	defer source.Close()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	moved, moveErr := moveRecordFile(
+		directory,
+		source,
+		"source",
+		"target",
+	)
+	closeErr := directory.Close()
+	if moveErr != nil || !moved || closeErr != nil {
+		t.Fatalf(
+			"move read-only source = moved %v, move %v, close %v",
+			moved,
+			moveErr,
 			closeErr,
 		)
 	}

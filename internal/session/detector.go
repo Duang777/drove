@@ -59,6 +59,7 @@ func (t *systemObservationTimer) Stop() bool {
 
 type observationRequest struct {
 	observation detect.Observation
+	drafts      []event.Draft
 	result      chan error
 }
 
@@ -148,6 +149,13 @@ func (a *observationActor) Deliver(
 }
 
 func (a *observationActor) Terminate(observation detect.Observation) error {
+	return a.terminate(observation, nil)
+}
+
+func (a *observationActor) terminate(
+	observation detect.Observation,
+	drafts []event.Draft,
+) error {
 	a.admissionMu.Lock()
 	if a.closing {
 		a.admissionMu.Unlock()
@@ -158,6 +166,7 @@ func (a *observationActor) Terminate(observation detect.Observation) error {
 
 	request := observationRequest{
 		observation: observation,
+		drafts:      append([]event.Draft(nil), drafts...),
 		result:      make(chan error, 1),
 	}
 	select {
@@ -199,12 +208,18 @@ func (a *observationActor) run() {
 	for {
 		select {
 		case request := <-a.requests:
-			err := a.handle(request.observation, &timer, &timerC, &timerRef)
+			err := a.handle(
+				request.observation,
+				request.drafts,
+				&timer,
+				&timerC,
+				&timerRef,
+			)
 			request.result <- err
 		case firedAt := <-timerC:
 			observation, err := detect.ObserveTimer(timerRef, firedAt)
 			if err == nil {
-				_ = a.handle(observation, &timer, &timerC, &timerRef)
+				_ = a.handle(observation, nil, &timer, &timerC, &timerRef)
 			}
 		case <-a.stop:
 			for {
@@ -212,6 +227,7 @@ func (a *observationActor) run() {
 				case request := <-a.requests:
 					err := a.handle(
 						request.observation,
+						request.drafts,
 						&timer,
 						&timerC,
 						&timerRef,
@@ -230,6 +246,7 @@ func (a *observationActor) run() {
 
 func (a *observationActor) handle(
 	observation detect.Observation,
+	drafts []event.Draft,
 	timer *observationTimer,
 	timerC *<-chan time.Time,
 	timerRef *detect.TimerRef,
@@ -243,6 +260,10 @@ func (a *observationActor) handle(
 		return err
 	}
 	if decision.Duplicate() {
+		if len(drafts) > 0 {
+			_, err := a.committer.CommitEvents(context.Background(), drafts)
+			return err
+		}
 		return nil
 	}
 	signal, outcome, ok := decision.Signal()
@@ -253,18 +274,20 @@ func (a *observationActor) handle(
 	if err != nil {
 		return err
 	}
+	decisionDrafts := []event.Draft{
+		event.NewAgentSignalDraft(
+			string(a.target.ID()),
+			string(a.target.ID()),
+			string(payload),
+		),
+	}
+	decisionDrafts = append(decisionDrafts, drafts...)
 	_, err = a.committer.CommitDecision(
 		context.Background(),
 		a.managed,
 		a.state,
 		decision,
-		[]event.Draft{
-			event.NewAgentSignalDraft(
-				string(a.target.ID()),
-				string(a.target.ID()),
-				string(payload),
-			),
-		},
+		decisionDrafts,
 	)
 	if err != nil {
 		return fmt.Errorf("%w: %v", errObservationCommit, err)

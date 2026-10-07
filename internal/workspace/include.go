@@ -3,17 +3,22 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 const (
@@ -25,6 +30,29 @@ type includeSelection struct {
 	paths    []string
 	manifest []byte
 	exists   bool
+}
+
+func includeManifestTemporaryName() string {
+	return "." + worktreeIncludeFile + "-" + uuid.NewString()
+}
+
+func includedFileTemporaryName(destinationName string) string {
+	return "." + destinationName + ".include-" + uuid.NewString()
+}
+
+func removeIncludeTemporary(
+	root *os.Root,
+	name string,
+	expected *os.File,
+	nextName string,
+) error {
+	return removeOwnedRecordPathIfSame(
+		root,
+		name,
+		expected,
+		nextName,
+		nil,
+	)
 }
 
 func (m *Manager) copyIncludedSelection(
@@ -45,7 +73,6 @@ func (m *Manager) copyIncludedSelection(
 		return nil, err
 	}
 	copiedPaths, err := m.copyIncludedFiles(
-		ctx,
 		sourceRoot,
 		target,
 		selection.paths,
@@ -66,7 +93,6 @@ func (m *Manager) copyIncludedSelection(
 }
 
 func (m *Manager) copyIncludedFiles(
-	ctx context.Context,
 	source *os.Root,
 	target Workspace,
 	paths []string,
@@ -122,18 +148,15 @@ func (m *Manager) copyIncludedFiles(
 		)
 	}
 
+	if len(paths) > 0 && target.trackedPaths == nil {
+		return nil, errors.New(
+			"workspace: target tracked-path snapshot is unavailable",
+		)
+	}
 	copiedPaths := make([]string, 0, len(paths))
 	for _, relative := range paths {
-		tracked, err := m.worktreePathTracked(
-			ctx,
-			target.Path,
-			destination,
-			relative,
-		)
-		if err != nil {
-			return nil, err
-		}
-		if tracked {
+		key := trackedPathKey(relative, target.trackedIgnoreCase)
+		if _, tracked := target.trackedPaths[key]; tracked {
 			continue
 		}
 		if err := copyIncludedPath(
@@ -176,34 +199,84 @@ func (m *Manager) copyIncludedFiles(
 	return copiedPaths, nil
 }
 
-func (m *Manager) worktreePathTracked(
+func (m *Manager) worktreeTrackedPaths(
 	ctx context.Context,
 	path string,
-	root *os.Root,
-	relative string,
-) (bool, error) {
-	_, err := m.runRootedGit(
+	repository repositoryCapability,
+) (map[string]struct{}, bool, error) {
+	ignoreCase, err := repositoryIgnoreCase(ctx, path, repository)
+	if err != nil {
+		return nil, false, err
+	}
+	output, err := repository.runPrivateGitAt(
 		ctx,
 		path,
-		root,
+		"",
 		"--literal-pathspecs",
 		"ls-files",
-		"--error-unmatch",
-		"--",
-		filepath.ToSlash(relative),
+		"--cached",
+		"--full-name",
+		"-z",
 	)
-	switch {
-	case err == nil:
-		return true, nil
-	case isExitCode(err, 1):
-		return false, nil
-	default:
-		return false, fmt.Errorf(
-			"workspace: inspect target include path %q: %w",
-			relative,
+	if err != nil {
+		return nil, false, fmt.Errorf(
+			"workspace: inspect target tracked paths: %w",
 			err,
 		)
 	}
+	tracked := make(map[string]struct{})
+	for _, rawPath := range strings.Split(string(output), "\x00") {
+		if rawPath != "" {
+			tracked[trackedPathKey(rawPath, ignoreCase)] = struct{}{}
+		}
+	}
+	return tracked, ignoreCase, nil
+}
+
+func repositoryIgnoreCase(
+	ctx context.Context,
+	path string,
+	repository repositoryCapability,
+) (bool, error) {
+	output, err := repository.runPrivateGitAt(
+		ctx,
+		path,
+		"",
+		"config",
+		"--type=bool",
+		"--get",
+		"core.ignoreCase",
+	)
+	if isExitCode(err, 1) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: inspect repository path case setting: %w",
+			err,
+		)
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New(
+			"workspace: repository path case setting is invalid",
+		)
+	}
+}
+
+func trackedPathKey(path string, ignoreCase bool) string {
+	key := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	if ignoreCase {
+		key = cases.Fold().String(key)
+	}
+	if runtime.GOOS == "darwin" {
+		key = norm.NFD.String(key)
+	}
+	return key
 }
 
 func (m *Manager) includedPaths(
@@ -347,15 +420,25 @@ func (m *Manager) runIncludeManifest(
 	}
 	defer func() {
 		verifyErr := verifyRealPathRoot(directory, root)
+		var cleanupErr error
+		if verifyErr == nil {
+			cleanupErr = cleanupRecordDeletionNamespace(root)
+		}
 		closeErr := root.Close()
 		var removeErr error
-		if verifyErr == nil {
+		if verifyErr == nil && cleanupErr == nil {
 			removeErr = os.Remove(directory)
 		}
-		result = errors.Join(result, verifyErr, closeErr, removeErr)
+		result = errors.Join(
+			result,
+			verifyErr,
+			cleanupErr,
+			closeErr,
+			removeErr,
+		)
 	}()
 
-	name := "." + worktreeIncludeFile + "-" + uuid.NewString()
+	name := includeManifestTemporaryName()
 	writer, err := root.OpenFile(
 		name,
 		os.O_RDWR|os.O_CREATE|os.O_EXCL,
@@ -367,14 +450,24 @@ func (m *Manager) runIncludeManifest(
 	if _, err := writer.Write(manifest); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: write include rule file: %w", err),
-			removeRecordPathIfSame(root, name, writer),
+			removeIncludeTemporary(
+				root,
+				name,
+				writer,
+				includeManifestTemporaryName(),
+			),
 			writer.Close(),
 		)
 	}
 	if err := writer.Sync(); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: sync include rule file: %w", err),
-			removeRecordPathIfSame(root, name, writer),
+			removeIncludeTemporary(
+				root,
+				name,
+				writer,
+				includeManifestTemporaryName(),
+			),
 			writer.Close(),
 		)
 	}
@@ -382,7 +475,12 @@ func (m *Manager) runIncludeManifest(
 	if err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: reopen include rule file: %w", err),
-			removeRecordPathIfSame(root, name, writer),
+			removeIncludeTemporary(
+				root,
+				name,
+				writer,
+				includeManifestTemporaryName(),
+			),
 			writer.Close(),
 		)
 	}
@@ -392,14 +490,24 @@ func (m *Manager) runIncludeManifest(
 	if err := errors.Join(statErr, readerStatErr, closeErr); err != nil {
 		return nil, errors.Join(
 			fmt.Errorf("workspace: inspect include rule file: %w", err),
-			removeRecordPathIfSame(root, name, reader),
+			removeIncludeTemporary(
+				root,
+				name,
+				reader,
+				includeManifestTemporaryName(),
+			),
 			reader.Close(),
 		)
 	}
 	if !os.SameFile(writerInfo, readerInfo) {
 		return nil, errors.Join(
 			errors.New("workspace: include rule file changed while reopening"),
-			removeRecordPathIfSame(root, name, reader),
+			removeIncludeTemporary(
+				root,
+				name,
+				reader,
+				includeManifestTemporaryName(),
+			),
 			reader.Close(),
 		)
 	}
@@ -407,7 +515,12 @@ func (m *Manager) runIncludeManifest(
 		if name != "" {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(root, name, reader),
+				removeIncludeTemporary(
+					root,
+					name,
+					reader,
+					includeManifestTemporaryName(),
+				),
 			)
 		}
 		result = errors.Join(result, reader.Close())
@@ -424,16 +537,25 @@ func (m *Manager) runIncludeManifest(
 		defer func() {
 			commandResult = errors.Join(commandResult, cleanup())
 		}()
-		excludePath, unlinkBeforeRun, err := configureIncludeManifestCommand(
-			command,
-			reader,
-			manifestPath,
-		)
+		excludePath, unlinkBeforeRun, cleanupManifest, err :=
+			configureIncludeManifestCommand(
+				command,
+				reader,
+				manifestPath,
+			)
 		if err != nil {
 			return nil, err
 		}
+		defer func() {
+			commandResult = errors.Join(commandResult, cleanupManifest())
+		}()
 		if unlinkBeforeRun && name != "" {
-			if err := root.Remove(name); err != nil {
+			if err := removeIncludeTemporary(
+				root,
+				name,
+				reader,
+				includeManifestTemporaryName(),
+			); err != nil {
 				return nil, fmt.Errorf(
 					"workspace: unlink include rule file: %w",
 					err,
@@ -460,9 +582,20 @@ func (m *Manager) runIncludeManifest(
 	output, commandErr := runCommand(command, cleanupCommand)
 
 	var sourceVerificationErr error
-	if commandErr == nil &&
-		repository.gitRoot != nil &&
-		verifyRealPathRoot(repository.gitPath, repository.gitRoot) == nil {
+	if commandErr == nil && repository.gitRoot != nil {
+		sourceVerificationErr = verifyRealPathRoot(
+			repository.gitPath,
+			repository.gitRoot,
+		)
+		if sourceVerificationErr == nil && repository.commonRoot != nil {
+			sourceVerificationErr = verifyRealPathRoot(
+				repository.commonPath,
+				repository.commonRoot,
+			)
+		}
+	}
+	if commandErr == nil && sourceVerificationErr == nil &&
+		repository.gitRoot != nil {
 		if _, err := reader.Seek(0, io.SeekStart); err != nil {
 			sourceVerificationErr = err
 		} else {
@@ -642,6 +775,9 @@ func readWorktreeInclude(
 }
 
 func validateIncludedPath(path string) (string, error) {
+	if !utf8.ValidString(path) {
+		return "", fmt.Errorf("workspace: invalid included path %q", path)
+	}
 	path = filepath.FromSlash(path)
 	clean := filepath.Clean(path)
 	if clean == "." ||
@@ -659,6 +795,24 @@ func copyIncludedPath(
 	destinationRoot *os.Root,
 	destinationName string,
 	relative string,
+) error {
+	return copyIncludedPathAfterCopy(
+		sourceRoot,
+		destinationBucket,
+		destinationRoot,
+		destinationName,
+		relative,
+		nil,
+	)
+}
+
+func copyIncludedPathAfterCopy(
+	sourceRoot *os.Root,
+	destinationBucket *os.Root,
+	destinationRoot *os.Root,
+	destinationName string,
+	relative string,
+	afterCopy func(),
 ) (result error) {
 	relative, err := validateIncludedPath(relative)
 	if err != nil {
@@ -741,11 +895,11 @@ func copyIncludedPath(
 		return fmt.Errorf("verify destination parent: %w", err)
 	}
 
-	temporaryName := "." + destinationName + ".include-" + uuid.NewString()
+	temporaryName := includedFileTemporaryName(destinationName)
 	output, err := destinationParent.OpenFile(
 		temporaryName,
 		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
-		sourceInfo.Mode().Perm(),
+		openedInfo.Mode().Perm(),
 	)
 	if err != nil {
 		return fmt.Errorf("create staged destination: %w", err)
@@ -755,10 +909,11 @@ func copyIncludedPath(
 		if temporaryName != "" {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(
+				removeIncludeTemporary(
 					destinationParent,
 					temporaryName,
 					output,
+					includedFileTemporaryName(destinationName),
 				),
 			)
 		}
@@ -766,19 +921,52 @@ func copyIncludedPath(
 			result = errors.Join(result, output.Close())
 		}
 	}()
-	copied, err := io.Copy(output, input)
+	copiedDigest := sha256.New()
+	copied, err := io.Copy(io.MultiWriter(output, copiedDigest), input)
 	if err != nil {
 		return fmt.Errorf("copy staged contents: %w", err)
 	}
-	afterCopy, err := input.Stat()
+	if afterCopy != nil {
+		afterCopy()
+	}
+	afterCopyInfo, err := input.Stat()
 	if err != nil {
 		return fmt.Errorf("reinspect copied source: %w", err)
 	}
 	if copied != openedInfo.Size() ||
-		afterCopy.Size() != openedInfo.Size() ||
-		afterCopy.Mode() != openedInfo.Mode() ||
-		!afterCopy.ModTime().Equal(openedInfo.ModTime()) {
+		afterCopyInfo.Size() != openedInfo.Size() ||
+		afterCopyInfo.Mode() != openedInfo.Mode() ||
+		!afterCopyInfo.ModTime().Equal(openedInfo.ModTime()) {
 		return errors.New("source changed while copying")
+	}
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind copied source: %w", err)
+	}
+	verifiedDigest := sha256.New()
+	verified, err := io.Copy(verifiedDigest, input)
+	if err != nil {
+		return fmt.Errorf("verify copied source contents: %w", err)
+	}
+	afterVerification, err := input.Stat()
+	if err != nil {
+		return fmt.Errorf("reinspect verified source: %w", err)
+	}
+	if verified != openedInfo.Size() ||
+		afterVerification.Size() != openedInfo.Size() ||
+		afterVerification.Mode() != openedInfo.Mode() ||
+		!afterVerification.ModTime().Equal(openedInfo.ModTime()) ||
+		!bytes.Equal(copiedDigest.Sum(nil), verifiedDigest.Sum(nil)) {
+		return errors.New("source changed while verifying copied contents")
+	}
+	if err := output.Chmod(openedInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("set staged destination mode: %w", err)
+	}
+	stagedInfo, err := output.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect staged destination: %w", err)
+	}
+	if stagedInfo.Mode().Perm() != openedInfo.Mode().Perm() {
+		return errors.New("staged destination mode does not match source")
 	}
 	if err := output.Sync(); err != nil {
 		return fmt.Errorf("sync staged destination: %w", err)
@@ -799,7 +987,7 @@ func copyIncludedPath(
 		return fmt.Errorf("verify destination parent: %w", err)
 	}
 
-	directoryFile, err := destinationParent.Open(".")
+	directoryFile, err := openRecordDirectory(destinationParent)
 	if err != nil {
 		return fmt.Errorf("open destination parent for install: %w", err)
 	}
@@ -876,7 +1064,7 @@ func openIncludedParent(
 					err,
 				)
 			}
-			directory, openErr := current.Open(".")
+			directory, openErr := openRecordDirectory(current)
 			if openErr != nil {
 				return nil, false, fmt.Errorf(
 					"open destination parent for sync: %w",

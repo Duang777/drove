@@ -13,11 +13,15 @@ func configureIncludeManifestCommand(
 	command *exec.Cmd,
 	manifest *os.File,
 	_ string,
-) (string, bool, error) {
+) (string, bool, func() error, error) {
 	fd := 3 + len(command.ExtraFiles)
 	command.ExtraFiles = append(command.ExtraFiles, manifest)
 	if runtime.GOOS == "linux" {
-		return fmt.Sprintf("/proc/self/fd/%d", fd), true, nil
+		return fmt.Sprintf("/proc/self/fd/%d", fd), true, noCleanup, nil
 	}
-	return fmt.Sprintf("/dev/fd/%d", fd), true, nil
+	return fmt.Sprintf("/dev/fd/%d", fd), false, noCleanup, nil
+}
+
+func noCleanup() error {
+	return nil
 }

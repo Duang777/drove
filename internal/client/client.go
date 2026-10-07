@@ -65,6 +65,11 @@ func IsUserError(err error) bool {
 		}
 	}
 
+	var expired *recording.OutputExpiredError
+	if errors.As(err, &expired) {
+		return true
+	}
+
 	var terminalErr *TerminalStreamError
 	if !errors.As(err, &terminalErr) {
 		return false

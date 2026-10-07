@@ -27,6 +27,8 @@ var (
 // Options configures one CLI terminal attachment.
 type Options struct {
 	ReadOnly bool
+	Stdin    io.Reader
+	Stdout   io.Writer
 }
 
 type terminalStream interface {
@@ -76,9 +78,13 @@ func Run(
 	if daemon == nil {
 		return errors.New("cliattach: client is required")
 	}
+	stdin, stdout, err := terminalStreams(options)
+	if err != nil {
+		return err
+	}
 	return run(ctx, agentID, options, runnerDependencies{
-		stdin:  os.Stdin,
-		stdout: os.Stdout,
+		stdin:  stdin,
+		stdout: stdout,
 		open: func(ctx context.Context) (terminalStream, error) {
 			return daemon.OpenTerminal(ctx)
 		},
@@ -97,6 +103,22 @@ func Run(
 		},
 		stopResize: signal.Stop,
 	})
+}
+
+func terminalStreams(options Options) (inputTerminal, io.Writer, error) {
+	input := io.Reader(os.Stdin)
+	if options.Stdin != nil {
+		input = options.Stdin
+	}
+	stdin, ok := input.(inputTerminal)
+	if !ok {
+		return nil, nil, errStdinNotTerminal
+	}
+	stdout := io.Writer(os.Stdout)
+	if options.Stdout != nil {
+		stdout = options.Stdout
+	}
+	return stdin, stdout, nil
 }
 
 func run(

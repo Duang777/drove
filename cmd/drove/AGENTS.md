@@ -55,6 +55,7 @@ log / timeline / explain / attach / tui / stop / worktree / token rotate / web /
 
 - main 必须保持极薄：解析参数 → 调用 client → 退出码语义化（0 成功 / 1 用户错误 / 2 运行时错误）。
 - 未知顶层或嵌套子命令属于用户输入错误，必须返回退出码 1。
+- Cobra 的隐藏补全入口 `__complete` 与 `__completeNoDesc` 必须绕过未知命令预检。
 - 禁止在 cmd 中复制业务逻辑或直接构造 session/pty/store；一律走 `internal/client`。
 - 本地自定义类型必须与 daemon API 的 JSON 契约一致（增删字段需同步 API 层测试）。
 - 导出符号：无（main 包不导出）。

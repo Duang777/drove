@@ -1,10 +1,96 @@
 package workspace
 
 import (
+	"context"
+	"os"
+	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 )
+
+func TestRootedPrivateGitCommandBindsCommonDirectoryForPlatform(
+	t *testing.T,
+) {
+	switch runtime.GOOS {
+	case "darwin", "dragonfly", "freebsd", "linux", "netbsd", "openbsd",
+		"windows":
+	default:
+		t.Skip("rooted private Git execution is unsupported")
+	}
+	parent := t.TempDir()
+	gitPath := filepath.Join(parent, "git")
+	commonPath := filepath.Join(parent, "common")
+	for _, path := range []string{gitPath, commonPath} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("create directory %q: %v", path, err)
+		}
+	}
+	gitRoot, err := openRealPathRoot(gitPath)
+	if err != nil {
+		t.Fatalf("open Git root: %v", err)
+	}
+	defer gitRoot.Close()
+	commonRoot, err := openRealPathRoot(commonPath)
+	if err != nil {
+		t.Fatalf("open common root: %v", err)
+	}
+	defer commonRoot.Close()
+
+	command, cleanup, err := rootedPrivateGitCommand(
+		context.Background(),
+		"git",
+		filepath.Join(parent, "worktree"),
+		gitPath,
+		gitRoot,
+		commonPath,
+		commonRoot,
+		[]string{"version"},
+	)
+	if err != nil {
+		t.Fatalf("create rooted private command: %v", err)
+	}
+	defer func() {
+		if err := cleanup(); err != nil {
+			t.Errorf("cleanup rooted private command: %v", err)
+		}
+	}()
+	wantExtraFiles := 1
+	if runtime.GOOS == "linux" {
+		wantExtraFiles = 2
+	} else if runtime.GOOS == "windows" {
+		wantExtraFiles = 0
+	}
+	if len(command.ExtraFiles) != wantExtraFiles {
+		t.Fatalf(
+			"private command inherited files = %d, want %d",
+			len(command.ExtraFiles),
+			wantExtraFiles,
+		)
+	}
+	switch runtime.GOOS {
+	case "linux":
+		want := "GIT_COMMON_DIR=/proc/self/fd/4"
+		if !slices.Contains(command.Env, want) {
+			t.Fatalf("private command environment lacks %q", want)
+		}
+	case "windows":
+		want := "GIT_COMMON_DIR=" + commonPath
+		if !slices.Contains(command.Env, want) {
+			t.Fatalf("private command environment lacks %q", want)
+		}
+	default:
+		for _, entry := range command.Env {
+			if strings.HasPrefix(entry, "GIT_COMMON_DIR=") {
+				t.Fatalf(
+					"private command reopens common Git directory: %q",
+					entry,
+				)
+			}
+		}
+	}
+}
 
 func TestBoundGitEnvironmentRemovesInheritedGitConfiguration(t *testing.T) {
 	environment := boundGitEnvironment(
@@ -30,6 +116,26 @@ func TestBoundGitEnvironmentRemovesInheritedGitConfiguration(t *testing.T) {
 		"HOME=/tmp/home",
 		"GIT_DIR=.",
 		"GIT_WORK_TREE=/source",
+	} {
+		if !slices.Contains(environment, want) {
+			t.Fatalf("bound environment %q does not contain %q", environment, want)
+		}
+	}
+}
+
+func TestBoundGitEnvironmentWithCommonSetsExplicitCommonDirectory(
+	t *testing.T,
+) {
+	environment := boundGitEnvironmentWithCommon(
+		[]string{"GIT_COMMON_DIR=/replacement"},
+		"/git",
+		"/worktree",
+		"/common",
+	)
+	for _, want := range []string{
+		"GIT_DIR=/git",
+		"GIT_WORK_TREE=/worktree",
+		"GIT_COMMON_DIR=/common",
 	} {
 		if !slices.Contains(environment, want) {
 			t.Fatalf("bound environment %q does not contain %q", environment, want)

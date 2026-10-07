@@ -32,19 +32,24 @@ func (m *Manager) acknowledgePreparation(
 		)
 	}
 	if record.PreparationCommitted &&
-		record.Version < workspaceRecordVersion {
+		record.Version < removalWorkspaceRecordVersion {
 		return target.preparation.Close()
 	}
 	if record.PreparationCommitted &&
 		record.BranchOperationID == "" &&
-		(target.preparation != nil ||
-			(record.Removal != nil &&
-				record.RepositoryEvidence == nil)) {
+		record.Removal != nil &&
+		record.RepositoryEvidence == nil {
+		return target.preparation.Close()
+	}
+	if record.PreparationCommitted &&
+		record.BranchOperationID == "" &&
+		record.Version >= workspaceRecordVersion &&
+		target.preparation.isClosed() {
 		return target.preparation.Close()
 	}
 	lease := target.preparation
 	temporaryLease := false
-	if lease == nil {
+	if lease == nil || lease.isClosed() {
 		lease, err = openRecordedPreparationLease(
 			context.Background(),
 			m,
@@ -58,6 +63,31 @@ func (m *Manager) acknowledgePreparation(
 			result = errors.Join(result, lease.Close())
 		}()
 	}
+	if record.Version == removalWorkspaceRecordVersion &&
+		record.ExpectedHeadOID == "" {
+		deriveCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		expectedHeadOID, deriveErr :=
+			lease.repository.derivePreparedWorktreeExpectedHead(
+				deriveCtx,
+				record.workspace(),
+			)
+		cancel()
+		if deriveErr != nil {
+			return fmt.Errorf(
+				"workspace: derive historical preparation HEAD: %w",
+				deriveErr,
+			)
+		}
+		record.ExpectedHeadOID = expectedHeadOID
+		if !sameWorkspace(record.workspace(), target) {
+			return errors.New(
+				"workspace: derived preparation acknowledgement does not match target",
+			)
+		}
+	}
 	verifyRepository := func(stage string) error {
 		ctx, cancel := context.WithTimeout(
 			context.Background(),
@@ -67,6 +97,26 @@ func (m *Manager) acknowledgePreparation(
 		if err := lease.repository.verifyBinding(ctx); err != nil {
 			return fmt.Errorf(
 				"workspace: verify repository %s: %w",
+				stage,
+				err,
+			)
+		}
+		return nil
+	}
+	verifyWorktree := func(stage string) error {
+		ctx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		defer cancel()
+		if err := m.verifyPreparedWorktreeForAcknowledgement(
+			ctx,
+			record.workspace(),
+			record,
+			lease.repository,
+		); err != nil {
+			return fmt.Errorf(
+				"workspace: verify prepared worktree %s: %w",
 				stage,
 				err,
 			)
@@ -90,6 +140,25 @@ func (m *Manager) acknowledgePreparation(
 			verifyErr,
 		)
 	}
+	if record.Version == removalWorkspaceRecordVersion {
+		upgradeWorkspaceRecord(&record)
+		if err := m.replaceWorkspaceRecord(record); err != nil {
+			return fmt.Errorf(
+				"workspace: migrate historical preparation record: %w",
+				err,
+			)
+		}
+		if err := verifyRepository(
+			"after migrating historical preparation",
+		); err != nil {
+			return err
+		}
+		if err := verifyWorktree(
+			"after migrating historical preparation",
+		); err != nil {
+			return err
+		}
+	}
 	if !record.PreparationCommitted {
 		record.PreparationCommitted = true
 		if err := m.replaceWorkspaceRecord(record); err != nil {
@@ -98,9 +167,15 @@ func (m *Manager) acknowledgePreparation(
 		if err := verifyRepository("after committing preparation"); err != nil {
 			return err
 		}
+		if err := verifyWorktree("after committing preparation"); err != nil {
+			return err
+		}
 	}
 	if record.BranchOperationID != "" {
 		if err := verifyRepository("before ownership cleanup"); err != nil {
+			return err
+		}
+		if err := verifyWorktree("before ownership cleanup"); err != nil {
 			return err
 		}
 		cleanupCtx, cancel := context.WithTimeout(
@@ -117,12 +192,25 @@ func (m *Manager) acknowledgePreparation(
 		if err := verifyRepository("after ownership cleanup"); err != nil {
 			return err
 		}
+		if err := verifyWorktree("after ownership cleanup"); err != nil {
+			return err
+		}
 		record.BranchOperationID = ""
 		if err := m.replaceWorkspaceRecord(record); err != nil {
 			return fmt.Errorf(
 				"workspace: confirm branch ownership cleanup: %w",
 				err,
 			)
+		}
+		if err := verifyRepository(
+			"after persisting ownership cleanup",
+		); err != nil {
+			return err
+		}
+		if err := verifyWorktree(
+			"after persisting ownership cleanup",
+		); err != nil {
+			return err
 		}
 	}
 	if temporaryLease {
@@ -232,6 +320,11 @@ func sameWorkspace(left Workspace, right Workspace) bool {
 	if left.directoryIdentity != "" &&
 		right.directoryIdentity != "" &&
 		left.directoryIdentity != right.directoryIdentity {
+		return false
+	}
+	if left.expectedHeadOID != "" &&
+		right.expectedHeadOID != "" &&
+		left.expectedHeadOID != right.expectedHeadOID {
 		return false
 	}
 	return left.AgentID == right.AgentID &&

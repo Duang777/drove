@@ -279,10 +279,18 @@ func parseExplainLimit(r *http.Request) (int, error) {
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := s.opts.Manager.Stop(agent.ID(id)); err != nil {
-		writeErr(w, http.StatusNotFound, err.Error())
+		writeStopError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func writeStopError(w http.ResponseWriter, err error) {
+	if errors.Is(err, session.ErrUnknownAgent) {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeErr(w, http.StatusInternalServerError, err.Error())
 }
 
 type workspaceCleanupResponse struct {

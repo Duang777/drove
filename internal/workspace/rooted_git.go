@@ -104,6 +104,17 @@ func (m *Manager) runRootedGitInputWithPolicy(
 }
 
 func runGitCommand(command *exec.Cmd, input string) ([]byte, error) {
+	output, err := runGitCommandKeepingOutput(command, input)
+	if err != nil {
+		return nil, err
+	}
+	return output, nil
+}
+
+func runGitCommandKeepingOutput(
+	command *exec.Cmd,
+	input string,
+) ([]byte, error) {
 	command.Env = append(command.Environ(), "LC_ALL=C", "LANG=C")
 	if input != "" {
 		command.Stdin = strings.NewReader(input)
@@ -119,10 +130,10 @@ func runGitCommand(command *exec.Cmd, input string) ([]byte, error) {
 			detail = detail[:4096]
 		}
 		if detail != "" {
-			return nil, fmt.Errorf("%s: %w", detail, err)
+			return output, fmt.Errorf("%s: %w", detail, err)
 		}
 	}
-	return nil, err
+	return output, err
 }
 
 func rootedGitEnvironment(environment []string) []string {
@@ -146,5 +157,17 @@ func boundGitEnvironment(
 		rootedGitEnvironment(environment),
 		"GIT_DIR="+gitDirectory,
 		"GIT_WORK_TREE="+worktree,
+	)
+}
+
+func boundGitEnvironmentWithCommon(
+	environment []string,
+	gitDirectory string,
+	worktree string,
+	commonDirectory string,
+) []string {
+	return append(
+		boundGitEnvironment(environment, gitDirectory, worktree),
+		"GIT_COMMON_DIR="+commonDirectory,
 	)
 }

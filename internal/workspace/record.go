@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -19,25 +20,28 @@ const (
 	protectedWorkspaceRecordVersion   = 2
 	preparationWorkspaceRecordVersion = 3
 	repositoryWorkspaceRecordVersion  = 4
-	workspaceRecordVersion            = 5
+	removalWorkspaceRecordVersion     = 5
+	workspaceRecordVersion            = 6
 	maxWorkspaceRecordSize            = 64 * 1024
 )
 
 type workspaceRecord struct {
-	Version              int                     `json:"version"`
-	AgentID              string                  `json:"agent_id"`
-	Repository           string                  `json:"repository"`
-	Path                 string                  `json:"path"`
-	Branch               string                  `json:"branch"`
-	ProtectionKnown      bool                    `json:"protection_known"`
-	IncludedPaths        []string                `json:"included_paths"`
-	PreparationCommitted bool                    `json:"preparation_committed"`
-	CreatedBranch        bool                    `json:"created_branch"`
-	BranchOperationID    string                  `json:"branch_operation_id,omitempty"`
-	GitDirectory         string                  `json:"git_directory,omitempty"`
-	DirectoryIdentity    string                  `json:"directory_identity,omitempty"`
-	RepositoryEvidence   *repositoryEvidence     `json:"repository_evidence,omitempty"`
-	Removal              *workspaceRemovalRecord `json:"removal,omitempty"`
+	Version                        int                     `json:"version"`
+	AgentID                        string                  `json:"agent_id"`
+	Repository                     string                  `json:"repository"`
+	Path                           string                  `json:"path"`
+	Branch                         string                  `json:"branch"`
+	ProtectionKnown                bool                    `json:"protection_known"`
+	IncludedPaths                  []string                `json:"included_paths"`
+	PreparationCommitted           bool                    `json:"preparation_committed"`
+	CreatedBranch                  bool                    `json:"created_branch"`
+	BranchOperationID              string                  `json:"branch_operation_id,omitempty"`
+	ExpectedHeadOID                string                  `json:"expected_head_oid,omitempty"`
+	GitDirectory                   string                  `json:"git_directory,omitempty"`
+	DirectoryIdentity              string                  `json:"directory_identity,omitempty"`
+	PreparedStageDirectoryIdentity string                  `json:"prepared_stage_directory_identity,omitempty"`
+	RepositoryEvidence             *repositoryEvidence     `json:"repository_evidence,omitempty"`
+	Removal                        *workspaceRemovalRecord `json:"removal,omitempty"`
 }
 
 type repositoryEvidence struct {
@@ -50,12 +54,18 @@ type repositoryEvidence struct {
 }
 
 type workspaceRemovalRecord struct {
-	OperationID    string `json:"operation_id"`
-	DirectoryToken string `json:"directory_token,omitempty"`
-	Force          bool   `json:"force"`
-	Started        bool   `json:"started"`
-	Quarantined    bool   `json:"quarantined,omitempty"`
-	PathAbsent     bool   `json:"path_absent,omitempty"`
+	OperationID     string `json:"operation_id"`
+	DirectoryToken  string `json:"directory_token,omitempty"`
+	Force           bool   `json:"force"`
+	Started         bool   `json:"started"`
+	Quarantined     bool   `json:"quarantined,omitempty"`
+	ContentsCleared bool   `json:"contents_cleared,omitempty"`
+	PathAbsent      bool   `json:"path_absent,omitempty"`
+}
+
+type recordAcknowledgement struct {
+	name        string
+	operationID string
 }
 
 func workspaceRecordPath(worktreePath string) string {
@@ -84,6 +94,7 @@ func newWorkspaceRecord(target Workspace, includedPaths []string) workspaceRecor
 		IncludedPaths:     append([]string{}, includedPaths...),
 		CreatedBranch:     target.createdBranch,
 		BranchOperationID: target.branchOperationID,
+		ExpectedHeadOID:   target.expectedHeadOID,
 		GitDirectory:      target.gitDirectory,
 		DirectoryIdentity: target.directoryIdentity,
 		RepositoryEvidence: cloneRepositoryEvidence(
@@ -100,6 +111,7 @@ func (r workspaceRecord) workspace() Workspace {
 		Branch:            r.Branch,
 		createdBranch:     r.CreatedBranch,
 		branchOperationID: r.BranchOperationID,
+		expectedHeadOID:   r.ExpectedHeadOID,
 		gitDirectory:      r.GitDirectory,
 		directoryIdentity: r.DirectoryIdentity,
 		repositoryEvidence: cloneRepositoryEvidence(
@@ -122,10 +134,15 @@ func upgradeWorkspaceRecord(record *workspaceRecord) {
 	if record.Version >= workspaceRecordVersion {
 		return
 	}
+	previousVersion := record.Version
 	record.Version = workspaceRecordVersion
-	record.RepositoryEvidence = nil
-	if record.PreparationCommitted {
-		record.BranchOperationID = ""
+	record.PreparedStageDirectoryIdentity = ""
+	if previousVersion < removalWorkspaceRecordVersion {
+		record.RepositoryEvidence = nil
+		record.ExpectedHeadOID = ""
+		if record.PreparationCommitted {
+			record.BranchOperationID = ""
+		}
 	}
 }
 
@@ -179,6 +196,22 @@ func (m *Manager) installWorkspaceRecordState(
 	defer func() {
 		result = errors.Join(result, bucket.Close())
 	}()
+	if err := recoverRecordRenameDebris(bucket); err != nil {
+		return false, fmt.Errorf(
+			"workspace: recover record file operations: %w",
+			err,
+		)
+	}
+	if err := m.recoverWorkspaceRecordArtifacts(
+		bucket,
+		filepath.Base(filepath.Dir(record.Path)),
+		record.AgentID,
+	); err != nil {
+		return false, fmt.Errorf(
+			"workspace: recover record artifacts: %w",
+			err,
+		)
+	}
 	name := agentID + workspaceRecordSuffix
 	if err := checkRecordTarget(bucket, name, recordPath, requireAbsent); err != nil {
 		return false, err
@@ -195,7 +228,7 @@ func (m *Manager) installWorkspaceRecordState(
 		)
 	}
 
-	temporaryName := "." + name + ".tmp-" + uuid.NewString()
+	temporaryName := workspaceRecordTemporaryName(name)
 	file, err := bucket.OpenFile(
 		temporaryName,
 		os.O_RDWR|os.O_CREATE|os.O_EXCL,
@@ -213,7 +246,13 @@ func (m *Manager) installWorkspaceRecordState(
 		if temporaryName != "" {
 			result = errors.Join(
 				result,
-				removeRecordPathIfSame(bucket, temporaryName, file),
+				removeOwnedRecordPathIfSame(
+					bucket,
+					temporaryName,
+					file,
+					workspaceRecordTemporaryName(name),
+					nil,
+				),
 			)
 		}
 		if fileOpen {
@@ -248,7 +287,7 @@ func (m *Manager) installWorkspaceRecordState(
 	if err := m.verifyRecordBucket(record.Path, bucket); err != nil {
 		return false, err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return false, fmt.Errorf(
 			"workspace: open record directory %q: %w",
@@ -326,31 +365,6 @@ func checkRecordTarget(
 	return nil
 }
 
-func removeRecordPathIfSame(
-	root *os.Root,
-	name string,
-	expected *os.File,
-) error {
-	current, err := root.Lstat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	opened, err := expected.Stat()
-	if err != nil {
-		return err
-	}
-	if !os.SameFile(opened, current) {
-		return fmt.Errorf(
-			"workspace: temporary path %q changed identity",
-			name,
-		)
-	}
-	return root.Remove(name)
-}
-
 func (m *Manager) readWorkspaceRecord(
 	worktreePath string,
 ) (_ workspaceRecord, _ bool, result error) {
@@ -379,6 +393,22 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 ) (_ workspaceRecord, _ bool, result error) {
 	recordPath := workspaceRecordPath(worktreePath)
 	name := agentID + workspaceRecordSuffix
+	if err := recoverRecordRenameDebris(bucket); err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: recover record file operations: %w",
+			err,
+		)
+	}
+	if err := m.recoverWorkspaceRecordArtifacts(
+		bucket,
+		filepath.Base(filepath.Dir(worktreePath)),
+		agentID,
+	); err != nil {
+		return workspaceRecord{}, false, fmt.Errorf(
+			"workspace: recover record artifacts: %w",
+			err,
+		)
+	}
 	info, err := bucket.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return workspaceRecord{}, false, nil
@@ -428,16 +458,32 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			recordPath,
 		)
 	}
+	record, err := m.decodeWorkspaceRecordFile(
+		file,
+		recordPath,
+		worktreePath,
+	)
+	if err != nil {
+		return workspaceRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (m *Manager) decodeWorkspaceRecordFile(
+	file *os.File,
+	recordPath string,
+	worktreePath string,
+) (workspaceRecord, error) {
 	raw, err := io.ReadAll(io.LimitReader(file, maxWorkspaceRecordSize+1))
 	if err != nil {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: read record %q: %w",
 			recordPath,
 			err,
 		)
 	}
 	if len(raw) > maxWorkspaceRecordSize {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q exceeds %d bytes",
 			recordPath,
 			maxWorkspaceRecordSize,
@@ -447,14 +493,14 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 	decoder.DisallowUnknownFields()
 	var record workspaceRecord
 	if err := decoder.Decode(&record); err != nil {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: decode record %q: %w",
 			recordPath,
 			err,
 		)
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q has trailing data",
 			recordPath,
 		)
@@ -466,11 +512,12 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 			record.PreparationCommitted ||
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
+			record.ExpectedHeadOID != "" ||
 			record.GitDirectory != "" ||
 			record.DirectoryIdentity != "" ||
 			record.RepositoryEvidence != nil ||
 			record.Removal != nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: legacy record %q contains newer fields",
 				recordPath,
 			)
@@ -478,7 +525,7 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		record.PreparationCommitted = true
 	case protectedWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 2 record %q has no included paths",
 				recordPath,
 			)
@@ -486,10 +533,11 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		if record.PreparationCommitted ||
 			record.CreatedBranch ||
 			record.BranchOperationID != "" ||
+			record.ExpectedHeadOID != "" ||
 			record.GitDirectory != "" ||
 			record.DirectoryIdentity != "" ||
 			record.RepositoryEvidence != nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 2 record %q contains version 3 fields",
 				recordPath,
 			)
@@ -500,52 +548,66 @@ func (m *Manager) readWorkspaceRecordFromBucket(
 		}
 	case preparationWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 3 record %q has no included paths",
 				recordPath,
 			)
 		}
 		if record.RepositoryEvidence != nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 3 record %q contains version 4 fields",
 				recordPath,
 			)
 		}
 	case repositoryWorkspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
+			return workspaceRecord{}, fmt.Errorf(
 				"workspace: version 4 record %q has no included paths",
+				recordPath,
+			)
+		}
+	case removalWorkspaceRecordVersion:
+		if record.IncludedPaths == nil {
+			return workspaceRecord{}, fmt.Errorf(
+				"workspace: version 5 record %q has no included paths",
 				recordPath,
 			)
 		}
 	case workspaceRecordVersion:
 		if record.IncludedPaths == nil {
-			return workspaceRecord{}, false, fmt.Errorf(
-				"workspace: version 5 record %q has no included paths",
+			return workspaceRecord{}, fmt.Errorf(
+				"workspace: version 6 record %q has no included paths",
 				recordPath,
 			)
 		}
 	default:
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q has unsupported version %d",
 			recordPath,
 			record.Version,
 		)
 	}
 	if filepath.Clean(worktreePath) != record.Path {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: record %q path mismatch",
 			recordPath,
 		)
 	}
+	if record.Version < workspaceRecordVersion &&
+		record.PreparedStageDirectoryIdentity != "" {
+		return workspaceRecord{}, fmt.Errorf(
+			"workspace: record %q contains version 6 fields",
+			recordPath,
+		)
+	}
 	if err := m.validateWorkspaceRecord(record); err != nil {
-		return workspaceRecord{}, false, fmt.Errorf(
+		return workspaceRecord{}, fmt.Errorf(
 			"workspace: validate record %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	return record, true, nil
+	return record, nil
 }
 
 func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
@@ -553,6 +615,7 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 		record.Version != protectedWorkspaceRecordVersion &&
 		record.Version != preparationWorkspaceRecordVersion &&
 		record.Version != repositoryWorkspaceRecordVersion &&
+		record.Version != removalWorkspaceRecordVersion &&
 		record.Version != workspaceRecordVersion {
 		return fmt.Errorf("workspace: unsupported record version %d", record.Version)
 	}
@@ -600,6 +663,20 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 				"workspace: quarantined removal has not been started",
 			)
 		}
+		if record.Version >= removalWorkspaceRecordVersion &&
+			record.Removal.Started &&
+			!record.Removal.Quarantined &&
+			!record.Removal.PathAbsent {
+			return errors.New(
+				"workspace: started removal has no quarantined or absent path",
+			)
+		}
+		if record.Removal.ContentsCleared &&
+			(!record.Removal.Started || !record.Removal.Quarantined) {
+			return errors.New(
+				"workspace: cleared removal contents require a started quarantine",
+			)
+		}
 		if record.Removal.PathAbsent && record.Removal.Quarantined {
 			return errors.New(
 				"workspace: absent-path removal cannot be quarantined",
@@ -623,6 +700,13 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 			)
 		}
 	}
+	if record.ExpectedHeadOID != "" &&
+		(len(record.ExpectedHeadOID) > 128 ||
+			strings.ContainsAny(record.ExpectedHeadOID, " \t\r\n")) {
+		return errors.New(
+			"workspace: expected HEAD object ID is invalid",
+		)
+	}
 	if record.GitDirectory != "" &&
 		(!filepath.IsAbs(record.GitDirectory) ||
 			filepath.Clean(record.GitDirectory) != record.GitDirectory) {
@@ -635,6 +719,18 @@ func (m *Manager) validateWorkspaceRecord(record workspaceRecord) error {
 			record.DirectoryIdentity {
 		return errors.New(
 			"workspace: directory identity is invalid",
+		)
+	}
+	if record.PreparedStageDirectoryIdentity != "" &&
+		!validDirectoryIdentity(record.PreparedStageDirectoryIdentity) {
+		return errors.New(
+			"workspace: prepared stage directory identity is invalid",
+		)
+	}
+	if record.PreparedStageDirectoryIdentity != "" &&
+		(record.BranchOperationID == "" || record.PreparationCommitted) {
+		return errors.New(
+			"workspace: prepared stage identity has no pending preparation",
 		)
 	}
 	if record.RepositoryEvidence != nil {
@@ -719,6 +815,13 @@ func validDirectoryIdentity(identity string) bool {
 
 func (m *Manager) removeWorkspaceRecord(
 	worktreePath string,
+) error {
+	return m.removeWorkspaceRecordAfterValidation(worktreePath, nil)
+}
+
+func (m *Manager) removeWorkspaceRecordAfterValidation(
+	worktreePath string,
+	afterValidation func(),
 ) (result error) {
 	recordPath := workspaceRecordPath(worktreePath)
 	bucket, agentID, err := m.openRecordBucket(worktreePath)
@@ -749,14 +852,113 @@ func (m *Manager) removeWorkspaceRecord(
 			recordPath,
 		)
 	}
-	if err := bucket.Remove(name); err != nil {
-		return fmt.Errorf("workspace: remove record %q: %w", recordPath, err)
+	opened, err := bucket.Open(name)
+	if err != nil {
+		return fmt.Errorf("workspace: open record %q: %w", recordPath, err)
 	}
-	return syncRecordBucket(bucket, recordPath)
+	defer func() {
+		result = errors.Join(result, opened.Close())
+	}()
+	openedInfo, err := opened.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect opened record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return fmt.Errorf(
+			"workspace: record %q changed while opening",
+			recordPath,
+		)
+	}
+	record, err := m.decodeWorkspaceRecordFile(
+		opened,
+		recordPath,
+		worktreePath,
+	)
+	if err != nil {
+		return err
+	}
+	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
+		return err
+	}
+	isolatedName := workspaceRecordRemovalName(record)
+	if err := removeOwnedRecordPath(
+		bucket,
+		name,
+		opened,
+		isolatedName,
+		func(candidate *os.File) error {
+			if _, err := candidate.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			current, err := m.decodeWorkspaceRecordFile(
+				candidate,
+				recordPath,
+				worktreePath,
+			)
+			if err != nil {
+				return err
+			}
+			if current.AgentID != record.AgentID {
+				return errors.New(
+					"workspace: isolated record changed ownership",
+				)
+			}
+			return nil
+		},
+		afterValidation,
+	); err != nil {
+		return fmt.Errorf(
+			"workspace: remove record %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	if err := m.verifyRecordBucket(worktreePath, bucket); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) removeAcknowledgedWorkspaceRecord(
 	removal Removal,
+) error {
+	return m.removeAcknowledgedWorkspaceRecordWithHooks(
+		removal,
+		nil,
+		nil,
+	)
+}
+
+func (m *Manager) removeAcknowledgedWorkspaceRecordAfterValidation(
+	removal Removal,
+	afterValidation func(),
+) error {
+	return m.removeAcknowledgedWorkspaceRecordWithHooks(
+		removal,
+		afterValidation,
+		nil,
+	)
+}
+
+func (m *Manager) removeAcknowledgedWorkspaceRecordAfterQuarantine(
+	removal Removal,
+	afterQuarantine func() error,
+) error {
+	return m.removeAcknowledgedWorkspaceRecordWithHooks(
+		removal,
+		nil,
+		afterQuarantine,
+	)
+}
+
+func (m *Manager) removeAcknowledgedWorkspaceRecordWithHooks(
+	removal Removal,
+	afterValidation func(),
+	afterQuarantine func() error,
 ) (result error) {
 	recordPath := workspaceRecordPath(removal.Workspace.Path)
 	bucket, agentID, err := m.openRecordBucket(removal.Workspace.Path)
@@ -771,8 +973,15 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 		)
 	}
 	defer func() {
-		result = errors.Join(result, bucket.Close())
+		result = errors.Join(
+			result,
+			m.verifyRecordBucket(removal.Workspace.Path, bucket),
+			bucket.Close(),
+		)
 	}()
+	if afterValidation != nil {
+		afterValidation()
+	}
 
 	quarantineName, exists, err := findRecordAcknowledgementQuarantine(
 		bucket,
@@ -811,11 +1020,8 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 	if err != nil {
 		return fmt.Errorf("workspace: open removal record %q: %w", recordPath, err)
 	}
-	fileOpen := true
 	defer func() {
-		if fileOpen {
-			result = errors.Join(result, file.Close())
-		}
+		result = errors.Join(result, file.Close())
 	}()
 	opened, err := m.verifyRemovalRecordFile(
 		file,
@@ -826,7 +1032,7 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 		return err
 	}
 
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open record directory %q: %w",
@@ -882,20 +1088,76 @@ func (m *Manager) removeAcknowledgedWorkspaceRecord(
 			restoreErr,
 		)
 	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf(
-			"workspace: close quarantined removal record %q: %w",
-			recordPath,
-			err,
-		)
+	if afterQuarantine != nil {
+		if err := afterQuarantine(); err != nil {
+			return fmt.Errorf(
+				"workspace: release removal acknowledgement reservation: %w",
+				err,
+			)
+		}
 	}
-	fileOpen = false
-	return m.removeRecordAcknowledgementQuarantine(
+	return m.removeRecordAcknowledgementQuarantineWithFile(
 		bucket,
 		quarantineName,
 		recordPath,
 		removal,
+		file,
 	)
+}
+
+func (m *Manager) removalAcknowledgementPending(
+	removal Removal,
+) (_ bool, result error) {
+	recordPath := workspaceRecordPath(removal.Workspace.Path)
+	bucket, agentID, err := m.openRecordBucket(removal.Workspace.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: open record directory %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, bucket.Close())
+	}()
+	entries, err := readRootDirectory(bucket)
+	if err != nil {
+		return false, fmt.Errorf(
+			"workspace: read record directory %q: %w",
+			recordPath,
+			err,
+		)
+	}
+	recordName := agentID + workspaceRecordSuffix
+	acknowledgementPrefix := "." + recordName + ".ack-"
+	pending := false
+	for _, entry := range entries {
+		if entry.Name() == recordName {
+			pending = true
+			continue
+		}
+		if !strings.HasPrefix(entry.Name(), acknowledgementPrefix) {
+			continue
+		}
+		acknowledgementAgentID, operationID, ok :=
+			recordAcknowledgementIdentity(entry.Name())
+		if !ok || acknowledgementAgentID != agentID {
+			return false, fmt.Errorf(
+				"workspace: acknowledgement record %q is invalid",
+				entry.Name(),
+			)
+		}
+		if operationID != removal.operationID {
+			return false, errors.New(
+				"workspace: removal acknowledgement token does not match quarantined record",
+			)
+		}
+		pending = true
+	}
+	return pending, nil
 }
 
 func recordAcknowledgementPrefix(
@@ -965,17 +1227,31 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 			_ = bucketRoot.Close()
 			return err
 		}
+		if err := recoverRecordRenameDebris(bucketRoot); err != nil {
+			_ = bucketRoot.Close()
+			return fmt.Errorf(
+				"workspace: recover record file operations: %w",
+				err,
+			)
+		}
+		if err := m.recoverWorkspaceRecordArtifacts(
+			bucketRoot,
+			bucket.Name(),
+			"",
+		); err != nil {
+			_ = bucketRoot.Close()
+			return fmt.Errorf(
+				"workspace: recover record artifacts: %w",
+				err,
+			)
+		}
 		entries, err := readRootDirectory(bucketRoot)
 		if err != nil {
 			_ = bucketRoot.Close()
 			return err
 		}
 		normalRecords := make(map[string]struct{})
-		type acknowledgement struct {
-			name        string
-			operationID string
-		}
-		acknowledgements := make(map[string][]acknowledgement)
+		acknowledgements := make(map[string][]recordAcknowledgement)
 		for _, entry := range entries {
 			if agentID, ok := workspaceRecordAgentID(entry.Name()); ok {
 				normalRecords[agentID] = struct{}{}
@@ -989,7 +1265,7 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 			}
 			acknowledgements[agentID] = append(
 				acknowledgements[agentID],
-				acknowledgement{
+				recordAcknowledgement{
 					name:        entry.Name(),
 					operationID: operationID,
 				},
@@ -999,15 +1275,18 @@ func (m *Manager) recoverRecordAcknowledgements() (result error) {
 			if _, exists := normalRecords[agentID]; exists {
 				continue
 			}
-			if len(candidates) != 1 {
+			candidate, err := coalesceRecordAcknowledgements(
+				bucketRoot,
+				candidates,
+			)
+			if err != nil {
 				_ = bucketRoot.Close()
 				return fmt.Errorf(
-					"workspace: agent %q has %d acknowledgement records",
+					"workspace: recover acknowledgement aliases for agent %q: %w",
 					agentID,
-					len(candidates),
+					err,
 				)
 			}
-			candidate := candidates[0]
 			name := agentID + workspaceRecordSuffix
 			if err := restoreRecordAcknowledgement(
 				bucketRoot,
@@ -1058,31 +1337,141 @@ func findRecordAcknowledgementQuarantine(
 		return "", false, err
 	}
 	prefix := recordAcknowledgementPrefix(agentID, operationID)
-	var matched string
+	var candidates []recordAcknowledgement
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		if matched != "" {
-			return "", false, fmt.Errorf(
-				"workspace: removal acknowledgement %q has multiple quarantined records",
-				operationID,
+		candidates = append(candidates, recordAcknowledgement{
+			name:        entry.Name(),
+			operationID: operationID,
+		})
+	}
+	if len(candidates) == 0 {
+		return "", false, nil
+	}
+	matched, err := coalesceRecordAcknowledgements(bucket, candidates)
+	if err != nil {
+		return "", false, err
+	}
+	return matched.name, true, nil
+}
+
+func coalesceRecordAcknowledgements(
+	bucket *os.Root,
+	candidates []recordAcknowledgement,
+) (recordAcknowledgement, error) {
+	return coalesceRecordAcknowledgementsAfterValidation(
+		bucket,
+		candidates,
+		nil,
+	)
+}
+
+func coalesceRecordAcknowledgementsAfterValidation(
+	bucket *os.Root,
+	candidates []recordAcknowledgement,
+	afterValidation func(),
+) (_ recordAcknowledgement, result error) {
+	if len(candidates) == 0 {
+		return recordAcknowledgement{}, errors.New(
+			"workspace: acknowledgement candidate list is empty",
+		)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].name < candidates[j].name
+	})
+	operationID := candidates[0].operationID
+	var expected *os.File
+	for _, candidate := range candidates {
+		if candidate.operationID != operationID {
+			return recordAcknowledgement{}, errors.New(
+				"workspace: acknowledgement aliases have different operation IDs",
 			)
 		}
-		info, err := bucket.Lstat(entry.Name())
+		info, err := bucket.Lstat(candidate.name)
 		if err != nil {
-			return "", false, err
+			return recordAcknowledgement{}, err
 		}
 		if !info.Mode().IsRegular() ||
 			info.Mode()&os.ModeSymlink != 0 {
-			return "", false, fmt.Errorf(
+			return recordAcknowledgement{}, fmt.Errorf(
 				"workspace: acknowledgement quarantine %q is not a regular file",
-				entry.Name(),
+				candidate.name,
 			)
 		}
-		matched = entry.Name()
+		file, err := bucket.Open(candidate.name)
+		if err != nil {
+			return recordAcknowledgement{}, err
+		}
+		opened, statErr := file.Stat()
+		if statErr == nil &&
+			(!opened.Mode().IsRegular() || !os.SameFile(info, opened)) {
+			statErr = fmt.Errorf(
+				"workspace: acknowledgement quarantine %q changed while opening",
+				candidate.name,
+			)
+		}
+		if statErr == nil && expected != nil {
+			expectedInfo, expectedErr := expected.Stat()
+			if expectedErr != nil {
+				statErr = expectedErr
+			} else if !os.SameFile(expectedInfo, opened) {
+				statErr = errors.New(
+					"workspace: acknowledgement aliases refer to different records",
+				)
+			}
+		}
+		if statErr != nil {
+			_ = file.Close()
+			return recordAcknowledgement{}, statErr
+		}
+		if expected == nil {
+			expected = file
+			defer func() {
+				result = errors.Join(result, expected.Close())
+			}()
+			continue
+		}
+		if err := file.Close(); err != nil {
+			return recordAcknowledgement{}, err
+		}
 	}
-	return matched, matched != "", nil
+	agentID, parsedOperationID, ok := recordAcknowledgementIdentity(
+		candidates[0].name,
+	)
+	if !ok || parsedOperationID != operationID {
+		return recordAcknowledgement{}, errors.New(
+			"workspace: acknowledgement candidate name is invalid",
+		)
+	}
+	for _, duplicate := range candidates[1:] {
+		isolatedName := recordAcknowledgementPrefix(
+			agentID,
+			operationID,
+		) + uuid.NewString()
+		if err := removeOwnedRecordPath(
+			bucket,
+			duplicate.name,
+			expected,
+			isolatedName,
+			nil,
+			afterValidation,
+		); err != nil {
+			return recordAcknowledgement{}, fmt.Errorf(
+				"workspace: remove acknowledgement alias %q: %w",
+				duplicate.name,
+				err,
+			)
+		}
+		afterValidation = nil
+	}
+	if len(candidates) > 1 {
+		if err := syncRecordBucket(bucket, candidates[0].name); err != nil {
+			return recordAcknowledgement{}, err
+		}
+	}
+	return candidates[0], nil
 }
 
 func (m *Manager) removeRecordAcknowledgementQuarantine(
@@ -1099,35 +1488,54 @@ func (m *Manager) removeRecordAcknowledgementQuarantine(
 			err,
 		)
 	}
-	fileOpen := true
 	defer func() {
-		if fileOpen {
-			result = errors.Join(result, file.Close())
-		}
+		result = errors.Join(result, file.Close())
 	}()
-	if _, err := m.verifyRemovalRecordFile(
-		file,
+	return m.removeRecordAcknowledgementQuarantineWithFile(
+		bucket,
+		name,
 		recordPath,
 		removal,
+		file,
+	)
+}
+
+func (m *Manager) removeRecordAcknowledgementQuarantineWithFile(
+	bucket *os.Root,
+	name string,
+	recordPath string,
+	removal Removal,
+	file *os.File,
+) error {
+	deleteName := recordAcknowledgementPrefix(
+		removal.Workspace.AgentID,
+		removal.operationID,
+	) + uuid.NewString()
+	if err := removeOwnedRecordPath(
+		bucket,
+		name,
+		file,
+		deleteName,
+		func(candidate *os.File) error {
+			if _, err := candidate.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			_, err := m.verifyRemovalRecordFile(
+				candidate,
+				recordPath,
+				removal,
+			)
+			return err
+		},
+		nil,
 	); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf(
-			"workspace: close quarantined removal record %q: %w",
-			recordPath,
-			err,
-		)
-	}
-	fileOpen = false
-	if err := bucket.Remove(name); err != nil {
 		return fmt.Errorf(
 			"workspace: remove quarantined record %q: %w",
 			recordPath,
 			err,
 		)
 	}
-	return syncRecordBucket(bucket, recordPath)
+	return nil
 }
 
 func restoreRecordAcknowledgement(
@@ -1146,7 +1554,7 @@ func restoreRecordAcknowledgement(
 	if err != nil {
 		return err
 	}
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return err
 	}
@@ -1183,7 +1591,7 @@ func syncRecordBucket(
 	bucket *os.Root,
 	recordPath string,
 ) error {
-	directory, err := bucket.Open(".")
+	directory, err := openRecordDirectory(bucket)
 	if err != nil {
 		return fmt.Errorf(
 			"workspace: open record directory %q for sync: %w",

@@ -28,7 +28,8 @@
   本身不持有 goroutine 或回调。
 - 一个全局 Committer goroutine 独占运行时事件序号和写入顺序。Store batch 成功后，
   Committer 才应用 Agent 投影并按序发布 Hub。workspace removal 使用 typed
-  operation，在 append 后清除 working directory、关闭 Resume，再发布事件。
+  operation，在 append 后清除 working directory、关闭 Resume，再发布事件；该元数据
+  事件不改变 Agent 状态的 UpdatedAt，恢复投影必须保持相同语义。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent →
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →
@@ -76,6 +77,11 @@
 - oneshot 自然成功退出为 `done`；interactive、失败退出和已登记的主动停止为 `stopped`。
 - PTY 进程组清理失败优先于自然成功或主动停止原因，必须持久化 error 并进入
   `stopped`，不得把仍有不可控后代的会话记录为 `done`。
+- PTY 进程组清理失败还必须把 leader PID 作为 typed
+  `session_lifecycle(process_group_cleanup_failed)` 与退出终态同批持久化。运行时和恢复
+  投影据此关闭 `Status.Resumable`、手动/启动恢复及 workspace cleanup；操作前只有
+  `internal/pty` 以 signal 0 明确确认进程组不存在，才能先持久化
+  `process_group_cleanup_completed` 再解除门禁。
 - `Close()`：拒绝新 Start → 等待进行中的 Start 和 workspace cleanup → 关闭全部 PTY 并等待回调 →
   幂等关闭 recording/terminal/observation actor → 清空运行中会话索引。
 - Manager 把同一 `terminationGrace` 传给新建和恢复的 PTY；关闭顺序仍按 Agent ID
@@ -120,7 +126,14 @@
   只更新已有会话的事件事实。
 - 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
   只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。候选等待同 Agent
-  cleanup completion，只有成功安装 resume reservation 后才消费；取消等待保留候选。
+  cleanup completion；自动或普通 `Resume` 消费此候选时，恢复进程及 required hook
+  均成功后必须用后台上下文持久化 `session_lifecycle(startup_resume_completed)`，只有
+  该事件 durable 后才清除内存资格并释放 resume reservation，避免短命进程退出后
+  workspace tombstone 抢先提交。取消等待、PTY 启动失败、required hook 失败及完成事件
+  未落库都保留候选。用户停止仍在进程组清理失败时以同批
+  `session_lifecycle(startup_resume_cancelled)` 持久取消候选，不能在 cleanup fence
+  解除后再次自动恢复。daemon 重启生成并持久化的 recovery `Stopped` 在投影读到完成
+  或取消事件前始终保留该资格，连续启动失败不能把候选静默降级为普通停止会话。
 - 信号与状态证据 reader 同时接受 v1、v2、typed screen v3 和 typed terminal v4；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。

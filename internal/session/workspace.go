@@ -140,7 +140,7 @@ func (m *Manager) CleanupWorkspace(
 		return workspace.Workspace{}, ErrWorkspaceUnavailable
 	}
 	agentID := agent.ID(id)
-	completion, err := m.reserveWorkspaceCleanup(agentID)
+	completion, err := m.reserveWorkspaceCleanup(ctx, agentID)
 	if err != nil {
 		return workspace.Workspace{}, err
 	}
@@ -234,8 +234,22 @@ func mapWorkspaceRemovalError(err error) error {
 }
 
 func (m *Manager) reserveWorkspaceCleanup(
+	ctx context.Context,
 	id agent.ID,
 ) (chan struct{}, error) {
+	if managed, ok := m.managed(id); ok {
+		pending, err := m.resolveProcessGroupCleanup(ctx, id, managed)
+		if err != nil {
+			return nil, errors.Join(ErrWorkspaceInUse, err)
+		}
+		if pending {
+			return nil, fmt.Errorf(
+				"%w: agent %q process group cleanup remains unresolved",
+				ErrWorkspaceInUse,
+				id,
+			)
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -260,6 +274,7 @@ func (m *Manager) reserveWorkspaceCleanup(
 		_, resuming := m.resuming[id]
 		state := managed.agent.State()
 		if attached || resuming ||
+			managed.processGroupCleanupPending() ||
 			(state != agent.StateDone && state != agent.StateStopped) {
 			return nil, fmt.Errorf(
 				"%w: agent %q is %s",

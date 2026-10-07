@@ -10,19 +10,25 @@ import (
 
 func renameDirectoryNoReplace(
 	directory *os.File,
-	_ os.FileInfo,
+	expected os.FileInfo,
 	sourceName string,
+	isolatedName string,
 	targetName string,
 ) (bool, error) {
-	fd := int(directory.Fd())
-	if err := unix.RenameatxNp(
-		fd,
+	return renameBoundDirectoryNoReplace(
+		directory,
+		expected,
 		sourceName,
-		fd,
+		isolatedName,
 		targetName,
-		unix.RENAME_EXCL,
-	); err != nil {
-		return false, err
-	}
-	return true, nil
+		func(fd int, source string, target string) error {
+			return unix.RenameatxNp(
+				fd,
+				source,
+				fd,
+				target,
+				unix.RENAME_EXCL,
+			)
+		},
+	)
 }
