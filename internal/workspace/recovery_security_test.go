@@ -1106,13 +1106,17 @@ func TestListRejectsReplacementDataDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
-	if _, err := manager.Prepare(
+	prepared, err := manager.Prepare(
 		context.Background(),
 		repository,
 		"",
 		testAgentID,
-	); err != nil {
+	)
+	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	original := dataDir + "-original"
 	if err := os.Rename(dataDir, original); err != nil {
