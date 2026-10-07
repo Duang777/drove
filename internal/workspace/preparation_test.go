@@ -17,7 +17,8 @@ import (
 
 func TestReconcilePreparationsAdoptsDurableAndDiscardsOrphan(t *testing.T) {
 	repository := newTestRepository(t)
-	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
@@ -39,15 +40,27 @@ func TestReconcilePreparationsAdoptsDurableAndDiscardsOrphan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare orphan workspace: %v", err)
 	}
+	if err := durable.preparation.Close(); err != nil {
+		t.Fatalf("close durable preparation lease: %v", err)
+	}
+	durable.preparation = nil
+	if err := orphan.preparation.Close(); err != nil {
+		t.Fatalf("close orphan preparation lease: %v", err)
+	}
+	orphan.preparation = nil
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
 
-	if err := manager.ReconcilePreparations(
+	if err := restarted.ReconcilePreparations(
 		context.Background(),
 		[]Workspace{durable},
 	); err != nil {
 		t.Fatalf("reconcile preparations: %v", err)
 	}
 
-	record, exists, err := manager.readWorkspaceRecord(durable.Path)
+	record, exists, err := restarted.readWorkspaceRecord(durable.Path)
 	if err != nil || !exists || !record.PreparationCommitted {
 		t.Fatalf(
 			"durable preparation record = %+v, exists=%v err=%v",
