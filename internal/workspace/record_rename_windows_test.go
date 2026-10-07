@@ -90,7 +90,6 @@ func TestUnlinkRecordUsesCompatibleIdentityHandle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open source: %v", err)
 	}
-	defer expected.Close()
 	directory, err := os.Open(rootPath)
 	if err != nil {
 		t.Fatalf("open parent directory: %v", err)
@@ -99,6 +98,9 @@ func TestUnlinkRecordUsesCompatibleIdentityHandle(t *testing.T) {
 
 	if err := unlinkRecordPath(directory, expected, "source"); err != nil {
 		t.Fatalf("unlink source while mutation handle is held: %v", err)
+	}
+	if err := expected.Close(); err != nil {
+		t.Fatalf("close identity handle: %v", err)
 	}
 	if _, err := os.Lstat(sourcePath); !os.IsNotExist(err) {
 		t.Fatalf("source remains after unlink: %v", err)
