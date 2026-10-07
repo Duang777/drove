@@ -282,6 +282,56 @@ func TestAcknowledgePreparationMigratesCommittedVersionFiveRecord(
 	}
 }
 
+func TestReconcilePreparationsAcceptsCommittedBranchAdvance(t *testing.T) {
+	repository := newTestRepository(t)
+	dataDir := filepath.Join(t.TempDir(), "data")
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(prepared.Path, "advanced.txt"),
+		[]byte("advanced\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write committed workspace change: %v", err)
+	}
+	runGit(t, prepared.Path, "add", "advanced.txt")
+	runGit(t, prepared.Path, "commit", "-m", "advance managed branch")
+
+	restarted, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("restart manager: %v", err)
+	}
+	if err := restarted.ReconcilePreparations(
+		context.Background(),
+		[]Workspace{prepared},
+	); err != nil {
+		t.Fatalf("adopt advanced committed preparation: %v", err)
+	}
+	record, exists, err := restarted.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists || !record.PreparationCommitted {
+		t.Fatalf(
+			"advanced committed record = %+v, exists=%v err=%v",
+			record,
+			exists,
+			err,
+		)
+	}
+}
+
 func TestReconcilePreparationsDiscardsPromotePendingStagingWorktree(
 	t *testing.T,
 ) {

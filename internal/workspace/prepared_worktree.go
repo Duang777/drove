@@ -748,6 +748,17 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 			"workspace: prepared worktree expected HEAD changed",
 		)
 	}
+	if record.PreparationCommitted {
+		currentHeadOID, err :=
+			repository.derivePreparedWorktreeExpectedHead(ctx, target)
+		if err != nil {
+			return fmt.Errorf(
+				"workspace: inspect committed worktree HEAD: %w",
+				err,
+			)
+		}
+		target.expectedHeadOID = currentHeadOID
+	}
 	if _, err := repository.boundGitDirectory(
 		record.GitDirectory,
 		target.AgentID,
