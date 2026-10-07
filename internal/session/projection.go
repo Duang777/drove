@@ -170,6 +170,8 @@ func (p *recoveryProjector) applyLifecycle(row store.EventRow) error {
 		return p.applyCreated(row)
 	case startupResumeCompletedReason:
 		return p.applyStartupResumeCompleted(row)
+	case startupResumeCancelledReason:
+		return p.applyStartupResumeCancelled(row)
 	case workspaceRemovedReason:
 		return p.applyWorkspaceRemoved(row)
 	case processGroupCleanupFailed:
@@ -319,6 +321,42 @@ func (p *recoveryProjector) applyStartupResumeCompleted(
 		return projectionError(
 			row,
 			"startup resume completion has no restart resume candidate",
+		)
+	}
+	draft.restartStopped = false
+	draft.startupResumePending = false
+	return nil
+}
+
+func (p *recoveryProjector) applyStartupResumeCancelled(
+	row store.EventRow,
+) error {
+	draft := p.draft(row)
+	if !draft.hasCreated && !draft.hasState {
+		return projectionError(
+			row,
+			"startup resume cancellation has no session history",
+		)
+	}
+	var payload startupResumeCancelledPayload
+	if err := json.Unmarshal([]byte(row.Payload), &payload); err != nil {
+		return projectionWrapError(
+			row,
+			"decode startup resume cancellation",
+			err,
+		)
+	}
+	if payload.Version != 1 {
+		return projectionError(
+			row,
+			"unsupported startup resume cancellation version %d",
+			payload.Version,
+		)
+	}
+	if !draft.startupResumePending {
+		return projectionError(
+			row,
+			"startup resume cancellation has no restart resume candidate",
 		)
 	}
 	draft.restartStopped = false

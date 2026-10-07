@@ -93,11 +93,16 @@ const (
 	initialTerminalRows          = 40
 	initialTerminalColumns       = 120
 	startupResumeCompletedReason = "startup_resume_completed"
+	startupResumeCancelledReason = "startup_resume_cancelled"
 	processGroupCleanupFailed    = "process_group_cleanup_failed"
 	processGroupCleanupCompleted = "process_group_cleanup_completed"
 )
 
 type startupResumeCompletedPayload struct {
+	Version int `json:"version"`
+}
+
+type startupResumeCancelledPayload struct {
 	Version int `json:"version"`
 }
 
@@ -1696,16 +1701,34 @@ func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo
 	if err != nil {
 		return
 	}
-	terminate := func() error {
-		return running.observer.terminate(observation, lifecycleDrafts)
+	terminate := func(cancelStartupResume bool) error {
+		drafts := append([]event.Draft(nil), lifecycleDrafts...)
+		if cancelStartupResume && info.CleanupErr != nil {
+			payload, err := json.Marshal(startupResumeCancelledPayload{
+				Version: 1,
+			})
+			if err != nil {
+				return fmt.Errorf(
+					"session: encode startup resume cancellation: %w",
+					err,
+				)
+			}
+			drafts = append(drafts, event.NewSessionLifecycleDraft(
+				string(id),
+				string(id),
+				startupResumeCancelledReason,
+				string(payload),
+			))
+		}
+		return running.observer.terminate(observation, drafts)
 	}
-	if cause == stopCauseUser && info.CleanupErr == nil {
+	if cause == stopCauseUser {
 		if managed, exists := m.managed(id); exists {
 			_ = managed.cancelResumeOnStartAfter(terminate)
 			return
 		}
 	}
-	_ = terminate()
+	_ = terminate(false)
 }
 
 func processObservation(

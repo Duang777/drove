@@ -1438,6 +1438,77 @@ func TestUserStopConsumesLiveStartupResumeIntent(t *testing.T) {
 	}
 }
 
+func TestUserStopWithCleanupFailureCancelsStartupResumeIntent(t *testing.T) {
+	manager, st := newTestManager(t)
+	managed := addStoppedAgent(t, manager, "agent-1", "claude", "vendor-ref")
+	var started pty.Config
+	manager.startPTY = func(config pty.Config) (launchedSession, error) {
+		started = config
+		return &fakeProcessSession{}, nil
+	}
+	if _, err := manager.Resume(
+		context.Background(),
+		managed.agent.ID(),
+	); err != nil {
+		t.Fatalf("resume agent: %v", err)
+	}
+	state := managed.workspaceState()
+	state.resumeOnStart = true
+	managed.setWorkspaceState(state)
+
+	manager.mu.RLock()
+	running := manager.sessions[managed.agent.ID()]
+	manager.mu.RUnlock()
+	if running == nil {
+		t.Fatal("resumed session is missing")
+	}
+	manager.requestStop(managed.agent.ID(), running, stopCauseUser)
+	started.OnExit(pty.ExitInfo{
+		PID:        4242,
+		CleanupErr: errors.New("process group remains"),
+	})
+	started.OnOutputEnd(0)
+
+	if managed.hasResumeOnStart() {
+		t.Fatal("cleanup failure retained the live startup resume intent")
+	}
+	rows, err := st.Replay(string(managed.agent.ID()))
+	if err != nil {
+		t.Fatalf("replay stopped resume: %v", err)
+	}
+	cancellationIndex := -1
+	cleanupIndex := -1
+	stoppedIndex := -1
+	for index, row := range rows {
+		if row.Type == string(event.TypeSessionLifecycle) {
+			switch row.Reason {
+			case startupResumeCancelledReason:
+				cancellationIndex = index
+				if row.Payload != `{"version":1}` {
+					t.Fatalf("startup resume cancellation = %+v", row)
+				}
+			case processGroupCleanupFailed:
+				cleanupIndex = index
+			}
+		}
+		if row.Type == string(event.TypeStateChanged) &&
+			row.To == string(agent.StateStopped) {
+			stoppedIndex = index
+		}
+	}
+	if cleanupIndex < 0 ||
+		cancellationIndex <= cleanupIndex ||
+		stoppedIndex <= cancellationIndex {
+		t.Fatalf(
+			"cleanup index = %d, cancellation index = %d, stopped index = %d, rows = %+v",
+			cleanupIndex,
+			cancellationIndex,
+			stoppedIndex,
+			rows,
+		)
+	}
+}
+
 func TestNormalizeRunMode(t *testing.T) {
 	tests := []struct {
 		name    string

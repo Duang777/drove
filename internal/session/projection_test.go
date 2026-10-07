@@ -671,6 +671,40 @@ func TestRecoveryProjectorRequiresDurableCompletionToConsumeStartupResume(
 			wantResume: false,
 		},
 		{
+			name: "user stop with process group cleanup failure",
+			finalRows: []store.EventRow{
+				{
+					Seq: 9, Timestamp: base.Add(8 * time.Second),
+					Type:      string(event.TypeSessionLifecycle),
+					SessionID: "agent-1", AgentID: "agent-1",
+					Reason:  processGroupCleanupFailed,
+					Payload: `{"version":1,"pid":4242}`,
+				},
+				{
+					Seq: 10, Timestamp: base.Add(9 * time.Second),
+					Type:      string(event.TypeSessionLifecycle),
+					SessionID: "agent-1", AgentID: "agent-1",
+					Reason:  startupResumeCancelledReason,
+					Payload: `{"version":1}`,
+				},
+				{
+					Seq: 11, Timestamp: base.Add(10 * time.Second),
+					Type:      string(event.TypeStateChanged),
+					SessionID: "agent-1", AgentID: "agent-1",
+					From: "working", To: "stopped",
+					Reason: "process exited code=0",
+				},
+				{
+					Seq: 12, Timestamp: base.Add(11 * time.Second),
+					Type:      string(event.TypeSessionLifecycle),
+					SessionID: "agent-1", AgentID: "agent-1",
+					Reason:  processGroupCleanupCompleted,
+					Payload: `{"version":1,"pid":4242}`,
+				},
+			},
+			wantResume: false,
+		},
+		{
 			name: "required hook failure",
 			finalRows: []store.EventRow{{
 				Seq: 9, Timestamp: base.Add(8 * time.Second), Type: string(event.TypeStateChanged),

@@ -117,10 +117,12 @@ func (m *managedAgent) completeResumeOnStart(
 	return true, err
 }
 
-func (m *managedAgent) cancelResumeOnStartAfter(commit func() error) error {
+func (m *managedAgent) cancelResumeOnStartAfter(
+	commit func(pending bool) error,
+) error {
 	m.workspaceMu.Lock()
 	defer m.workspaceMu.Unlock()
-	if err := commit(); err != nil {
+	if err := commit(m.workspace.resumeOnStart); err != nil {
 		return err
 	}
 	m.workspace.resumeOnStart = false

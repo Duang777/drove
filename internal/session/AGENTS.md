@@ -130,8 +130,10 @@
   均成功后必须用后台上下文持久化 `session_lifecycle(startup_resume_completed)`，只有
   该事件 durable 后才清除内存资格并释放 resume reservation，避免短命进程退出后
   workspace tombstone 抢先提交。取消等待、PTY 启动失败、required hook 失败及完成事件
-  未落库都保留候选。daemon 重启生成并持久化的 recovery `Stopped` 在投影读到完成事件
-  前始终保留该资格，连续启动失败不能把候选静默降级为普通停止会话。
+  未落库都保留候选。用户停止仍在进程组清理失败时以同批
+  `session_lifecycle(startup_resume_cancelled)` 持久取消候选，不能在 cleanup fence
+  解除后再次自动恢复。daemon 重启生成并持久化的 recovery `Stopped` 在投影读到完成
+  或取消事件前始终保留该资格，连续启动失败不能把候选静默降级为普通停止会话。
 - 信号与状态证据 reader 同时接受 v1、v2、typed screen v3 和 typed terminal v4；v2 的 notify
   只在 fallback 下确认 Idle。未知补充版本按既有计数策略跳过，已知畸形版本报错。
   adapter 标记为忽略的厂商内部通知不提交事件。
