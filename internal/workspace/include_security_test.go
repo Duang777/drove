@@ -236,8 +236,12 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 		t.Fatalf("copy included files: %v", err)
 	}
 	assertFileContents(t, filepath.Join(target.Path, "secret"), "original\n")
-	if err := verifyRealPathRoot(sourcePath, source); err == nil {
+	verifyErr := verifyRealPathRoot(sourcePath, source)
+	if renameErr == nil && verifyErr == nil {
 		t.Fatal("source replacement passed final identity verification")
+	}
+	if renameErr != nil && verifyErr != nil {
+		t.Fatalf("locked source failed final identity verification: %v", verifyErr)
 	}
 }
 
