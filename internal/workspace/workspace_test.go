@@ -250,6 +250,9 @@ func TestPrepareListAndCleanupWorktree(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(prepared.Path, "ignored.key")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("unlisted ignored file exists or inspect failed: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 
 	listed, err := manager.List(context.Background())
 	if err != nil {
