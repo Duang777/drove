@@ -374,6 +374,9 @@ func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare first worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(first); err != nil {
+		t.Fatalf("acknowledge first preparation: %v", err)
+	}
 	second, err := manager.Prepare(
 		context.Background(),
 		repository,
@@ -382,6 +385,9 @@ func TestPrepareIsolatesConcurrentAgentChanges(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare second worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(second); err != nil {
+		t.Fatalf("acknowledge second preparation: %v", err)
 	}
 
 	if err := os.WriteFile(
@@ -1159,6 +1165,9 @@ func TestRemoveUpgradesExistingIntentToForce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -1585,6 +1594,9 @@ func TestAcknowledgeRemovalValidatesTokenAndIsIdempotent(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
 	if err != nil || result.State != RemovalComplete {

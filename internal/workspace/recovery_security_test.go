@@ -1994,6 +1994,9 @@ func TestReconcileStartedRemovalDoesNotRecreateMissingMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare workspace: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
@@ -2291,6 +2294,9 @@ func TestAcknowledgeRemovalRecoversQuarantinedRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
 	if err != nil || result.State != RemovalComplete {
 		t.Fatalf("remove workspace = %+v, %v", result, err)
@@ -2375,6 +2381,9 @@ func TestReconcileRemovalCoalescesAcknowledgementHardLinks(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
 	if err != nil || result.State != RemovalComplete {
@@ -2485,6 +2494,9 @@ func TestRemoveRecoversQuarantinedAcknowledgementRecord(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	result, err := manager.Remove(context.Background(), prepared.AgentID, true)
 	if err != nil || result.State != RemovalComplete {
