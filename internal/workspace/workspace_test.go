@@ -437,6 +437,9 @@ func TestListAndCleanupDetachedWorktree(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	runGit(t, prepared.Path, "checkout", "--detach")
 	if err := os.WriteFile(
 		filepath.Join(prepared.Path, "detached.txt"),
@@ -1440,6 +1443,9 @@ func TestReconcileRemovalReturnsAlreadyAbsentWorkspace(t *testing.T) {
 	)
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
 	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
