@@ -726,6 +726,47 @@ func (r repositoryCapability) verifyBoundPreparedWorktree(
 	)
 }
 
+func (r repositoryCapability) derivePreparedWorktreeExpectedHead(
+	ctx context.Context,
+	target Workspace,
+) (string, error) {
+	if err := r.verifyBinding(ctx); err != nil {
+		return "", err
+	}
+	registered, exists, err := r.worktreeRegistration(ctx, target.Path)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", errors.New(
+			"workspace: prepared worktree registration disappeared",
+		)
+	}
+	if err := r.verifyPreparedWorktreeRegistration(
+		target,
+		registered,
+		"",
+	); err != nil {
+		return "", err
+	}
+	branchOID, exists, err := r.refOID(
+		ctx,
+		"refs/heads/"+target.Branch,
+	)
+	if err != nil {
+		return "", err
+	}
+	if !exists || branchOID != registered.head {
+		return "", errors.New(
+			"workspace: prepared branch does not match worktree registration",
+		)
+	}
+	if err := r.verifyBinding(ctx); err != nil {
+		return "", err
+	}
+	return branchOID, nil
+}
+
 func (r repositoryCapability) verifyPreparationRefs(
 	ctx context.Context,
 	target Workspace,

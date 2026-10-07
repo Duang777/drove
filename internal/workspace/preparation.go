@@ -43,12 +43,13 @@ func (m *Manager) acknowledgePreparation(
 	}
 	if record.PreparationCommitted &&
 		record.BranchOperationID == "" &&
+		record.Version >= workspaceRecordVersion &&
 		target.preparation.isClosed() {
 		return target.preparation.Close()
 	}
 	lease := target.preparation
 	temporaryLease := false
-	if lease == nil {
+	if lease == nil || lease.isClosed() {
 		lease, err = openRecordedPreparationLease(
 			context.Background(),
 			m,
@@ -61,6 +62,31 @@ func (m *Manager) acknowledgePreparation(
 		defer func() {
 			result = errors.Join(result, lease.Close())
 		}()
+	}
+	if record.Version == removalWorkspaceRecordVersion &&
+		record.ExpectedHeadOID == "" {
+		deriveCtx, cancel := context.WithTimeout(
+			context.Background(),
+			10*time.Second,
+		)
+		expectedHeadOID, deriveErr :=
+			lease.repository.derivePreparedWorktreeExpectedHead(
+				deriveCtx,
+				record.workspace(),
+			)
+		cancel()
+		if deriveErr != nil {
+			return fmt.Errorf(
+				"workspace: derive historical preparation HEAD: %w",
+				deriveErr,
+			)
+		}
+		record.ExpectedHeadOID = expectedHeadOID
+		if !sameWorkspace(record.workspace(), target) {
+			return errors.New(
+				"workspace: derived preparation acknowledgement does not match target",
+			)
+		}
 	}
 	verifyRepository := func(stage string) error {
 		ctx, cancel := context.WithTimeout(
@@ -113,6 +139,25 @@ func (m *Manager) acknowledgePreparation(
 			"workspace: verify preparation acknowledgement: %w",
 			verifyErr,
 		)
+	}
+	if record.Version == removalWorkspaceRecordVersion {
+		upgradeWorkspaceRecord(&record)
+		if err := m.replaceWorkspaceRecord(record); err != nil {
+			return fmt.Errorf(
+				"workspace: migrate historical preparation record: %w",
+				err,
+			)
+		}
+		if err := verifyRepository(
+			"after migrating historical preparation",
+		); err != nil {
+			return err
+		}
+		if err := verifyWorktree(
+			"after migrating historical preparation",
+		); err != nil {
+			return err
+		}
 	}
 	if !record.PreparationCommitted {
 		record.PreparationCommitted = true

@@ -189,7 +189,9 @@ func TestReconcilePreparationsAcceptsVersionFiveEvidence(t *testing.T) {
 			record,
 		)
 	}
+	expectedHeadOID := record.ExpectedHeadOID
 	record.Version = removalWorkspaceRecordVersion
+	record.ExpectedHeadOID = ""
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write version 5 preparation record: %v", err)
 	}
@@ -220,10 +222,63 @@ func TestReconcilePreparationsAcceptsVersionFiveEvidence(t *testing.T) {
 			err,
 		)
 	}
-	if adopted.Version != removalWorkspaceRecordVersion ||
+	if adopted.Version != workspaceRecordVersion ||
 		!adopted.PreparationCommitted ||
+		adopted.ExpectedHeadOID != expectedHeadOID ||
+		adopted.BranchOperationID != "" ||
 		adopted.RepositoryEvidence == nil {
 		t.Fatalf("adopted version 5 preparation = %+v", adopted)
+	}
+}
+
+func TestAcknowledgePreparationMigratesCommittedVersionFiveRecord(
+	t *testing.T,
+) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read preparation record: exists=%v err=%v", exists, err)
+	}
+	expectedHeadOID := record.ExpectedHeadOID
+	record.Version = removalWorkspaceRecordVersion
+	record.ExpectedHeadOID = ""
+	if err := manager.replaceWorkspaceRecord(record); err != nil {
+		t.Fatalf("write committed version 5 preparation record: %v", err)
+	}
+
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("migrate committed version 5 preparation: %v", err)
+	}
+	migrated, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf(
+			"read migrated preparation: exists=%v err=%v",
+			exists,
+			err,
+		)
+	}
+	if migrated.Version != workspaceRecordVersion ||
+		!migrated.PreparationCommitted ||
+		migrated.ExpectedHeadOID != expectedHeadOID ||
+		migrated.BranchOperationID != "" ||
+		migrated.RepositoryEvidence == nil {
+		t.Fatalf("migrated version 5 preparation = %+v", migrated)
 	}
 }
 
