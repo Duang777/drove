@@ -86,6 +86,7 @@ function agentFixture(): AgentStatus {
     state: 'working',
     created_at: '2026-10-04T12:00:00Z',
     updated_at: '2026-10-04T12:00:05Z',
+    state_since: '2026-10-04T12:00:05Z',
     hook_policy: 'off',
     hook_status: 'off',
     signal_injection: 'off',

@@ -108,6 +108,7 @@ describe('TerminalSessionController', () => {
     const firstResize = stream.blockNextResize()
     await stream.emit(caughtUpMessage('raw', 0n, 0n))
     expect(fixture.controller.getSnapshot().inputEnabled).toBe(true)
+    expect(live.focusCalls).toBe(1)
     expect(stream.resizeCalls).toEqual([
       { agentID: 'agent-1', rows: 50, columns: 100 },
     ])
@@ -372,6 +373,7 @@ class FakeTerminal implements TerminalAdapter {
   }
   disposeCalls = 0
   inputDisposeCalls = 0
+  focusCalls = 0
   private inputListener: ((data: string) => void) | null = null
   private readonly writeBlocks: Array<Deferred<void>> = []
 
@@ -407,7 +409,9 @@ class FakeTerminal implements TerminalAdapter {
     return this.proposedDimensions
   }
 
-  focus(): void {}
+  focus(): void {
+    this.focusCalls += 1
+  }
 
   dispose(): void {
     this.disposeCalls += 1

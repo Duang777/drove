@@ -51,7 +51,6 @@ Drove 想解决的问题是：多个 coding agent 各自在终端里运行，用
 - WebSocket 输入控制已接通；终端 attach 和 resize 端点尚未实现。
 - Web 控制台没有可达的回放入口。
 - ACP 仍是文档中的预留项。
-- CI 只验证 Go，不验证 Web 构建或类型检查。
 
 ## 3. 实际架构
 
@@ -901,3 +900,50 @@ Bubbles viewport 显示类型化 explain。`q` 和 Ctrl-C 只退出本地总览�
 
 `go test ./internal/clitui ./cmd/drove -race -count=20`、串行全仓库 race、
 `go vet ./...` 和 `make build` 均通过。
+
+## 15. Web 塔台网格
+
+Issue #26 把 Web 首页改为多 Agent 塔台网格。前端同时消费权威 Agent 列表、
+v1 状态事件和 v2 snapshot 流：
+
+- 状态事件在两次 5 秒列表刷新之间更新卡片，列表刷新负责纠正丢失事件。
+- 所有非终态 Agent 共用一个 `TerminalStream`，每个 Agent 只保留最新的有界快照。
+- Blocked 卡片按 `state_since` 排序和计时，刷新页面后继续使用 daemon 时间。
+- 数字键 1 到 9 打开对应详情，详情页自动聚焦 xterm.js，Esc 返回网格。
+- 回复仍通过既有输入通道发送，事件日志只显示 `agent.input` 的字节数。
+
+Blocked 脉动只修改伪元素透明度。`prefers-reduced-motion: reduce` 会关闭动画；
+文字状态、等待时长和 evidence 不依赖颜色或动画。
+
+### 10 Agent 稳态 CPU 基准
+
+基准环境：
+
+- macOS 26.5.1 arm64，Apple M5 Pro
+- Google Chrome 147.0.7727.56，headless 模式，1280 x 900 viewport
+- Go 1.24.13、Node 24.16.0、npm 11.13.0
+- 隔离的临时配置和数据目录，10 个 generic `/bin/cat` Agent
+- 页面确认显示 10 张卡片且 WebSocket 为“已连接”后开始采样
+
+采样使用 macOS `ps`。浏览器 CPU 和 RSS 汇总 Playwright 控制进程下的全部
+Chrome 子进程，不包含 Node 控制进程；daemon 只统计监听 17373 端口的 `droved`
+进程，不包含 10 个 Agent 子进程。CPU 百分比以单个逻辑核心为 100%。稳态采样
+间隔为 2 秒，共 15 次；采样期间整机 1 分钟 load average 为 2.94 到 4.14。
+
+| 指标 | 均值 | 最小值 | 最大值 |
+| --- | ---: | ---: | ---: |
+| Chrome CPU | 0.19% | 0.0% | 2.5% |
+| `droved` CPU | 0.00% | 0.0% | 0.0% |
+| Chrome RSS | 约 700 MiB | 699.4 MiB | 700.3 MiB |
+| `droved` RSS | 约 35 MiB | 34.9 MiB | 35.0 MiB |
+
+`droved` 的 15 个 CPU 样本均低于 `ps` 的 0.1% 显示精度。每次采样都确认
+Chrome 有 6 个子进程，`droved` 有 10 个 `/bin/cat` 子进程。基准结束后通过
+REST 停止全部 Agent，并确认 daemon、Vite 和专用 Chrome 进程退出。
+
+Web CI 使用 Node 22，依次执行 `npm ci`、typecheck、单元测试、生产构建和
+Playwright Chromium E2E。E2E 启动真实 `droved` 和 Vite，同时运行 2 个 Claude、
+2 个 Codex 和 1 个 generic 自定义 PTY。测试覆盖 screen candidate 到 Blocked
+卡片不超过 1 秒、脉动与计时、刷新后计时连续、数字键进入、xterm.js 输入、
+回复后回到 Working、Esc 返回、`agent.input` 审计，以及 1280、375 和 320
+像素宽度下的布局。使用系统 Chrome 连续重复 3 轮均通过。
