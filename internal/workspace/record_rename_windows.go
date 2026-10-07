@@ -94,8 +94,11 @@ func unlinkRecordPathAfterValidation(
 	if err != nil {
 		return err
 	}
+	deletingOpen := true
 	defer func() {
-		result = errors.Join(result, deleting.Close())
+		if deletingOpen {
+			result = errors.Join(result, deleting.Close())
+		}
 	}()
 	expectedInfo, err := expected.Stat()
 	if err != nil {
@@ -127,16 +130,38 @@ func unlinkRecordPathAfterValidation(
 		return fmt.Errorf("record path %q changed identity", name)
 	}
 
-	deleteFile := byte(1)
+	disposition := uint32(
+		windows.FILE_DISPOSITION_DELETE |
+			windows.FILE_DISPOSITION_POSIX_SEMANTICS |
+			windows.FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK,
+	)
 	var status windows.IO_STATUS_BLOCK
 	if err := windows.NtSetInformationFile(
 		windows.Handle(deleting.Fd()),
 		&status,
-		&deleteFile,
-		1,
-		windows.FileDispositionInformation,
+		(*byte)(unsafe.Pointer(&disposition)),
+		uint32(unsafe.Sizeof(disposition)),
+		windows.FileDispositionInformationEx,
 	); err != nil {
 		return fmt.Errorf("remove record path %q: %w", name, err)
+	}
+	if err := deleting.Close(); err != nil {
+		deletingOpen = false
+		return fmt.Errorf("close removed record path %q: %w", name, err)
+	}
+	deletingOpen = false
+
+	current, err = openRecordForIdentity(directory, name)
+	if err == nil {
+		closeErr := current.Close()
+		return errors.Join(
+			fmt.Errorf("record path %q remains after removal", name),
+			closeErr,
+		)
+	}
+	if err != windows.STATUS_OBJECT_NAME_NOT_FOUND &&
+		err != windows.STATUS_OBJECT_PATH_NOT_FOUND {
+		return fmt.Errorf("verify removed record path %q: %w", name, err)
 	}
 	return nil
 }
