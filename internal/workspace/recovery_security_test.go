@@ -1695,12 +1695,17 @@ func TestReconcileQuarantinedRemovalPreservesReplacementPath(t *testing.T) {
 		t.Fatalf("write replacement sentinel: %v", err)
 	}
 
-	if _, err := manager.ReconcileRemovals(context.Background()); err == nil {
+	_, reconcileErr := manager.ReconcileRemovals(context.Background())
+	if reconcileErr == nil {
 		t.Fatal("reconciliation accepted a replacement at the original path")
 	}
 	assertFileContents(t, sentinel, "replacement\n")
 	if _, err := os.Lstat(quarantinePath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("quarantined worktree remains or inspect failed: %v", err)
+		t.Fatalf(
+			"quarantined worktree remains or inspect failed: %v (reconcile error: %v)",
+			err,
+			reconcileErr,
+		)
 	}
 	current, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists ||
