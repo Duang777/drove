@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestRenameRecordRejectsSourceReplacementAfterValidation(t *testing.T) {
@@ -123,6 +125,322 @@ func TestUnlinkRecordPreservesReplacementAfterValidation(t *testing.T) {
 	}
 	assertFileContents(t, sourcePath, "replacement\n")
 	assertFileContents(t, movedPath, "original\n")
+}
+
+func TestUnlinkRecordPreservesReplacementAfterFinalValidation(t *testing.T) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	source, err := os.OpenFile(
+		sourcePath,
+		os.O_RDWR|os.O_CREATE|os.O_EXCL,
+		0o600,
+	)
+	if err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	defer source.Close()
+	if _, err := source.WriteString("original\n"); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	movedPath := filepath.Join(rootPath, "source-original")
+
+	err = unlinkRecordPathAfterValidation(
+		directory,
+		source,
+		"source",
+		func(name string) {
+			path := filepath.Join(rootPath, name)
+			if err := os.Rename(path, movedPath); err != nil {
+				t.Fatalf("move validated source: %v", err)
+			}
+			if err := os.WriteFile(
+				path,
+				[]byte("replacement\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("install replacement source: %v", err)
+			}
+		},
+	)
+	if err == nil {
+		t.Fatal("unlink accepted a final replacement")
+	}
+	assertFileContents(t, sourcePath, "replacement\n")
+	assertFileContents(t, movedPath, "original\n")
+}
+
+func TestUnlinkLinkedRecordPreservesReplacementAfterFinalValidation(
+	t *testing.T,
+) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("original\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	targetPath := filepath.Join(rootPath, "target")
+	if err := os.Link(sourcePath, targetPath); err != nil {
+		t.Fatalf("link target witness: %v", err)
+	}
+	expected, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer expected.Close()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	var replacementPath, movedPath string
+
+	err = unlinkLinkedRecordPathAfterValidation(
+		directory,
+		expected,
+		"source",
+		"target",
+		func(name string) {
+			replacementPath = filepath.Join(rootPath, name)
+			movedPath = replacementPath + ".original"
+			if err := os.Rename(replacementPath, movedPath); err != nil {
+				t.Fatalf("move validated linked source: %v", err)
+			}
+			if err := os.WriteFile(
+				replacementPath,
+				[]byte("replacement\n"),
+				0o600,
+			); err != nil {
+				t.Fatalf("install replacement linked source: %v", err)
+			}
+		},
+	)
+	if err == nil {
+		t.Fatal("linked unlink accepted a final replacement")
+	}
+	assertFileContents(t, replacementPath, "replacement\n")
+	assertFileContents(t, movedPath, "original\n")
+	assertFileContents(t, targetPath, "original\n")
+}
+
+func TestRecoverRecordDeletionRestoresReplacement(t *testing.T) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("original\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	expected, err := os.Open(sourcePath)
+	if err != nil {
+		t.Fatalf("open source: %v", err)
+	}
+	defer expected.Close()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	transactionName := "12121212-1212-4121-8121-121212121212"
+	transaction, err := createRecordDeletionTransaction(
+		namespace,
+		transactionName,
+		"source",
+	)
+	if err != nil {
+		t.Fatalf("create deletion transaction: %v", err)
+	}
+	if err := unix.Linkat(
+		int(directory.Fd()),
+		"source",
+		int(transaction.Fd()),
+		recordDeletionWitness,
+		0,
+	); err != nil {
+		t.Fatalf("link deletion witness: %v", err)
+	}
+	if err := verifyRecordPathIdentity(
+		transaction,
+		expected,
+		recordDeletionWitness,
+	); err != nil {
+		t.Fatalf("verify deletion witness: %v", err)
+	}
+	if err := markRecordDeletionValidated(transaction); err != nil {
+		t.Fatalf("mark deletion validated: %v", err)
+	}
+	movedPath := filepath.Join(rootPath, "source-original")
+	if err := os.Rename(sourcePath, movedPath); err != nil {
+		t.Fatalf("move validated source: %v", err)
+	}
+	if err := os.WriteFile(
+		sourcePath,
+		[]byte("replacement\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("install replacement source: %v", err)
+	}
+	if err := unix.Renameat(
+		int(directory.Fd()),
+		"source",
+		int(transaction.Fd()),
+		recordDeletionCandidate,
+	); err != nil {
+		t.Fatalf("move replacement candidate: %v", err)
+	}
+	if err := transaction.Close(); err != nil {
+		t.Fatalf("close deletion transaction: %v", err)
+	}
+	if err := namespace.Close(); err != nil {
+		t.Fatalf("close deletion namespace: %v", err)
+	}
+
+	namespace, err = openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("reopen deletion namespace: %v", err)
+	}
+	defer namespace.Close()
+	if err := recoverRecordDeletionTransactions(
+		directory,
+		namespace,
+	); err != nil {
+		t.Fatalf("recover deletion transaction: %v", err)
+	}
+	assertFileContents(t, sourcePath, "replacement\n")
+	assertFileContents(t, movedPath, "original\n")
+	entries, err := readRecordDeletionDirectory(namespace)
+	if err != nil {
+		t.Fatalf("read recovered deletion namespace: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("recovered deletion artifacts remain: %v", entries)
+	}
+}
+
+func TestRecoverRecordDeletionCompletesValidatedCleanup(t *testing.T) {
+	rootPath := t.TempDir()
+	sourcePath := filepath.Join(rootPath, "source")
+	if err := os.WriteFile(sourcePath, []byte("original\n"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	defer namespace.Close()
+	transactionName := "34343434-3434-4343-8343-343434343434"
+	transaction, err := createRecordDeletionTransaction(
+		namespace,
+		transactionName,
+		"source",
+	)
+	if err != nil {
+		t.Fatalf("create deletion transaction: %v", err)
+	}
+	if err := unix.Linkat(
+		int(directory.Fd()),
+		"source",
+		int(transaction.Fd()),
+		recordDeletionWitness,
+		0,
+	); err != nil {
+		t.Fatalf("link deletion witness: %v", err)
+	}
+	if err := markRecordDeletionValidated(transaction); err != nil {
+		t.Fatalf("mark deletion validated: %v", err)
+	}
+	if err := unix.Renameat(
+		int(directory.Fd()),
+		"source",
+		int(transaction.Fd()),
+		recordDeletionCandidate,
+	); err != nil {
+		t.Fatalf("move deletion candidate: %v", err)
+	}
+	if err := unlinkPrivateRecordPath(
+		transaction,
+		recordDeletionCandidate,
+	); err != nil {
+		t.Fatalf("remove deletion candidate: %v", err)
+	}
+	if err := unlinkPrivateRecordPath(
+		transaction,
+		recordDeletionWitness,
+	); err != nil {
+		t.Fatalf("remove deletion witness: %v", err)
+	}
+	if err := transaction.Sync(); err != nil {
+		t.Fatalf("sync interrupted deletion transaction: %v", err)
+	}
+	if err := transaction.Close(); err != nil {
+		t.Fatalf("close deletion transaction: %v", err)
+	}
+
+	if err := recoverRecordDeletionTransactions(
+		directory,
+		namespace,
+	); err != nil {
+		t.Fatalf("recover validated deletion cleanup: %v", err)
+	}
+	if _, err := os.Lstat(sourcePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("deleted source returned: %v", err)
+	}
+	entries, err := readRecordDeletionDirectory(namespace)
+	if err != nil {
+		t.Fatalf("read recovered deletion namespace: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("recovered deletion artifacts remain: %v", entries)
+	}
+}
+
+func TestRecoverRecordDeletionRemovesEmptyTransaction(t *testing.T) {
+	rootPath := t.TempDir()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	defer namespace.Close()
+	transactionName := "56565656-5656-4565-8565-565656565656"
+	if err := unix.Mkdirat(
+		int(namespace.Fd()),
+		transactionName,
+		0o700,
+	); err != nil {
+		t.Fatalf("create empty deletion transaction: %v", err)
+	}
+	if err := namespace.Sync(); err != nil {
+		t.Fatalf("sync empty deletion transaction: %v", err)
+	}
+
+	if err := recoverRecordDeletionTransactions(
+		directory,
+		namespace,
+	); err != nil {
+		t.Fatalf("recover empty deletion transaction: %v", err)
+	}
+	entries, err := readRecordDeletionDirectory(namespace)
+	if err != nil {
+		t.Fatalf("read recovered deletion namespace: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("empty deletion transaction remains: %v", entries)
+	}
 }
 
 func TestUnlinkLinkedRecordPathAcceptsMissingSourceWithMatchingWitness(

@@ -19,7 +19,7 @@ func configureIncludeManifestCommand(
 	if runtime.GOOS == "linux" {
 		return fmt.Sprintf("/proc/self/fd/%d", fd), true, noCleanup, nil
 	}
-	return fmt.Sprintf("/dev/fd/%d", fd), true, noCleanup, nil
+	return fmt.Sprintf("/dev/fd/%d", fd), false, noCleanup, nil
 }
 
 func noCleanup() error {

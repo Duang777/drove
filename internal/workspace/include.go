@@ -420,12 +420,22 @@ func (m *Manager) runIncludeManifest(
 	}
 	defer func() {
 		verifyErr := verifyRealPathRoot(directory, root)
+		var cleanupErr error
+		if verifyErr == nil {
+			cleanupErr = cleanupRecordDeletionNamespace(root)
+		}
 		closeErr := root.Close()
 		var removeErr error
-		if verifyErr == nil {
+		if verifyErr == nil && cleanupErr == nil {
 			removeErr = os.Remove(directory)
 		}
-		result = errors.Join(result, verifyErr, closeErr, removeErr)
+		result = errors.Join(
+			result,
+			verifyErr,
+			cleanupErr,
+			closeErr,
+			removeErr,
+		)
 	}()
 
 	name := includeManifestTemporaryName()

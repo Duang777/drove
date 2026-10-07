@@ -359,6 +359,12 @@ func ensureRemovalMarker(
 	if err := cleanupRemovalMarkerTemps(root, record); err != nil {
 		return err
 	}
+	defer func() {
+		result = errors.Join(
+			result,
+			cleanupRecordDeletionNamespace(root),
+		)
+	}()
 	name := removalMarkerName(record)
 	_, err := root.Lstat(name)
 	switch {
@@ -534,10 +540,11 @@ func cleanupRemovalMarkerTemps(
 		}
 		removed = true
 	}
+	var syncErr error
 	if removed {
-		return syncRecordBucket(root, removalMarkerName(record))
+		syncErr = syncRecordBucket(root, removalMarkerName(record))
 	}
-	return nil
+	return errors.Join(syncErr, cleanupRecordDeletionNamespace(root))
 }
 
 func removeIncompleteRemovalMarker(
@@ -669,6 +676,9 @@ func validateClearedRemovalDirectory(
 	record workspaceRecord,
 	requireMarker bool,
 ) error {
+	if err := cleanupRecordDeletionNamespace(root); err != nil {
+		return err
+	}
 	entries, err := readRootDirectory(root)
 	if err != nil {
 		return err
@@ -765,7 +775,7 @@ func removeRemovalMarkerIfPresent(
 	); err != nil {
 		return fmt.Errorf("workspace: remove removal marker: %w", err)
 	}
-	return nil
+	return cleanupRecordDeletionNamespace(root)
 }
 
 func findRemovalQuarantine(

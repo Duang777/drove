@@ -191,6 +191,22 @@ func unlinkLinkedRecordPath(
 	name string,
 	witnessName string,
 ) error {
+	return unlinkLinkedRecordPathAfterValidation(
+		directory,
+		expected,
+		name,
+		witnessName,
+		nil,
+	)
+}
+
+func unlinkLinkedRecordPathAfterValidation(
+	directory *os.File,
+	expected *os.File,
+	name string,
+	witnessName string,
+	afterValidation func(string),
+) error {
 	if err := verifyRecordPathIdentity(
 		directory,
 		expected,
@@ -207,51 +223,13 @@ func unlinkLinkedRecordPath(
 	} else if err != nil {
 		return err
 	}
-	fd := int(directory.Fd())
-	isolatedName := ".drove-install-" + uuid.NewString()
-	if err := unix.Renameat(fd, name, fd, isolatedName); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			if witnessErr := verifyRecordPathIdentity(
-				directory,
-				expected,
-				witnessName,
-			); witnessErr == nil {
-				return nil
-			}
-		}
-		return fmt.Errorf("isolate linked record path %q: %w", name, err)
-	}
-	restore := func() error {
-		if err := unix.Linkat(fd, isolatedName, fd, name, 0); err != nil {
-			return fmt.Errorf(
-				"restore linked record path %q: %w",
-				name,
-				err,
-			)
-		}
-		if err := unix.Unlinkat(fd, isolatedName, 0); err != nil {
-			return fmt.Errorf(
-				"remove restored linked record isolation %q: %w",
-				isolatedName,
-				err,
-			)
-		}
-		return nil
-	}
-	if err := errors.Join(
-		verifyRecordPathIdentity(directory, expected, isolatedName),
-		verifyRecordPathIdentity(directory, expected, witnessName),
+	if err := unlinkRecordPathAfterValidation(
+		directory,
+		expected,
+		name,
+		afterValidation,
 	); err != nil {
-		return errors.Join(
-			fmt.Errorf("verify isolated linked record path %q: %w", name, err),
-			restore(),
-		)
-	}
-	if err := unix.Unlinkat(fd, isolatedName, 0); err != nil {
-		return errors.Join(
-			fmt.Errorf("remove isolated linked record path %q: %w", name, err),
-			restore(),
-		)
+		return fmt.Errorf("remove linked record path %q: %w", name, err)
 	}
 	return nil
 }
