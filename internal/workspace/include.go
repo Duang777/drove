@@ -270,7 +270,7 @@ func repositoryIgnoreCase(
 
 func trackedPathKey(path string, ignoreCase bool) string {
 	key := filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
-	if ignoreCase || runtime.GOOS == "windows" {
+	if ignoreCase {
 		key = cases.Fold().String(key)
 	}
 	if runtime.GOOS == "darwin" {

@@ -11,6 +11,20 @@ import (
 	"testing"
 )
 
+func TestTrackedPathKeyPreservesCaseForCaseSensitiveRepository(t *testing.T) {
+	got := trackedPathKey("Directory/Secret.local", false)
+	if got != "Directory/Secret.local" {
+		t.Fatalf("tracked path key = %q, want case preserved", got)
+	}
+}
+
+func TestTrackedPathKeyFoldsCaseForCaseInsensitiveRepository(t *testing.T) {
+	got := trackedPathKey("Directory/Secret.local", true)
+	if got != "directory/secret.local" {
+		t.Fatalf("tracked path key = %q, want folded case", got)
+	}
+}
+
 func TestValidateIncludedPathRejectsInvalidUTF8(t *testing.T) {
 	path := string([]byte{'i', 'n', 'v', 'a', 'l', 'i', 'd', '-', 0xff})
 	if _, err := validateIncludedPath(path); err == nil {

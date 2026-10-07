@@ -37,13 +37,31 @@ func configureIncludeManifestCommand(
 		windows.FILE_SHARE_READ,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_ATTRIBUTE_NORMAL,
+		windows.FILE_ATTRIBUTE_NORMAL|
+			windows.FILE_FLAG_OPEN_REPARSE_POINT,
 		0,
 	)
 	if err != nil {
 		return "", false, nil, fmt.Errorf(
 			"workspace: lock include manifest: %w",
 			err,
+		)
+	}
+	var handleInfo windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(
+		handle,
+		&handleInfo,
+	); err != nil {
+		_ = windows.CloseHandle(handle)
+		return "", false, nil, fmt.Errorf(
+			"workspace: inspect include manifest handle: %w",
+			err,
+		)
+	}
+	if handleInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		_ = windows.CloseHandle(handle)
+		return "", false, nil, errors.New(
+			"workspace: include manifest is a reparse point",
 		)
 	}
 	guard := os.NewFile(uintptr(handle), path)
