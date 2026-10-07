@@ -315,9 +315,15 @@ func TestReconcilePreparationsAcceptsCommittedBranchAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restart manager: %v", err)
 	}
+	recovered := Workspace{
+		AgentID:    prepared.AgentID,
+		Repository: prepared.Repository,
+		Path:       prepared.Path,
+		Branch:     prepared.Branch,
+	}
 	if err := restarted.ReconcilePreparations(
 		context.Background(),
-		[]Workspace{prepared},
+		[]Workspace{recovered},
 	); err != nil {
 		t.Fatalf("adopt advanced committed preparation: %v", err)
 	}
