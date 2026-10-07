@@ -1681,6 +1681,17 @@ func TestReconcileQuarantinedRemovalPreservesReplacementPath(t *testing.T) {
 	if err := manager.replaceWorkspaceRecord(record); err != nil {
 		t.Fatalf("write removal intent: %v", err)
 	}
+	workspaceRoot, err := openRealPathRoot(prepared.Path)
+	if err != nil {
+		t.Fatalf("open workspace root: %v", err)
+	}
+	if err := ensureRemovalMarker(workspaceRoot, record); err != nil {
+		_ = workspaceRoot.Close()
+		t.Fatalf("install removal marker: %v", err)
+	}
+	if err := workspaceRoot.Close(); err != nil {
+		t.Fatalf("close workspace root: %v", err)
+	}
 	quarantineName := removalQuarantinePrefix(record) +
 		"57575757-5757-4757-8757-575757575757"
 	quarantinePath := filepath.Join(filepath.Dir(prepared.Path), quarantineName)
