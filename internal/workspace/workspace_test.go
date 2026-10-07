@@ -2300,6 +2300,7 @@ func newTestRepository(t *testing.T) string {
 	}
 	runGit(t, repository, "init", "--initial-branch=main")
 	runGit(t, repository, "config", "core.autocrlf", "false")
+	runGit(t, repository, "config", "core.longpaths", "true")
 	runGit(t, repository, "config", "user.name", "Drove Test")
 	runGit(t, repository, "config", "user.email", "drove@example.invalid")
 	files := map[string]string{
