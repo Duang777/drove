@@ -959,6 +959,9 @@ func TestReconcilePreparationWithoutIdentityPreservesPresentPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare workspace: %v", err)
 	}
+	if err := prepared.preparation.Close(); err != nil {
+		t.Fatalf("close preparation lease: %v", err)
+	}
 	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
 	if err != nil || !exists {
 		t.Fatalf("read workspace record: exists=%v err=%v", exists, err)
