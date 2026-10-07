@@ -618,6 +618,7 @@ func TestPreparedChangeRestrictsDoneToProcessExit(t *testing.T) {
 
 func TestRecordError(t *testing.T) {
 	a := New("a1")
+	stateSince := a.StateSince()
 	prepared, err := a.Prepare(RecordError("boom", Evidence{
 		Source: EvidenceProcess, Event: "process_start_failed", Confidence: 1,
 	}))
@@ -629,5 +630,11 @@ func TestRecordError(t *testing.T) {
 	}
 	if a.LastError() != "boom" {
 		t.Fatalf("LastError = %q, want boom", a.LastError())
+	}
+	if !a.UpdatedAt().Equal(prepared.Timestamp()) {
+		t.Fatalf("UpdatedAt = %s, want %s", a.UpdatedAt(), prepared.Timestamp())
+	}
+	if !a.StateSince().Equal(stateSince) {
+		t.Fatalf("StateSince = %s, want %s", a.StateSince(), stateSince)
 	}
 }

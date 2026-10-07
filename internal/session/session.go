@@ -37,6 +37,7 @@ type Status struct {
 	PID                   int                         `json:"pid,omitempty"`
 	CreatedAt             time.Time                   `json:"created_at"`
 	UpdatedAt             time.Time                   `json:"updated_at"`
+	StateSince            time.Time                   `json:"state_since"`
 	LastError             string                      `json:"last_error,omitempty"`
 	HookPolicy            agent.HookPolicy            `json:"hook_policy"`
 	HookStatus            detect.HookStatus           `json:"hook_status"`
@@ -1127,6 +1128,7 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		State:          state,
 		CreatedAt:      a.CreatedAt(),
 		UpdatedAt:      a.UpdatedAt(),
+		StateSince:     a.StateSince(),
 		LastError:      a.LastError(),
 		HookPolicy:     a.HookPolicy(),
 		HookStatus:     hookStatus,

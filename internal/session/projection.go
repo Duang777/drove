@@ -53,6 +53,7 @@ type sessionDraft struct {
 	lastTransition         *agent.Evidence
 	createdAt              time.Time
 	updatedAt              time.Time
+	stateSince             time.Time
 	firstSeq               uint64
 	lastStateGapGeneration uint64
 	vendorSessionRef       string
@@ -288,6 +289,7 @@ func (p *recoveryProjector) applyCreated(row store.EventRow) error {
 	draft.vendor = metadata.Vendor
 	draft.state = agent.StatePending
 	draft.updatedAt = row.Timestamp
+	draft.stateSince = row.Timestamp
 	draft.hasCreated = true
 	return nil
 }
@@ -549,6 +551,7 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 		draft.lastTransition = evidence
 	}
 	draft.updatedAt = row.Timestamp
+	draft.stateSince = row.Timestamp
 	draft.lastStateGapGeneration = p.gapGeneration
 	draft.hasState = true
 	return nil
@@ -924,9 +927,14 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			}
 			state = agent.StateStopped
 			updatedAt = recoveryTime
+			draft.stateSince = recoveryTime
 		}
 		if updatedAt.Before(draft.createdAt) {
 			updatedAt = draft.createdAt
+		}
+		stateSince := draft.stateSince
+		if stateSince.IsZero() || stateSince.Before(draft.createdAt) {
+			stateSince = draft.createdAt
 		}
 		plan.Snapshots = append(plan.Snapshots, agent.RestoreSnapshot{
 			ID:              agent.ID(draft.id),
@@ -943,6 +951,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			LastTransition:  draft.lastTransition,
 			CreatedAt:       draft.createdAt,
 			UpdatedAt:       updatedAt,
+			StateSince:      stateSince,
 		})
 	}
 	plan.Report.Sessions = len(plan.Snapshots)

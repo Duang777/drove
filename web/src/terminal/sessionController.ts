@@ -503,6 +503,12 @@ export class TerminalSessionController implements TerminalControllerStore {
               this.access === 'read_write' &&
               this.snapshot.replay.kind === 'live',
           })
+          if (
+            this.access === 'read_write' &&
+            this.snapshot.replay.kind === 'live'
+          ) {
+            this.liveTerminal.focus()
+          }
           this.proposeResize()
         } else {
           requireCursorMatch(this.eventCursor, message.cursor, 'events')

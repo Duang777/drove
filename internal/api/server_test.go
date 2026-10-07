@@ -358,6 +358,11 @@ func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 		status.PID <= 0 {
 		t.Fatalf("status = %+v, want live oneshot session", status)
 	}
+	if status.StateSince.IsZero() ||
+		status.StateSince.Before(status.CreatedAt) ||
+		status.StateSince.After(status.UpdatedAt) {
+		t.Fatalf("state_since = %s outside [%s, %s]", status.StateSince, status.CreatedAt, status.UpdatedAt)
+	}
 }
 
 func TestHandleResumeReturnsExistingAgentAndMapsConflicts(t *testing.T) {

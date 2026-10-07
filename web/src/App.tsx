@@ -1,10 +1,13 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { listAgents } from './api/client'
 import type { AgentStatus } from './api/types'
 import { useAgentEvents } from './hooks/useAgentEvents'
+import { useFleetSnapshots } from './hooks/useFleetSnapshots'
 import { AgentList } from './components/AgentList'
 import { AgentDetailPage } from './components/AgentDetailPage'
 import { EventLog } from './components/EventLog'
+import { resolveFleetKeyboardAction } from './fleet/fleetKeyboard'
+import { projectFleetAgents } from './fleet/fleetProjection'
 import {
   appLocationHref,
   parseAppLocation,
@@ -48,6 +51,59 @@ export default function App() {
     window.history.pushState(null, '', appLocationHref(next))
     setLocation(next)
   }, [])
+
+  const fleetAgents = useMemo(
+    () => projectFleetAgents(agents, events),
+    [agents, events],
+  )
+  const snapshotAgentIDs = useMemo(
+    () =>
+      fleetAgents
+        .filter(
+          (agent) =>
+            agent.state !== 'done' && agent.state !== 'stopped',
+        )
+        .map((agent) => agent.agentID),
+    [fleetAgents],
+  )
+  const snapshots = useFleetSnapshots(snapshotAgentIDs, {
+    enabled: location.kind === 'fleet',
+  })
+  const nowMillis = useFleetClock(
+    location.kind === 'fleet' &&
+      fleetAgents.some((agent) => agent.state === 'blocked'),
+  )
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const action = resolveFleetKeyboardAction({
+        location,
+        key: event.key,
+        hasModifier:
+          event.metaKey || event.ctrlKey || event.altKey || event.shiftKey,
+        editableTarget: isEditableTarget(event.target),
+        orderedAgentIDs: fleetAgents.map((agent) => agent.agentID),
+      })
+      if (action === null) return
+      event.preventDefault()
+      switch (action.kind) {
+        case 'open_agent':
+          navigate({ kind: 'agent', agentID: action.agentID })
+          return
+        case 'back_to_fleet':
+          navigate({ kind: 'fleet' })
+          return
+        default: {
+          const exhaustive: never = action
+          return exhaustive
+        }
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown, true)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown, true)
+    }
+  }, [fleetAgents, location, navigate])
 
   const selectedAgent =
     location.kind === 'agent'
@@ -94,8 +150,9 @@ export default function App() {
       ) : (
         <main id="main-content" className="workspace">
           <AgentList
-            agents={agents}
-            events={events}
+            agents={fleetAgents}
+            snapshots={snapshots.byAgentID}
+            nowMillis={nowMillis}
             onOpenAgent={(agentID) =>
               navigate({ kind: 'agent', agentID })
             }
@@ -105,5 +162,30 @@ export default function App() {
         </main>
       )}
     </div>
+  )
+}
+
+function useFleetClock(enabled: boolean): number {
+  const [nowMillis, setNowMillis] = useState(() => Date.now())
+  useEffect(() => {
+    if (!enabled) return
+    setNowMillis(Date.now())
+    const timer = window.setInterval(() => {
+      setNowMillis(Date.now())
+    }, 250)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [enabled])
+  return nowMillis
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return (
+    target.isContentEditable ||
+    target.tagName === 'INPUT' ||
+    target.tagName === 'TEXTAREA' ||
+    target.tagName === 'SELECT'
   )
 }

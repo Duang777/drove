@@ -34,4 +34,6 @@ coverage.html
 # Frontend
 web/node_modules/
 web/dist/
+web/playwright-report/
+web/test-results/
 web/tsconfig.tsbuildinfo

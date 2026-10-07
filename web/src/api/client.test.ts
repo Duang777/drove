@@ -136,6 +136,7 @@ describe('terminal REST parsing', () => {
             state: 'blocked',
             created_at: '2026-10-04T12:00:00Z',
             updated_at: '2026-10-04T12:00:05Z',
+            state_since: '2026-10-04T12:00:03Z',
             hook_policy: 'auto',
             hook_status: 'fallback',
             signal_injection: 'off',
@@ -164,6 +165,7 @@ describe('terminal REST parsing', () => {
       {
         agent_id: 'agent-1',
         dir: '/workspace/drove',
+        state_since: '2026-10-04T12:00:03Z',
         hook_policy: 'auto',
         signal_injection_reason: 'unsupported',
         resumable: true,

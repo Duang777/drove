@@ -56,6 +56,13 @@ export interface ScreenAttribution {
   evidence: string
 }
 
+/** terminal notify 状态证据的有界归因。 */
+export interface TerminalAttribution {
+  protocol: 'osc9'
+  output_offset: number
+  last_output_seq: number
+}
+
 interface StateEvidenceBase {
   event: string
   confidence: number
@@ -64,8 +71,16 @@ interface StateEvidenceBase {
 /** 状态迁移的脱敏证据。 */
 export type StateEvidence =
   | (StateEvidenceBase & {
-      source: 'hook' | 'notify'
+      source: 'hook'
       delivery_id: string
+    })
+  | (StateEvidenceBase & {
+      source: 'notify'
+      delivery_id: string
+    })
+  | (StateEvidenceBase & {
+      source: 'notify'
+      terminal: TerminalAttribution
     })
   | (StateEvidenceBase & {
       source: 'screen'
@@ -91,6 +106,7 @@ export interface AgentStatus {
   pid?: number
   created_at: string
   updated_at: string
+  state_since: string
   last_error?: string
   hook_policy: HookPolicy
   hook_status: HookStatus
