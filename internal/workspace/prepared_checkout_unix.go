@@ -5,12 +5,9 @@ package workspace
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -109,8 +106,10 @@ func checkoutPreparedWorktree(
 		switch entry.mode {
 		case preparedCheckoutRegularMode, preparedCheckoutExecutableMode:
 			if err := installPreparedCheckoutFile(
-				repository.gitRoot,
+				ctx,
+				repository,
 				worktreeRoot,
+				expectedHeadOID,
 				entry,
 			); err != nil {
 				return err
@@ -449,111 +448,43 @@ func bindPreparedCheckoutTemps(
 	return nil
 }
 
-func verifyPreparedCheckoutTemp(entry *preparedCheckoutEntry) error {
-	if entry.temp == nil || entry.temp.file == nil {
-		return fmt.Errorf(
-			"workspace: prepared checkout source for %q is not open",
-			entry.path,
-		)
-	}
-	oid, err := preparedCheckoutTempBlobOID(
-		entry.temp,
-		entry.path,
-		entry.oid,
-	)
-	if err != nil {
-		return err
-	}
-	if !strings.EqualFold(oid, entry.oid) {
-		return fmt.Errorf(
-			"workspace: prepared checkout source for %q does not match the index",
-			entry.path,
-		)
-	}
-	entry.temp.verified = true
-	return nil
-}
-
-func preparedCheckoutTempBlobOID(
-	temp *preparedCheckoutTemp,
+func hashPreparedCheckoutBytes(
+	ctx context.Context,
+	repository repositoryCapability,
+	input io.Reader,
+	output io.Writer,
 	path string,
-	expectedOID string,
+	expectedHeadOID string,
 ) (string, error) {
-	before, err := temp.file.Stat()
-	if err != nil {
-		return "", fmt.Errorf(
-			"workspace: inspect prepared checkout source for %q: %w",
-			path,
-			err,
-		)
-	}
-	if !samePreparedCheckoutTempState(temp.info, before) {
-		return "", fmt.Errorf(
-			"workspace: prepared checkout source for %q changed before reading",
-			path,
-		)
-	}
-	if _, err := temp.file.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf(
-			"workspace: rewind prepared checkout source for %q: %w",
-			path,
-			err,
-		)
-	}
-	digest, err := newPreparedCheckoutBlobHash(expectedOID, before.Size())
+	command, cleanup, err := repository.privateGitCommandAt(
+		ctx,
+		".",
+		"--attr-source="+expectedHeadOID,
+		"hash-object",
+		"--stdin",
+		"--path="+path,
+	)
 	if err != nil {
 		return "", err
 	}
-	read, err := io.Copy(digest, temp.file)
-	if err != nil {
+	command.Stdin = io.TeeReader(input, output)
+	rawOID, commandErr := runGitCommand(command, "")
+	if err := errors.Join(commandErr, cleanup()); err != nil {
 		return "", fmt.Errorf(
-			"workspace: hash prepared checkout source for %q: %w",
+			"workspace: hash prepared checkout bytes for %q: %w",
 			path,
 			err,
 		)
 	}
-	after, err := temp.file.Stat()
-	if err != nil {
+	oid := strings.TrimSpace(string(rawOID))
+	if err := validatePreparedCheckoutOID(oid); err != nil {
 		return "", fmt.Errorf(
-			"workspace: inspect prepared checkout source for %q after reading: %w",
+			"workspace: hash prepared checkout bytes for %q: %w",
 			path,
 			err,
 		)
 	}
-	if read != before.Size() ||
-		!samePreparedCheckoutTempState(before, after) ||
-		!samePreparedCheckoutTempState(temp.info, after) {
-		return "", fmt.Errorf(
-			"workspace: prepared checkout source for %q changed while reading",
-			path,
-		)
-	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
-}
-
-func newPreparedCheckoutBlobHash(
-	expectedOID string,
-	size int64,
-) (hash.Hash, error) {
-	var digest hash.Hash
-	switch len(expectedOID) {
-	case sha1.Size * 2:
-		digest = sha1.New()
-	case sha256.Size * 2:
-		digest = sha256.New()
-	default:
-		return nil, errors.New(
-			"workspace: prepared checkout object ID uses an unsupported hash",
-		)
-	}
-	header := fmt.Sprintf("blob %d\x00", size)
-	if _, err := io.WriteString(digest, header); err != nil {
-		return nil, fmt.Errorf(
-			"workspace: initialize prepared checkout blob hash: %w",
-			err,
-		)
-	}
-	return digest, nil
+	return oid, nil
 }
 
 func samePreparedCheckoutTempState(
@@ -597,8 +528,10 @@ func removePreparedCheckoutTemps(
 }
 
 func installPreparedCheckoutFile(
-	gitRoot *os.Root,
+	ctx context.Context,
+	repository repositoryCapability,
 	worktreeRoot *os.Root,
+	expectedHeadOID string,
 	entry *preparedCheckoutEntry,
 ) (result error) {
 	if entry.temp == nil {
@@ -607,21 +540,21 @@ func installPreparedCheckoutFile(
 			entry.path,
 		)
 	}
-	if err := openPreparedCheckoutTemp(gitRoot, entry.temp); err != nil {
+	if err := openPreparedCheckoutTemp(
+		repository.gitRoot,
+		entry.temp,
+	); err != nil {
 		return err
 	}
 	defer func() {
 		result = errors.Join(
 			result,
 			removePreparedCheckoutTemps(
-				gitRoot,
+				repository.gitRoot,
 				[]*preparedCheckoutTemp{entry.temp},
 			),
 		)
 	}()
-	if err := verifyPreparedCheckoutTemp(entry); err != nil {
-		return err
-	}
 	input := entry.temp.file
 	sourceInfo, err := input.Stat()
 	if err != nil {
@@ -694,54 +627,49 @@ func installPreparedCheckoutFile(
 			err,
 		)
 	}
-	copiedDigest, err := newPreparedCheckoutBlobHash(
-		entry.oid,
-		sourceInfo.Size(),
+	copiedOID, err := hashPreparedCheckoutBytes(
+		ctx,
+		repository,
+		input,
+		output,
+		entry.path,
+		expectedHeadOID,
 	)
 	if err != nil {
 		return err
-	}
-	copied, err := io.Copy(io.MultiWriter(output, copiedDigest), input)
-	if err != nil {
-		return fmt.Errorf(
-			"workspace: copy prepared checkout path %q: %w",
-			entry.path,
-			err,
-		)
 	}
 	afterCopy, err := input.Stat()
 	if err != nil {
 		return err
 	}
-	copiedOID := hex.EncodeToString(copiedDigest.Sum(nil))
-	if copied != sourceInfo.Size() ||
-		!samePreparedCheckoutTempState(sourceInfo, afterCopy) ||
-		!samePreparedCheckoutTempState(entry.temp.info, afterCopy) ||
-		!strings.EqualFold(copiedOID, entry.oid) {
-		return fmt.Errorf(
-			"workspace: prepared checkout source for %q changed or did not match the index while copying",
-			entry.path,
-		)
-	}
-	verifiedOID, err := preparedCheckoutTempBlobOID(
-		entry.temp,
-		entry.path,
-		entry.oid,
-	)
+	outputInfo, err := output.Stat()
 	if err != nil {
 		return err
 	}
-	if !strings.EqualFold(verifiedOID, entry.oid) ||
-		!strings.EqualFold(verifiedOID, copiedOID) {
+	if !samePreparedCheckoutTempState(sourceInfo, afterCopy) ||
+		!samePreparedCheckoutTempState(entry.temp.info, afterCopy) {
 		return fmt.Errorf(
-			"workspace: prepared checkout source for %q did not match the index while verifying",
+			"workspace: prepared checkout source for %q changed while copying",
 			entry.path,
 		)
 	}
+	if outputInfo.Size() != sourceInfo.Size() {
+		return fmt.Errorf(
+			"workspace: prepared checkout copy for %q is incomplete",
+			entry.path,
+		)
+	}
+	if !strings.EqualFold(copiedOID, entry.oid) {
+		return fmt.Errorf(
+			"workspace: prepared checkout source for %q does not match the index",
+			entry.path,
+		)
+	}
+	entry.temp.verified = true
 	if err := output.Sync(); err != nil {
 		return err
 	}
-	outputInfo, err := output.Stat()
+	outputInfo, err = output.Stat()
 	if err != nil {
 		return err
 	}

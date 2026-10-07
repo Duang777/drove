@@ -160,6 +160,40 @@ func TestPreparedCheckoutRejectsWorkingTreeFilter(t *testing.T) {
 	}
 }
 
+func TestPreparedCheckoutPreservesTextConversion(t *testing.T) {
+	repository := newTestRepository(t)
+	if err := os.WriteFile(
+		filepath.Join(repository, ".gitattributes"),
+		[]byte("tracked.txt text eol=crlf\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("write attributes: %v", err)
+	}
+	runGit(t, repository, "add", ".gitattributes")
+	runGit(t, repository, "commit", "-m", "add checkout text conversion")
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare converted worktree: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(prepared.Path, "tracked.txt"))
+	if err != nil {
+		t.Fatalf("read converted tracked file: %v", err)
+	}
+	if string(content) != "tracked\r\n" {
+		t.Fatalf("converted tracked file = %q, want CRLF", content)
+	}
+}
+
 func TestRemovePreparedCheckoutTempsPreservesReplacement(t *testing.T) {
 	path := t.TempDir()
 	const (
@@ -192,15 +226,7 @@ func TestRemovePreparedCheckoutTempsPreservesReplacement(t *testing.T) {
 			}
 		}
 	}()
-	entry := &preparedCheckoutEntry{
-		mode: preparedCheckoutRegularMode,
-		oid:  "3136b9e8f996037b1178065c3d107c5053690d7f",
-		path: "tracked.txt",
-		temp: temps[0],
-	}
-	if err := verifyPreparedCheckoutTemp(entry); err != nil {
-		t.Fatalf("verify prepared checkout temporary: %v", err)
-	}
+	temp.verified = true
 	if err := os.Rename(
 		filepath.Join(path, name),
 		filepath.Join(path, original),
