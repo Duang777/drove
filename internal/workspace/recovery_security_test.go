@@ -242,7 +242,7 @@ func TestRemoveOpenedDirectoryPreservesCanonicalReplacement(t *testing.T) {
 	}
 }
 
-func TestRemoveAllRecoversIsolatedDirectoryDeletion(t *testing.T) {
+func TestRemoveAllRejectsUnownedIsolatedDirectoryDeletion(t *testing.T) {
 	parentPath := t.TempDir()
 	debrisName := rootDeletionPrefix("workspace") +
 		"49494949-4949-4949-8949-494949494949"
@@ -263,12 +263,100 @@ func TestRemoveAllRecoversIsolatedDirectoryDeletion(t *testing.T) {
 	}
 	defer parent.Close()
 
-	if err := removeAllFromRoot(parent, "workspace"); err != nil {
-		t.Fatalf("recover isolated deletion: %v", err)
+	if err := removeAllFromRoot(parent, "workspace"); err == nil {
+		t.Fatal("remove accepted deletion debris without persisted identity")
+	}
+	assertFileContents(t, filepath.Join(debrisPath, "old"), "old\n")
+}
+
+func TestRemoveRootDeletionDebrisRecoversPersistedIdentity(t *testing.T) {
+	parentPath := t.TempDir()
+	originalPath := filepath.Join(parentPath, "workspace")
+	if err := os.Mkdir(originalPath, 0o700); err != nil {
+		t.Fatalf("create original directory: %v", err)
+	}
+	original, err := openRealPathRoot(originalPath)
+	if err != nil {
+		t.Fatalf("open original directory: %v", err)
+	}
+	identity, identityErr := openedDirectoryIdentity(original)
+	closeErr := original.Close()
+	if err := errors.Join(identityErr, closeErr); err != nil {
+		t.Fatalf("inspect original directory identity: %v", err)
+	}
+	debrisName := rootDeletionName("workspace", identity)
+	debrisPath := filepath.Join(parentPath, debrisName)
+	if err := os.Rename(originalPath, debrisPath); err != nil {
+		t.Fatalf("isolate original directory: %v", err)
+	}
+	parent, err := openRealPathRoot(parentPath)
+	if err != nil {
+		t.Fatalf("open parent root: %v", err)
+	}
+	defer parent.Close()
+
+	if err := removeAllFromRoot(parent, "workspace"); err == nil {
+		t.Fatal("remove inferred deletion ownership from a missing original name")
+	}
+	if _, err := os.Lstat(debrisPath); err != nil {
+		t.Fatalf("untrusted identity-bound debris changed: %v", err)
+	}
+	if err := removeRootDeletionDebris(
+		parent,
+		"workspace",
+		identity,
+	); err != nil {
+		t.Fatalf("recover identity-bound deletion: %v", err)
 	}
 	if _, err := os.Lstat(debrisPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("deletion debris remains: %v", err)
+		t.Fatalf("identity-bound deletion debris remains: %v", err)
 	}
+}
+
+func TestRemoveRootDeletionDebrisRejectsReplacedIdentity(t *testing.T) {
+	parentPath := t.TempDir()
+	originalPath := filepath.Join(parentPath, "workspace")
+	if err := os.Mkdir(originalPath, 0o700); err != nil {
+		t.Fatalf("create original directory: %v", err)
+	}
+	original, err := openRealPathRoot(originalPath)
+	if err != nil {
+		t.Fatalf("open original directory: %v", err)
+	}
+	identity, identityErr := openedDirectoryIdentity(original)
+	closeErr := original.Close()
+	if err := errors.Join(identityErr, closeErr); err != nil {
+		t.Fatalf("inspect original directory identity: %v", err)
+	}
+	if err := os.Rename(
+		originalPath,
+		filepath.Join(parentPath, "original-held"),
+	); err != nil {
+		t.Fatalf("retain original directory identity: %v", err)
+	}
+	debrisName := rootDeletionName("workspace", identity)
+	debrisPath := filepath.Join(parentPath, debrisName)
+	if err := os.Mkdir(debrisPath, 0o700); err != nil {
+		t.Fatalf("create replacement debris: %v", err)
+	}
+	replacement := filepath.Join(debrisPath, "replacement")
+	if err := os.WriteFile(replacement, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("write replacement debris: %v", err)
+	}
+	parent, err := openRealPathRoot(parentPath)
+	if err != nil {
+		t.Fatalf("open parent root: %v", err)
+	}
+	defer parent.Close()
+
+	if err := removeRootDeletionDebris(
+		parent,
+		"workspace",
+		identity,
+	); err == nil {
+		t.Fatal("remove accepted replaced identity-bound deletion debris")
+	}
+	assertFileContents(t, replacement, "replacement\n")
 }
 
 func TestRenameRecordRejectsReplacedTemporaryPath(t *testing.T) {

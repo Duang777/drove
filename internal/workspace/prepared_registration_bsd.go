@@ -335,12 +335,6 @@ func finalizePreparedWorktreeAdd(
 	if err := validateBSDStageContents(stageRoot); err != nil {
 		return err
 	}
-	if err := removeRootDeletionDebris(
-		repository.commonRoot,
-		stageName,
-	); err != nil {
-		return err
-	}
 	ownedStageRoot := stageRoot
 	stageRoot = nil
 	if err := removeOpenedDirectoryFromRoot(
@@ -485,6 +479,7 @@ func cleanupBSDPreparedWorktreeStage(
 	if err := removeRootDeletionDebris(
 		repository.commonRoot,
 		stageName,
+		expectedIdentity,
 	); err != nil {
 		return err
 	}

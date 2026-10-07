@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1200,7 +1201,18 @@ func readRootDirectory(root *os.Root) ([]os.DirEntry, error) {
 func removeAllFromRoot(root *os.Root, name string) (result error) {
 	info, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
-		return removeRootDeletionDebris(root, name)
+		debris, debrisErr := findRootDeletionDebris(root, name, "")
+		if debrisErr != nil {
+			return debrisErr
+		}
+		if debris != "" {
+			return fmt.Errorf(
+				"directory %q has deletion debris %q without persisted identity",
+				name,
+				debris,
+			)
+		}
+		return nil
 	}
 	if err != nil {
 		return err
@@ -1279,7 +1291,11 @@ func removeOpenedDirectoryFromRootAfterIsolation(
 	if err != nil {
 		return err
 	}
-	deleteName := rootDeletionPrefix(recoveryName) + uuid.NewString()
+	directoryIdentity, err := openedDirectoryIdentity(root)
+	if err != nil {
+		return fmt.Errorf("inspect removed directory identity: %w", err)
+	}
+	deleteName := rootDeletionName(recoveryName, directoryIdentity)
 	directory, err = openRecordDirectory(parent)
 	if err != nil {
 		return err
@@ -1304,6 +1320,13 @@ func removeOpenedDirectoryFromRootAfterIsolation(
 	if err := verifyRootEntryUnchanged(parent, name, root); err != nil {
 		return err
 	}
+	isolatedIdentity, err := openedDirectoryIdentity(root)
+	if err != nil {
+		return fmt.Errorf("reinspect removed directory identity: %w", err)
+	}
+	if isolatedIdentity != directoryIdentity {
+		return errors.New("removed directory changed identity during isolation")
+	}
 	if afterIsolation != nil {
 		afterIsolation(name)
 	}
@@ -1323,14 +1346,38 @@ func rootDeletionPrefix(name string) string {
 	return fmt.Sprintf(".drove-delete-%x-", digest[:8])
 }
 
+func rootDeletionName(name string, directoryIdentity string) string {
+	digest := sha256.Sum256([]byte(directoryIdentity))
+	return rootDeletionPrefix(name) +
+		hex.EncodeToString(digest[:]) + "-" + uuid.NewString()
+}
+
 func isRootDeletionName(name string, recoveryName string) bool {
+	_, valid := rootDeletionIdentityDigest(name, recoveryName)
+	return valid
+}
+
+func rootDeletionIdentityDigest(
+	name string,
+	recoveryName string,
+) (string, bool) {
 	suffix, found := strings.CutPrefix(name, rootDeletionPrefix(recoveryName))
 	if !found {
-		return false
+		return "", false
 	}
 	suffix = strings.TrimSuffix(suffix, ".rename")
-	_, err := uuid.Parse(suffix)
-	return err == nil
+	identityDigest, operationID, found := strings.Cut(suffix, "-")
+	if !found || len(identityDigest) != sha256.Size*2 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(identityDigest); err != nil {
+		return "", false
+	}
+	parsed, err := uuid.Parse(operationID)
+	if err != nil || parsed.String() != operationID {
+		return "", false
+	}
+	return identityDigest, true
 }
 
 func findRootDeletionDebris(
@@ -1344,9 +1391,20 @@ func findRootDeletionDebris(
 	}
 	found := ""
 	for _, entry := range entries {
-		if entry.Name() == ignoredName ||
-			!isRootDeletionName(entry.Name(), recoveryName) {
+		if entry.Name() == ignoredName {
 			continue
+		}
+		if !strings.HasPrefix(
+			entry.Name(),
+			rootDeletionPrefix(recoveryName),
+		) {
+			continue
+		}
+		if !isRootDeletionName(entry.Name(), recoveryName) {
+			return "", fmt.Errorf(
+				"deletion debris %q has no persisted directory identity",
+				entry.Name(),
+			)
 		}
 		info, err := parent.Lstat(entry.Name())
 		if err != nil {
@@ -1372,15 +1430,60 @@ func findRootDeletionDebris(
 func removeRootDeletionDebris(
 	parent *os.Root,
 	recoveryName string,
-) error {
+	expectedIdentity string,
+) (result error) {
 	name, err := findRootDeletionDebris(parent, recoveryName, "")
 	if err != nil || name == "" {
 		return err
+	}
+	if !validDirectoryIdentity(expectedIdentity) {
+		return fmt.Errorf(
+			"deletion debris %q has no trusted directory identity",
+			name,
+		)
+	}
+	expectedIdentityDigest, valid := rootDeletionIdentityDigest(
+		name,
+		recoveryName,
+	)
+	if !valid {
+		return fmt.Errorf(
+			"deletion debris %q has no persisted directory identity",
+			name,
+		)
+	}
+	digest := sha256.Sum256([]byte(expectedIdentity))
+	if hex.EncodeToString(digest[:]) != expectedIdentityDigest {
+		return fmt.Errorf(
+			"deletion debris %q does not match the trusted directory identity",
+			name,
+		)
 	}
 	root, err := openRealRootFromRoot(parent, name)
 	if err != nil {
 		return err
 	}
+	rootOwned := true
+	defer func() {
+		if rootOwned {
+			result = errors.Join(result, root.Close())
+		}
+	}()
+	directoryIdentity, err := openedDirectoryIdentity(root)
+	if err != nil {
+		return fmt.Errorf(
+			"inspect deletion debris %q identity: %w",
+			name,
+			err,
+		)
+	}
+	if directoryIdentity != expectedIdentity {
+		return fmt.Errorf(
+			"deletion debris %q changed directory identity",
+			name,
+		)
+	}
+	rootOwned = false
 	return removeOpenedDirectoryFromRootAfterIsolation(
 		parent,
 		name,
