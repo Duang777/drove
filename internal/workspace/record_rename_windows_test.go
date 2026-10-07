@@ -81,7 +81,12 @@ func TestUnlinkRecordUsesCompatibleIdentityHandle(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
 		t.Fatalf("write source: %v", err)
 	}
-	expected, err := os.Open(sourcePath)
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open root: %v", err)
+	}
+	defer root.Close()
+	expected, err := root.Open("source")
 	if err != nil {
 		t.Fatalf("open source: %v", err)
 	}
