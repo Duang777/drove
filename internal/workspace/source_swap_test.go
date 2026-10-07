@@ -1323,6 +1323,89 @@ func TestAcknowledgeRejectsReplacementCommonGitDirectory(
 	}
 }
 
+func TestAcknowledgeRejectsRedirectedPreparedCommonGitDirectory(
+	t *testing.T,
+) {
+	parent := t.TempDir()
+	source := filepath.Join(parent, "source")
+	initSourceSwapRepository(t, source)
+
+	manager, err := New(filepath.Join(parent, "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		source,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	record, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists ||
+		record.GitDirectory == "" ||
+		record.RepositoryEvidence == nil {
+		t.Fatalf(
+			"read preparation record: exists=%v err=%v record=%+v",
+			exists,
+			err,
+			record,
+		)
+	}
+	commonDirectory := record.RepositoryEvidence.CommonGitDirectory
+	replacementCommon := filepath.Join(parent, "replacement-common")
+	if err := os.CopyFS(
+		replacementCommon,
+		os.DirFS(commonDirectory),
+	); err != nil {
+		t.Fatalf("copy common Git directory: %v", err)
+	}
+	commonPointer := filepath.Join(record.GitDirectory, "commondir")
+	originalPointer, err := os.ReadFile(commonPointer)
+	if err != nil {
+		t.Fatalf("read prepared common directory pointer: %v", err)
+	}
+	if err := os.WriteFile(
+		commonPointer,
+		[]byte(replacementCommon+"\n"),
+		0o600,
+	); err != nil {
+		t.Fatalf("redirect prepared common directory pointer: %v", err)
+	}
+
+	err = manager.AcknowledgePreparation(prepared)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"private Git common directory binding changed",
+	) {
+		t.Fatalf(
+			"acknowledge redirected prepared common directory error = %v",
+			err,
+		)
+	}
+	assertGitRefExists(
+		t,
+		commonDirectory,
+		branchOwnershipRef(prepared.branchOperationID),
+	)
+	failed, exists, err := manager.readWorkspaceRecord(prepared.Path)
+	if err != nil || !exists {
+		t.Fatalf("read failed preparation record: exists=%v err=%v", exists, err)
+	}
+	if failed.PreparationCommitted || failed.BranchOperationID == "" {
+		t.Fatalf("failed acknowledgement record = %+v", failed)
+	}
+
+	if err := os.WriteFile(commonPointer, originalPointer, 0o600); err != nil {
+		t.Fatalf("restore prepared common directory pointer: %v", err)
+	}
+	if err := manager.Discard(context.Background(), prepared); err != nil {
+		t.Fatalf("discard restored preparation: %v", err)
+	}
+}
+
 func TestAcknowledgeRejectsReplacementSourceGitPointer(t *testing.T) {
 	parent := t.TempDir()
 	repository := filepath.Join(parent, "repository")

@@ -387,6 +387,9 @@ func (m *Manager) initializePreparedWorktree(
 	if err := verifyRealPathRoot(gitDirectory, gitRoot); err != nil {
 		return err
 	}
+	if err := privateRepository.verifyPrivateGitCommonDirectory(); err != nil {
+		return err
+	}
 	target.gitDirectory = gitDirectory
 
 	record, exists, err := m.readWorkspaceRecord(target.Path)
@@ -822,6 +825,9 @@ func (m *Manager) verifyPreparedWorktreeForAcknowledgement(
 		target,
 		!record.PreparationCommitted,
 	); err != nil {
+		return err
+	}
+	if err := privateRepository.verifyPrivateGitCommonDirectory(); err != nil {
 		return err
 	}
 	return repository.verifyBinding(ctx)

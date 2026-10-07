@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+const maxPrivateGitCommonDirectorySize = 64 * 1024
 
 type repositoryCapability struct {
 	manager    *Manager
@@ -719,10 +722,166 @@ func (r repositoryCapability) verifyBoundPreparedWorktree(
 	target Workspace,
 	registered registeredWorktree,
 ) error {
-	return r.verifyPreparedWorktreeRegistration(
+	if err := r.verifyPrivateGitCommonDirectory(); err != nil {
+		return err
+	}
+	if err := r.verifyPreparedWorktreeRegistration(
 		target,
 		registered,
 		target.expectedHeadOID,
+	); err != nil {
+		return err
+	}
+	return r.verifyPrivateGitCommonDirectory()
+}
+
+func (r repositoryCapability) verifyPrivateGitCommonDirectory() (
+	result error,
+) {
+	if r.gitRoot == nil ||
+		r.commonRoot == nil ||
+		r.gitPath == "" ||
+		r.commonPath == "" {
+		return errors.New(
+			"workspace: private Git common directory binding is incomplete",
+		)
+	}
+	if err := verifyRealPathRoot(r.gitPath, r.gitRoot); err != nil {
+		return err
+	}
+	if err := verifyRealPathRoot(r.commonPath, r.commonRoot); err != nil {
+		return err
+	}
+
+	const name = "commondir"
+	pathInfo, err := r.gitRoot.Lstat(name)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if !pathInfo.Mode().IsRegular() ||
+		pathInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New(
+			"workspace: private Git common directory pointer is not a regular file",
+		)
+	}
+	file, err := r.gitRoot.Open(name)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open private Git common directory pointer: %w",
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, file.Close())
+	}()
+	before, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: inspect opened private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if !before.Mode().IsRegular() ||
+		before.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(pathInfo, before) {
+		return errors.New(
+			"workspace: private Git common directory pointer changed while opening",
+		)
+	}
+	raw, err := io.ReadAll(
+		io.LimitReader(file, maxPrivateGitCommonDirectorySize+1),
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: read private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if len(raw) > maxPrivateGitCommonDirectorySize {
+		return errors.New(
+			"workspace: private Git common directory pointer is too large",
+		)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: reinspect private Git common directory pointer: %w",
+			err,
+		)
+	}
+	current, err := r.gitRoot.Lstat(name)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: reinspect private Git common directory pointer path: %w",
+			err,
+		)
+	}
+	if !after.Mode().IsRegular() ||
+		after.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(before, after) ||
+		before.Size() != after.Size() ||
+		before.Mode() != after.Mode() ||
+		!before.ModTime().Equal(after.ModTime()) ||
+		!current.Mode().IsRegular() ||
+		current.Mode()&os.ModeSymlink != 0 ||
+		!os.SameFile(before, current) {
+		return errors.New(
+			"workspace: private Git common directory pointer changed while reading",
+		)
+	}
+
+	value := strings.TrimSuffix(string(raw), "\n")
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") {
+		return errors.New(
+			"workspace: private Git common directory pointer is invalid",
+		)
+	}
+	commonPath := value
+	if !filepath.IsAbs(commonPath) {
+		commonPath = filepath.Join(r.gitPath, commonPath)
+	}
+	commonPath, err = resolvePath(commonPath)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: resolve private Git common directory pointer: %w",
+			err,
+		)
+	}
+	if commonPath != r.commonPath {
+		return errors.New(
+			"workspace: private Git common directory binding changed",
+		)
+	}
+	commonRoot, err := openRealPathRoot(commonPath)
+	if err != nil {
+		return fmt.Errorf(
+			"workspace: open private Git common directory target: %w",
+			err,
+		)
+	}
+	defer func() {
+		result = errors.Join(result, commonRoot.Close())
+	}()
+	expectedIdentity, err := openedDirectoryIdentity(r.commonRoot)
+	if err != nil {
+		return err
+	}
+	currentIdentity, err := openedDirectoryIdentity(commonRoot)
+	if err != nil {
+		return err
+	}
+	if currentIdentity != expectedIdentity {
+		return errors.New(
+			"workspace: private Git common directory identity changed",
+		)
+	}
+	return errors.Join(
+		verifyRealPathRoot(r.gitPath, r.gitRoot),
+		verifyRealPathRoot(r.commonPath, r.commonRoot),
+		verifyRealPathRoot(commonPath, commonRoot),
 	)
 }
 
