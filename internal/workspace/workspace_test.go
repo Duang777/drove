@@ -2292,6 +2292,24 @@ func TestValidateBranchRejectsHEAD(t *testing.T) {
 	}
 }
 
+func TestValidateBranchRejectsPreviousCheckoutExpression(t *testing.T) {
+	repository := newTestRepository(t)
+	runGit(t, repository, "checkout", "-b", "current")
+	t.Chdir(repository)
+
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	err = manager.validateBranch(context.Background(), "@{-1}")
+	if !errors.Is(err, ErrInvalidBranch) {
+		t.Fatalf(
+			"validate previous checkout expression error = %v, want ErrInvalidBranch",
+			err,
+		)
+	}
+}
+
 func newTestRepository(t *testing.T) string {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {

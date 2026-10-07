@@ -1301,11 +1301,16 @@ func (m *Manager) repositoryPaths(
 
 func (m *Manager) validateBranch(ctx context.Context, branch string) error {
 	if branch == "" ||
+		branch == "HEAD" ||
 		strings.HasPrefix(branch, "-") ||
 		strings.ContainsRune(branch, '\x00') {
 		return fmt.Errorf("%w: %q", ErrInvalidBranch, branch)
 	}
-	if _, err := m.run(ctx, "check-ref-format", "--branch", branch); err != nil {
+	if _, err := m.run(
+		ctx,
+		"check-ref-format",
+		"refs/heads/"+branch,
+	); err != nil {
 		if isExitCode(err, 1) || isExitCode(err, 128) {
 			return errors.Join(
 				fmt.Errorf("%w: %q", ErrInvalidBranch, branch),
