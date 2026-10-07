@@ -512,9 +512,10 @@ type Agent struct {
 	lastError       string
 	lastTransition  *Evidence
 
-	createdAt time.Time
-	updatedAt time.Time
-	revision  uint64
+	createdAt  time.Time
+	updatedAt  time.Time
+	stateSince time.Time
+	revision   uint64
 }
 
 // Option 是 Agent 的构建选项。
@@ -536,6 +537,7 @@ type RestoreSnapshot struct {
 	LastTransition  *Evidence
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
+	StateSince      time.Time
 }
 
 // WithName 设置 agent 显示名。
@@ -578,6 +580,7 @@ func WithSignalInjection(
 
 // New 创建处于 StatePending 的 agent。
 func New(id ID, opts ...Option) *Agent {
+	now := time.Now().UTC()
 	a := &Agent{
 		id:              id,
 		runMode:         RunModeInteractive,
@@ -586,8 +589,9 @@ func New(id ID, opts ...Option) *Agent {
 		injectionStatus: InjectionOff,
 		injectionReason: InjectionReasonConfiguredOff,
 		state:           StatePending,
-		createdAt:       time.Now().UTC(),
-		updatedAt:       time.Now().UTC(),
+		createdAt:       now,
+		updatedAt:       now,
+		stateSince:      now,
 	}
 	for _, o := range opts {
 		o(a)
@@ -611,6 +615,10 @@ func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
 		injectionStatus = InjectionOff
 		injectionReason = InjectionReasonConfiguredOff
 	}
+	stateSince := snapshot.StateSince
+	if stateSince.IsZero() {
+		stateSince = snapshot.UpdatedAt
+	}
 	a := &Agent{
 		id:              snapshot.ID,
 		name:            snapshot.Name,
@@ -626,6 +634,7 @@ func Restore(snapshot RestoreSnapshot, opts ...Option) (*Agent, error) {
 		lastTransition:  cloneEvidence(snapshot.LastTransition),
 		createdAt:       snapshot.CreatedAt,
 		updatedAt:       snapshot.UpdatedAt,
+		stateSince:      stateSince,
 	}
 	for _, option := range opts {
 		option(a)
@@ -676,6 +685,12 @@ func validateRestoredAgent(a *Agent) error {
 	}
 	if a.updatedAt.Before(a.createdAt) {
 		return errors.New("agent: restore: update time is before creation time")
+	}
+	if a.stateSince.Before(a.createdAt) {
+		return errors.New("agent: restore: state time is before creation time")
+	}
+	if a.stateSince.After(a.updatedAt) {
+		return errors.New("agent: restore: state time is after update time")
 	}
 	if a.lastTransition != nil {
 		if err := a.lastTransition.Validate(); err != nil {
@@ -870,6 +885,7 @@ func (a *Agent) ApplyCommitted(prepared PreparedChange) error {
 	if prepared.hasState {
 		a.state = prepared.to
 		a.lastTransition = cloneEvidence(&prepared.evidence)
+		a.stateSince = prepared.at
 	}
 	a.updatedAt = prepared.at
 	a.revision++
@@ -916,4 +932,11 @@ func (a *Agent) UpdatedAt() time.Time {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.updatedAt
+}
+
+// StateSince returns when the Agent entered its current state.
+func (a *Agent) StateSince() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.stateSince
 }

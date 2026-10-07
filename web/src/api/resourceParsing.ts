@@ -20,6 +20,7 @@ import type {
   SignalInjectionReason,
   SignalInjectionStatus,
   StateEvidence,
+  TerminalAttribution,
 } from './types'
 
 export function parseAgentList(value: unknown): AgentStatus[] {
@@ -43,6 +44,7 @@ export function parseAgentStatus(
       'state',
       'created_at',
       'updated_at',
+      'state_since',
       'hook_policy',
       'hook_status',
       'signal_injection',
@@ -77,6 +79,10 @@ export function parseAgentStatus(
     state: parseAgentState(object.state, `${name}.state`),
     created_at: requireTimestamp(object.created_at, `${name}.created_at`).iso,
     updated_at: requireTimestamp(object.updated_at, `${name}.updated_at`).iso,
+    state_since: requireTimestamp(
+      object.state_since,
+      `${name}.state_since`,
+    ).iso,
     hook_policy: parseHookPolicy(object.hook_policy, `${name}.hook_policy`),
     hook_status: parseHookStatus(object.hook_status, `${name}.hook_status`),
     signal_injection: parseSignalInjectionMode(
@@ -147,11 +153,15 @@ export function parseAgentState(value: unknown, name: string): AgentState {
   throw new Error(`${name} is unsupported`)
 }
 
-function parseStateEvidence(value: unknown, name: string): StateEvidence {
+export function parseStateEvidence(
+  value: unknown,
+  name: string,
+): StateEvidence {
   const object = requireRecord(value, name)
   requireKeys(object, ['source', 'event', 'confidence'], [
     'delivery_id',
     'screen',
+    'terminal',
   ])
   const source = object.source
   if (
@@ -179,10 +189,9 @@ function parseStateEvidence(value: unknown, name: string): StateEvidence {
     confidence: object.confidence,
   }
   switch (source) {
-    case 'hook':
-    case 'notify':
-      if (object.screen !== undefined) {
-        throw new Error(`${name}.screen requires screen evidence`)
+    case 'hook': {
+      if (object.screen !== undefined || object.terminal !== undefined) {
+        throw new Error(`${name}.hook contains unsupported attribution`)
       }
       return {
         ...base,
@@ -192,9 +201,41 @@ function parseStateEvidence(value: unknown, name: string): StateEvidence {
           `${name}.delivery_id`,
         ),
       }
+    }
+    case 'notify': {
+      if (object.screen !== undefined) {
+        throw new Error(`${name}.screen requires screen evidence`)
+      }
+      if (object.terminal !== undefined) {
+        if (object.delivery_id !== undefined) {
+          throw new Error(
+            `${name}.terminal notify cannot contain delivery_id`,
+          )
+        }
+        return {
+          ...base,
+          source,
+          terminal: parseTerminalAttribution(
+            object.terminal,
+            `${name}.terminal`,
+          ),
+        }
+      }
+      return {
+        ...base,
+        source,
+        delivery_id: requireString(
+          object.delivery_id,
+          `${name}.delivery_id`,
+        ),
+      }
+    }
     case 'screen':
-      if (object.delivery_id !== undefined) {
-        throw new Error(`${name}.screen cannot contain delivery_id`)
+      if (
+        object.delivery_id !== undefined ||
+        object.terminal !== undefined
+      ) {
+        throw new Error(`${name}.screen contains unsupported attribution`)
       }
       return {
         ...base,
@@ -206,7 +247,11 @@ function parseStateEvidence(value: unknown, name: string): StateEvidence {
     case 'heuristic':
     case 'timer':
     case 'recovery':
-      if (object.delivery_id !== undefined || object.screen !== undefined) {
+      if (
+        object.delivery_id !== undefined ||
+        object.screen !== undefined ||
+        object.terminal !== undefined
+      ) {
         throw new Error(`${name}.${source} contains unsupported attribution`)
       }
       return { ...base, source }
@@ -214,6 +259,28 @@ function parseStateEvidence(value: unknown, name: string): StateEvidence {
       const exhaustive: never = source
       throw new Error(`Unsupported evidence source ${String(exhaustive)}`)
     }
+  }
+}
+
+function parseTerminalAttribution(
+  value: unknown,
+  name: string,
+): TerminalAttribution {
+  const object = requireRecord(value, name)
+  requireKeys(object, ['protocol', 'output_offset', 'last_output_seq'])
+  if (object.protocol !== 'osc9') {
+    throw new Error(`${name}.protocol is unsupported`)
+  }
+  return {
+    protocol: object.protocol,
+    output_offset: requirePositiveInteger(
+      object.output_offset,
+      `${name}.output_offset`,
+    ),
+    last_output_seq: requirePositiveInteger(
+      object.last_output_seq,
+      `${name}.last_output_seq`,
+    ),
   }
 }
 

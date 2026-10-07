@@ -181,6 +181,60 @@ func TestRecoveryProjectorUsesLegacyMetadataAndFactTimestamps(t *testing.T) {
 	}
 }
 
+func TestRecoveryProjectorKeepsStateTimeAcrossLaterErrors(t *testing.T) {
+	createdAt := time.Date(2026, time.October, 3, 6, 0, 0, 0, time.UTC)
+	stateSince := createdAt.Add(time.Minute)
+	updatedAt := createdAt.Add(2 * time.Minute)
+	projector := newRecoveryProjector()
+	for _, row := range []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: createdAt,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"generic"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: stateSince,
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "stopped",
+		},
+		{
+			Seq:       3,
+			Timestamp: updatedAt,
+			Type:      string(event.TypeError),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Payload:   "late diagnostic",
+		},
+	} {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+
+	plan, err := projector.Finish(createdAt.Add(3 * time.Minute))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if len(plan.Snapshots) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(plan.Snapshots))
+	}
+	snapshot := plan.Snapshots[0]
+	if !snapshot.StateSince.Equal(stateSince) {
+		t.Fatalf("state since = %s, want %s", snapshot.StateSince, stateSince)
+	}
+	if !snapshot.UpdatedAt.Equal(updatedAt) {
+		t.Fatalf("updated at = %s, want %s", snapshot.UpdatedAt, updatedAt)
+	}
+}
+
 func TestRecoveryProjectorIgnoresOutputAndErrorOnlySessions(t *testing.T) {
 	base := time.Date(2026, time.October, 3, 5, 0, 0, 0, time.UTC)
 	projector := newRecoveryProjector()
