@@ -221,12 +221,21 @@ func ensureBoundGitPointer(
 	if err != nil {
 		return err
 	}
-	if oldFile != nil {
-		defer func() {
-			result = errors.Join(result, oldFile.Close())
-		}()
+	closeOldFile := func() error {
+		if oldFile == nil {
+			return nil
+		}
+		closeErr := oldFile.Close()
+		oldFile = nil
+		return closeErr
 	}
+	defer func() {
+		result = errors.Join(result, closeOldFile())
+	}()
 	if exists && current == content {
+		if err := closeOldFile(); err != nil {
+			return err
+		}
 		return errors.Join(
 			cleanupBoundGitPointerTemps(root, newPrefix, content),
 			cleanupBoundGitPointerTemps(root, oldPrefix, allowedOld),
@@ -303,6 +312,9 @@ func ensureBoundGitPointer(
 				return err
 			}
 		}
+	}
+	if err := closeOldFile(); err != nil {
+		return err
 	}
 	tempName, tempFile, err := findBoundGitPointerTemp(
 		root,
