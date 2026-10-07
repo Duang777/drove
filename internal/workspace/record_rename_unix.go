@@ -206,7 +206,19 @@ func unlinkLinkedRecordPathAfterValidation(
 	name string,
 	witnessName string,
 	afterValidation func(string),
-) error {
+) (result error) {
+	if err := validateRecordDeletionSourceName(name); err != nil {
+		return err
+	}
+	if err := lockRecordDeletionDirectory(directory); err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(
+			result,
+			unlockRecordDeletionDirectory(directory),
+		)
+	}()
 	if err := verifyRecordPathIdentity(
 		directory,
 		expected,
@@ -223,7 +235,7 @@ func unlinkLinkedRecordPathAfterValidation(
 	} else if err != nil {
 		return err
 	}
-	if err := unlinkRecordPathAfterValidation(
+	if err := unlinkRecordPathAfterValidationLocked(
 		directory,
 		expected,
 		name,

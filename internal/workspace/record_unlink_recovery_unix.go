@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -64,6 +65,10 @@ func settleRecordDeletionTransaction(
 		return err
 	}
 	if len(entries) == 0 {
+		transactionInfo, err := transaction.Stat()
+		if err != nil {
+			return err
+		}
 		if err := transaction.Close(); err != nil {
 			return err
 		}
@@ -71,6 +76,7 @@ func settleRecordDeletionTransaction(
 		return removeSettledRecordDeletionTransaction(
 			namespace,
 			name,
+			transactionInfo,
 		)
 	}
 	sourceName, validated, witness, candidate, err :=
@@ -173,20 +179,71 @@ func settleRecordDeletionTransaction(
 	); err != nil {
 		return err
 	}
+	transactionInfo, err := transaction.Stat()
+	if err != nil {
+		return err
+	}
 	if err := transaction.Close(); err != nil {
 		return err
 	}
 	transactionOpen = false
-	return removeSettledRecordDeletionTransaction(namespace, name)
+	return removeSettledRecordDeletionTransaction(
+		namespace,
+		name,
+		transactionInfo,
+	)
 }
 
 func removeSettledRecordDeletionTransaction(
 	namespace *os.File,
 	name string,
+	expected os.FileInfo,
 ) error {
+	return removeSettledRecordDeletionTransactionAfterValidation(
+		namespace,
+		name,
+		expected,
+		nil,
+	)
+}
+
+func removeSettledRecordDeletionTransactionAfterValidation(
+	namespace *os.File,
+	name string,
+	expected os.FileInfo,
+	afterValidation func(),
+) error {
+	if expected == nil || !expected.IsDir() {
+		return errors.New(
+			"workspace: settled record deletion transaction identity is invalid",
+		)
+	}
+	if afterValidation != nil {
+		afterValidation()
+	}
+	isolatedName := recordDeletionTransactionIsolationPrefix +
+		uuid.NewString()
+	moved, err := renameDirectoryNoReplace(
+		namespace,
+		expected,
+		name,
+		isolatedName+".rename",
+		isolatedName,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"isolate settled record deletion transaction: %w",
+			err,
+		)
+	}
+	if !moved {
+		return errors.New(
+			"workspace: settled record deletion transaction was not isolated",
+		)
+	}
 	if err := unix.Unlinkat(
 		int(namespace.Fd()),
-		name,
+		isolatedName,
 		unix.AT_REMOVEDIR,
 	); err != nil {
 		return fmt.Errorf("remove settled record deletion transaction: %w", err)

@@ -16,10 +16,12 @@ import (
 const (
 	recordDeletionNamespace = ".drove-delete-v1"
 
-	recordDeletionSource    = "source"
-	recordDeletionWitness   = "witness"
-	recordDeletionValidated = "validated"
-	recordDeletionCandidate = "candidate"
+	recordDeletionNamespaceIsolationPrefix   = ".drove-delete-v1-isolated-"
+	recordDeletionTransactionIsolationPrefix = ".drove-transaction-isolated-"
+	recordDeletionSource                     = "source"
+	recordDeletionWitness                    = "witness"
+	recordDeletionValidated                  = "validated"
+	recordDeletionCandidate                  = "candidate"
 )
 
 func unlinkRecordPath(
@@ -44,6 +46,29 @@ func unlinkRecordPathAfterValidation(
 	if err := validateRecordDeletionSourceName(name); err != nil {
 		return err
 	}
+	if err := lockRecordDeletionDirectory(directory); err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(
+			result,
+			unlockRecordDeletionDirectory(directory),
+		)
+	}()
+	return unlinkRecordPathAfterValidationLocked(
+		directory,
+		expected,
+		name,
+		afterValidation,
+	)
+}
+
+func unlinkRecordPathAfterValidationLocked(
+	directory *os.File,
+	expected *os.File,
+	name string,
+	afterValidation func(string),
+) (result error) {
 	namespace, err := openRecordDeletionNamespace(directory)
 	if err != nil {
 		return err
@@ -208,6 +233,26 @@ func openRecordDeletionNamespace(
 	return namespace, nil
 }
 
+func lockRecordDeletionDirectory(directory *os.File) error {
+	if err := unix.Flock(int(directory.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf(
+			"lock record directory for private deletion: %w",
+			err,
+		)
+	}
+	return nil
+}
+
+func unlockRecordDeletionDirectory(directory *os.File) error {
+	if err := unix.Flock(int(directory.Fd()), unix.LOCK_UN); err != nil {
+		return fmt.Errorf(
+			"unlock record directory after private deletion: %w",
+			err,
+		)
+	}
+	return nil
+}
+
 func openRecordDeletionDirectoryAt(
 	parent *os.File,
 	name string,
@@ -263,14 +308,8 @@ func createRecordDeletionTransaction(
 	}
 	transaction, err := openRecordDeletionDirectoryAt(namespace, name)
 	if err != nil {
-		removeErr := unix.Unlinkat(
-			int(namespace.Fd()),
-			name,
-			unix.AT_REMOVEDIR,
-		)
 		return nil, errors.Join(
 			fmt.Errorf("open record deletion transaction: %w", err),
-			removeErr,
 			namespace.Sync(),
 		)
 	}
@@ -283,15 +322,20 @@ func createRecordDeletionTransaction(
 		if errors.Is(removeSourceErr, unix.ENOENT) {
 			removeSourceErr = nil
 		}
+		transactionInfo, statErr := transaction.Stat()
 		closeErr := transaction.Close()
-		removeTransactionErr := unix.Unlinkat(
-			int(namespace.Fd()),
-			name,
-			unix.AT_REMOVEDIR,
-		)
+		var removeTransactionErr error
+		if removeSourceErr == nil && statErr == nil && closeErr == nil {
+			removeTransactionErr = removeSettledRecordDeletionTransaction(
+				namespace,
+				name,
+				transactionInfo,
+			)
+		}
 		return nil, errors.Join(
 			cause,
 			removeSourceErr,
+			statErr,
 			closeErr,
 			removeTransactionErr,
 			namespace.Sync(),

@@ -6,11 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
 func cleanupRecordDeletionNamespace(root *os.Root) (result error) {
+	return cleanupRecordDeletionNamespaceAfterValidation(root, nil)
+}
+
+func cleanupRecordDeletionNamespaceAfterValidation(
+	root *os.Root,
+	afterValidation func(),
+) (result error) {
 	directory, err := openRecordDirectory(root)
 	if err != nil {
 		return err
@@ -18,6 +27,18 @@ func cleanupRecordDeletionNamespace(root *os.Root) (result error) {
 	defer func() {
 		result = errors.Join(result, directory.Close())
 	}()
+	if err := lockRecordDeletionDirectory(directory); err != nil {
+		return err
+	}
+	defer func() {
+		result = errors.Join(
+			result,
+			unlockRecordDeletionDirectory(directory),
+		)
+	}()
+	if err := rejectRecordDeletionNamespaceIsolationDebris(directory); err != nil {
+		return err
+	}
 	namespace, err := openRecordDeletionDirectoryAt(
 		directory,
 		recordDeletionNamespace,
@@ -31,8 +52,11 @@ func cleanupRecordDeletionNamespace(root *os.Root) (result error) {
 			err,
 		)
 	}
+	namespaceOpen := true
 	defer func() {
-		result = errors.Join(result, namespace.Close())
+		if namespaceOpen {
+			result = errors.Join(result, namespace.Close())
+		}
 	}()
 	if err := validateRecordDeletionDirectory(namespace); err != nil {
 		return err
@@ -73,9 +97,38 @@ func cleanupRecordDeletionNamespace(root *os.Root) (result error) {
 			"workspace: private record deletion namespace changed identity",
 		)
 	}
+	if afterValidation != nil {
+		afterValidation()
+	}
+	isolatedName := recordDeletionNamespaceIsolationPrefix + uuid.NewString()
+	moved, err := renameDirectoryNoReplace(
+		directory,
+		expectedInfo,
+		recordDeletionNamespace,
+		isolatedName+".rename",
+		isolatedName,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"isolate private record deletion namespace: %w",
+			err,
+		)
+	}
+	if !moved {
+		return errors.New(
+			"workspace: private record deletion namespace was not isolated",
+		)
+	}
+	namespaceOpen = false
+	if err := namespace.Close(); err != nil {
+		return fmt.Errorf(
+			"close isolated private record deletion namespace: %w",
+			err,
+		)
+	}
 	if err := unix.Unlinkat(
 		int(directory.Fd()),
-		recordDeletionNamespace,
+		isolatedName,
 		unix.AT_REMOVEDIR,
 	); err != nil {
 		return fmt.Errorf(
@@ -88,6 +141,30 @@ func cleanupRecordDeletionNamespace(root *os.Root) (result error) {
 			"sync removed private record deletion namespace: %w",
 			err,
 		)
+	}
+	return nil
+}
+
+func rejectRecordDeletionNamespaceIsolationDebris(
+	directory *os.File,
+) error {
+	entries, err := readRecordDeletionDirectory(directory)
+	if err != nil {
+		return fmt.Errorf(
+			"inspect private record deletion namespace debris: %w",
+			err,
+		)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(
+			entry.Name(),
+			recordDeletionNamespaceIsolationPrefix,
+		) {
+			return fmt.Errorf(
+				"workspace: private record deletion namespace debris %q has no recoverable owner",
+				entry.Name(),
+			)
+		}
 	}
 	return nil
 }

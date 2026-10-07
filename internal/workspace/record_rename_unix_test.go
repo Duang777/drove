@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -228,6 +229,7 @@ func TestUnlinkLinkedRecordPreservesReplacementAfterFinalValidation(
 }
 
 func TestRecoverRecordDeletionRestoresReplacement(t *testing.T) {
+	requireAtomicRecordDeletion(t)
 	rootPath := t.TempDir()
 	sourcePath := filepath.Join(rootPath, "source")
 	if err := os.WriteFile(sourcePath, []byte("original\n"), 0o600); err != nil {
@@ -324,6 +326,7 @@ func TestRecoverRecordDeletionRestoresReplacement(t *testing.T) {
 }
 
 func TestRecoverRecordDeletionCompletesValidatedCleanup(t *testing.T) {
+	requireAtomicRecordDeletion(t)
 	rootPath := t.TempDir()
 	sourcePath := filepath.Join(rootPath, "source")
 	if err := os.WriteFile(sourcePath, []byte("original\n"), 0o600); err != nil {
@@ -406,6 +409,7 @@ func TestRecoverRecordDeletionCompletesValidatedCleanup(t *testing.T) {
 }
 
 func TestRecoverRecordDeletionRemovesEmptyTransaction(t *testing.T) {
+	requireAtomicRecordDeletion(t)
 	rootPath := t.TempDir()
 	directory, err := os.Open(rootPath)
 	if err != nil {
@@ -444,7 +448,163 @@ func TestRecoverRecordDeletionRemovesEmptyTransaction(t *testing.T) {
 	}
 }
 
+func TestRemoveSettledRecordDeletionTransactionRejectsReplacement(
+	t *testing.T,
+) {
+	rootPath := t.TempDir()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open record directory: %v", err)
+	}
+	defer directory.Close()
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	defer namespace.Close()
+	transactionName := "45454545-4545-4454-8454-454545454545"
+	if err := unix.Mkdirat(
+		int(namespace.Fd()),
+		transactionName,
+		0o700,
+	); err != nil {
+		t.Fatalf("create deletion transaction: %v", err)
+	}
+	transactionPath := filepath.Join(
+		rootPath,
+		recordDeletionNamespace,
+		transactionName,
+	)
+	originalInfo, err := os.Stat(transactionPath)
+	if err != nil {
+		t.Fatalf("inspect deletion transaction: %v", err)
+	}
+	originalPath := transactionPath + "-original"
+	var replacementInfo os.FileInfo
+
+	err = removeSettledRecordDeletionTransactionAfterValidation(
+		namespace,
+		transactionName,
+		originalInfo,
+		func() {
+			if err := os.Rename(transactionPath, originalPath); err != nil {
+				t.Fatalf("move validated deletion transaction: %v", err)
+			}
+			if err := os.Mkdir(transactionPath, 0o700); err != nil {
+				t.Fatalf("create replacement deletion transaction: %v", err)
+			}
+			replacementInfo, err = os.Stat(transactionPath)
+			if err != nil {
+				t.Fatalf("inspect replacement deletion transaction: %v", err)
+			}
+		},
+	)
+	if err == nil {
+		t.Fatal("removed a replacement deletion transaction")
+	}
+	currentInfo, err := os.Stat(transactionPath)
+	if err != nil {
+		t.Fatalf("replacement deletion transaction was removed: %v", err)
+	}
+	if !os.SameFile(replacementInfo, currentInfo) {
+		t.Fatal("replacement deletion transaction changed identity")
+	}
+	displacedInfo, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatalf("validated deletion transaction was removed: %v", err)
+	}
+	if !os.SameFile(originalInfo, displacedInfo) {
+		t.Fatal("validated deletion transaction changed identity")
+	}
+}
+
+func TestCleanupRecordDeletionNamespaceRejectsReplacementAfterValidation(
+	t *testing.T,
+) {
+	rootPath := t.TempDir()
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open record root: %v", err)
+	}
+	defer root.Close()
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		t.Fatalf("open record directory: %v", err)
+	}
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	if err := errors.Join(namespace.Close(), directory.Close()); err != nil {
+		t.Fatalf("close deletion namespace: %v", err)
+	}
+	namespacePath := filepath.Join(rootPath, recordDeletionNamespace)
+	originalInfo, err := os.Stat(namespacePath)
+	if err != nil {
+		t.Fatalf("inspect deletion namespace: %v", err)
+	}
+	originalPath := namespacePath + "-original"
+	var replacementInfo os.FileInfo
+
+	err = cleanupRecordDeletionNamespaceAfterValidation(root, func() {
+		if err := os.Rename(namespacePath, originalPath); err != nil {
+			t.Fatalf("move validated deletion namespace: %v", err)
+		}
+		if err := os.Mkdir(namespacePath, 0o700); err != nil {
+			t.Fatalf("create replacement deletion namespace: %v", err)
+		}
+		replacementInfo, err = os.Stat(namespacePath)
+		if err != nil {
+			t.Fatalf("inspect replacement deletion namespace: %v", err)
+		}
+	})
+	if err == nil {
+		t.Fatal("removed a replacement deletion namespace")
+	}
+	currentInfo, err := os.Stat(namespacePath)
+	if err != nil {
+		t.Fatalf("replacement deletion namespace was removed: %v", err)
+	}
+	if !os.SameFile(replacementInfo, currentInfo) {
+		t.Fatal("replacement deletion namespace changed identity")
+	}
+	displacedInfo, err := os.Stat(originalPath)
+	if err != nil {
+		t.Fatalf("validated deletion namespace was removed: %v", err)
+	}
+	if !os.SameFile(originalInfo, displacedInfo) {
+		t.Fatal("validated deletion namespace changed identity")
+	}
+}
+
+func TestCleanupRecordDeletionNamespaceRejectsIsolationDebris(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open record root: %v", err)
+	}
+	defer root.Close()
+	name := recordDeletionNamespaceIsolationPrefix +
+		"23232323-2323-4232-8232-232323232323"
+	if err := root.Mkdir(name, 0o700); err != nil {
+		t.Fatalf("create deletion namespace debris: %v", err)
+	}
+
+	err = cleanupRecordDeletionNamespace(root)
+	if err == nil || !strings.Contains(err.Error(), "no recoverable owner") {
+		t.Fatalf("cleanup deletion namespace debris error = %v", err)
+	}
+	info, err := root.Stat(name)
+	if err != nil {
+		t.Fatalf("deletion namespace debris was removed: %v", err)
+	}
+	if !info.IsDir() {
+		t.Fatal("deletion namespace debris changed type")
+	}
+}
+
 func TestRecoverRecordRenameDebrisSettlesDeletionNamespace(t *testing.T) {
+	requireAtomicRecordDeletion(t)
 	rootPath := t.TempDir()
 	root, err := os.OpenRoot(rootPath)
 	if err != nil {
@@ -487,6 +647,7 @@ func TestRecoverRecordRenameDebrisSettlesDeletionNamespace(t *testing.T) {
 }
 
 func TestRemoveRecoversRecordDeletionNamespaceBeforeStatus(t *testing.T) {
+	requireAtomicRecordDeletion(t)
 	repository := newTestRepository(t)
 	manager, err := New(filepath.Join(t.TempDir(), "data"))
 	if err != nil {
@@ -559,6 +720,7 @@ func TestRemoveRecoversRecordDeletionNamespaceBeforeStatus(t *testing.T) {
 func TestUnlinkLinkedRecordPathAcceptsMissingSourceWithMatchingWitness(
 	t *testing.T,
 ) {
+	requireAtomicRecordDeletion(t)
 	rootPath := t.TempDir()
 	sourcePath := filepath.Join(rootPath, "source")
 	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
@@ -594,6 +756,7 @@ func TestUnlinkLinkedRecordPathAcceptsMissingSourceWithMatchingWitness(
 }
 
 func TestRecoverRecordInstallAliasUsesSameFileWitness(t *testing.T) {
+	requireAtomicRecordDeletion(t)
 	rootPath := t.TempDir()
 	sourcePath := filepath.Join(rootPath, "source")
 	if err := os.WriteFile(sourcePath, []byte("record\n"), 0o600); err != nil {
@@ -680,4 +843,11 @@ func TestRecoverRecordRenameDebrisRejectsLegacyRemovalBeforeMutation(
 	}
 	assertFileContents(t, aliasPath, "record\n")
 	assertFileContents(t, legacyPath, "legacy\n")
+}
+
+func requireAtomicRecordDeletion(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("atomic no-replace directory rename is unavailable")
+	}
 }
