@@ -132,6 +132,9 @@ func TestAcknowledgedRecordRemovalPreservesQuarantineReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare worktree: %v", err)
 	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
 	result, err := manager.Remove(
 		context.Background(),
 		prepared.AgentID,
