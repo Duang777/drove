@@ -122,6 +122,7 @@ type Session struct {
 	onExit        func(info ExitInfo)
 	readDone      chan struct{}
 	processExited chan struct{}
+	exitNotified  chan struct{}
 	done          chan struct{}
 
 	// WaitCh 返回进程退出信息（Close 后仍可读取一次）。
@@ -184,6 +185,7 @@ func startWithProcessGroupSignal(
 		onExit:        cfg.OnExit,
 		readDone:      make(chan struct{}),
 		processExited: make(chan struct{}),
+		exitNotified:  make(chan struct{}),
 		done:          make(chan struct{}),
 		WaitCh:        make(chan ExitInfo, 1),
 	}
@@ -309,6 +311,7 @@ func (s *Session) waitLoop() {
 	if !exitNotified && s.onExit != nil {
 		s.onExit(info)
 	}
+	close(s.exitNotified)
 	select {
 	case s.WaitCh <- info:
 	default:
@@ -532,6 +535,7 @@ func (s *Session) Close() error {
 		s.beginClose()
 		s.closeProcessGroup()
 		<-s.processExited
+		<-s.exitNotified
 		s.closeMaster()
 		s.joinWriter()
 		<-s.done

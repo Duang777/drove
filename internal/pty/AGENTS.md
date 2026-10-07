@@ -34,9 +34,10 @@
 - `ProcessGroupAlive` 是 session 层解除持久化 cleanup fence 的唯一探测入口；只有
   signal 0 返回 `ESRCH` 才报告不存在，`EPERM` 仍报告存活。
 - PTY master 只在直接子进程已回收后关闭；`Close` 幂等，并等待读取、进程退出和
-  全部回调及 writer 完成。健康的自然退出先排空读取再关闭 master；进程组清理失败时
-  先关闭 master 打断继承 slave 的不可清理后代，再等待读取结束。两条路径共享唯一的
-  master close。
+  全部回调及 writer 完成。并发 `Close` 在关闭 master 前还必须等待 `OnExit` 返回，
+  不能越过进程组清理失败建立的退出 fence。健康的自然退出先排空读取再关闭 master；
+  进程组清理失败时先关闭 master 打断继承 slave 的不可清理后代，再等待读取结束。
+  两条路径共享唯一的 master close。
 - 进程退出码经 `WaitCh` 返回，供状态机迁移到 `Stopped`/`Done`。
 
 ## 约束

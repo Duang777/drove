@@ -689,6 +689,7 @@ func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
 		},
 		readDone:      make(chan struct{}),
 		processExited: make(chan struct{}),
+		exitNotified:  make(chan struct{}),
 		done:          make(chan struct{}),
 		WaitCh:        make(chan ExitInfo, 1),
 	}
@@ -713,6 +714,10 @@ func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("exit callback did not start")
 	}
+	closeResult := make(chan error, 1)
+	go func() {
+		closeResult <- sess.Close()
+	}()
 	outputPassedExitFence := false
 	select {
 	case <-outputEnded:
@@ -731,18 +736,18 @@ func TestCleanupFailureClosesMasterHeldBySurvivingDescendant(t *testing.T) {
 	})
 
 	select {
-	case <-sess.done:
+	case closeErr := <-closeResult:
+		if !errors.Is(closeErr, syscall.EPERM) {
+			t.Fatalf("close error = %v, want EPERM", closeErr)
+		}
 	case <-time.After(2 * time.Second):
 		_ = syscall.Kill(childPID, syscall.SIGKILL)
 		childNeedsCleanup = false
-		<-sess.done
+		<-closeResult
 		t.Fatal("session waited for an inaccessible descendant to close the PTY")
 	}
 	if err := syscall.Kill(childPID, 0); err != nil {
 		t.Fatalf("descendant exited before PTY cleanup completed: %v", err)
-	}
-	if closeErr := sess.Close(); !errors.Is(closeErr, syscall.EPERM) {
-		t.Fatalf("close error = %v, want EPERM", closeErr)
 	}
 	if exit := waitExit(t, exits); !errors.Is(exit.CleanupErr, syscall.EPERM) {
 		t.Fatalf("exit cleanup error = %v, want EPERM", exit.CleanupErr)
