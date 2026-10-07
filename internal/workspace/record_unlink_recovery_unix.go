@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
@@ -21,25 +22,82 @@ func recoverRecordDeletionTransactions(
 		return fmt.Errorf("read private record deletion namespace: %w", err)
 	}
 	for _, entry := range entries {
-		if !canonicalUUID(entry.Name()) {
+		var recoverErr error
+		switch {
+		case canonicalUUID(entry.Name()):
+			recoverErr = settleRecordDeletionTransaction(
+				directory,
+				namespace,
+				entry.Name(),
+			)
+		case isRecordDeletionTransactionIsolationName(entry.Name()):
+			recoverErr = removeIsolatedRecordDeletionTransaction(
+				namespace,
+				entry.Name(),
+			)
+		default:
 			return fmt.Errorf(
 				"workspace: private record deletion artifact %q is invalid",
 				entry.Name(),
 			)
 		}
-		if err := settleRecordDeletionTransaction(
-			directory,
-			namespace,
-			entry.Name(),
-		); err != nil {
+		if recoverErr != nil {
 			return fmt.Errorf(
 				"workspace: recover record deletion transaction %q: %w",
 				entry.Name(),
-				err,
+				recoverErr,
 			)
 		}
 	}
 	return nil
+}
+
+func isRecordDeletionTransactionIsolationName(name string) bool {
+	suffix, found := strings.CutPrefix(
+		name,
+		recordDeletionTransactionIsolationPrefix,
+	)
+	if !found {
+		return false
+	}
+	return canonicalUUID(strings.TrimSuffix(suffix, ".rename"))
+}
+
+func removeIsolatedRecordDeletionTransaction(
+	namespace *os.File,
+	name string,
+) (result error) {
+	transaction, err := openRecordDeletionDirectoryAt(namespace, name)
+	if err != nil {
+		return err
+	}
+	transactionOpen := true
+	defer func() {
+		if transactionOpen {
+			result = errors.Join(result, transaction.Close())
+		}
+	}()
+	if err := validateRecordDeletionDirectory(transaction); err != nil {
+		return err
+	}
+	entries, err := readRecordDeletionDirectory(transaction)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return errors.New(
+			"workspace: isolated record deletion transaction is not empty",
+		)
+	}
+	info, err := transaction.Stat()
+	if err != nil {
+		return err
+	}
+	if err := transaction.Close(); err != nil {
+		return err
+	}
+	transactionOpen = false
+	return removeSettledRecordDeletionTransaction(namespace, name, info)
 }
 
 func settleRecordDeletionTransaction(

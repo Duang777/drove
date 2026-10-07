@@ -448,6 +448,94 @@ func TestRecoverRecordDeletionRemovesEmptyTransaction(t *testing.T) {
 	}
 }
 
+func TestRecoverRecordDeletionRemovesIsolatedEmptyTransaction(t *testing.T) {
+	requireAtomicRecordDeletion(t)
+	for _, suffix := range []string{"", ".rename"} {
+		t.Run(suffix, func(t *testing.T) {
+			rootPath := t.TempDir()
+			directory, err := os.Open(rootPath)
+			if err != nil {
+				t.Fatalf("open directory: %v", err)
+			}
+			defer directory.Close()
+			namespace, err := openRecordDeletionNamespace(directory)
+			if err != nil {
+				t.Fatalf("open deletion namespace: %v", err)
+			}
+			defer namespace.Close()
+			name := recordDeletionTransactionIsolationPrefix +
+				"67676767-6767-4767-8767-676767676767" + suffix
+			if err := unix.Mkdirat(
+				int(namespace.Fd()),
+				name,
+				0o700,
+			); err != nil {
+				t.Fatalf("create isolated deletion transaction: %v", err)
+			}
+			if err := namespace.Sync(); err != nil {
+				t.Fatalf("sync isolated deletion transaction: %v", err)
+			}
+
+			if err := recoverRecordDeletionTransactions(
+				directory,
+				namespace,
+			); err != nil {
+				t.Fatalf("recover isolated deletion transaction: %v", err)
+			}
+			entries, err := readRecordDeletionDirectory(namespace)
+			if err != nil {
+				t.Fatalf("read recovered deletion namespace: %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf(
+					"isolated deletion transaction remains: %v",
+					entries,
+				)
+			}
+		})
+	}
+}
+
+func TestRecoverRecordDeletionRejectsNonemptyIsolatedTransaction(t *testing.T) {
+	requireAtomicRecordDeletion(t)
+	rootPath := t.TempDir()
+	directory, err := os.Open(rootPath)
+	if err != nil {
+		t.Fatalf("open directory: %v", err)
+	}
+	defer directory.Close()
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	defer namespace.Close()
+	name := recordDeletionTransactionIsolationPrefix +
+		"78787878-7878-4787-8787-787878787878"
+	if err := unix.Mkdirat(int(namespace.Fd()), name, 0o700); err != nil {
+		t.Fatalf("create isolated deletion transaction: %v", err)
+	}
+	sentinel := filepath.Join(
+		rootPath,
+		recordDeletionNamespace,
+		name,
+		"must-remain",
+	)
+	if err := os.WriteFile(sentinel, []byte("sentinel\n"), 0o600); err != nil {
+		t.Fatalf("write isolated transaction sentinel: %v", err)
+	}
+	if err := namespace.Sync(); err != nil {
+		t.Fatalf("sync isolated deletion transaction: %v", err)
+	}
+
+	if err := recoverRecordDeletionTransactions(
+		directory,
+		namespace,
+	); err == nil {
+		t.Fatal("recovery accepted a nonempty isolated deletion transaction")
+	}
+	assertFileContents(t, sentinel, "sentinel\n")
+}
+
 func TestRemoveSettledRecordDeletionTransactionRejectsReplacement(
 	t *testing.T,
 ) {
