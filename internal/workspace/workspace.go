@@ -1061,6 +1061,16 @@ func (m *Manager) inspectAtRoot(
 			path,
 		)
 	}
+	if err := verifyRealPathRoot(path, root); err != nil {
+		return Workspace{}, err
+	}
+	if err := cleanupRecordDeletionNamespace(root); err != nil {
+		return Workspace{}, fmt.Errorf(
+			"workspace: recover internal deletions for %q: %w",
+			path,
+			err,
+		)
+	}
 
 	branchOutput, err := m.runRootedGit(
 		ctx,

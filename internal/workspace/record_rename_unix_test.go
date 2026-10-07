@@ -3,6 +3,7 @@
 package workspace
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -443,6 +444,118 @@ func TestRecoverRecordDeletionRemovesEmptyTransaction(t *testing.T) {
 	}
 }
 
+func TestRecoverRecordRenameDebrisSettlesDeletionNamespace(t *testing.T) {
+	rootPath := t.TempDir()
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatalf("open record root: %v", err)
+	}
+	defer root.Close()
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		t.Fatalf("open record directory: %v", err)
+	}
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open deletion namespace: %v", err)
+	}
+	transaction, err := createRecordDeletionTransaction(
+		namespace,
+		"67676767-6767-4767-8767-676767676767",
+		"interrupted-record",
+	)
+	if err != nil {
+		t.Fatalf("create deletion transaction: %v", err)
+	}
+	if err := errors.Join(
+		transaction.Close(),
+		namespace.Close(),
+		directory.Close(),
+	); err != nil {
+		t.Fatalf("close deletion transaction: %v", err)
+	}
+
+	if err := recoverRecordRenameDebris(root); err != nil {
+		t.Fatalf("recover deletion namespace: %v", err)
+	}
+	if _, err := root.Lstat(recordDeletionNamespace); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("deletion namespace remains: %v", err)
+	}
+}
+
+func TestRemoveRecoversRecordDeletionNamespaceBeforeStatus(t *testing.T) {
+	repository := newTestRepository(t)
+	manager, err := New(filepath.Join(t.TempDir(), "data"))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	prepared, err := manager.Prepare(
+		context.Background(),
+		repository,
+		"",
+		testAgentID,
+	)
+	if err != nil {
+		t.Fatalf("prepare workspace: %v", err)
+	}
+	if err := manager.AcknowledgePreparation(prepared); err != nil {
+		t.Fatalf("acknowledge preparation: %v", err)
+	}
+	root, err := os.OpenRoot(prepared.Path)
+	if err != nil {
+		t.Fatalf("open workspace root: %v", err)
+	}
+	directory, err := openRecordDirectory(root)
+	if err != nil {
+		t.Fatalf("open workspace directory: %v", err)
+	}
+	namespace, err := openRecordDeletionNamespace(directory)
+	if err != nil {
+		t.Fatalf("open workspace deletion namespace: %v", err)
+	}
+	transaction, err := createRecordDeletionTransaction(
+		namespace,
+		"89898989-8989-4898-8989-898989898989",
+		"interrupted-marker",
+	)
+	if err != nil {
+		t.Fatalf("create marker deletion transaction: %v", err)
+	}
+	if err := errors.Join(
+		transaction.Close(),
+		namespace.Close(),
+		directory.Close(),
+		root.Close(),
+	); err != nil {
+		t.Fatalf("close marker deletion transaction: %v", err)
+	}
+	status := runGit(
+		t,
+		prepared.Path,
+		"status",
+		"--porcelain=v1",
+		"--untracked-files=all",
+	)
+	if !strings.Contains(status, recordDeletionNamespace) {
+		t.Fatalf("Git status did not observe deletion namespace: %q", status)
+	}
+
+	result, err := manager.Remove(
+		context.Background(),
+		prepared.AgentID,
+		false,
+	)
+	if err != nil || result.State != RemovalComplete {
+		t.Fatalf("remove after deletion recovery = %+v, %v", result, err)
+	}
+	if err := manager.AcknowledgeRemoval(result.Removal); err != nil {
+		t.Fatalf("acknowledge removal: %v", err)
+	}
+}
+
 func TestUnlinkLinkedRecordPathAcceptsMissingSourceWithMatchingWitness(
 	t *testing.T,
 ) {
@@ -507,6 +620,12 @@ func TestRecoverRecordInstallAliasUsesSameFileWitness(t *testing.T) {
 	assertFileContents(t, sourcePath, "record\n")
 	if _, err := os.Lstat(aliasPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("install alias remains: %v", err)
+	}
+	if _, err := root.Lstat(recordDeletionNamespace); !errors.Is(
+		err,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("record deletion namespace remains: %v", err)
 	}
 }
 

@@ -21,6 +21,12 @@ type recordInstallAlias struct {
 }
 
 func recoverRecordRenameDebris(root *os.Root) (result error) {
+	if err := cleanupRecordDeletionNamespace(root); err != nil {
+		return fmt.Errorf(
+			"workspace: recover record deletion transactions: %w",
+			err,
+		)
+	}
 	entries, err := readRootDirectory(root)
 	if err != nil {
 		return err
@@ -56,8 +62,11 @@ func recoverRecordRenameDebris(root *os.Root) (result error) {
 	if err != nil {
 		return err
 	}
+	directoryOpen := true
 	defer func() {
-		result = errors.Join(result, directory.Close())
+		if directoryOpen {
+			result = errors.Join(result, directory.Close())
+		}
 	}()
 	for _, alias := range aliases {
 		file, err := openRecordPath(directory, alias.name)
@@ -87,7 +96,20 @@ func recoverRecordRenameDebris(root *os.Root) (result error) {
 			return err
 		}
 	}
-	return syncRecordDirectory(directory)
+	if err := syncRecordDirectory(directory); err != nil {
+		return err
+	}
+	directoryOpen = false
+	if err := directory.Close(); err != nil {
+		return err
+	}
+	if err := cleanupRecordDeletionNamespace(root); err != nil {
+		return fmt.Errorf(
+			"workspace: cleanup record deletion transactions: %w",
+			err,
+		)
+	}
+	return nil
 }
 
 func validRecordInstallAliasName(name string) bool {
