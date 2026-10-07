@@ -54,18 +54,21 @@ func TestCopyIncludedPathUsesOpenedSourceRoot(t *testing.T) {
 	defer destination.Close()
 
 	openedSourcePath := sourcePath + "-opened"
-	if err := os.Rename(sourcePath, openedSourcePath); err != nil {
-		t.Fatalf("move opened source: %v", err)
+	renameErr := os.Rename(sourcePath, openedSourcePath)
+	if renameErr != nil && runtime.GOOS != "windows" {
+		t.Fatalf("move opened source: %v", renameErr)
 	}
-	if err := os.Mkdir(sourcePath, 0o700); err != nil {
-		t.Fatalf("replace source directory: %v", err)
-	}
-	if err := os.WriteFile(
-		filepath.Join(sourcePath, "secret"),
-		[]byte("replacement\n"),
-		0o600,
-	); err != nil {
-		t.Fatalf("write replacement source: %v", err)
+	if renameErr == nil {
+		if err := os.Mkdir(sourcePath, 0o700); err != nil {
+			t.Fatalf("replace source directory: %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(sourcePath, "secret"),
+			[]byte("replacement\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write replacement source: %v", err)
+		}
 	}
 
 	if err := copyIncludedPath(
@@ -208,18 +211,21 @@ func TestCopyIncludedFilesUsesPinnedSourceRoot(t *testing.T) {
 	}
 
 	openedSourcePath := sourcePath + "-opened"
-	if err := os.Rename(sourcePath, openedSourcePath); err != nil {
-		t.Fatalf("move opened source: %v", err)
+	renameErr := os.Rename(sourcePath, openedSourcePath)
+	if renameErr != nil && runtime.GOOS != "windows" {
+		t.Fatalf("move opened source: %v", renameErr)
 	}
-	if err := os.Mkdir(sourcePath, 0o700); err != nil {
-		t.Fatalf("replace source directory: %v", err)
-	}
-	if err := os.WriteFile(
-		filepath.Join(sourcePath, "secret"),
-		[]byte("replacement\n"),
-		0o600,
-	); err != nil {
-		t.Fatalf("write replacement source: %v", err)
+	if renameErr == nil {
+		if err := os.Mkdir(sourcePath, 0o700); err != nil {
+			t.Fatalf("replace source directory: %v", err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(sourcePath, "secret"),
+			[]byte("replacement\n"),
+			0o600,
+		); err != nil {
+			t.Fatalf("write replacement source: %v", err)
+		}
 	}
 
 	if _, err := manager.copyIncludedFiles(
