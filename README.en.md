@@ -22,10 +22,10 @@ Drove is a local daemon and CLI. It starts Claude Code, Codex, or any executable
 
 The recorder and terminal controls work today. `drove tui` shows all sessions,
 `drove attach` connects to one live terminal, and the Web detail page shows a
-live xterm.js terminal with exact time-based playback. The tower grid, push
-notifications, and phone approval remain in
-[Epic #31](https://github.com/Duang777/drove/issues/31). There are no release
-binaries.
+live xterm.js terminal with exact time-based playback. Drove can send a Web
+Push or ntfy notification when an Agent enters `blocked`. The tower grid and
+phone approval remain in [Epic #31](https://github.com/Duang777/drove/issues/31).
+There are no release binaries.
 
 ## Status
 
@@ -51,7 +51,7 @@ binaries.
 | `drove attach` and the Web xterm.js single-session terminal | Shipped | [#20](https://github.com/Duang777/drove/issues/20), [spec 013](specs/013-terminal-attach-web-playback/spec.md) |
 | Bubble Tea multi-session terminal overview | Shipped | [#41](https://github.com/Duang777/drove/issues/41), [spec 014](specs/014-terminal-overview-tui/spec.md) |
 | Control-tower grid | Planned | [#26](https://github.com/Duang777/drove/issues/26) |
-| Push notifications | Planned | [#27](https://github.com/Duang777/drove/issues/27) |
+| Web Push and ntfy notifications for Blocked | Shipped | [#27](https://github.com/Duang777/drove/issues/27), [spec 016](specs/016-push-notifications/spec.md) |
 | Approve, deny, or reply from a phone | Planned | [#28](https://github.com/Duang777/drove/issues/28) |
 | Native resume, and process-group SIGTERM with a grace period before SIGKILL | Shipped | [#16](https://github.com/Duang777/drove/issues/16) |
 | Agent processes that survive daemon exit | Planned | [#17](https://github.com/Duang777/drove/issues/17), [#18](https://github.com/Duang777/drove/issues/18) |
@@ -294,6 +294,21 @@ The config file is `~/.drove/config.json`. `DROVE_DATA_DIR` overrides `data_dir`
   "session": {
     "auto_resume_on_start": false,
     "termination_grace_seconds": 5
+  },
+  "notify": {
+    "on": ["blocked"],
+    "debounce_seconds": 30,
+    "quiet_when_active": true,
+    "web_push": {
+      "enabled": false,
+      "vapid_subject": ""
+    },
+    "ntfy": {
+      "enabled": false,
+      "base_url": "",
+      "topic": "",
+      "token_file": ""
+    }
   }
 }
 ```
@@ -314,6 +329,66 @@ and CLI available. `drove web` returns an error in this mode.
 
 The control token is 256 random bits, stored as lowercase hex in `<data_dir>/control.token` with mode `0600`. It is created the first time the daemon starts. The config file itself is mode `0644`.
 
+### Blocked notifications
+
+To enable Web Push, set `notify.web_push.enabled` to `true` and set
+`notify.web_push.vapid_subject` to a `mailto:` or HTTPS URI. On its first
+start, the daemon creates VAPID keys at `<data_dir>/notify/vapid.json`. The
+directory has mode `0700`, and the file has mode `0600`.
+
+```json
+{
+  "notify": {
+    "on": ["blocked"],
+    "debounce_seconds": 30,
+    "quiet_when_active": true,
+    "web_push": {
+      "enabled": true,
+      "vapid_subject": "mailto:operator@example.com"
+    }
+  }
+}
+```
+
+Restart the daemon, then run `drove web`. Open the notification panel in the
+header and select **Enable this device**. A remote browser requires HTTPS.
+Loopback addresses also qualify as secure browser contexts. On iOS, first add
+the console to the Home Screen from Safari. See
+[Remote access](docs/remote-access.md) for setup steps.
+
+You can enable ntfy alone or together with Web Push. A remote `base_url` must
+use HTTPS. A loopback service can use HTTP. The `topic` must contain 1 to 64
+ASCII letters, digits, hyphens, or underscores. Put a bearer token in a
+regular `0600` file at an absolute path. Do not put the token in `config.json`.
+
+```json
+{
+  "notify": {
+    "on": ["blocked"],
+    "debounce_seconds": 30,
+    "quiet_when_active": true,
+    "ntfy": {
+      "enabled": true,
+      "base_url": "https://ntfy.example.com",
+      "topic": "drove_ops",
+      "token_file": "/home/you/.drove/ntfy.token"
+    }
+  }
+}
+```
+
+Only committed `agent.state_changed` events trigger notifications. The first
+Blocked event enters the outbox immediately. Repeated Blocked transitions for
+the same Agent do not create another visible notification during the debounce
+window. When `quiet_when_active` is enabled, a short-lived heartbeat from a
+visible console suppresses new notifications.
+
+The default payload contains only a notification ID, Agent ID, Agent name,
+vendor, state, Blocked event sequence, occurrence time, and same-origin detail
+link. It contains no terminal screen, output, prompt, input, signal token, or
+vendor credential. Web Push payloads pass through the browser push service.
+The configured ntfy server can read the listed metadata.
+
 ## Web console
 
 The daemon embeds and serves the production frontend from the loopback browser
@@ -330,7 +405,8 @@ the fragment. Browser JavaScript never reads `control.token`.
 The page lists, starts, and stops sessions. A selected session shows its name,
 state, working directory, connection state, live xterm.js terminal, and state
 timeline. Writable input stays disabled until the raw stream reaches the
-durable head.
+durable head. The notification panel in the header can enable, test, and
+revoke the current browser's Web Push subscription.
 
 The Vite development server proxies `/api` and `/ws` to `api_bind` and adds a
 Bearer token from `control.token`. Start the daemon first:
@@ -357,11 +433,12 @@ The tower grid is tracked by [#26](https://github.com/Duang777/drove/issues/26).
 The approved MVP is [Epic #31, flight recorder + control tower](https://github.com/Duang777/drove/issues/31).
 
 The screen model, WebSocket terminal stream, terminal overview, single-session
-interaction and playback, and control-plane hardening are complete.
-The next items are:
+interaction and playback, control-plane hardening, and
+[#27](https://github.com/Duang777/drove/issues/27) push notifications are
+complete. The remaining items are:
 
 1. [#26](https://github.com/Duang777/drove/issues/26) control-tower grid
-2. [#27](https://github.com/Duang777/drove/issues/27) push and [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
+2. [#28](https://github.com/Duang777/drove/issues/28) approve, deny, or reply from a phone
 3. [#35](https://github.com/Duang777/drove/issues/35) exact x/vt checkpoints for large recordings
 
 After the MVP: the shim in [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18), then the away brief [#29](https://github.com/Duang777/drove/issues/29), full-text search [#30](https://github.com/Duang777/drove/issues/30), and worktrees [#23](https://github.com/Duang777/drove/issues/23). Structured state sources [#22](https://github.com/Duang777/drove/issues/22) and the persistent hook installer [#24](https://github.com/Duang777/drove/issues/24) are deferred.
@@ -388,6 +465,13 @@ This is a single-user control plane on the local machine.
   writable or read-only access. It stores no attachment ID or client identity.
 - Signal tokens in the output stream are redacted with an equal-length replacement.
 - Fully injected Codex OSC 9 retains only fixed approval classification prefixes. Free-form text is redacted before Store, Hub, replay, and raw tail.
+- The notification database and VAPID private key are separate `0600` files.
+  Default notifications contain no terminal screen, output, prompt, or input.
+  The ntfy server can still read the Agent name, vendor, state, time, and
+  detail link.
+- Access the remote console through an HTTPS reverse proxy or an SSH port
+  forward. `api_bind` remains loopback-only. See
+  [Remote access](docs/remote-access.md).
 - There is no auto-approve. Phone approval is [#28](https://github.com/Duang777/drove/issues/28), and the default there is still not automatic approval.
 
 The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-state-and-control.md). The repository does not have a separate threat-model document.
@@ -407,6 +491,8 @@ The design notes are in [RFC-001, security considerations](docs/rfc-001-agent-st
 | [spec 013](specs/013-terminal-attach-web-playback/spec.md) | CLI attach and Web live terminal playback |
 | [spec 014](specs/014-terminal-overview-tui/spec.md) | Bubble Tea multi-session terminal overview |
 | [spec 015](specs/015-control-plane-hardening/spec.md) | Control-plane hardening delivery plan |
+| [spec 016](specs/016-push-notifications/spec.md) | Durable Blocked notifications and PWA |
+| [Remote access](docs/remote-access.md) | Tailscale Serve and SSH port forwarding |
 | [Technical notes](docs/technical-notes.md) | A point-in-time reading. Its opening says the first six sections are not current `main` |
 | [AGENTS.md](AGENTS.md) | Directory responsibilities and engineering constraints |
 

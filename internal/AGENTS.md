@@ -22,7 +22,7 @@ cmd/* ──▶ internal/clitui ──▶ internal/client ──▶ internal/ses
   装配其生命周期，API 只依赖窄通知接口。
 - `localipc` 封装 Unix listener、peer credential 与客户端 transport，供 daemon
   和 client 依赖。
-- `api` 只依赖 `session` 与 `event` 的公开接口。
+- `api` 只依赖 `session`、`event` 与窄通知接口，不得访问通知数据库或渠道实现。
 - `client` 只做 JSON 透传（HTTP 客户端），不解析领域类型。
 - `clitui` 只协调 client 公开能力与 `cliattach` 交接；fleet 状态来自
   `session.Status`，只有选中会话持有 snapshot stream。

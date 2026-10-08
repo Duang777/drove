@@ -21,7 +21,8 @@
   ntfy token 不进入配置文件。
 - ntfy 远端地址必须使用 HTTPS；HTTP 只允许 loopback。token 只允许引用绝对
   `0600` 文件路径。
-- `Validate()` 在启动早期校验；API 只允许 loopback 监听，WebSocket Origin 只允许配置的本地 HTTP Origin。
+- `Validate()` 在启动早期校验；API 只允许 loopback 监听。HTTP Origin 只允许
+  loopback，显式配置的远程 Origin 必须使用 HTTPS。
 - `disable_tcp=true` 只关闭供浏览器使用的 loopback TCP listener；daemon 的 Unix
   socket 控制面始终启用。
 

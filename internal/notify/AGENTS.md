@@ -14,6 +14,8 @@ outbox、投递租约与短期浏览器 presence，并通过渠道接口投递�
 - 通知 payload 由固定字段构造，不得复制事件 payload、终端内容或输入正文。
 - 投递采用有界租约和至少一次语义。过期租约可以在重启后重新领取。
 - Web Push 与 ntfy 只实现 `Channel`，不得反向依赖 daemon、API 或 session。
+- Web Push 测试通知直接发送到一个指定订阅，不写 session 事件或改变 Agent 状态。
+- API 可读取公开设备 ID、名称和创建时间，但不得读取 endpoint 或订阅密钥。
 
 ## 约束
 

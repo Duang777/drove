@@ -8,6 +8,8 @@
 
 - `dist/` 是经过 `npm --prefix web run build` 生成并提交的生产资源，保证干净 checkout
   只运行 Go 工具链也能构建完整 daemon。
+- `dist/` 包含 PWA manifest、service worker 和本地图标。service worker 不得增加
+  fetch handler 或缓存控制台、认证、API、WebSocket 和终端数据。
 - `FS()` 只暴露 `dist/` 子树；HTTP 路由、认证、缓存和 SPA fallback 由
   `internal/api` 决定。
 - `go generate ./internal/webui` 从仓库内 `web/` 重新生成资源。

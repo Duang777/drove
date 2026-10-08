@@ -13,7 +13,8 @@
 - 所有 listener 必须在任一 Serve goroutine 启动前创建成功；Unix listener 始终启用，
   TCP 可由配置关闭。
 - Unix listener 只接受 `drove.local` Host；TCP listener 从实际端口派生
-  `127.0.0.1`、`localhost` 和 `[::1]` Host 与同源 Origin 白名单。
+  `127.0.0.1`、`localhost` 和 `[::1]` Host 与同源 Origin 白名单。显式配置的
+  HTTPS console Origin 也把精确 Host 加入白名单，供 loopback 反向代理使用。
 - 浏览器 listener 同源提供 `internal/webui` 的嵌入式生产构建；运行时不依赖源码目录
   或 Node。
 - 自动恢复开启时，API server 必须先进入 listener `Accept`，再按创建时间顺序调用

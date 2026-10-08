@@ -22,12 +22,19 @@ daemon 通信。
   - `POST /api/v1/auth/login-code`：仅允许 Unix socket 签发一次性浏览器登录码
   - `POST /api/v1/auth/login`：浏览器同源兑换 HttpOnly cookie
   - `POST /api/v1/auth/token/rotate`：仅允许 Unix socket 调用的控制令牌轮换
+  - `GET  /api/v1/notifications`：返回通知渠道可用性与公开策略
+  - `GET  /api/v1/push/subscriptions`：列出不含 endpoint 和密钥的设备
+  - `POST /api/v1/push/subscriptions`：严格校验并保存浏览器订阅
+  - `DELETE /api/v1/push/subscriptions/{id}`：撤销浏览器订阅
+  - `POST /api/v1/notifications/presence`：记录可见页面的短期 presence
+  - `POST /api/v1/notifications/test`：向一个订阅发送元数据测试通知
   - `GET  /api/v1/agents/{id}/timeline`：状态区间、Blocked 索引与输出保留范围
   - `GET  /api/v1/agents/{id}/timeline/blocked/{number}`：一基 Blocked 跳转位置
   - `GET  /api/v1/agents/{id}/frame`：按 seq、at 或 offset 精确重建受限终端帧
   - `GET  /ws`：WebSocket 实时事件流与版本化双向输入
-- 浏览器 listener 从嵌入文件系统提供 `/`、`/login` 和哈希静态资源；Unix listener
-  不提供前端。
+- 浏览器 listener 从嵌入文件系统提供 `/`、`/login`、PWA 根文件、图标和哈希静态
+  资源；Unix listener 不提供前端。service worker 与 manifest 不使用 immutable
+  cache，控制 HTML 保持 `no-store`。
 - 每个 listener 先绑定访问类型和精确 Host 白名单；所有路由（含 signal 与静态资源）都
   在认证前校验 Host，浏览器边界对任何已携带的 Origin 做精确白名单校验。
 - 控制 REST 与 WebSocket 接受 Bearer 或浏览器 cookie；cookie 认证的非安全请求和
@@ -64,6 +71,8 @@ daemon 通信。
 - worktree 的非 Git 仓库或非法分支映射为 400；daemon 没有可用 workspace manager
   时映射为 503；创建目录、执行 Git 等运行故障保留为 500。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
+- 通知处理函数只依赖 `NotificationService`。公开响应不得返回 subscription
+  endpoint、订阅密钥、VAPID 私钥或 ntfy 凭据。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。
 - WebSocket 发送带 write deadline + ping/pong 保活，防止死连接。
 
