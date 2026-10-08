@@ -98,6 +98,14 @@ Serve。Drove 页面把一次性登录码兑换成有效期 12 小时的 HttpOnl
 iOS 只有从主屏幕启动的 PWA 能申请 Web Push 权限。所有平台都需要允许通知。
 浏览器拒绝权限后，需要从站点设置中重新授权。
 
+Agent 进入可操作的 Blocked 审批框后，通知会显示浏览器支持的 action。**批准**和
+**回复**会打开 PWA 审批页；批准还需要再次确认。**拒绝**可以从通知直接提交一次，
+失败时会打开审批页。iOS 不显示通知 action 按钮时，点击通知正文打开同一审批页。
+
+审批页必须能继续访问同一个 HTTPS Origin。它会使用 HttpOnly cookie 请求当前受限
+屏幕和新 ticket。旧通知不会作用于新的审批框，ticket 也不会进入 URL 或浏览器
+存储。
+
 停止共享 Drove：
 
 ```bash
@@ -141,10 +149,11 @@ subscription 仍保存在 `notify.db`，直到用户在通知面板中停用设�
 - `console_origins` 必须包含完整 scheme、host 和可选端口。不要添加通配符。
 - Tailscale Serve 提供 HTTPS，但 Drove 仍校验 Host、Origin 和自己的 cookie。
 - service worker 不缓存控制台 HTML、登录响应、API、WebSocket 或终端数据。
-- 通知只含 Agent 元数据和同源详情链接。远程控制台仍能读取终端和发送输入，因此只
-  应对可信设备签发登录链接。
-- [#28](https://github.com/Duang777/drove/issues/28) 才会增加通知中的批准、拒绝和
-  回复动作。当前通知点击只打开对应 Agent。
+- 通知只含 Agent 元数据、同源详情链接和可操作审批框的短期 action ticket，不含
+  终端画面或回复正文。ticket 默认 10 分钟过期，只能使用一次，并绑定设备和
+  Blocked 序号。
+- Drove 没有自动批准路径。批准必须打开 PWA 并再次确认。远程控制台仍能读取终端和
+  发送输入，因此只应对可信设备签发登录链接。
 
 Tailscale Serve 的命令格式见
 [Tailscale Serve command](https://tailscale.com/kb/1242/tailscale-serve)。

@@ -12,6 +12,10 @@ hook JSON）的包。上层只接收规范化 hook signal 和 screen hint。
   session 私有文件描述；只做纯计划，不读写文件。
 - `Entry.NewScreenClassifier` 为每个 session 创建独立的有状态分类器；规则定义、
   matcher、区域选择和边沿记忆都留在本包，只输出复制后的 `ScreenHint`。
+- approval screen rule 同时保存该厂商的 `approve` / `deny` / `reply` PTY 字节映射；
+  action plan 只匹配调用时提供的当前 `term.Snapshot`，并返回输入副本。reply 在组装前
+  必须通过 UTF-8、trim 后 1..4096 字节和无 C0/C1 控制字符校验；approve/deny 不接受
+  reply。
 - 屏幕规则的确认时长必须与 `detect.ScreenRuleConfirmation` 完全一致；适配器只声明
   稳定性元数据，不决定状态或信号权威。
 - Claude/Codex 私有 normalizer 把厂商 hook JSON 压缩成 `detect.Signal`；未知事件拒绝，
@@ -43,5 +47,5 @@ hook JSON）的包。上层只接收规范化 hook signal 和 screen hint。
 - signal injection 同样只允许精确 adapter；参数冲突必须返回显式错误，禁止覆盖
   调用方提供的 `--settings`、`--bare` 或 Codex managed notification key。
 - 导出类型以 `Registry`、`Entry`、`Runner`、`ScreenClassifier`、
-  `ScreenHint`、`HookInput`、`HookNormalizer`、`SignalInjector` 和
+  `ScreenHint`、`ApprovalActionPlan`、`HookInput`、`HookNormalizer`、`SignalInjector` 和
   `TerminalNotificationNormalizer` 为核心。

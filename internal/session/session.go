@@ -34,6 +34,7 @@ type Status struct {
 	Dir                   string                      `json:"dir,omitempty"`
 	Mode                  agent.RunMode               `json:"mode"`
 	State                 agent.State                 `json:"state"`
+	StateSeq              StateSeq                    `json:"state_seq"`
 	PID                   int                         `json:"pid,omitempty"`
 	CreatedAt             time.Time                   `json:"created_at"`
 	UpdatedAt             time.Time                   `json:"updated_at"`
@@ -160,7 +161,8 @@ type launchedSession interface {
 }
 
 type runningSession struct {
-	inputMu        sync.Mutex
+	controlMu      sync.Mutex
+	responseFence  StateSeq
 	process        processSession
 	observer       *observationActor
 	classifier     *adapter.ScreenClassifier
@@ -303,6 +305,7 @@ func Bootstrap(
 			return nil, fmt.Errorf("session: bootstrap restore agent %q: %w", snapshot.ID, err)
 		}
 		managed := newManagedAgent(restored)
+		managed.setStateSeq(plan.StateSeqs[string(snapshot.ID)])
 		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
 		managed.setWorkspaceState(workspaceRuntimeState{
 			workingDir:    plan.WorkingDirs[string(snapshot.ID)],
@@ -495,7 +498,7 @@ func (m *Manager) Start(
 	running.injectionDir = injection.dir
 	receipt, err := m.committer.CommitAgent(
 		ctx,
-		a,
+		managed,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "session_start",
@@ -627,7 +630,7 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 	running.process = sess
 	m.mu.Unlock()
 
-	terminalActor, err := newTerminalActorAtOffset(
+	terminalActor, err := newTerminalActorAtOffsetWithReplyWriter(
 		plan.terminalSize,
 		sess,
 		running.classifier,
@@ -639,6 +642,9 @@ func (m *Manager) activate(ctx context.Context, plan activation) error {
 			m.failTerminalActor(id, actorErr)
 		},
 		plan.outputOffset,
+		func(data []byte) (int, error) {
+			return m.writeTerminalReply(id, running, data)
+		},
 	)
 	if err != nil {
 		startErr := fmt.Errorf("session: initialize terminal: %w", err)
@@ -789,7 +795,7 @@ func (m *Manager) resumeReserved(
 	}
 	if _, err := m.committer.CommitAgent(
 		ctx,
-		target,
+		managed,
 		agent.ResumeToStarting("session resume", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "session_resume",
@@ -993,9 +999,6 @@ func (m *Manager) Close() error {
 		m.mu.Lock()
 		attached := make([]attachedSession, 0, len(m.sessions))
 		for id, sess := range m.sessions {
-			if !sess.exitClaimed && sess.stopCause == stopCauseNone {
-				sess.stopCause = stopCauseShutdown
-			}
 			attached = append(attached, attachedSession{id: id, session: sess})
 		}
 		m.mu.Unlock()
@@ -1005,11 +1008,14 @@ func (m *Manager) Close() error {
 
 		var closeErrors []error
 		for _, item := range attached {
-			if err := item.session.process.Close(); err != nil {
-				closeErrors = append(
-					closeErrors,
-					fmt.Errorf("session: close agent %q: %w", item.id, err),
-				)
+			m.requestStop(item.id, item.session, stopCauseShutdown)
+			if item.session.process != nil {
+				if err := item.session.process.Close(); err != nil {
+					closeErrors = append(
+						closeErrors,
+						fmt.Errorf("session: close agent %q: %w", item.id, err),
+					)
+				}
 			}
 			if item.session.output != nil {
 				if err := item.session.output.Close(); err != nil {
@@ -1102,7 +1108,8 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 			hookStatus = sess.observer.Snapshot().HookStatus()
 		}
 	}
-	state := a.State()
+	stateView := managed.stateView()
+	state := stateView.state
 	ref := managed.vendorSessionReference()
 	entry, exactVendor := m.reg.Lookup(a.Vendor())
 	workspaceState := managed.workspaceState()
@@ -1126,13 +1133,14 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		Dir:            workingDir,
 		Mode:           a.RunMode(),
 		State:          state,
-		CreatedAt:      a.CreatedAt(),
-		UpdatedAt:      a.UpdatedAt(),
-		StateSince:     a.StateSince(),
-		LastError:      a.LastError(),
+		StateSeq:       stateView.stateSeq,
+		CreatedAt:      stateView.createdAt,
+		UpdatedAt:      stateView.updatedAt,
+		StateSince:     stateView.stateSince,
+		LastError:      stateView.lastError,
 		HookPolicy:     a.HookPolicy(),
 		HookStatus:     hookStatus,
-		LastTransition: a.LastTransition(),
+		LastTransition: stateView.lastTransition,
 		Resumable:      resumable,
 	}
 	st.SignalInjection = a.SignalInjection()
@@ -1474,7 +1482,7 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 
 	m.mu.RLock()
 	closed := m.closed
-	_, known := m.agents[id]
+	managed, known := m.agents[id]
 	running, attached := m.sessions[id]
 	var process processSession
 	if attached {
@@ -1491,25 +1499,30 @@ func (m *Manager) SendInput(id agent.ID, data []byte) (InputResult, error) {
 		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
-	if !running.inputMu.TryLock() {
+	if !running.controlMu.TryLock() {
 		return InputResult{}, ErrInputBackpressure
 	}
-	defer running.inputMu.Unlock()
+	defer running.controlMu.Unlock()
 
 	m.mu.RLock()
 	current, stillAttached := m.sessions[id]
 	closed = m.closed
 	exitClaimed := running.exitClaimed
+	stopping := running.stopCause != stopCauseNone
+	process = running.process
 	m.mu.RUnlock()
 	if closed {
 		return InputResult{}, ErrManagerClosed
 	}
-	if !stillAttached || current != running || exitClaimed {
+	if !stillAttached || current != running || exitClaimed || stopping || process == nil {
 		return InputResult{}, fmt.Errorf("%w: %q", ErrNotAttached, id)
 	}
 
 	written, err := process.Write(data)
 	result := InputResult{BytesWritten: written}
+	if written > 0 {
+		running.responseFence = managed.currentStateSeq()
+	}
 	if writeErr := classifyInputWrite(id, written, len(data), err); writeErr != nil {
 		return result, writeErr
 	}
@@ -1582,6 +1595,30 @@ func classifyInputWrite(
 	)
 }
 
+func (m *Manager) writeTerminalReply(
+	id agent.ID,
+	running *runningSession,
+	data []byte,
+) (int, error) {
+	running.controlMu.Lock()
+	defer running.controlMu.Unlock()
+
+	m.mu.RLock()
+	current, attached := m.sessions[id]
+	process := running.process
+	unavailable := m.closed ||
+		!attached ||
+		current != running ||
+		running.exitClaimed ||
+		running.stopCause != stopCauseNone ||
+		process == nil
+	m.mu.RUnlock()
+	if unavailable {
+		return 0, fmt.Errorf("%w: %q", ErrNotAttached, id)
+	}
+	return process.Write(data)
+}
+
 func validateInput(data []byte) (string, error) {
 	if len(data) == 0 {
 		return "", ErrInputEmpty
@@ -1603,9 +1640,7 @@ func validateInput(data []byte) (string, error) {
 
 // onExit 根据运行模式和停止原因记录终态，再移除 PTY。
 func (m *Manager) onExit(id agent.ID, running *runningSession, info pty.ExitInfo) {
-	running.inputMu.Lock()
 	cause, ok := m.claimExit(id, running)
-	running.inputMu.Unlock()
 	if !ok {
 		return
 	}
@@ -1804,6 +1839,8 @@ func (m *Manager) endStart() {
 }
 
 func (m *Manager) requestStop(id agent.ID, running *runningSession, cause stopCause) {
+	running.controlMu.Lock()
+	defer running.controlMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if current, ok := m.sessions[id]; ok &&
@@ -1815,6 +1852,8 @@ func (m *Manager) requestStop(id agent.ID, running *runningSession, cause stopCa
 }
 
 func (m *Manager) claimExit(id agent.ID, running *runningSession) (stopCause, bool) {
+	running.controlMu.Lock()
+	defer running.controlMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current, ok := m.sessions[id]

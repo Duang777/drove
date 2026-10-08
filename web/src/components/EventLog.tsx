@@ -9,6 +9,7 @@ const KIND_STYLE: Record<string, string> = {
   error: 'event-error',
   session_lifecycle: 'event-lifecycle',
   'agent.input': 'event-input',
+  'agent.action': 'event-action',
   'agent.signal': 'event-signal',
 }
 
@@ -87,6 +88,7 @@ export function EventLog({ liveEvents, replayID }: Props) {
 
 function formatEventText(kind: string, text: string): string {
   if (kind === 'output.chunk') return formatOutputChunk(text)
+  if (kind === 'agent.action') return formatAgentAction(text)
   if (kind !== 'agent.signal' || text === '') return text
   try {
     const value: unknown = JSON.parse(text)
@@ -97,6 +99,30 @@ function formatEventText(kind: string, text: string): string {
     return parts.length > 0 ? parts.join(' · ') : text
   } catch {
     return text
+  }
+}
+
+function formatAgentAction(text: string): string {
+  try {
+    const value: unknown = JSON.parse(text)
+    if (!isRecord(value)) return 'invalid action metadata'
+    const action = value.action
+    const channel = value.channel
+    const replyBytes = value.reply_bytes
+    const promptRule = value.prompt_rule
+    if (
+      typeof action !== 'string' ||
+      typeof channel !== 'string' ||
+      typeof replyBytes !== 'number' ||
+      !Number.isSafeInteger(replyBytes) ||
+      replyBytes < 0 ||
+      typeof promptRule !== 'string'
+    ) {
+      return 'invalid action metadata'
+    }
+    return `${action} · ${channel} · ${replyBytes} reply bytes · ${promptRule}`
+  } catch {
+    return 'invalid action metadata'
   }
 }
 

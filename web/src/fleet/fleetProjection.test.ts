@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { formatUint64 } from '../api/parsing'
 import type { AgentState, AgentStatus, Event } from '../api/types'
 import {
   formatBlockedDuration,
@@ -93,6 +94,7 @@ function agentFixture(
     vendor: 'generic',
     mode: 'interactive',
     state,
+    state_seq: formatUint64(1n),
     created_at: '2026-10-04T12:00:00Z',
     updated_at: stateSince,
     state_since: stateSince,

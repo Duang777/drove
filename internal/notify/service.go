@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	eventstore "github.com/Duang777/drove/internal/store"
 )
@@ -26,6 +28,8 @@ type ServiceOptions struct {
 	Events               EventSource
 	Hub                  *event.Hub
 	Resolver             MetadataResolver
+	ActionResolver       ActionResolver
+	ActionTickets        *ActionTickets
 	Policy               Policy
 	Channels             []Channel
 	BatchSize            int
@@ -45,6 +49,8 @@ type Service struct {
 	events               EventSource
 	hub                  *event.Hub
 	resolver             MetadataResolver
+	actionResolver       ActionResolver
+	actionTickets        *ActionTickets
 	policy               Policy
 	channels             map[ChannelKind]Channel
 	enabled              map[ChannelKind]bool
@@ -147,6 +153,8 @@ func NewService(options ServiceOptions) (*Service, error) {
 		events:               options.Events,
 		hub:                  options.Hub,
 		resolver:             options.Resolver,
+		actionResolver:       options.ActionResolver,
+		actionTickets:        options.ActionTickets,
 		policy:               options.Policy,
 		channels:             channels,
 		enabled:              enabled,
@@ -352,6 +360,7 @@ func (s *Service) deliverReady(ctx context.Context, channel Channel) bool {
 	if !found {
 		return false
 	}
+	s.addActionTickets(ctx, &delivery)
 
 	result, sendErr := channel.Send(ctx, delivery)
 	if sendErr != nil {
@@ -425,6 +434,47 @@ func (s *Service) deliverReady(ctx context.Context, channel Channel) bool {
 		)
 	}
 	return true
+}
+
+func (s *Service) addActionTickets(ctx context.Context, delivery *Delivery) {
+	if delivery.Channel != ChannelWebPush ||
+		delivery.Subscription == nil ||
+		s.actionResolver == nil ||
+		s.actionTickets == nil {
+		return
+	}
+	actions, err := s.actionResolver.ResolveNotificationActions(
+		ctx,
+		delivery.AgentID,
+		delivery.SourceSeq,
+	)
+	if err != nil || len(actions) == 0 {
+		return
+	}
+	issued, err := s.actionTickets.Issue(ctx, ActionTicketRequest{
+		AgentID:    agent.ID(delivery.AgentID),
+		BlockedSeq: delivery.SourceSeq,
+		Actions:    actions,
+		DeviceID:   delivery.Subscription.ID,
+	})
+	if err != nil {
+		s.logger.Warn(
+			"notification action tickets could not be issued",
+			"delivery_id",
+			delivery.ID,
+			"agent_id",
+			delivery.AgentID,
+			"error_type",
+			fmt.Sprintf("%T", err),
+		)
+		return
+	}
+	delivery.Notification.ActionContext = &PushActionContext{
+		Version:    1,
+		BlockedSeq: strconv.FormatUint(delivery.SourceSeq, 10),
+		Tickets:    issued.Tickets,
+		ExpiresAt:  issued.ExpiresAt,
+	}
 }
 
 func (s *Service) retryDelay(attempt int) time.Duration {
@@ -566,6 +616,29 @@ func (s *Service) CurrentBlockedSeq(
 	agentID string,
 ) (uint64, bool, error) {
 	return s.store.CurrentBlockedSeq(ctx, agentID)
+}
+
+// IssueActionTickets creates action-bound tickets for an active push device.
+func (s *Service) IssueActionTickets(
+	ctx context.Context,
+	request ActionTicketRequest,
+) (IssuedActionTickets, error) {
+	if s.actionTickets == nil {
+		return IssuedActionTickets{}, ErrActionTicketsUnavailable
+	}
+	return s.actionTickets.Issue(ctx, request)
+}
+
+// ConsumeActionTicket verifies and durably consumes a remote action ticket.
+func (s *Service) ConsumeActionTicket(
+	ctx context.Context,
+	expectedAgent agent.ID,
+	token string,
+) (ActionTicketClaims, error) {
+	if s.actionTickets == nil {
+		return ActionTicketClaims{}, ErrActionTicketsUnavailable
+	}
+	return s.actionTickets.Consume(ctx, expectedAgent, token)
 }
 
 // Close stops all loops and returns outstanding leases to the queue.

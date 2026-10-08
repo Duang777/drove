@@ -31,6 +31,8 @@
 | `internal/event` | 事件模型、Hub 扇出、订阅 |
 | `internal/session` | 会话编排：agent 创建、快照、回放 |
 | `internal/store` | 持久化（SQLite，只追加事件日志） |
+| `internal/notify` | Blocked 通知、Web Push 设备与一次性 action ticket |
+| `internal/respond` | action ticket 消费与实时会话响应的跨域顺序 |
 | `internal/workspace` | Drove 管理的 Git worktree 创建、枚举与显式清理 |
 | `internal/adapter` | 跨厂商适配层（claude/codex/generic/ACP） |
 | `internal/daemon` | daemon 生命周期、IPC |
@@ -38,7 +40,7 @@
 | `internal/config` | 配置加载与校验 |
 | `internal/version` | 版本信息（由 ldflags 注入） |
 | `pkg/` | 对外可复用公共包（当前留空） |
-| `web/` | 前端（TS/React，规划中，MVP 未启用） |
+| `web/` | 内嵌 TS/React 控制台、终端回放、通知与远程审批 |
 
 ## 4. 工程规范
 

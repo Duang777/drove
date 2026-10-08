@@ -43,6 +43,7 @@ type screenRuleDefinition struct {
 	pattern    string
 	present    screenRuleEdge
 	cleared    *screenRuleEdge
+	approval   *approvalDefinition
 }
 
 type screenRegion struct {

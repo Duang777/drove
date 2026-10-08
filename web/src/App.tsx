@@ -174,8 +174,10 @@ export default function App() {
 
       {location.kind === 'agent' ? (
         <AgentDetailPage
+          key={`${location.agentID}:${location.blockedSeq ?? ''}`}
           agentID={location.agentID}
           agent={selectedAgent}
+          requestedBlockedSeq={location.blockedSeq}
           onBack={() => navigate({ kind: 'fleet' })}
         />
       ) : (

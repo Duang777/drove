@@ -2,6 +2,7 @@ import { act, create } from 'react-test-renderer'
 import type { ReactTestRenderer } from 'react-test-renderer'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { startAgent } from '../api/client'
+import { formatUint64 } from '../api/parsing'
 import type { AgentStatus } from '../api/types'
 import { AgentList } from './AgentList'
 
@@ -69,6 +70,7 @@ function agentFixture(): AgentStatus {
     vendor: 'generic',
     mode: 'interactive',
     state: 'working',
+    state_seq: formatUint64(3n),
     created_at: '2026-10-04T12:00:00Z',
     updated_at: '2026-10-04T12:00:00Z',
     state_since: '2026-10-04T12:00:00Z',

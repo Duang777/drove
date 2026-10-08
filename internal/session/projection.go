@@ -2,9 +2,12 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,7 +39,13 @@ type recoveryProjector struct {
 	gapGeneration uint64
 	lastResumeSeq uint64
 	lastResumeID  string
+	pendingAction *pendingAction
 	report        RecoveryReport
+}
+
+type pendingAction struct {
+	row     store.EventRow
+	payload event.AgentActionPayloadV1
 }
 
 type sessionDraft struct {
@@ -54,6 +63,8 @@ type sessionDraft struct {
 	createdAt              time.Time
 	updatedAt              time.Time
 	stateSince             time.Time
+	stateSeq               StateSeq
+	respondedStateSeq      StateSeq
 	firstSeq               uint64
 	lastStateGapGeneration uint64
 	vendorSessionRef       string
@@ -69,6 +80,7 @@ type sessionDraft struct {
 
 type recoveryPlan struct {
 	Snapshots           []agent.RestoreSnapshot
+	StateSeqs           map[string]StateSeq
 	VendorSessionRefs   map[string]string
 	WorkingDirs         map[string]string
 	Workspaces          map[string]workspaceMetadata
@@ -98,6 +110,10 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 	p.lastSeq = row.Seq
 	p.report.ScannedEvents++
 
+	if p.pendingAction != nil {
+		return p.applyActionInput(row)
+	}
+
 	switch event.Type(row.Type) {
 	case event.TypeSessionLifecycle:
 		return p.applyLifecycle(row)
@@ -110,6 +126,8 @@ func (p *recoveryProjector) Apply(row store.EventRow) error {
 			return projectionError(row, "%s event has empty session ID", row.Type)
 		}
 		return validateAgentID(row)
+	case event.TypeAgentAction:
+		return p.applyAction(row)
 	case event.TypeAgentSignal:
 		return p.applySignal(row)
 	case event.TypeAgentResized:
@@ -552,8 +570,133 @@ func (p *recoveryProjector) applyState(row store.EventRow) error {
 	}
 	draft.updatedAt = row.Timestamp
 	draft.stateSince = row.Timestamp
+	draft.stateSeq = StateSeq(row.Seq)
 	draft.lastStateGapGeneration = p.gapGeneration
 	draft.hasState = true
+	return nil
+}
+
+func (p *recoveryProjector) applyAction(row store.EventRow) error {
+	if row.SessionID == "" {
+		return projectionError(row, "agent.action event has empty session ID")
+	}
+	if err := validateAgentID(row); err != nil {
+		return err
+	}
+	if row.AgentID != row.SessionID {
+		return projectionError(row, "agent.action requires a matching agent ID")
+	}
+	if row.Reason != "responded" {
+		return projectionError(
+			row,
+			"agent.action event has invalid reason %q",
+			row.Reason,
+		)
+	}
+	payload, err := event.DecodeAgentActionPayload(row.Payload)
+	if err != nil {
+		return projectionWrapError(row, "validate agent.action payload", err)
+	}
+	blockedSeq, err := strconv.ParseUint(payload.BlockedSeq, 10, 64)
+	if err != nil {
+		return projectionWrapError(row, "parse agent.action blocked sequence", err)
+	}
+	draft := p.sessions[row.SessionID]
+	if draft == nil || !draft.hasState {
+		return projectionError(row, "agent.action has no state history")
+	}
+	if draft.state != agent.StateBlocked {
+		return projectionError(
+			row,
+			"agent.action requires blocked state, got %s",
+			draft.state,
+		)
+	}
+	if draft.stateSeq != StateSeq(blockedSeq) {
+		return projectionError(
+			row,
+			"agent.action blocked sequence %d does not match current state sequence %d",
+			blockedSeq,
+			draft.stateSeq,
+		)
+	}
+	if draft.respondedStateSeq == StateSeq(blockedSeq) {
+		return projectionError(
+			row,
+			"duplicate agent.action for blocked sequence %d",
+			blockedSeq,
+		)
+	}
+	p.pendingAction = &pendingAction{row: row, payload: payload}
+	return nil
+}
+
+func (p *recoveryProjector) applyActionInput(row store.EventRow) error {
+	action := p.pendingAction
+	if action == nil {
+		return projectionError(row, "missing pending agent.action")
+	}
+	if row.Seq != action.row.Seq+1 ||
+		event.Type(row.Type) != event.TypeAgentInput ||
+		row.SessionID != action.row.SessionID ||
+		row.AgentID != action.row.AgentID ||
+		!row.Timestamp.Equal(action.row.Timestamp) {
+		return projectionError(
+			row,
+			"agent.action at seq %d requires an adjacent same-batch agent.input",
+			action.row.Seq,
+		)
+	}
+	if row.Reason != "accepted" {
+		return projectionError(
+			row,
+			"paired agent.input has invalid reason %q",
+			row.Reason,
+		)
+	}
+	if err := validateAgentID(row); err != nil {
+		return err
+	}
+	if err := validateInputAuditPayload(row.Payload); err != nil {
+		return projectionWrapError(row, "validate paired agent.input payload", err)
+	}
+	blockedSeq, err := strconv.ParseUint(action.payload.BlockedSeq, 10, 64)
+	if err != nil {
+		return projectionWrapError(
+			action.row,
+			"parse agent.action blocked sequence",
+			err,
+		)
+	}
+	p.sessions[row.SessionID].respondedStateSeq = StateSeq(blockedSeq)
+	p.pendingAction = nil
+	return nil
+}
+
+func validateInputAuditPayload(raw string) error {
+	var payload inputAuditPayload
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return fmt.Errorf("decode input audit: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return fmt.Errorf("decode input audit: %w", err)
+	}
+	if payload.Version != 1 {
+		return fmt.Errorf("input audit version %d is unsupported", payload.Version)
+	}
+	if payload.Bytes <= 0 || payload.Bytes > MaxInputBytes {
+		return fmt.Errorf(
+			"input audit bytes %d must be between 1 and %d",
+			payload.Bytes,
+			MaxInputBytes,
+		)
+	}
 	return nil
 }
 
@@ -832,6 +975,12 @@ func (p *recoveryProjector) draft(row store.EventRow) *sessionDraft {
 }
 
 func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error) {
+	if p.pendingAction != nil {
+		return recoveryPlan{}, projectionError(
+			p.pendingAction.row,
+			"agent.action is missing its adjacent agent.input",
+		)
+	}
 	drafts := make([]*sessionDraft, 0, len(p.sessions))
 	for _, draft := range p.sessions {
 		if draft.hasCreated || draft.hasState {
@@ -847,6 +996,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 
 	plan := recoveryPlan{
 		Snapshots:           make([]agent.RestoreSnapshot, 0, len(drafts)),
+		StateSeqs:           make(map[string]StateSeq),
 		VendorSessionRefs:   make(map[string]string),
 		WorkingDirs:         make(map[string]string),
 		Workspaces:          make(map[string]workspaceMetadata),
@@ -928,6 +1078,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			state = agent.StateStopped
 			updatedAt = recoveryTime
 			draft.stateSince = recoveryTime
+			draft.stateSeq = StateSeq(nextSeq)
 		}
 		if updatedAt.Before(draft.createdAt) {
 			updatedAt = draft.createdAt
@@ -953,6 +1104,7 @@ func (p *recoveryProjector) Finish(recoveryTime time.Time) (recoveryPlan, error)
 			UpdatedAt:       updatedAt,
 			StateSince:      stateSince,
 		})
+		plan.StateSeqs[draft.id] = draft.stateSeq
 	}
 	plan.Report.Sessions = len(plan.Snapshots)
 	plan.Report.LastSeq = nextSeq

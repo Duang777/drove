@@ -3,6 +3,7 @@ package notify
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/event"
 	eventstore "github.com/Duang777/drove/internal/store"
 )
@@ -211,6 +213,135 @@ func TestServiceChannelFailureLogDoesNotExposeProviderSecrets(t *testing.T) {
 	if !strings.Contains(logs.String(), `"error_type"`) ||
 		!strings.Contains(logs.String(), `"delivery_id"`) {
 		t.Fatalf("channel failure log lacks safe context: %s", logs.String())
+	}
+}
+
+func TestServiceIssuesFreshActionTicketsForEachWebPushAttempt(t *testing.T) {
+	ctx := context.Background()
+	base := time.Date(2026, time.October, 8, 19, 30, 0, 0, time.UTC)
+	now := base.Add(time.Second)
+	notifications := openInitializedStore(t, 0)
+	saveTestSubscription(t, notifications, "phone", base.Add(-time.Minute))
+	if _, err := notifications.project(ctx, projectionBatch{
+		afterSeq: 0,
+		events:   []eventstore.EventRow{stateRow(1, base, "working", "blocked")},
+		metadata: map[string]AgentMetadata{
+			"agent-1": {Name: "Agent one", Vendor: "claude"},
+		},
+		channels: map[ChannelKind]bool{ChannelWebPush: true},
+		policy:   testPolicy(),
+	}); err != nil {
+		t.Fatalf("project delivery: %v", err)
+	}
+	actionTickets, err := NewActionTickets(
+		notifications,
+		ActionTicketKey{1, 2, 3, 4},
+		ActionTicketOptions{Now: func() time.Time { return now }},
+	)
+	if err != nil {
+		t.Fatalf("create action tickets: %v", err)
+	}
+	resolverCalls := 0
+	channel := &recordingChannel{
+		kind:       ChannelWebPush,
+		deliveries: make(chan Delivery, 2),
+		result: SendResult{
+			Outcome:    SendRetry,
+			RetryAfter: time.Second,
+		},
+	}
+	service := &Service{
+		store: notifications,
+		actionResolver: ActionResolverFunc(func(
+			_ context.Context,
+			agentID string,
+			blockedSeq uint64,
+		) ([]agent.ActionKind, error) {
+			resolverCalls++
+			if agentID != "agent-1" || blockedSeq != 1 {
+				t.Fatalf("resolve actions for %q/%d", agentID, blockedSeq)
+			}
+			return []agent.ActionKind{agent.ActionApprove, agent.ActionDeny}, nil
+		}),
+		actionTickets: actionTickets,
+		leaseDuration: 30 * time.Second,
+		minRetry:      time.Second,
+		maxRetry:      time.Minute,
+		now:           func() time.Time { return now },
+		logger:        slog.New(slog.DiscardHandler),
+	}
+
+	if !service.deliverReady(ctx, channel) {
+		t.Fatal("first delivery was not claimed")
+	}
+	first := <-channel.deliveries
+	now = now.Add(2 * time.Second)
+	channel.result = SendResult{Outcome: SendDelivered}
+	if !service.deliverReady(ctx, channel) {
+		t.Fatal("retry delivery was not claimed")
+	}
+	second := <-channel.deliveries
+
+	if resolverCalls != 2 {
+		t.Fatalf("action resolver calls = %d, want 2", resolverCalls)
+	}
+	if first.Notification.ActionContext == nil ||
+		second.Notification.ActionContext == nil ||
+		len(first.Notification.ActionContext.Tickets) != 2 ||
+		len(second.Notification.ActionContext.Tickets) != 2 {
+		t.Fatalf(
+			"action contexts = first %+v, second %+v",
+			first.Notification.ActionContext,
+			second.Notification.ActionContext,
+		)
+	}
+	if first.Notification.ActionContext.Version != 1 ||
+		second.Notification.ActionContext.Version != 1 {
+		t.Fatal("action context version is not 1")
+	}
+	if first.Notification.ActionContext.BlockedSeq != "1" ||
+		second.Notification.ActionContext.BlockedSeq != "1" {
+		t.Fatalf(
+			"action context blocked sequences = %q, %q; want 1",
+			first.Notification.ActionContext.BlockedSeq,
+			second.Notification.ActionContext.BlockedSeq,
+		)
+	}
+	if first.Notification.ActionContext.Tickets[0].Ticket ==
+		second.Notification.ActionContext.Tickets[0].Ticket {
+		t.Fatal("retry reused an action ticket")
+	}
+	providerPayload, err := json.Marshal(first.Notification)
+	if err != nil {
+		t.Fatalf("encode provider payload: %v", err)
+	}
+	if !bytes.Contains(providerPayload, []byte(`"ticket":`)) {
+		t.Fatalf("provider payload has no action ticket: %s", providerPayload)
+	}
+	if !bytes.Contains(providerPayload, []byte(`"blocked_seq":"1"`)) {
+		t.Fatalf("provider payload has no decimal blocked_seq: %s", providerPayload)
+	}
+	for _, forbidden := range [][]byte{
+		[]byte(`"screen":`),
+		[]byte(`"reply":`),
+	} {
+		if bytes.Contains(providerPayload, forbidden) {
+			t.Fatalf(
+				"provider payload contains forbidden field %s: %s",
+				forbidden,
+				providerPayload,
+			)
+		}
+	}
+	var persisted string
+	if err := notifications.db.QueryRow(
+		`SELECT payload FROM notify_deliveries WHERE source_seq = 1`,
+	).Scan(&persisted); err != nil {
+		t.Fatalf("read persisted delivery payload: %v", err)
+	}
+	if strings.Contains(persisted, "action_context") ||
+		strings.Contains(persisted, "ticket") {
+		t.Fatalf("persisted outbox contains action tickets: %s", persisted)
 	}
 }
 

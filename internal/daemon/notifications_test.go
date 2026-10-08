@@ -28,6 +28,10 @@ func TestRunStartsAndStopsConfiguredNotificationService(t *testing.T) {
 		BaseURL: "http://127.0.0.1:8787",
 		Topic:   "drove_test",
 	}
+	cfg.Notify.WebPush = config.WebPushConfig{
+		Enabled:      true,
+		VAPIDSubject: "mailto:drove@example.com",
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runResult := make(chan error, 1)
@@ -47,6 +51,17 @@ func TestRunStartsAndStopsConfiguredNotificationService(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("notification database mode = %04o, want 0600", info.Mode().Perm())
+	}
+	actionKeyPath := filepath.Join(dataDir, "notify", "action-ticket.key")
+	actionKeyInfo, err := os.Lstat(actionKeyPath)
+	if err != nil {
+		t.Fatalf("inspect action ticket key: %v", err)
+	}
+	if !actionKeyInfo.Mode().IsRegular() {
+		t.Fatalf("action ticket key mode = %v, want regular", actionKeyInfo.Mode())
+	}
+	if runtime.GOOS != "windows" && actionKeyInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("action ticket key mode = %04o, want 0600", actionKeyInfo.Mode().Perm())
 	}
 
 	cancel()

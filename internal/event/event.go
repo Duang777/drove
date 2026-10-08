@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +37,8 @@ const (
 	TypeSessionLifecycle Type = "session_lifecycle"
 	// TypeAgentInput 表示已写入 Agent PTY 的脱敏输入审计。
 	TypeAgentInput Type = "agent.input"
+	// TypeAgentAction records one explicit response to an approval prompt.
+	TypeAgentAction Type = "agent.action"
 	// TypeAgentSignal 表示 Detector 已接受的脱敏状态信号。
 	TypeAgentSignal Type = "agent.signal"
 	// TypeAgentResized 表示已成功应用到 PTY 和终端模型的尺寸。
@@ -289,6 +292,109 @@ func NewAgentInputDraft(sessionID, agentID, payload string) Draft {
 	}
 }
 
+const (
+	// AgentActionPayloadVersion is the current agent.action payload version.
+	AgentActionPayloadVersion = 1
+)
+
+// AgentActionPayloadV1 records bounded metadata about one remote response.
+type AgentActionPayloadV1 struct {
+	Version    int    `json:"version"`
+	Action     string `json:"action"`
+	Channel    string `json:"channel"`
+	DeviceID   string `json:"device_id"`
+	BlockedSeq string `json:"blocked_seq"`
+	ReplyBytes int    `json:"reply_bytes"`
+	PromptRule string `json:"prompt_rule"`
+}
+
+// Validate rejects malformed or privacy-unsafe action metadata.
+func (p AgentActionPayloadV1) Validate() error {
+	if p.Version != AgentActionPayloadVersion {
+		return fmt.Errorf("event: agent action version %d is unsupported", p.Version)
+	}
+	if !oneOf(p.Action, "approve", "deny", "reply") {
+		return fmt.Errorf("event: agent action %q is invalid", p.Action)
+	}
+	if p.Channel != "web_push" {
+		return fmt.Errorf("event: agent action channel %q is invalid", p.Channel)
+	}
+	if !canonicalUUID(p.DeviceID) {
+		return errors.New("event: agent action device_id must be a canonical UUID")
+	}
+	blockedSeq, err := strconv.ParseUint(p.BlockedSeq, 10, 64)
+	if err != nil ||
+		blockedSeq == 0 ||
+		strconv.FormatUint(blockedSeq, 10) != p.BlockedSeq {
+		return errors.New("event: agent action blocked_seq must be a positive canonical uint64")
+	}
+	if p.ReplyBytes < 0 || p.ReplyBytes > 4096 {
+		return errors.New("event: agent action reply_bytes must be between 0 and 4096")
+	}
+	if p.Action == "reply" && p.ReplyBytes == 0 {
+		return errors.New("event: reply action must record positive reply_bytes")
+	}
+	if p.Action != "reply" && p.ReplyBytes != 0 {
+		return errors.New("event: non-reply action cannot record reply_bytes")
+	}
+	if len(p.PromptRule) == 0 ||
+		len(p.PromptRule) > 64 ||
+		!ascii(p.PromptRule) ||
+		!strings.HasSuffix(p.PromptRule, ".approval_prompt") {
+		return errors.New("event: agent action prompt_rule is invalid")
+	}
+	return nil
+}
+
+// DecodeAgentActionPayload decodes and validates an agent.action v1 payload.
+func DecodeAgentActionPayload(payload string) (AgentActionPayloadV1, error) {
+	var decoded AgentActionPayloadV1
+	decoder := json.NewDecoder(strings.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&decoded); err != nil {
+		return AgentActionPayloadV1{}, fmt.Errorf(
+			"event: decode agent action payload: %w",
+			err,
+		)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return AgentActionPayloadV1{}, fmt.Errorf(
+			"event: decode agent action payload: %w",
+			err,
+		)
+	}
+	if err := decoded.Validate(); err != nil {
+		return AgentActionPayloadV1{}, err
+	}
+	return decoded, nil
+}
+
+// NewAgentActionDraft constructs an uncommitted remote-action audit event.
+func NewAgentActionDraft(
+	sessionID string,
+	agentID string,
+	payload AgentActionPayloadV1,
+) (Draft, error) {
+	if err := payload.Validate(); err != nil {
+		return Draft{}, err
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return Draft{}, fmt.Errorf("event: encode agent action payload: %w", err)
+	}
+	return Draft{
+		typ:       TypeAgentAction,
+		sessionID: sessionID,
+		agentID:   agentID,
+		reason:    "responded",
+		payload:   string(encoded),
+	}, nil
+}
+
 // NewAgentSignalDraft constructs an uncommitted signal audit event.
 func NewAgentSignalDraft(sessionID, agentID, payload string) Draft {
 	publicPayload, _ := PublicPayload(TypeAgentSignal, "observed", payload)
@@ -505,6 +611,7 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		TypeError,
 		TypeSessionLifecycle,
 		TypeAgentInput,
+		TypeAgentAction,
 		TypeAgentSignal,
 		TypeAgentResized,
 		TypeAgentAttachment,
@@ -546,6 +653,10 @@ func Commit(seq uint64, at time.Time, draft Draft) (Event, error) {
 		}
 		storedPayload = draft.storedPayload
 		outputAttachment = append([]byte(nil), draft.outputAttachment...)
+	} else if draft.typ == TypeAgentAction {
+		if _, err := DecodeAgentActionPayload(draft.payload); err != nil {
+			return Event{}, err
+		}
 	} else if draft.typ == TypeAgentSignal {
 		publicPayload, err := PublicPayload(
 			TypeAgentSignal,

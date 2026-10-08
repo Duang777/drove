@@ -1,6 +1,7 @@
 import { act, create } from 'react-test-renderer'
 import type { ReactTestRenderer } from 'react-test-renderer'
 import { describe, expect, it } from 'vitest'
+import { formatUint64 } from '../api/parsing'
 import type { AgentStatus } from '../api/types'
 import {
   createInitialAgentTerminalView,
@@ -84,6 +85,7 @@ function agentFixture(): AgentStatus {
     vendor: 'generic',
     mode: 'interactive',
     state: 'working',
+    state_seq: formatUint64(3n),
     created_at: '2026-10-04T12:00:00Z',
     updated_at: '2026-10-04T12:00:05Z',
     state_since: '2026-10-04T12:00:05Z',

@@ -559,6 +559,7 @@ func validEventType(typ event.Type) bool {
 		event.TypeError,
 		event.TypeSessionLifecycle,
 		event.TypeAgentInput,
+		event.TypeAgentAction,
 		event.TypeAgentSignal,
 		event.TypeAgentResized,
 		event.TypeAgentAttachment:

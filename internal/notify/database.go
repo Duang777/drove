@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const notificationSchemaVersion = 1
+const notificationSchemaVersion = 2
 
 // Store owns mutable notification delivery state.
 type Store struct {
@@ -173,6 +173,27 @@ func (s *Store) migrate() error {
 				ON notify_deliveries(channel, target_id, state);
 		`); err != nil {
 			return fmt.Errorf("notify: migrate schema version 1: %w", err)
+		}
+	}
+	if version < 2 {
+		if _, err := tx.Exec(`
+			CREATE TABLE action_tickets (
+				jti_digest BLOB PRIMARY KEY CHECK(length(jti_digest) = 32),
+				agent_id   TEXT NOT NULL,
+				blocked_seq TEXT NOT NULL,
+				action      TEXT NOT NULL CHECK(action IN ('approve', 'deny', 'reply')),
+				device_id   TEXT NOT NULL,
+				issued_at   TEXT NOT NULL,
+				expires_at  TEXT NOT NULL,
+				consumed_at TEXT
+			);
+
+			CREATE INDEX idx_action_tickets_device
+				ON action_tickets(device_id, consumed_at);
+			CREATE INDEX idx_action_tickets_expiry
+				ON action_tickets(expires_at);
+		`); err != nil {
+			return fmt.Errorf("notify: migrate schema version 2: %w", err)
 		}
 	}
 	if _, err := tx.Exec(
@@ -384,6 +405,14 @@ func (s *Store) RevokePushSubscription(
 		id,
 	); err != nil {
 		return false, fmt.Errorf("notify: cancel revoked subscription deliveries: %w", err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`DELETE FROM action_tickets
+		 WHERE device_id = ? AND consumed_at IS NULL`,
+		id,
+	); err != nil {
+		return false, fmt.Errorf("notify: invalidate revoked device action tickets: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("notify: commit subscription revocation: %w", err)

@@ -1,5 +1,6 @@
 import { ArrowLeft, FolderClosed } from 'lucide-react'
-import type { AgentStatus } from '../api/types'
+import { useState } from 'react'
+import type { AgentStatus, DecimalString } from '../api/types'
 import {
   useAgentTerminal,
   type TerminalControllerFactory,
@@ -9,12 +10,14 @@ import type {
   TerminalConnectionState,
 } from '../terminal/sessionController'
 import { PlaybackRail } from './PlaybackRail'
+import { RemoteActionPanel } from './RemoteActionPanel'
 import { StatusBadge } from './StatusBadge'
 import { TerminalViewport } from './TerminalViewport'
 
 interface Props {
   readonly agentID: string
   readonly agent?: AgentStatus
+  readonly requestedBlockedSeq?: DecimalString
   readonly onBack: () => void
   readonly createController?: TerminalControllerFactory
 }
@@ -22,13 +25,24 @@ interface Props {
 export function AgentDetailPage({
   agentID,
   agent,
+  requestedBlockedSeq,
   onBack,
   createController,
 }: Props) {
+  const [remoteHandled, setRemoteHandled] = useState(false)
+  const remoteApprovalPending =
+    requestedBlockedSeq !== undefined &&
+    !remoteHandled &&
+    (agent === undefined ||
+      (agent.state === 'blocked' &&
+        agent.state_seq === requestedBlockedSeq))
   const terminal = useAgentTerminal(
     agentID,
     'read_write',
-    createController === undefined ? {} : { createController },
+    {
+      enabled: !remoteApprovalPending,
+      ...(createController === undefined ? {} : { createController }),
+    },
   )
 
   return (
@@ -73,16 +87,39 @@ export function AgentDetailPage({
           <span
             className={`terminal-connection terminal-connection-${terminal.view.connection}`}
           >
-            {connectionLabel(terminal.view.connection)}
+            {remoteApprovalPending
+              ? '审批中'
+              : connectionLabel(terminal.view.connection)}
           </span>
         </div>
       </header>
 
-      <PlaybackRail view={terminal.view} dispatch={terminal.dispatch} />
-      <TerminalViewport
-        view={terminal.view}
-        bindViewport={terminal.bindViewport}
-      />
+      {agent?.state === 'blocked' &&
+        (requestedBlockedSeq === undefined ||
+        requestedBlockedSeq === agent.state_seq ? (
+          <RemoteActionPanel
+            key={`${agentID}:${agent.state_seq}`}
+            agentID={agentID}
+            blockedSeq={agent.state_seq}
+            onSubmitted={() => setRemoteHandled(true)}
+          />
+        ) : (
+          <section className="remote-action-panel remote-action-stale">
+            <p role="status">
+              这条通知对应的请求已经过期。当前 Agent 正在等待另一项处理。
+            </p>
+          </section>
+        ))}
+
+      {!remoteApprovalPending && (
+        <>
+          <PlaybackRail view={terminal.view} dispatch={terminal.dispatch} />
+          <TerminalViewport
+            view={terminal.view}
+            bindViewport={terminal.bindViewport}
+          />
+        </>
+      )}
     </main>
   )
 }

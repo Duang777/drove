@@ -355,6 +355,7 @@ func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 	}
 	if status.Mode != agent.RunModeOneshot ||
 		status.Dir != workingDir ||
+		status.StateSeq == 0 ||
 		status.PID <= 0 {
 		t.Fatalf("status = %+v, want live oneshot session", status)
 	}
@@ -500,7 +501,11 @@ func TestHandleExplainReturnsAttachedTypedResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start: %v", err)
 	}
-	if _, err := manager.SendInput(agent.ID(status.AgentID), []byte("screen\n")); err != nil {
+	if _, err := sendInputWithControlRetry(
+		manager,
+		agent.ID(status.AgentID),
+		[]byte("screen\n"),
+	); err != nil {
 		t.Fatalf("send input: %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -947,31 +952,52 @@ func TestHandleInputReturnsServiceUnavailableUnderPTYBackpressure(t *testing.T) 
 		resumeStoppedAgent(t, manager, status.AgentID)
 	})
 
-	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	firstAttempts := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
-		req := httptest.NewRequest(
-			http.MethodPost,
-			"/api/v1/agents/"+status.AgentID+"/input",
-			strings.NewReader(
-				`{"data":"`+strings.Repeat("x", session.MaxInputBytes)+`"}`,
-			),
-		)
-		req.Header.Set("Content-Type", "application/json")
-		rec := httptest.NewRecorder()
-		serveAuthorized(server, rec, req)
-		firstDone <- rec
+		for {
+			req := httptest.NewRequest(
+				http.MethodPost,
+				"/api/v1/agents/"+status.AgentID+"/input",
+				strings.NewReader(
+					`{"data":"`+strings.Repeat("x", session.MaxInputBytes)+`"}`,
+				),
+			)
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			serveAuthorized(server, rec, req)
+			firstAttempts <- rec
+			if rec.Code != http.StatusServiceUnavailable ||
+				!strings.Contains(rec.Body.String(), session.ErrInputBackpressure.Error()) ||
+				strings.Contains(rec.Body.String(), "do not retry") {
+				return
+			}
+		}
 	}()
 
-	select {
-	case rec := <-firstDone:
-		t.Fatalf(
-			"first input returned before PTY deadline: %d %q",
-			rec.Code,
-			rec.Body.String(),
-		)
-	case <-time.After(50 * time.Millisecond):
+	quiet := time.NewTimer(50 * time.Millisecond)
+	defer quiet.Stop()
+	for {
+		select {
+		case rec := <-firstAttempts:
+			if rec.Code != http.StatusServiceUnavailable ||
+				!strings.Contains(rec.Body.String(), session.ErrInputBackpressure.Error()) ||
+				strings.Contains(rec.Body.String(), "do not retry") {
+				t.Fatalf(
+					"first input returned before PTY deadline: %d %q",
+					rec.Code,
+					rec.Body.String(),
+				)
+			}
+			if !quiet.Stop() {
+				<-quiet.C
+			}
+			quiet.Reset(50 * time.Millisecond)
+		case <-quiet.C:
+			goto firstInputBlocked
+		}
 	}
 
+firstInputBlocked:
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/agents/"+status.AgentID+"/input",
@@ -986,7 +1012,7 @@ func TestHandleInputReturnsServiceUnavailableUnderPTYBackpressure(t *testing.T) 
 	}
 
 	select {
-	case first := <-firstDone:
+	case first := <-firstAttempts:
 		if first.Code != http.StatusServiceUnavailable ||
 			!strings.Contains(first.Body.String(), "do not retry") {
 			t.Fatalf(

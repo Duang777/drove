@@ -10,12 +10,14 @@
 | 模块 | 职责 |
 |---|---|
 | `src/api/types.ts` | 与 daemon JSON 契约对齐的类型（**契约唯一事实来源在 Go 端，改动需两侧同步**） |
-| `src/api/client.ts` | REST 客户端（会话、回放、通知状态、订阅、presence 与测试） |
+| `src/api/client.ts` | REST 客户端（会话、回放、通知、action context 与远程响应） |
 | `src/api/parsing.ts` | REST 与 WebSocket 共用的严格边界解析原语 |
 | `src/api/replayParsing.ts` | timeline、frame 与 output expiry 契约解析 |
 | `src/api/notificationParsing.ts` | 通知状态与公开设备响应的严格解析 |
+| `src/api/actionParsing.ts` | action context、ticket、受限屏幕与执行结果的严格解析 |
 | `src/notifications/push.ts` | service worker、浏览器订阅、设备协调与可见页面心跳 |
 | `src/components/NotificationPanel.tsx` | 当前设备的 Web Push 启用、测试与撤销 |
+| `src/components/RemoteActionPanel.tsx` | 受限实时屏幕、批准确认、拒绝与有界回复 |
 | `src/terminal/recordingBoundary.ts` | terminal DTO 到 bigint 录制领域值的单向转换 |
 | `src/terminal/sessionTape.ts` | 浏览器内存中的精确 origin 前缀与时间戳关联 |
 | `src/terminal/xtermAdapter.ts` | controller 私有的 xterm 构造、挂载、写入、测量与释放封装 |
@@ -24,7 +26,7 @@
 | `src/ws/terminalStream.ts` | `drove.v2` terminal 客户端：严格解码 raw/event/resize/snapshot，消费成功后推进 cursor |
 | `src/hooks/useAgentEvents.ts` | React hook：订阅事件流 + 本地投影（`latestAgentState`） |
 | `src/hooks/useAgentTerminal.ts` | controller 的 external-store React 生命周期适配器 |
-| `src/navigation.ts` | `?agent=<id>` 查询导航与浏览器 Back |
+| `src/navigation.ts` | `?agent=<id>&blocked=<decimal>` 查询导航与浏览器 Back |
 | `src/components/AgentDetailPage.tsx` | 单会话 header、连接状态与终端详情布局 |
 | `src/components/TerminalViewport.tsx` | live/replay xterm.js 容器与终端状态 |
 | `src/components/PlaybackRail.tsx` | 状态 spans、Blocked markers、seek 与播放控制 |
@@ -42,6 +44,8 @@
 - **原始输出摘要**：`output.chunk` 只显示 offset 和解码长度；EventLog 不渲染
   `data_b64`。
 - **本地投影仅是视图**：前端从事件流推导的状态只是展示用，权威状态永远以 daemon 为准（刷新列表纠正）。
+- **状态序号不进 number**：`AgentStatus.state_seq` 在 JSON 中是规范十进制字符串，
+  经边界解析后保留为 branded `DecimalString`。
 - **本地录制有界**：tape 达到 64 MiB 后冻结 exact frontier，但 live xterm.js
   继续更新。origin prefix 不淘汰，过期附件通过 `OutputExpiredError` 进入明确状态。
 - **工作目录兼容旧事件**：详情 header 显示 `AgentResource.dir`；旧 creation 事件
@@ -51,6 +55,10 @@
   浏览器请求只使用同源 cookie，不读取控制令牌。
 - **PWA 不缓存控制面**：service worker 只处理 push 与 notification click，不注册
   fetch handler。通知点击只接受同源根路径，详情查询参数由应用解析。
+- **ticket 只在内存中存在**：action ticket 不写入 URL、localStorage 或
+  sessionStorage。每次提交结束后清空 ticket 和 reply，再等待 daemon 的权威状态。
+- **审批深链先于终端 attach**：带 `blocked` 的通知页面先确认同一 Blocked 序号并
+  获取受限实时屏幕。动作完成前不创建会发送 resize 的 terminal controller。
 - **订阅状态双边确认**：只有浏览器 subscription 与 daemon 返回的公开设备 ID
   同时存在，界面才显示当前设备已启用。localStorage 不作为订阅权威。
 - **presence 有界**：页面可见时立即发送心跳并每 20 秒续期；页面隐藏或卸载后停止
@@ -66,6 +74,8 @@
   使用 `bigint`。
 - 通知 API 响应必须从 `unknown` 严格解析。浏览器代码不得读取或持久化 endpoint、
   P256DH、auth secret 或 VAPID 私钥；localStorage 只保存公开订阅 ID。
+- action context 与执行响应必须从 `unknown` 严格解析。`blocked_seq` 和审计序号保留
+  为 `DecimalString`；组件只能在内存中持有 action ticket。
 - `Frame` 与 `Snapshot` 只能显示预览，不得写入 `SessionTape` 或充当 xterm 恢复状态。
 - `TerminalSessionController` 是 xterm.js、游标、输入、resize、重连和回放的唯一
   所有者。React 组件不得持有这些可变对象。

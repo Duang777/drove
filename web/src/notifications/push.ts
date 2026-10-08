@@ -13,6 +13,12 @@ const serviceWorkerPath = '/service-worker.js'
 const subscriptionIDKey = 'drove.push.subscription-id'
 const presenceIntervalMillis = 20_000
 
+/** Return the public daemon ID for this browser's current push target. */
+export function currentPushDeviceID(): string | null {
+  const id = window.localStorage.getItem(subscriptionIDKey)
+  return id === null || id.length === 0 ? null : id
+}
+
 export type PushDeviceState =
   | { readonly kind: 'unavailable'; readonly reason: string }
   | { readonly kind: 'permission_denied' }
@@ -78,7 +84,7 @@ export async function loadPushDeviceState(
     unsupportedReason: null,
     permission: Notification.permission,
     hasBrowserSubscription: subscription !== null,
-    storedDeviceID: window.localStorage.getItem(subscriptionIDKey),
+    storedDeviceID: currentPushDeviceID(),
     devices,
   })
 }

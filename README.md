@@ -22,7 +22,8 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 
 黑匣子和终端交互已经能用：`drove tui` 总览全部会话，`drove attach` 连接单个
 实时终端，Web 详情页显示实时 xterm.js 终端并按时间精确回放。Agent 进入
-`blocked` 后，Drove 可以通过 Web Push 或 ntfy 发送通知。塔台网格和手机审批仍在
+`blocked` 后，Drove 可以通过 Web Push 或 ntfy 发送通知，并从 Web Push 通知或
+PWA 审批页批准、拒绝或回复 Claude 和 Codex 的审批框。塔台网格仍在
 [Epic #31](https://github.com/Duang777/drove/issues/31) 中。仓库没有发布包。
 
 ## 功能状态
@@ -50,7 +51,7 @@ Drove 是一个本地 daemon 加 CLI。它在真实 PTY 里启动 Claude Code、
 | Bubble Tea 多会话终端总览 | 已落地 | [#41](https://github.com/Duang777/drove/issues/41)，[spec 014](specs/014-terminal-overview-tui/spec.md) |
 | 塔台网格 | 规划中 | [#26](https://github.com/Duang777/drove/issues/26) |
 | Blocked 状态的 Web Push 与 ntfy 通知 | 已落地 | [#27](https://github.com/Duang777/drove/issues/27)，[spec 016](specs/016-push-notifications/spec.md) |
-| 手机上批准、拒绝或回一句 | 规划中 | [#28](https://github.com/Duang777/drove/issues/28) |
+| 手机上批准、拒绝或回一句 | 已落地 | [#28](https://github.com/Duang777/drove/issues/28)，[spec 017](specs/017-remote-actions/spec.md) |
 | 原生 resume，停止按进程组 SIGTERM 后宽限再 SIGKILL | 已落地 | [#16](https://github.com/Duang777/drove/issues/16) |
 | 每个 agent 使用独立 Git worktree | 已落地 | [#23](https://github.com/Duang777/drove/issues/23) |
 | daemon 退出后 agent 进程仍在 | 规划中 | [#17](https://github.com/Duang777/drove/issues/17)、[#18](https://github.com/Duang777/drove/issues/18) |
@@ -418,6 +419,16 @@ outbox，同一 Agent 在去抖窗口内反复进入 Blocked 不会重复创建�
 时间和同源详情链接。载荷不含终端画面、输出、prompt、输入、signal token 或厂商
 凭据。Web Push 载荷经过浏览器推送服务；ntfy 服务能看到上述元数据。
 
+当前审批框可操作时，Web Push 载荷还包含版本化 action context、十进制
+`blocked_seq` 和短期 action ticket。ticket 默认 10 分钟过期，只能使用一次，并
+绑定 Agent、Blocked 序号、action 和当前设备。载荷仍不含终端画面或回复正文。
+ntfy 不携带 action ticket，也不能执行远程操作。
+
+通知中的**批准**、**回复**和未知 action 会打开 PWA 审批页。批准必须在页面中再次
+确认。**拒绝**可以从通知直接提交一次；提交失败时会打开审批页。审批页重新读取
+当前受限屏幕并签发新 ticket，不从 URL 或浏览器存储读取 ticket。旧通知、已用
+ticket、已经回复的审批框和不再匹配的 `blocked_seq` 都会被拒绝。
+
 ## Web 控制台
 
 daemon 内嵌并同源托管生产前端。运行下面的命令会经 Unix socket 签发一次性登录码，
@@ -431,6 +442,8 @@ drove web
 页面可以列出、启动和停止会话。选择会话后，详情页显示名称、状态、工作目录、
 连接状态、实时 xterm.js 终端和状态时间线。可写连接在 raw stream 追到 durable head
 后才启用输入。页眉中的通知面板可以启用、测试和停用当前浏览器的 Web Push 订阅。
+从通知打开审批页时，页面先显示 daemon 返回的受限实时屏幕和可用 action，不连接
+会触发 resize 的交互终端。动作完成后才恢复终端连接。
 
 前端开发服务器继续把 `/api` 和 `/ws` 代理到 daemon，并由 Vite 进程读取控制令牌：
 
@@ -452,17 +465,17 @@ Blocked 跳转和返回 live。录制过期或达到浏览器本地上限时，�
 已批准的 MVP 是 [Epic #31：黑匣子 + 塔台](https://github.com/Duang777/drove/issues/31)。
 
 屏幕模型、WebSocket 终端流、终端总览、单会话交互、回放、控制面加固和
-[#27](https://github.com/Duang777/drove/issues/27) 推送通知已经完成。剩余项目是：
+[#27](https://github.com/Duang777/drove/issues/27) 推送通知、
+[#28](https://github.com/Duang777/drove/issues/28) 手机审批已经完成。剩余项目是：
 
 1. [#26](https://github.com/Duang777/drove/issues/26) 塔台网格
-2. [#28](https://github.com/Duang777/drove/issues/28) 手机上的批准、拒绝或回复
-3. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
+2. [#35](https://github.com/Duang777/drove/issues/35) 大型录制的精确 x/vt checkpoint
 
 MVP 之后是 [#17](https://github.com/Duang777/drove/issues/17) / [#18](https://github.com/Duang777/drove/issues/18) 的 shim，然后是 [#29](https://github.com/Duang777/drove/issues/29) 离开简报和 [#30](https://github.com/Duang777/drove/issues/30) 全文搜索。[#22](https://github.com/Duang777/drove/issues/22) 结构化状态源和 [#24](https://github.com/Duang777/drove/issues/24) 持久 hook 安装器推迟。
 
 ## 和其他工具的差别
 
-Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供本地事件日志、字节回放、独立 Git worktree，以及 Claude 与 Codex 共用的状态命令。它不提供 diff 审阅或 PR 流程，也不自动合并 worktree 分支。
+Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供本地事件日志、字节回放、独立 Git worktree，以及 Claude 与 Codex 共用的状态命令和手机审批。它不提供 diff 审阅或 PR 流程，也不自动合并 worktree 分支。
 
 [herdr](https://herdr.dev/) 以 TUI 为中心，公开定位是关掉客户端后由后台 server 继续持有终端。Drove 把终端字节和状态事件留在本机 SQLite 里。daemon 退出后进程仍在，不是 Drove 今天的行为。单厂商的后台会话、手机审批和官方 App，各自只覆盖自己的 agent。
 
@@ -487,11 +500,15 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 - 输出流里的 signal token 会按等长方式打码。
 - 完整注入的 Codex OSC 9 只保留固定审批分类前缀，所有自由文本在 Store、Hub、回放和 raw tail 之前等长打码。
 - `drove explain` 的 live screen 没有通用密钥扫描，只在会话 attached 时返回。
-- 通知数据库与 VAPID 私钥是独立的 `0600` 文件。默认通知不含终端、输出、prompt
-  或输入；ntfy 服务仍能看到 Agent 名称、厂商、状态、时间和详情链接。
+- 通知数据库、VAPID 私钥和 action-ticket HMAC key 使用独立的 `0600` 文件。
+  Web Push action ticket 只含短期签名 claims；数据库只保存 JTI 摘要和有界绑定。
+  通知不含终端、输出、prompt、输入或回复；ntfy 服务仍能看到 Agent 名称、厂商、
+  状态、时间和详情链接。
 - 远程控制台必须经 HTTPS 反向代理或 SSH 端口转发访问。`api_bind` 仍只接受
   loopback。配置步骤见 [远程访问指南](docs/remote-access.md)。
-- 没有自动批准。手机上的批准动作在 [#28](https://github.com/Duang777/drove/issues/28)，默认也不会自动同意。
+- 没有自动批准。批准必须打开 PWA 审批页并再次确认。每次远程操作都会相邻写入
+  `agent.action` 和 `agent.input`；审计只记录 action、channel、设备 ID、Blocked
+  序号、prompt 规则和回复字节数，不记录 ticket 或回复正文。
 
 设计说明在 [RFC-001 的安全考虑](docs/rfc-001-agent-state-and-control.md)。仓库没有单独的威胁模型文件。
 
@@ -511,6 +528,7 @@ Drove 跑的是厂商自己的 CLI，不接它们的私有 SDK。它现在提供
 | [spec 014](specs/014-terminal-overview-tui/spec.md) | Bubble Tea 多会话终端总览 |
 | [spec 015](specs/015-control-plane-hardening/spec.md) | 控制面加固交付计划 |
 | [spec 016](specs/016-push-notifications/spec.md) | 持久化 Blocked 通知与 PWA |
+| [spec 017](specs/017-remote-actions/spec.md) | 一次性 ticket、远程操作和审计 |
 | [远程访问指南](docs/remote-access.md) | Tailscale Serve 与 SSH 端口转发 |
 | [技术笔记](docs/technical-notes.md) | 阶段性阅读笔记。文首说明前六节不代表当前主干 |
 | [AGENTS.md](AGENTS.md) | 目录职责和工程约束 |
