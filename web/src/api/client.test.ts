@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  executeAgentAction,
+  getAgentActionContext,
   getAgentFrame,
   listAgents,
   OutputExpiredError,
@@ -7,6 +9,7 @@ import {
   parseTimeline,
 } from './client'
 import { frameWire, timelineWire } from '../test/terminalFixtures'
+import { formatUint64 } from './parsing'
 import { parseAgentStatus } from './resourceParsing'
 
 describe('terminal REST parsing', () => {
@@ -119,6 +122,85 @@ describe('terminal REST parsing', () => {
       {
         headers: { 'Content-Type': 'application/json' },
         signal: undefined,
+      },
+    )
+  })
+
+  it('posts exact decimal action context and opaque action ticket bodies', async () => {
+    const responses = [
+      Response.json({
+        state_seq: '9007199254740993',
+        actions: ['reply'],
+        tickets: [{ action: 'reply', ticket: 'opaque-ticket' }],
+        expires_at: '2026-10-08T18:10:00Z',
+        screen: {
+          captured_at: '2026-10-08T18:00:00Z',
+          rows: ['Approve?'],
+          truncated: false,
+        },
+      }),
+      Response.json({
+        state_seq: '9007199254740993',
+        bytes_written: 12,
+        action_seq: '9007199254740994',
+        input_seq: '9007199254740995',
+      }),
+    ]
+    const fetchMock = vi.fn(async () => {
+      const response = responses.shift()
+      if (response === undefined) throw new Error('unexpected request')
+      return response
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const signal = new AbortController().signal
+
+    await expect(
+      getAgentActionContext(
+        'agent/one',
+        formatUint64(9_007_199_254_740_993n),
+        'device-1',
+        signal,
+      ),
+    ).resolves.toMatchObject({
+      stateSeq: '9007199254740993',
+      actions: ['reply'],
+    })
+    await expect(
+      executeAgentAction(
+        'agent/one',
+        'opaque-ticket',
+        'ship it',
+        signal,
+      ),
+    ).resolves.toMatchObject({
+      actionSeq: '9007199254740994',
+      inputSeq: '9007199254740995',
+    })
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/v1/agents/agent%2Fone/action-context',
+      {
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        body: JSON.stringify({
+          blocked_seq: '9007199254740993',
+          device_id: 'device-1',
+        }),
+        signal,
+      },
+    )
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/v1/agents/agent%2Fone/actions',
+      {
+        headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        body: JSON.stringify({
+          ticket: 'opaque-ticket',
+          reply: 'ship it',
+        }),
+        signal,
       },
     )
   })

@@ -299,6 +299,14 @@ func TestServiceIssuesFreshActionTicketsForEachWebPushAttempt(t *testing.T) {
 		second.Notification.ActionContext.Version != 1 {
 		t.Fatal("action context version is not 1")
 	}
+	if first.Notification.ActionContext.BlockedSeq != "1" ||
+		second.Notification.ActionContext.BlockedSeq != "1" {
+		t.Fatalf(
+			"action context blocked sequences = %q, %q; want 1",
+			first.Notification.ActionContext.BlockedSeq,
+			second.Notification.ActionContext.BlockedSeq,
+		)
+	}
 	if first.Notification.ActionContext.Tickets[0].Ticket ==
 		second.Notification.ActionContext.Tickets[0].Ticket {
 		t.Fatal("retry reused an action ticket")
@@ -309,6 +317,9 @@ func TestServiceIssuesFreshActionTicketsForEachWebPushAttempt(t *testing.T) {
 	}
 	if !bytes.Contains(providerPayload, []byte(`"ticket":`)) {
 		t.Fatalf("provider payload has no action ticket: %s", providerPayload)
+	}
+	if !bytes.Contains(providerPayload, []byte(`"blocked_seq":"1"`)) {
+		t.Fatalf("provider payload has no decimal blocked_seq: %s", providerPayload)
 	}
 	for _, forbidden := range [][]byte{
 		[]byte(`"screen":`),

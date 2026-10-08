@@ -46,9 +46,10 @@ type Notification struct {
 
 // PushActionContext is the versioned action data allowed in Web Push payloads.
 type PushActionContext struct {
-	Version   int                  `json:"version"`
-	Tickets   []IssuedActionTicket `json:"tickets"`
-	ExpiresAt time.Time            `json:"expires_at"`
+	Version    int                  `json:"version"`
+	BlockedSeq string               `json:"blocked_seq"`
+	Tickets    []IssuedActionTicket `json:"tickets"`
+	ExpiresAt  time.Time            `json:"expires_at"`
 }
 
 // AgentMetadata contains stable labels used in a notification.

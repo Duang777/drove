@@ -282,36 +282,339 @@ test('operator can enable, test, and revoke Web Push', async ({
   ).toBeVisible()
 })
 
-test('notification click opens the Agent deep link in the existing window', async ({
+test('non-denial notification actions open the approval page without tickets in the URL', async ({
   context,
   page,
 }) => {
   const workerPromise = context.waitForEvent('serviceworker')
   await page.goto('/')
   const worker = await workerPromise
-  await worker.evaluate(async () => {
+  for (const action of ['approve', 'reply', '', 'launch']) {
+    const agentID = `push-agent-${action || 'empty'}`
+    await worker.evaluate(
+      async ({ clickedAction, targetAgent }) => {
+        let completion: Promise<unknown> | undefined
+        const event = new Event('notificationclick')
+        Object.defineProperty(event, 'action', { value: clickedAction })
+        Object.defineProperty(event, 'notification', {
+          value: {
+            close() {},
+            data: {
+              agentID: targetAgent,
+              blockedSeq: '9007199254740993',
+              deepLink: `/?agent=${encodeURIComponent(targetAgent)}`,
+            },
+          },
+        })
+        Object.defineProperty(event, 'waitUntil', {
+          value: (promise: Promise<unknown>) => {
+            completion = promise
+          },
+        })
+        self.dispatchEvent(event)
+        await completion
+      },
+      { clickedAction: action, targetAgent: agentID },
+    )
+    await expect(page).toHaveURL(
+      new RegExp(
+        `[?&]agent=${agentID}&blocked=9007199254740993(?:&|$)`,
+      ),
+    )
+    expect(page.url()).not.toContain('ticket')
+  }
+})
+
+test('service worker exposes only declared supported notification actions', async ({
+  context,
+  page,
+}) => {
+  const workerPromise = context.waitForEvent('serviceworker')
+  await page.goto('/')
+  const worker = await workerPromise
+  const shown = await worker.evaluate(async () => {
     let completion: Promise<unknown> | undefined
-    const event = new Event('notificationclick')
-    Object.defineProperty(event, 'notification', {
-      value: {
-        close() {},
-        data: { deepLink: '/?agent=push-agent-1' },
+    let captured:
+      | {
+          readonly title: string
+          readonly actions: ReadonlyArray<{
+            readonly action: string
+            readonly title: string
+          }>
+          readonly data: unknown
+        }
+      | undefined
+    const registration = self.registration
+    const original = registration.showNotification.bind(registration)
+    Object.defineProperty(registration, 'showNotification', {
+      configurable: true,
+      value: async (title: string, options?: NotificationOptions) => {
+        captured = {
+          title,
+          actions: options?.actions ?? [],
+          data: options?.data,
+        }
       },
     })
-    Object.defineProperty(event, 'waitUntil', {
-      value: (promise: Promise<unknown>) => {
-        completion = promise
-      },
-    })
-    self.dispatchEvent(event)
-    await completion
+    try {
+      const event = new Event('push')
+      Object.defineProperty(event, 'data', {
+        value: {
+          json: () => ({
+            id: 'delivery-1',
+            agent_id: 'agent-1',
+            agent_name: 'Reviewer',
+            vendor: 'codex',
+            state: 'blocked',
+            blocked_seq: 9_007_199_254_740_992,
+            deep_link: '/?agent=agent-1',
+            action_context: {
+              version: 1,
+              blocked_seq: '9007199254740993',
+              tickets: [
+                { action: 'approve', ticket: 'approve-ticket' },
+                { action: 'deny', ticket: 'deny-ticket' },
+                { action: 'toString', ticket: 'unsupported-ticket' },
+              ],
+              expires_at: '2026-10-08T18:10:00Z',
+            },
+          }),
+        },
+      })
+      Object.defineProperty(event, 'waitUntil', {
+        value: (promise: Promise<unknown>) => {
+          completion = promise
+        },
+      })
+      self.dispatchEvent(event)
+      await completion
+      return captured
+    } finally {
+      Object.defineProperty(registration, 'showNotification', {
+        configurable: true,
+        value: original,
+      })
+    }
   })
-  await expect(page).toHaveURL(/[?&]agent=push-agent-1(?:&|$)/)
+
+  expect(shown).toMatchObject({
+    title: 'Reviewer 等待处理',
+    actions: [
+      { action: 'approve', title: '批准' },
+      { action: 'deny', title: '拒绝' },
+    ],
+    data: {
+      agentID: 'agent-1',
+      blockedSeq: '9007199254740993',
+      denyTicket: 'deny-ticket',
+    },
+  })
+})
+
+test('failed direct denial posts once and opens the approval page', async ({
+  context,
+  page,
+}) => {
+  const workerPromise = context.waitForEvent('serviceworker')
+  await page.goto('/')
+  const worker = await workerPromise
+  const requests = await worker.evaluate(async () => {
+    let completion: Promise<unknown> | undefined
+    const calls: Array<{ url: string; init?: RequestInit }> = []
+    const original = self.fetch
+    Object.defineProperty(self, 'fetch', {
+      configurable: true,
+      value: async (url: string, init?: RequestInit) => {
+        calls.push({ url, init })
+        return new Response('', { status: 409 })
+      },
+    })
+    try {
+      const event = new Event('notificationclick')
+      Object.defineProperty(event, 'action', { value: 'deny' })
+      Object.defineProperty(event, 'notification', {
+        value: {
+          close() {},
+          data: {
+            agentID: 'agent/one',
+            blockedSeq: '9007199254740993',
+            deepLink: '/?agent=agent%2Fone',
+            denyTicket: 'deny-ticket',
+          },
+        },
+      })
+      Object.defineProperty(event, 'waitUntil', {
+        value: (promise: Promise<unknown>) => {
+          completion = promise
+        },
+      })
+      self.dispatchEvent(event)
+      await completion
+      return calls
+    } finally {
+      Object.defineProperty(self, 'fetch', {
+        configurable: true,
+        value: original,
+      })
+    }
+  })
+
+  expect(requests).toHaveLength(1)
+  expect(requests[0]).toMatchObject({
+    url: '/api/v1/agents/agent%2Fone/actions',
+    init: {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: JSON.stringify({ ticket: 'deny-ticket' }),
+    },
+  })
+  await expect(page).toHaveURL(
+    /[?&]agent=agent%2Fone&blocked=9007199254740993(?:&|$)/,
+  )
+})
+
+test('remote approval page executes approve, reply, and direct denial against the daemon', async ({
+  context,
+  page,
+  request,
+}, testInfo) => {
+  const createdAgentIDs: string[] = []
+  try {
+    const deviceID = await registerPushDevice(request, testInfo.testId)
+    await page.addInitScript((id) => {
+      window.localStorage.setItem('drove.push.subscription-id', id)
+    }, deviceID)
+
+    const approveAgent = await createBlockedAgent(
+      request,
+      `approve-agent-${testInfo.retry}`,
+    )
+    createdAgentIDs.push(approveAgent.agentID)
+    await page.goto(actionPageURL(approveAgent))
+    await expect(
+      page.getByRole('heading', { name: '等待你的决定' }),
+    ).toBeVisible()
+    await expect(page.locator('.remote-action-screen pre')).toContainText(
+      'Press enter to confirm',
+    )
+    await expectNoHorizontalOverflow(page.locator('html'))
+    await page.screenshot({
+      path: testInfo.outputPath('approval-desktop.png'),
+      fullPage: true,
+    })
+    await page.setViewportSize({ width: 375, height: 812 })
+    await expectNoHorizontalOverflow(page.locator('html'))
+    await page.screenshot({
+      path: testInfo.outputPath('approval-mobile-375.png'),
+      fullPage: true,
+    })
+    await page.setViewportSize({ width: 320, height: 720 })
+    await expectNoHorizontalOverflow(page.locator('html'))
+    await page.screenshot({
+      path: testInfo.outputPath('approval-mobile-320.png'),
+      fullPage: true,
+    })
+    await page.setViewportSize({ width: 1280, height: 900 })
+
+    await page.getByRole('button', { name: '批准请求' }).click()
+    await expect(page.getByText('确认批准当前请求？')).toBeVisible()
+    const approveResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          `/api/v1/agents/${approveAgent.agentID}/actions`,
+    )
+    await page.getByRole('button', { name: '确认批准请求' }).click()
+    expect((await approveResponse).status()).toBe(200)
+    await expectActionAudit(request, approveAgent.agentID, 'approve', 0)
+
+    const replyAgent = await createBlockedAgent(
+      request,
+      `reply-agent-${testInfo.retry}`,
+    )
+    createdAgentIDs.push(replyAgent.agentID)
+    await page.goto(actionPageURL(replyAgent))
+    await expect(page.getByLabel('回复 Agent')).toBeVisible()
+    await page.getByLabel('回复 Agent').fill('continue read only')
+    const replyResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          `/api/v1/agents/${replyAgent.agentID}/actions`,
+    )
+    await page.getByRole('button', { name: '发送回复' }).click()
+    expect((await replyResponse).status()).toBe(200)
+    await expectActionAudit(
+      request,
+      replyAgent.agentID,
+      'reply',
+      new TextEncoder().encode('continue read only').byteLength,
+    )
+
+    const denyAgent = await createBlockedAgent(
+      request,
+      `deny-agent-${testInfo.retry}`,
+    )
+    createdAgentIDs.push(denyAgent.agentID)
+    const actionContext = await request.post(
+      `/api/v1/agents/${encodeURIComponent(denyAgent.agentID)}/action-context`,
+      {
+        data: {
+          blocked_seq: denyAgent.blockedSeq,
+          device_id: deviceID,
+        },
+      },
+    )
+    expect(actionContext.status()).toBe(200)
+    const denyTicket = actionTicket(await actionContext.json(), 'deny')
+    const worker =
+      context.serviceWorkers()[0] ??
+      (await context.waitForEvent('serviceworker'))
+    const beforeDirectDeny = page.url()
+    await worker.evaluate(
+      async ({ agentID, blockedSeq, ticket }) => {
+        let completion: Promise<unknown> | undefined
+        const event = new Event('notificationclick')
+        Object.defineProperty(event, 'action', { value: 'deny' })
+        Object.defineProperty(event, 'notification', {
+          value: {
+            close() {},
+            data: {
+              agentID,
+              blockedSeq,
+              deepLink: `/?agent=${encodeURIComponent(agentID)}`,
+              denyTicket: ticket,
+            },
+          },
+        })
+        Object.defineProperty(event, 'waitUntil', {
+          value: (promise: Promise<unknown>) => {
+            completion = promise
+          },
+        })
+        self.dispatchEvent(event)
+        await completion
+      },
+      {
+        agentID: denyAgent.agentID,
+        blockedSeq: denyAgent.blockedSeq,
+        ticket: denyTicket,
+      },
+    )
+    expect(page.url()).toBe(beforeDirectDeny)
+    await expectActionAudit(request, denyAgent.agentID, 'deny', 0)
+  } finally {
+    await stopAgents(request, createdAgentIDs)
+  }
 })
 
 interface CreatedAgent {
   readonly agentID: string
   readonly name: string
+}
+
+interface BlockedAgent extends CreatedAgent {
+  readonly blockedSeq: string
 }
 
 type Vendor = 'claude' | 'codex'
@@ -353,6 +656,152 @@ async function createStagedBlockedAgent(
   })
   expect(response.status()).toBe(201)
   return parseAgent(await response.json())
+}
+
+async function createBlockedAgent(
+  request: APIRequestContext,
+  name: string,
+): Promise<BlockedAgent> {
+  const created = await createStagedBlockedAgent(request, name)
+  const input = await request.post(
+    `/api/v1/agents/${encodeURIComponent(created.agentID)}/input`,
+    { data: { data: 'go\n' } },
+  )
+  expect(input.status()).toBe(204)
+
+  let blockedSeq = ''
+  await expect
+    .poll(async () => {
+      const response = await request.get('/api/v1/agents')
+      expect(response.status()).toBe(200)
+      const value: unknown = await response.json()
+      if (!Array.isArray(value)) return ''
+      const current = value.find(
+        (item) =>
+          typeof item === 'object' &&
+          item !== null &&
+          'agent_id' in item &&
+          item.agent_id === created.agentID,
+      )
+      if (
+        typeof current !== 'object' ||
+        current === null ||
+        !('state' in current) ||
+        current.state !== 'blocked' ||
+        !('state_seq' in current) ||
+        typeof current.state_seq !== 'string'
+      ) {
+        return ''
+      }
+      blockedSeq = current.state_seq
+      return blockedSeq
+    })
+    .toMatch(/^[1-9][0-9]*$/)
+  return { ...created, blockedSeq }
+}
+
+async function registerPushDevice(
+  request: APIRequestContext,
+  suffix: string,
+): Promise<string> {
+  const response = await request.post('/api/v1/push/subscriptions', {
+    data: {
+      endpoint: `https://push.example.test/${encodeURIComponent(suffix)}`,
+      keys: {
+        p256dh: pushPublicKey,
+        auth: pushAuth,
+      },
+      device_name: 'E2E browser',
+    },
+  })
+  expect(response.status()).toBe(201)
+  const value: unknown = await response.json()
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('id' in value) ||
+    typeof value.id !== 'string'
+  ) {
+    throw new Error('push subscription response must contain id')
+  }
+  return value.id
+}
+
+function actionPageURL(agent: BlockedAgent): string {
+  const query = new URLSearchParams({
+    agent: agent.agentID,
+    blocked: agent.blockedSeq,
+  })
+  return `/?${query.toString()}`
+}
+
+function actionTicket(value: unknown, action: string): string {
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !('tickets' in value) ||
+    !Array.isArray(value.tickets)
+  ) {
+    throw new Error('action context must contain tickets')
+  }
+  const match = value.tickets.find(
+    (item) =>
+      typeof item === 'object' &&
+      item !== null &&
+      'action' in item &&
+      item.action === action,
+  )
+  if (
+    typeof match !== 'object' ||
+    match === null ||
+    !('ticket' in match) ||
+    typeof match.ticket !== 'string'
+  ) {
+    throw new Error(`action context has no ${action} ticket`)
+  }
+  return match.ticket
+}
+
+async function expectActionAudit(
+  request: APIRequestContext,
+  agentID: string,
+  action: string,
+  replyBytes: number,
+): Promise<void> {
+  await expect
+    .poll(async () => {
+      const response = await request.get(
+        `/api/v1/agents/${encodeURIComponent(agentID)}/events`,
+      )
+      if (!response.ok()) return null
+      const value: unknown = await response.json()
+      if (!Array.isArray(value)) return null
+      for (const row of value) {
+        if (
+          typeof row !== 'object' ||
+          row === null ||
+          !('Type' in row) ||
+          row.Type !== 'agent.action' ||
+          !('Payload' in row) ||
+          typeof row.Payload !== 'string'
+        ) {
+          continue
+        }
+        const payload: unknown = JSON.parse(row.Payload)
+        if (
+          typeof payload === 'object' &&
+          payload !== null &&
+          'action' in payload &&
+          payload.action === action &&
+          'reply_bytes' in payload &&
+          payload.reply_bytes === replyBytes
+        ) {
+          return { action, replyBytes }
+        }
+      }
+      return null
+    })
+    .toEqual({ action, replyBytes })
 }
 
 async function triggerBlockedAndMeasure(

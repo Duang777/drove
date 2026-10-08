@@ -70,13 +70,13 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
       rejected.
 - [x] Sequence values cross JavaScript boundaries as decimal strings.
 - [x] Web Push payloads contain action tickets but no screen or reply text.
-- [ ] The service worker never approves directly.
-- [ ] Direct denial posts once; any failure opens the PWA approval page.
-- [ ] Approve, reply, empty actions, and unsupported action buttons open the
+- [x] The service worker never approves directly.
+- [x] Direct denial posts once; any failure opens the PWA approval page.
+- [x] Approve, reply, empty actions, and unsupported action buttons open the
       approval page without putting tickets in the URL.
-- [ ] The page shows the bounded live approval view, confirms approval, accepts
+- [x] The page shows the bounded live approval view, confirms approval, accepts
       a bounded reply, and waits for authoritative state changes.
-- [ ] `agent.action` is visible in replay without changing frontend state.
+- [x] `agent.action` is visible in replay without changing frontend state.
 
 ## Verification
 
@@ -90,6 +90,6 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 - [x] `make build` passes.
 - [x] `scripts/check-workspace-platforms.sh` passes.
 - [x] Web typecheck, unit tests, and production build pass.
-- [ ] Playwright covers notification actions and the approval page.
-- [ ] Approval UI has no horizontal overflow at 320, 375, and 1280 px.
-- [ ] Git diff and generated Web assets contain no secret or reply fixture.
+- [x] Playwright covers notification actions and the approval page.
+- [x] Approval UI has no horizontal overflow at 320, 375, and 1280 px.
+- [x] Git diff and generated Web assets contain no secret or reply fixture.

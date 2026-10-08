@@ -85,6 +85,36 @@ describe('useAgentTerminal', () => {
     expect(controllers[0]?.disposeCalls).toBe(1)
     expect(controllers[1]?.disposeCalls).toBe(1)
   })
+
+  it('does not attach or resize a terminal while remote approval is pending', async () => {
+    const events: string[] = []
+    const controllers: FakeController[] = []
+    const factory: TerminalControllerFactory = (options) => {
+      const controller = new FakeController(options, events)
+      controllers.push(controller)
+      return controller
+    }
+
+    function Probe({ enabled }: { readonly enabled: boolean }): null {
+      useAgentTerminal('agent-1', 'read_write', {
+        createController: factory,
+        enabled,
+      })
+      return null
+    }
+
+    let renderer: ReactTestRenderer | undefined
+    await act(async () => {
+      renderer = create(<Probe enabled={false} />)
+    })
+    expect(controllers).toHaveLength(0)
+
+    await act(async () => {
+      renderer?.update(<Probe enabled />)
+    })
+    expect(controllers).toHaveLength(1)
+    expect(controllers[0]?.startCalls).toBe(1)
+  })
 })
 
 class FakeController implements TerminalControllerStore {

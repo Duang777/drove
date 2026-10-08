@@ -28,6 +28,7 @@ export type TerminalControllerFactory = (
 
 export interface UseAgentTerminalOptions {
   readonly createController?: TerminalControllerFactory
+  readonly enabled?: boolean
 }
 
 interface ActiveController {
@@ -121,6 +122,7 @@ export function useAgentTerminal(
   }
   const lifetime = lifetimeRef.current
   const factory = options.createController ?? defaultControllerFactory
+  const enabled = options.enabled ?? true
   const storedView = useSyncExternalStore(
     lifetime.subscribe,
     lifetime.getSnapshot,
@@ -128,11 +130,15 @@ export function useAgentTerminal(
   )
 
   useLayoutEffect(() => {
+    if (!enabled) {
+      lifetime.deactivate(agentID, access)
+      return
+    }
     lifetime.activate(agentID, access, factory)
     return () => {
       lifetime.deactivate(agentID, access)
     }
-  }, [access, agentID, factory, lifetime])
+  }, [access, agentID, enabled, factory, lifetime])
 
   const view =
     storedView.agentID === agentID && storedView.access === access

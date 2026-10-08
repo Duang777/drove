@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -469,9 +470,10 @@ func (s *Service) addActionTickets(ctx context.Context, delivery *Delivery) {
 		return
 	}
 	delivery.Notification.ActionContext = &PushActionContext{
-		Version:   1,
-		Tickets:   issued.Tickets,
-		ExpiresAt: issued.ExpiresAt,
+		Version:    1,
+		BlockedSeq: strconv.FormatUint(delivery.SourceSeq, 10),
+		Tickets:    issued.Tickets,
+		ExpiresAt:  issued.ExpiresAt,
 	}
 }
 

@@ -47,7 +47,8 @@ a {
 
 button,
 select,
-input {
+input,
+textarea {
   min-height: 40px;
   font: inherit;
   touch-action: manipulation;
@@ -72,7 +73,8 @@ button:active:not(:disabled),
 button:focus-visible,
 select:focus-visible,
 a:focus-visible,
-input:focus-visible {
+input:focus-visible,
+textarea:focus-visible {
   outline: 2px solid oklch(62% 0.13 164);
   outline-offset: 2px;
 }
@@ -741,6 +743,10 @@ code,
   color: oklch(76% 0.09 205);
 }
 
+.event-action {
+  color: oklch(79% 0.12 76);
+}
+
 .event-signal {
   color: oklch(76% 0.1 160);
 }
@@ -823,6 +829,224 @@ code,
   align-items: center;
   justify-content: flex-end;
   gap: 7px;
+}
+
+.remote-action-panel {
+  order: 0;
+  min-width: 0;
+  margin-bottom: 10px;
+  border-top: 1px solid oklch(82% 0.07 76);
+  border-bottom: 1px solid oklch(82% 0.07 76);
+  background: oklch(97% 0.018 76);
+  padding: 14px 0 16px;
+}
+
+.remote-action-heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.remote-action-heading h3,
+.remote-action-heading p {
+  margin: 0;
+}
+
+.remote-action-heading h3 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: oklch(31% 0.065 70);
+  font-size: 14px;
+  font-weight: 730;
+  line-height: 1.4;
+}
+
+.remote-action-heading h3 svg {
+  flex: none;
+}
+
+.remote-action-heading p,
+.remote-action-expiry {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.remote-action-heading p {
+  margin-top: 3px;
+}
+
+.remote-action-heading > code {
+  flex: none;
+  color: oklch(46% 0.07 70);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+}
+
+.remote-action-status,
+.remote-action-sent,
+.remote-action-stale p {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.remote-action-sent {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: oklch(35% 0.1 155);
+  font-weight: 650;
+}
+
+.remote-action-result {
+  margin-top: 14px;
+}
+
+.remote-action-result .inline-error {
+  margin-bottom: 9px;
+}
+
+.remote-action-screen {
+  position: relative;
+  min-width: 0;
+  margin-top: 12px;
+  overflow: hidden;
+  border-radius: var(--radius-medium);
+  color: oklch(86% 0.012 240);
+  background: oklch(17% 0.014 245);
+  box-shadow: inset 0 0 0 1px oklch(34% 0.015 245);
+}
+
+.remote-action-screen-meta {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid oklch(30% 0.014 245);
+  color: oklch(64% 0.018 245);
+  background: oklch(20% 0.014 245);
+  padding: 0 10px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.remote-action-screen pre {
+  max-height: 13em;
+  margin: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre;
+  overscroll-behavior: contain;
+}
+
+.remote-action-truncated {
+  display: block;
+  border-top: 1px solid oklch(30% 0.014 245);
+  color: oklch(78% 0.02 245);
+  background: oklch(20% 0.014 245);
+  padding: 5px 10px;
+  font-size: 9px;
+  text-align: right;
+}
+
+.remote-action-controls,
+.remote-action-confirm,
+.remote-action-reply-footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.remote-action-controls {
+  margin-top: 12px;
+}
+
+.remote-action-confirm {
+  flex-wrap: wrap;
+}
+
+.remote-action-confirm > span {
+  color: oklch(36% 0.07 70);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.remote-action-reply {
+  margin-top: 12px;
+  border-top: 1px solid oklch(86% 0.04 76);
+  padding-top: 12px;
+}
+
+.remote-action-reply label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.remote-action-reply textarea {
+  display: block;
+  width: 100%;
+  min-height: 80px;
+  resize: vertical;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-medium);
+  color: var(--text);
+  background: var(--surface-raised);
+  padding: 9px 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.remote-action-reply textarea::placeholder {
+  color: var(--faint);
+}
+
+.remote-action-reply-footer {
+  justify-content: space-between;
+  margin-top: 7px;
+}
+
+.remote-action-reply-footer > span,
+.remote-action-expiry {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.remote-action-reply-footer > span {
+  color: var(--faint);
+  font-size: 10px;
+}
+
+.remote-action-reply .inline-error {
+  margin: 8px 0 0;
+}
+
+.remote-action-expiry {
+  margin: 10px 0 0;
+}
+
+.remote-action-stale {
+  color: var(--danger);
+  border-color: oklch(87% 0.055 25);
+  background: oklch(96% 0.03 25);
+}
+
+.remote-action-stale p {
+  margin: 0;
+  color: inherit;
 }
 
 .terminal-connection {
@@ -1348,6 +1572,32 @@ code,
     grid-column: 2;
     justify-content: flex-start;
     overflow-x: auto;
+  }
+
+  .remote-action-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .remote-action-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .remote-action-controls > .button {
+    width: 100%;
+  }
+
+  .remote-action-confirm {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    width: 100%;
+  }
+
+  .remote-action-reply-footer {
+    align-items: flex-end;
+    flex-direction: column;
   }
 
   .terminal-panel-bar {

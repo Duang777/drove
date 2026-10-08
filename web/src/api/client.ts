@@ -19,14 +19,21 @@ import {
   parsePushDevice,
   parsePushDevices,
 } from './notificationParsing'
+import {
+  parseActionContext,
+  parseActionResponse,
+} from './actionParsing'
 import type {
   AgentStatus,
+  DecimalString,
   EventRow,
   FrameSelector,
   NotificationStatus,
   OutputRange,
   PushDevice,
   PushSubscriptionInput,
+  RemoteActionContext,
+  RemoteActionResult,
   StartRequest,
   TerminalFramePreview,
   TerminalTimeline,
@@ -114,6 +121,45 @@ export function sendPushTest(subscriptionID: string): Promise<void> {
     method: 'POST',
     body: JSON.stringify({ subscription_id: subscriptionID }),
   })
+}
+
+/** Load a fresh bounded screen and one ticket for each available action. */
+export function getAgentActionContext(
+  id: string,
+  blockedSeq: DecimalString,
+  deviceID: string,
+  signal?: AbortSignal,
+): Promise<RemoteActionContext> {
+  return requestJSON(
+    `/agents/${encodeURIComponent(id)}/action-context`,
+    parseActionContext,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        blocked_seq: blockedSeq,
+        device_id: deviceID,
+      }),
+      signal,
+    },
+  )
+}
+
+/** Consume one opaque action ticket and execute its bound response. */
+export function executeAgentAction(
+  id: string,
+  ticket: string,
+  reply: string,
+  signal?: AbortSignal,
+): Promise<RemoteActionResult> {
+  return requestJSON(
+    `/agents/${encodeURIComponent(id)}/actions`,
+    parseActionResponse,
+    {
+      method: 'POST',
+      body: JSON.stringify({ ticket, reply }),
+      signal,
+    },
+  )
 }
 
 /** Replay one session's event envelopes. */

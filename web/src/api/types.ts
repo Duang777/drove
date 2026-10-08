@@ -164,6 +164,39 @@ export interface PushSubscriptionInput {
   readonly deviceName: string
 }
 
+/** Vendor-neutral response to one live approval prompt. */
+export type RemoteActionKind = 'approve' | 'deny' | 'reply'
+
+/** One opaque, action-bound authorization returned by the daemon. */
+export interface RemoteActionTicket {
+  readonly action: RemoteActionKind
+  readonly ticket: string
+}
+
+/** Bounded live terminal view attached to a remote action context. */
+export interface RemoteActionScreen {
+  readonly capturedAt: Timestamp
+  readonly rows: ReadonlyArray<string>
+  readonly truncated: boolean
+}
+
+/** Fresh action choices and in-memory-only tickets for one Blocked occurrence. */
+export interface RemoteActionContext {
+  readonly stateSeq: DecimalString
+  readonly actions: ReadonlyArray<RemoteActionKind>
+  readonly tickets: ReadonlyArray<RemoteActionTicket>
+  readonly expiresAt: Timestamp
+  readonly screen?: RemoteActionScreen
+}
+
+/** Audited result returned after one remote action reaches the PTY. */
+export interface RemoteActionResult {
+  readonly stateSeq: DecimalString
+  readonly bytesWritten: number
+  readonly actionSeq: DecimalString
+  readonly inputSeq: DecimalString
+}
+
 /** 事件类型（Go: event.Type）。 */
 export type EventType =
   | 'state_changed'
