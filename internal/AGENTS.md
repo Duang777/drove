@@ -20,6 +20,8 @@ cmd/* ──▶ internal/clitui ──▶ internal/client ──▶ internal/ses
 - `daemon` 装配 session/api/config/store/hub（composition root）。
 - `notify` 只依赖 agent/event/store 的稳定类型，独立维护可变通知状态；daemon
   装配其生命周期，API 只依赖窄通知接口。
+- `respond` 只协调 notify ticket 与 session action。它先消费 ticket，再调用
+  session，API 通过窄 `ActionService` 接口依赖它。
 - `localipc` 封装 Unix listener、peer credential 与客户端 transport，供 daemon
   和 client 依赖。
 - `api` 只依赖 `session`、`event` 与窄通知接口，不得访问通知数据库或渠道实现。

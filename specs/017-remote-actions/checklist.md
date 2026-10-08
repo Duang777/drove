@@ -93,3 +93,9 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 - [x] Playwright covers notification actions and the approval page.
 - [x] Approval UI has no horizontal overflow at 320, 375, and 1280 px.
 - [x] Git diff and generated Web assets contain no secret or reply fixture.
+- [x] On 2026-10-08, system Chrome passed all 6 Playwright scenarios against a
+      real daemon; Web typecheck passed and all 82 Vitest cases passed.
+- [x] Physical iOS and Android delivery is recorded as unavailable in this
+      environment. Service Worker push/click behavior and the daemon action
+      path were verified in Chrome, but no external push provider delivered to
+      a physical phone.
