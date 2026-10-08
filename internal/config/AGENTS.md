@@ -17,7 +17,12 @@
   vendor ref 的会话。
 - `session.termination_grace_seconds` 默认 5；零值仍由 PTY 回退到 5 秒，负值
   在 daemon 启动前被拒绝。
-- `Validate()` 在启动早期校验；API 只允许 loopback 监听，WebSocket Origin 只允许配置的本地 HTTP Origin。
+- `notify` 保存 Blocked 通知策略和 Web Push/ntfy 渠道开关；VAPID 私钥与
+  ntfy token 不进入配置文件。
+- ntfy 远端地址必须使用 HTTPS；HTTP 只允许 loopback。token 只允许引用绝对
+  `0600` 文件路径。
+- `Validate()` 在启动早期校验；API 只允许 loopback 监听。HTTP Origin 只允许
+  loopback，显式配置的远程 Origin 必须使用 HTTPS。
 - `disable_tcp=true` 只关闭供浏览器使用的 loopback TCP listener；daemon 的 Unix
   socket 控制面始终启用。
 
@@ -25,4 +30,5 @@
 
 - 禁止在其它包硬编码路径/端口常量；一律从 Config 读取。
 - 环境变量覆盖（如 `DROVE_DATA_DIR`）只允许在本包实现。
-- 导出类型：`Config`、`AgentConfig`、`SignalInjection`。
+- 导出类型：`Config`、`AgentConfig`、`SignalInjection`、`NotifyConfig`、
+  `WebPushConfig`、`NtfyConfig`。

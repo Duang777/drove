@@ -335,6 +335,87 @@ func (s *Store) ScanEvents(ctx context.Context, visit func(EventRow) error) (uin
 	return lastSeq, nil
 }
 
+// ReadEventRange returns at most limit event envelopes after afterSeq and no
+// later than throughSeq. It never loads output attachments.
+func (s *Store) ReadEventRange(
+	ctx context.Context,
+	afterSeq uint64,
+	throughSeq uint64,
+	limit int,
+) ([]EventRow, error) {
+	if limit <= 0 {
+		return nil, errors.New("store: event range limit must be positive")
+	}
+	if throughSeq < afterSeq {
+		return nil, fmt.Errorf(
+			"store: event range upper sequence %d precedes lower sequence %d",
+			throughSeq,
+			afterSeq,
+		)
+	}
+	if throughSeq == afterSeq {
+		return []EventRow{}, nil
+	}
+
+	rows, err := s.readers.QueryContext(
+		ctx,
+		`SELECT seq, ts, type, session_id, agent_id, from_state, to_state, reason, payload
+		 FROM events
+		 WHERE seq > ? AND seq <= ?
+		 ORDER BY seq ASC
+		 LIMIT ?`,
+		afterSeq,
+		throughSeq,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"store: read event range (%d, %d]: %w",
+			afterSeq,
+			throughSeq,
+			err,
+		)
+	}
+	defer rows.Close()
+
+	out := make([]EventRow, 0, limit)
+	for rows.Next() {
+		var row EventRow
+		var rawSeq int64
+		var timestamp string
+		if err := rows.Scan(
+			&rawSeq,
+			&timestamp,
+			&row.Type,
+			&row.SessionID,
+			&row.AgentID,
+			&row.From,
+			&row.To,
+			&row.Reason,
+			&row.Payload,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan event range row: %w", err)
+		}
+		if rawSeq <= 0 {
+			return nil, fmt.Errorf("store: invalid event range seq %d", rawSeq)
+		}
+		row.Seq = uint64(rawSeq)
+		row.Timestamp, err = time.Parse(time.RFC3339Nano, timestamp)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"store: parse event range timestamp at seq %d: %w",
+				row.Seq,
+				err,
+			)
+		}
+		out = append(out, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: iterate event range: %w", err)
+	}
+	return out, nil
+}
+
 // Replay 按 seq 升序回放某会话的全部事件。
 func (s *Store) Replay(sessionID string) ([]EventRow, error) {
 	rows, err := s.db.Query(

@@ -23,9 +23,31 @@ import (
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/auth"
 	"github.com/Duang777/drove/internal/event"
+	"github.com/Duang777/drove/internal/notify"
 	"github.com/Duang777/drove/internal/recording"
 	"github.com/Duang777/drove/internal/session"
 )
+
+// NotificationService is the API-facing subset of durable notification state.
+type NotificationService interface {
+	SavePushSubscription(
+		context.Context,
+		notify.PushSubscription,
+	) (notify.PushSubscription, error)
+	PushSubscriptions(context.Context) ([]notify.PushSubscription, error)
+	RevokePushSubscription(context.Context, string) (bool, error)
+	RecordPresence()
+	SendPushTest(context.Context, string) error
+}
+
+// NotificationOptions configures notification API capabilities.
+type NotificationOptions struct {
+	Service          NotificationService
+	WebPushPublicKey string
+	NtfyEnabled      bool
+	Debounce         time.Duration
+	QuietWhenActive  bool
+}
 
 // ServerOptions 配置 API server。
 type ServerOptions struct {
@@ -41,6 +63,8 @@ type ServerOptions struct {
 	EventBuffer int
 	// AllowedOrigins contains the exact browser origins accepted by REST and WebSocket.
 	AllowedOrigins []string
+	// Notifications contains the optional durable notification runtime.
+	Notifications NotificationOptions
 }
 
 // Server 是 HTTP/WS 服务。
@@ -112,6 +136,18 @@ func (s *Server) routes(mux *http.ServeMux) {
 		s.handleBlockedOccurrence,
 	)
 	mux.HandleFunc("GET /api/v1/agents/{id}/frame", s.handleFrame)
+	mux.HandleFunc("GET /api/v1/notifications", s.handleNotificationStatus)
+	mux.HandleFunc("GET /api/v1/push/subscriptions", s.handlePushSubscriptions)
+	mux.HandleFunc("POST /api/v1/push/subscriptions", s.handleSavePushSubscription)
+	mux.HandleFunc(
+		"DELETE /api/v1/push/subscriptions/{id}",
+		s.handleRevokePushSubscription,
+	)
+	mux.HandleFunc(
+		"POST /api/v1/notifications/presence",
+		s.handleNotificationPresence,
+	)
+	mux.HandleFunc("POST /api/v1/notifications/test", s.handleNotificationTest)
 	mux.HandleFunc("GET /ws", s.handleWS)
 }
 
@@ -458,6 +494,16 @@ func (s *Server) handleWeb(w http.ResponseWriter, r *http.Request) {
 		cloned.URL = &urlCopy
 		w.Header().Set("Cache-Control", "no-store")
 		s.web.ServeHTTP(w, cloned)
+	case r.URL.Path == "/service-worker.js":
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Service-Worker-Allowed", "/")
+		s.web.ServeHTTP(w, r)
+	case r.URL.Path == "/manifest.webmanifest":
+		w.Header().Set("Cache-Control", "no-cache")
+		s.web.ServeHTTP(w, r)
+	case strings.HasPrefix(r.URL.Path, "/icons/"):
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		s.web.ServeHTTP(w, r)
 	case strings.HasPrefix(r.URL.Path, "/assets/"):
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 		s.web.ServeHTTP(w, r)

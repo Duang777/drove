@@ -181,6 +181,30 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		for _, host := range browserHosts {
 			allowedOrigins = append(allowedOrigins, "http://"+host)
 		}
+		browserHosts, err = appendConsoleOriginHosts(
+			browserHosts,
+			d.cfg.ConsoleOrigins,
+		)
+		if err != nil {
+			closeErr := mgr.Close()
+			hub.Close()
+			return errors.Join(
+				fmt.Errorf("daemon: browser proxy policy: %w", err),
+				closeListeners(listeners),
+				closeErr,
+			)
+		}
+	}
+
+	notifications, err := startNotifications(d.cfg, st, hub, mgr, log)
+	if err != nil {
+		closeErr := mgr.Close()
+		hub.Close()
+		return errors.Join(
+			err,
+			closeListeners(listeners),
+			closeErr,
+		)
 	}
 
 	srv := api.NewServer(api.ServerOptions{
@@ -190,6 +214,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		Web:            webui.FS(),
 		EventBuffer:    d.cfg.EventBuffer,
 		AllowedOrigins: allowedOrigins,
+		Notifications:  notificationAPIOptions(notifications, d.cfg.Notify),
 	})
 
 	stopRetention, retentionDone := d.startRetentionLoop(st, log)
@@ -297,7 +322,36 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 	if err := mgr.Close(); err != nil {
 		runErr = errors.Join(runErr, fmt.Errorf("daemon: shutdown sessions: %w", err))
 	}
+	notificationDrainCtx, cancelNotificationDrain := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	if err := notifications.drain(notificationDrainCtx); err != nil {
+		runErr = errors.Join(
+			runErr,
+			fmt.Errorf("daemon: drain notifications: %w", err),
+		)
+	}
+	cancelNotificationDrain()
+
+	notificationCloseCtx, cancelNotificationClose := context.WithTimeout(
+		context.Background(),
+		20*time.Second,
+	)
+	if err := notifications.closeService(notificationCloseCtx); err != nil {
+		runErr = errors.Join(
+			runErr,
+			fmt.Errorf("daemon: stop notifications: %w", err),
+		)
+	}
+	cancelNotificationClose()
 	hub.Close()
+	if err := notifications.closeStore(); err != nil {
+		runErr = errors.Join(
+			runErr,
+			fmt.Errorf("daemon: close notification store: %w", err),
+		)
+	}
 	log.Info("drove daemon stopped")
 	return runErr
 }
@@ -326,6 +380,28 @@ func loopbackHosts(address string) ([]string, error) {
 		}
 		seen[candidate] = struct{}{}
 		hosts = append(hosts, candidate)
+	}
+	return hosts, nil
+}
+
+func appendConsoleOriginHosts(
+	hosts []string,
+	origins []string,
+) ([]string, error) {
+	seen := make(map[string]struct{}, len(hosts)+len(origins))
+	for _, host := range hosts {
+		seen[host] = struct{}{}
+	}
+	for _, origin := range origins {
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host == "" {
+			return nil, fmt.Errorf("parse console origin %q", origin)
+		}
+		if _, exists := seen[parsed.Host]; exists {
+			continue
+		}
+		seen[parsed.Host] = struct{}{}
+		hosts = append(hosts, parsed.Host)
 	}
 	return hosts, nil
 }

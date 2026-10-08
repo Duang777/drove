@@ -14,11 +14,19 @@ import {
   parseAgentStatus,
   parseEventRows,
 } from './resourceParsing'
+import {
+  parseNotificationStatus,
+  parsePushDevice,
+  parsePushDevices,
+} from './notificationParsing'
 import type {
   AgentStatus,
   EventRow,
   FrameSelector,
+  NotificationStatus,
   OutputRange,
+  PushDevice,
+  PushSubscriptionInput,
   StartRequest,
   TerminalFramePreview,
   TerminalTimeline,
@@ -57,6 +65,54 @@ export function startAgent(req: StartRequest): Promise<AgentStatus> {
 export function stopAgent(id: string): Promise<void> {
   return requestNoContent(`/agents/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+  })
+}
+
+/** Load provider availability and notification policy. */
+export function getNotificationStatus(): Promise<NotificationStatus> {
+  return requestJSON('/notifications', parseNotificationStatus)
+}
+
+/** List public metadata for active browser subscriptions. */
+export function listPushDevices(): Promise<PushDevice[]> {
+  return requestJSON('/push/subscriptions', parsePushDevices)
+}
+
+/** Register or refresh one browser PushSubscription. */
+export function savePushSubscription(
+  subscription: PushSubscriptionInput,
+): Promise<PushDevice> {
+  return requestJSON('/push/subscriptions', parsePushDevice, {
+    method: 'POST',
+    body: JSON.stringify({
+      endpoint: subscription.endpoint,
+      keys: {
+        p256dh: subscription.p256dh,
+        auth: subscription.auth,
+      },
+      device_name: subscription.deviceName,
+    }),
+  })
+}
+
+/** Revoke one browser push target. */
+export function revokePushSubscription(id: string): Promise<void> {
+  return requestNoContent(
+    `/push/subscriptions/${encodeURIComponent(id)}`,
+    { method: 'DELETE' },
+  )
+}
+
+/** Extend visible-page suppression for the configured policy window. */
+export function recordNotificationPresence(): Promise<void> {
+  return requestNoContent('/notifications/presence', { method: 'POST' })
+}
+
+/** Send one test notification to a selected browser target. */
+export function sendPushTest(subscriptionID: string): Promise<void> {
+  return requestNoContent('/notifications/test', {
+    method: 'POST',
+    body: JSON.stringify({ subscription_id: subscriptionID }),
   })
 }
 

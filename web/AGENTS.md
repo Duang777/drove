@@ -10,9 +10,12 @@
 | 模块 | 职责 |
 |---|---|
 | `src/api/types.ts` | 与 daemon JSON 契约对齐的类型（**契约唯一事实来源在 Go 端，改动需两侧同步**） |
-| `src/api/client.ts` | REST 客户端（list / start / stop / replay / timeline / frame） |
+| `src/api/client.ts` | REST 客户端（会话、回放、通知状态、订阅、presence 与测试） |
 | `src/api/parsing.ts` | REST 与 WebSocket 共用的严格边界解析原语 |
 | `src/api/replayParsing.ts` | timeline、frame 与 output expiry 契约解析 |
+| `src/api/notificationParsing.ts` | 通知状态与公开设备响应的严格解析 |
+| `src/notifications/push.ts` | service worker、浏览器订阅、设备协调与可见页面心跳 |
+| `src/components/NotificationPanel.tsx` | 当前设备的 Web Push 启用、测试与撤销 |
 | `src/terminal/recordingBoundary.ts` | terminal DTO 到 bigint 录制领域值的单向转换 |
 | `src/terminal/sessionTape.ts` | 浏览器内存中的精确 origin 前缀与时间戳关联 |
 | `src/terminal/xtermAdapter.ts` | controller 私有的 xterm 构造、挂载、写入、测量与释放封装 |
@@ -46,6 +49,12 @@
 - **Dev 代理**：`vite.config.ts` 将 `/api`、`/ws` 代理到 loopback daemon，并在每次 HTTP 请求与 WebSocket upgrade 时从 DataDir 读取控制令牌注入 Bearer 认证。
 - **生产托管**：Vite 输出到 `internal/webui/dist`，由 Go embed 打包进 daemon；生产
   浏览器请求只使用同源 cookie，不读取控制令牌。
+- **PWA 不缓存控制面**：service worker 只处理 push 与 notification click，不注册
+  fetch handler。通知点击只接受同源根路径，详情查询参数由应用解析。
+- **订阅状态双边确认**：只有浏览器 subscription 与 daemon 返回的公开设备 ID
+  同时存在，界面才显示当前设备已启用。localStorage 不作为订阅权威。
+- **presence 有界**：页面可见时立即发送心跳并每 20 秒续期；页面隐藏或卸载后停止
+  timer。
 
 ## 约束
 
@@ -55,6 +64,8 @@
   不得转成 JavaScript `number`。
 - timeline/frame 响应必须从 `unknown` 严格解析；浏览器领域中的 sequence/offset
   使用 `bigint`。
+- 通知 API 响应必须从 `unknown` 严格解析。浏览器代码不得读取或持久化 endpoint、
+  P256DH、auth secret 或 VAPID 私钥；localStorage 只保存公开订阅 ID。
 - `Frame` 与 `Snapshot` 只能显示预览，不得写入 `SessionTape` 或充当 xterm 恢复状态。
 - `TerminalSessionController` 是 xterm.js、游标、输入、resize、重连和回放的唯一
   所有者。React 组件不得持有这些可变对象。

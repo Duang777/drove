@@ -1904,6 +1904,54 @@ func TestEmbeddedWebIsPublicOnlyOnBrowserAccess(t *testing.T) {
 			t.Fatalf("path %q security headers = %v", path, rec.Header())
 		}
 	}
+	for _, test := range []struct {
+		path         string
+		cacheControl string
+		workerScope  string
+	}{
+		{
+			path:         "/service-worker.js",
+			cacheControl: "no-cache",
+			workerScope:  "/",
+		},
+		{
+			path:         "/manifest.webmanifest",
+			cacheControl: "no-cache",
+		},
+		{
+			path:         "/icons/drove-192.png",
+			cacheControl: "public, max-age=86400",
+		},
+	} {
+		req := httptest.NewRequest(http.MethodGet, test.path, nil)
+		req.Host = "127.0.0.1:7373"
+		rec := httptest.NewRecorder()
+		browser.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf(
+				"path %q response = %d %q, want 200",
+				test.path,
+				rec.Code,
+				rec.Body.String(),
+			)
+		}
+		if got := rec.Header().Get("Cache-Control"); got != test.cacheControl {
+			t.Fatalf(
+				"path %q cache control = %q, want %q",
+				test.path,
+				got,
+				test.cacheControl,
+			)
+		}
+		if got := rec.Header().Get("Service-Worker-Allowed"); got != test.workerScope {
+			t.Fatalf(
+				"path %q worker scope = %q, want %q",
+				test.path,
+				got,
+				test.workerScope,
+			)
+		}
+	}
 
 	localRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	localRequest.Host = "drove.local"
@@ -2220,8 +2268,12 @@ func newTestServerWithOptions(
 		Hub:     hub,
 		Auth:    credentials,
 		Web: fstest.MapFS{
-			"index.html":    {Data: []byte("<!doctype html><title>Drove</title>")},
-			"assets/app.js": {Data: []byte("export {}")},
+			"index.html":           {Data: []byte("<!doctype html><title>Drove</title>")},
+			"assets/app.js":        {Data: []byte("export {}")},
+			"manifest.webmanifest": {Data: []byte(`{"name":"Drove"}`)},
+			"service-worker.js":    {Data: []byte("self.skipWaiting()")},
+			"icons/drove-192.png":  {Data: []byte("png")},
+			"icons/drove-512.png":  {Data: []byte("png")},
 		},
 		AllowedOrigins: []string{"http://localhost:5173"},
 	}), manager, st

@@ -561,6 +561,30 @@ func TestLoopbackHostsIncludesConfiguredAddressAndAliases(t *testing.T) {
 	}
 }
 
+func TestAppendConsoleOriginHostsAddsExactReverseProxyHosts(t *testing.T) {
+	hosts, err := appendConsoleOriginHosts(
+		[]string{"127.0.0.1:7373"},
+		[]string{
+			"http://localhost:5173",
+			"https://drove.example.ts.net",
+			"https://drove.example.ts.net:8443",
+			"http://127.0.0.1:7373",
+		},
+	)
+	if err != nil {
+		t.Fatalf("append console origin hosts: %v", err)
+	}
+	want := []string{
+		"127.0.0.1:7373",
+		"localhost:5173",
+		"drove.example.ts.net",
+		"drove.example.ts.net:8443",
+	}
+	if !slices.Equal(hosts, want) {
+		t.Fatalf("hosts = %#v, want %#v", hosts, want)
+	}
+}
+
 func reserveAddress(t *testing.T) string {
 	t.Helper()
 

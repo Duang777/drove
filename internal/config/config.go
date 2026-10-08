@@ -13,6 +13,7 @@ import (
 )
 
 const maxTerminationGraceSeconds int64 = 9_223_372_036
+const maxNotifyDebounceSeconds int64 = 9_223_372_036
 
 // SignalInjection controls process-local vendor signal configuration.
 type SignalInjection string
@@ -41,6 +42,34 @@ type SessionConfig struct {
 	TerminationGraceSeconds int64 `json:"termination_grace_seconds"`
 }
 
+// NotifyConfig controls durable notifications for committed Agent states.
+type NotifyConfig struct {
+	On              []string      `json:"on"`
+	DebounceSeconds int64         `json:"debounce_seconds"`
+	QuietWhenActive bool          `json:"quiet_when_active"`
+	WebPush         WebPushConfig `json:"web_push"`
+	Ntfy            NtfyConfig    `json:"ntfy"`
+}
+
+// WebPushConfig controls browser Push API delivery.
+type WebPushConfig struct {
+	Enabled      bool   `json:"enabled"`
+	VAPIDSubject string `json:"vapid_subject"`
+}
+
+// NtfyConfig controls delivery to one ntfy topic.
+type NtfyConfig struct {
+	Enabled   bool   `json:"enabled"`
+	BaseURL   string `json:"base_url"`
+	Topic     string `json:"topic"`
+	TokenFile string `json:"token_file"`
+}
+
+// Enabled reports whether any notification channel is enabled.
+func (c NotifyConfig) Enabled() bool {
+	return c.WebPush.Enabled || c.Ntfy.Enabled
+}
+
 // Config 是 Drove 的运行时配置。
 type Config struct {
 	// DataDir 存放 SQLite 事件日志与工作区数据。
@@ -61,6 +90,8 @@ type Config struct {
 	Storage StorageConfig `json:"storage"`
 	// Session controls automatic recovery and PTY shutdown behavior.
 	Session SessionConfig `json:"session"`
+	// Notify controls durable out-of-process notifications.
+	Notify NotifyConfig `json:"notify"`
 }
 
 // Defaults 返回安全默认配置。
@@ -78,6 +109,11 @@ func Defaults() *Config {
 		},
 		Session: SessionConfig{
 			TerminationGraceSeconds: 5,
+		},
+		Notify: NotifyConfig{
+			On:              []string{"blocked"},
+			DebounceSeconds: 30,
+			QuietWhenActive: true,
 		},
 	}
 }
@@ -169,6 +205,9 @@ func (c *Config) Validate() error {
 			maxTerminationGraceSeconds,
 		)
 	}
+	if err := c.Notify.validate(); err != nil {
+		return err
+	}
 	if len(c.ConsoleOrigins) == 0 {
 		return fmt.Errorf("config: console_origins must not be empty")
 	}
@@ -196,6 +235,125 @@ func (c *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+func (c NotifyConfig) validate() error {
+	if len(c.On) == 0 {
+		if c.Enabled() {
+			return fmt.Errorf(`config: notify.on must contain only "blocked"`)
+		}
+	} else if len(c.On) != 1 || c.On[0] != "blocked" {
+		return fmt.Errorf(`config: notify.on must contain only "blocked"`)
+	}
+	if c.DebounceSeconds < 0 {
+		return fmt.Errorf("config: notify.debounce_seconds must not be negative")
+	}
+	if c.DebounceSeconds > maxNotifyDebounceSeconds {
+		return fmt.Errorf(
+			"config: notify.debounce_seconds must not exceed %d",
+			maxNotifyDebounceSeconds,
+		)
+	}
+	if c.WebPush.Enabled {
+		if err := validateVAPIDSubject(c.WebPush.VAPIDSubject); err != nil {
+			return err
+		}
+	}
+	if c.Ntfy.Enabled {
+		if err := validateNtfyBaseURL(c.Ntfy.BaseURL); err != nil {
+			return err
+		}
+		if !validNtfyTopic(c.Ntfy.Topic) {
+			return fmt.Errorf(
+				"config: notify.ntfy.topic must be 1-64 ASCII letters, digits, hyphens, or underscores",
+			)
+		}
+		if c.Ntfy.TokenFile != "" && !filepath.IsAbs(c.Ntfy.TokenFile) {
+			return fmt.Errorf("config: notify.ntfy.token_file must be an absolute path")
+		}
+	}
+	return nil
+}
+
+func validateVAPIDSubject(subject string) error {
+	if subject == "" || strings.TrimSpace(subject) != subject {
+		return fmt.Errorf(
+			"config: notify.web_push.vapid_subject must be an HTTPS or mailto URI",
+		)
+	}
+	parsed, err := url.Parse(subject)
+	if err != nil {
+		return fmt.Errorf("config: notify.web_push.vapid_subject: %w", err)
+	}
+	switch parsed.Scheme {
+	case "https":
+		if parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf(
+				"config: notify.web_push.vapid_subject must be an HTTPS or mailto URI",
+			)
+		}
+	case "mailto":
+		if parsed.Opaque == "" ||
+			parsed.Host != "" ||
+			parsed.User != nil ||
+			parsed.RawQuery != "" ||
+			parsed.Fragment != "" {
+			return fmt.Errorf(
+				"config: notify.web_push.vapid_subject must be an HTTPS or mailto URI",
+			)
+		}
+	default:
+		return fmt.Errorf(
+			"config: notify.web_push.vapid_subject must be an HTTPS or mailto URI",
+		)
+	}
+	return nil
+}
+
+func validateNtfyBaseURL(raw string) error {
+	if raw == "" || strings.TrimSpace(raw) != raw {
+		return fmt.Errorf(
+			"config: notify.ntfy.base_url must be HTTPS or loopback HTTP",
+		)
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("config: notify.ntfy.base_url: %w", err)
+	}
+	if parsed.Host == "" ||
+		parsed.User != nil ||
+		parsed.RawQuery != "" ||
+		parsed.Fragment != "" {
+		return fmt.Errorf(
+			"config: notify.ntfy.base_url must be HTTPS or loopback HTTP",
+		)
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme == "http" && isLoopbackHost(parsed.Hostname()) {
+		return nil
+	}
+	return fmt.Errorf(
+		"config: notify.ntfy.base_url must be HTTPS or loopback HTTP",
+	)
+}
+
+func validNtfyTopic(topic string) bool {
+	if len(topic) == 0 || len(topic) > 64 {
+		return false
+	}
+	for _, char := range topic {
+		if char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' ||
+			char == '-' ||
+			char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // SignalInjectionFor resolves one vendor setting against adapter capability.
@@ -226,7 +384,12 @@ func validateConsoleOrigin(origin string) error {
 		return fmt.Errorf("config: console origin %q must be an HTTP origin", origin)
 	}
 	if !isLoopbackHost(parsed.Hostname()) {
-		return fmt.Errorf("config: console origin host %q must be loopback", parsed.Hostname())
+		if parsed.Scheme == "http" {
+			return fmt.Errorf(
+				"config: HTTP console origin host %q must be loopback",
+				parsed.Hostname(),
+			)
+		}
 	}
 	return nil
 }

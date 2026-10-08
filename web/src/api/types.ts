@@ -128,6 +128,41 @@ export interface StartRequest {
   hooks?: HookPolicy
 }
 
+/** Web Push channel availability and public browser enrollment key. */
+export type WebPushAvailability =
+  | { readonly kind: 'unavailable' }
+  | { readonly kind: 'available'; readonly vapidPublicKey: string }
+
+/** Notification policy exposed without provider credentials. */
+export interface NotificationPolicy {
+  readonly on: ReadonlyArray<'blocked'>
+  readonly debounceSeconds: number
+  readonly quietWhenActive: boolean
+}
+
+/** Public notification status. */
+export interface NotificationStatus {
+  readonly webPush: WebPushAvailability
+  readonly ntfyAvailable: boolean
+  readonly policy: NotificationPolicy
+  readonly activeDeviceCount: number
+}
+
+/** Public push target metadata. Endpoint and key material never cross this API. */
+export interface PushDevice {
+  readonly id: string
+  readonly deviceName: string
+  readonly createdAt: Timestamp
+}
+
+/** Browser subscription material accepted by the daemon. */
+export interface PushSubscriptionInput {
+  readonly endpoint: string
+  readonly p256dh: string
+  readonly auth: string
+  readonly deviceName: string
+}
+
 /** 事件类型（Go: event.Type）。 */
 export type EventType =
   | 'state_changed'
