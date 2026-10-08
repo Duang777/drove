@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -403,5 +404,215 @@ func TestValidateRejectsDataDirectoryFile(t *testing.T) {
 	cfg.DataDir = path
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("validate accepted a data directory file")
+	}
+}
+
+func TestNotifyDefaultsAreDisabledWithBlockedPolicy(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Notify.Enabled() {
+		t.Fatal("notification channels are enabled by default")
+	}
+	if len(cfg.Notify.On) != 1 || cfg.Notify.On[0] != "blocked" {
+		t.Fatalf("notify events = %#v, want blocked", cfg.Notify.On)
+	}
+	if cfg.Notify.DebounceSeconds != 30 {
+		t.Fatalf("notify debounce = %d, want 30", cfg.Notify.DebounceSeconds)
+	}
+	if !cfg.Notify.QuietWhenActive {
+		t.Fatal("quiet_when_active = false, want true")
+	}
+}
+
+func TestLoadResolvedParsesNotificationChannels(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DROVE_DATA_DIR", "")
+	tokenPath := filepath.Join(t.TempDir(), "ntfy.token")
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	raw := `{
+		"data_dir": "/tmp/drove",
+		"api_bind": "127.0.0.1:7373",
+		"event_buffer": 16,
+		"console_origins": ["http://localhost:5173"],
+		"notify": {
+			"on": ["blocked"],
+			"debounce_seconds": 12,
+			"quiet_when_active": false,
+			"web_push": {
+				"enabled": true,
+				"vapid_subject": "mailto:operator@example.com"
+			},
+			"ntfy": {
+				"enabled": true,
+				"base_url": "https://ntfy.example.com/root",
+				"topic": "drove_ops",
+				"token_file": ` + strconv.Quote(tokenPath) + `
+			}
+		}
+	}`
+	if err := os.WriteFile(configPath, []byte(raw), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, _, err := LoadResolved(configPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cfg.DataDir = t.TempDir()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate config: %v", err)
+	}
+	if !cfg.Notify.Enabled() ||
+		cfg.Notify.DebounceSeconds != 12 ||
+		cfg.Notify.QuietWhenActive ||
+		cfg.Notify.WebPush.VAPIDSubject != "mailto:operator@example.com" ||
+		cfg.Notify.Ntfy.Topic != "drove_ops" ||
+		cfg.Notify.Ntfy.TokenFile != tokenPath {
+		t.Fatalf("notification config = %+v", cfg.Notify)
+	}
+}
+
+func TestValidateAcceptsNotificationEndpointPolicies(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject string
+		baseURL string
+	}{
+		{
+			name:    "mailto and HTTPS",
+			subject: "mailto:operator@example.com",
+			baseURL: "https://ntfy.example.com",
+		},
+		{
+			name:    "HTTPS subject and loopback HTTP",
+			subject: "https://drove.example.com/contact",
+			baseURL: "http://127.0.0.1:8080/root",
+		},
+		{
+			name:    "IPv6 loopback HTTP",
+			subject: "mailto:operator@example.com",
+			baseURL: "http://[::1]:8080",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.DataDir = t.TempDir()
+			cfg.Notify.WebPush = WebPushConfig{
+				Enabled:      true,
+				VAPIDSubject: test.subject,
+			}
+			cfg.Notify.Ntfy = NtfyConfig{
+				Enabled: true,
+				BaseURL: test.baseURL,
+				Topic:   "drove-test",
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("validate: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsInvalidNotificationConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		change func(*Config)
+		want   string
+	}{
+		{
+			name: "unknown event",
+			change: func(cfg *Config) {
+				cfg.Notify.On = []string{"done"}
+			},
+			want: "notify.on",
+		},
+		{
+			name: "negative debounce",
+			change: func(cfg *Config) {
+				cfg.Notify.DebounceSeconds = -1
+			},
+			want: "debounce_seconds",
+		},
+		{
+			name: "overflowing debounce",
+			change: func(cfg *Config) {
+				cfg.Notify.DebounceSeconds = maxNotifyDebounceSeconds + 1
+			},
+			want: "must not exceed",
+		},
+		{
+			name: "missing VAPID subject",
+			change: func(cfg *Config) {
+				cfg.Notify.WebPush.Enabled = true
+			},
+			want: "vapid_subject",
+		},
+		{
+			name: "unsafe VAPID subject",
+			change: func(cfg *Config) {
+				cfg.Notify.WebPush = WebPushConfig{
+					Enabled:      true,
+					VAPIDSubject: "http://example.com/contact",
+				}
+			},
+			want: "vapid_subject",
+		},
+		{
+			name: "remote plain HTTP ntfy",
+			change: func(cfg *Config) {
+				cfg.Notify.Ntfy = NtfyConfig{
+					Enabled: true,
+					BaseURL: "http://ntfy.example.com",
+					Topic:   "drove",
+				}
+			},
+			want: "base_url",
+		},
+		{
+			name: "ntfy URL credentials",
+			change: func(cfg *Config) {
+				cfg.Notify.Ntfy = NtfyConfig{
+					Enabled: true,
+					BaseURL: "https://token@ntfy.example.com",
+					Topic:   "drove",
+				}
+			},
+			want: "base_url",
+		},
+		{
+			name: "ntfy topic path",
+			change: func(cfg *Config) {
+				cfg.Notify.Ntfy = NtfyConfig{
+					Enabled: true,
+					BaseURL: "https://ntfy.example.com",
+					Topic:   "team/drove",
+				}
+			},
+			want: "topic",
+		},
+		{
+			name: "relative token file",
+			change: func(cfg *Config) {
+				cfg.Notify.Ntfy = NtfyConfig{
+					Enabled:   true,
+					BaseURL:   "https://ntfy.example.com",
+					Topic:     "drove",
+					TokenFile: "ntfy.token",
+				}
+			},
+			want: "token_file",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.DataDir = t.TempDir()
+			test.change(cfg)
+			err := cfg.Validate()
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validate error = %v, want %q", err, test.want)
+			}
+		})
 	}
 }

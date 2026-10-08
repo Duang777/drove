@@ -8,8 +8,8 @@
 
 - `Daemon.Run(ctx)`：校验配置并打开本地凭据控制器 → 打开 store → 构建
   Hub/Registry/Manager → 恢复投影 → 打开 Unix socket 和可选 loopback TCP listener
-  → 把 signal origin 一次性配置给 Manager → 启动 API server → 阻塞直到 ctx
-  取消或收到 SIGINT/SIGTERM。
+  → 把 signal origin 一次性配置给 Manager → 启动通知 planner/worker → 启动
+  API server → 阻塞直到 ctx 取消或收到 SIGINT/SIGTERM。
 - 所有 listener 必须在任一 Serve goroutine 启动前创建成功；Unix listener 始终启用，
   TCP 可由配置关闭。
 - Unix listener 只接受 `drove.local` Host；TCP listener 从实际端口派生
@@ -22,7 +22,9 @@
   负责进程组信号与升级。
 - daemon 把 DataDir 注入 session workspace manager；没有 worktree 请求时 Git
   不参与会话启动。
-- 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 → 关闭 Hub 订阅 → 关闭 store。
+- 优雅关闭顺序：先停 API（不再接受新连接）→ 停止会话并等待 PTY 回调 →
+  通知 planner 追平已发布序号并停止 worker → 关闭 Hub → 关闭 notify store 与
+  session store。
 - session Committer 报告运行时持久化或投影失败时立即走同一关闭路径，禁止 daemon 在不可恢复状态下继续服务。
 - Store 打开后、投影恢复前执行一次严格的输出附件保留清理；首次失败中止启动。
   启动成功后每 24 小时重试，计划清理失败只记录警告。

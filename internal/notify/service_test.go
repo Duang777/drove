@@ -172,6 +172,48 @@ func TestServiceMetadataFailureUsesSafeFallback(t *testing.T) {
 	}
 }
 
+func TestServiceChannelFailureLogDoesNotExposeProviderSecrets(t *testing.T) {
+	ctx := context.Background()
+	notifications := openInitializedStore(t, 0)
+	base := time.Date(2026, time.October, 8, 19, 0, 0, 0, time.UTC)
+	saveTestSubscription(t, notifications, "phone", base.Add(-time.Minute))
+	if _, err := notifications.project(ctx, projectionBatch{
+		afterSeq: 0,
+		events:   []eventstore.EventRow{stateRow(1, base, "working", "blocked")},
+		metadata: map[string]AgentMetadata{
+			"agent-1": {Name: "Agent one", Vendor: "generic"},
+		},
+		channels: map[ChannelKind]bool{ChannelWebPush: true},
+		policy:   testPolicy(),
+	}); err != nil {
+		t.Fatalf("project delivery: %v", err)
+	}
+
+	var logs bytes.Buffer
+	service := &Service{
+		store:         notifications,
+		leaseDuration: 30 * time.Second,
+		minRetry:      time.Second,
+		maxRetry:      time.Minute,
+		now:           func() time.Time { return base.Add(time.Second) },
+		logger:        slog.New(slog.NewJSONHandler(&logs, nil)),
+	}
+	channel := &failingChannel{
+		kind: ChannelWebPush,
+		err:  errors.New("SECRET-ENDPOINT SECRET-TOKEN"),
+	}
+	if !service.deliverReady(ctx, channel) {
+		t.Fatal("delivery was not claimed")
+	}
+	if strings.Contains(logs.String(), "SECRET-") {
+		t.Fatalf("channel failure log leaked provider data: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), `"error_type"`) ||
+		!strings.Contains(logs.String(), `"delivery_id"`) {
+		t.Fatalf("channel failure log lacks safe context: %s", logs.String())
+	}
+}
+
 func TestServicePresenceExpiresBeforeLaterBlockedTransition(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -396,6 +438,22 @@ func (c *blockingChannel) Send(
 	}
 	<-ctx.Done()
 	return SendResult{}, ctx.Err()
+}
+
+type failingChannel struct {
+	kind ChannelKind
+	err  error
+}
+
+func (c *failingChannel) Kind() ChannelKind {
+	return c.kind
+}
+
+func (c *failingChannel) Send(
+	context.Context,
+	Delivery,
+) (SendResult, error) {
+	return SendResult{}, c.err
 }
 
 func fixedMetadataResolver() MetadataResolver {
