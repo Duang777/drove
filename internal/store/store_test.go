@@ -371,6 +371,117 @@ func TestAppendEventsAppendsConsecutiveBatch(t *testing.T) {
 	}
 }
 
+func TestReadEventRangeBoundsRowsWithoutLoadingAttachments(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	base := time.Date(2026, time.October, 8, 10, 0, 0, 0, time.UTC)
+	rows := []EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "working",
+			To:        "blocked",
+		},
+		{
+			Seq:              2,
+			Timestamp:        base.Add(time.Second),
+			Type:             string(event.TypeOutputChunk),
+			SessionID:        "agent-1",
+			AgentID:          "agent-1",
+			Payload:          `{"version":1,"offset":0,"len":6}`,
+			OutputAttachment: []byte("secret"),
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(2 * time.Second),
+			Type:      string(event.TypeOutput),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Payload:   "third",
+		},
+		{
+			Seq:       4,
+			Timestamp: base.Add(3 * time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "blocked",
+			To:        "working",
+		},
+		{
+			Seq:       5,
+			Timestamp: base.Add(4 * time.Second),
+			Type:      string(event.TypeOutput),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Payload:   "outside upper bound",
+		},
+	}
+	if _, err := s.AppendEvents(context.Background(), 0, rows); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+
+	got, err := s.ReadEventRange(context.Background(), 1, 4, 2)
+	if err != nil {
+		t.Fatalf("read event range: %v", err)
+	}
+	if len(got) != 2 || got[0].Seq != 2 || got[1].Seq != 3 {
+		t.Fatalf("event range seqs = %+v, want [2 3]", got)
+	}
+	if got[0].OutputAttachment != nil || got[0].OutputAttachmentPresent {
+		t.Fatalf("event range loaded output attachment: %+v", got[0])
+	}
+	if !got[0].Timestamp.Equal(rows[1].Timestamp) ||
+		!got[1].Timestamp.Equal(rows[2].Timestamp) {
+		t.Fatalf("event range timestamps changed: %+v", got)
+	}
+
+	empty, err := s.ReadEventRange(context.Background(), 4, 4, 2)
+	if err != nil {
+		t.Fatalf("read empty range: %v", err)
+	}
+	if empty == nil || len(empty) != 0 {
+		t.Fatalf("empty event range = %#v, want non-nil empty slice", empty)
+	}
+}
+
+func TestReadEventRangeRejectsInvalidBoundsAndLimit(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for _, test := range []struct {
+		name       string
+		afterSeq   uint64
+		throughSeq uint64
+		limit      int
+	}{
+		{name: "zero limit", afterSeq: 0, throughSeq: 1, limit: 0},
+		{name: "negative limit", afterSeq: 0, throughSeq: 1, limit: -1},
+		{name: "reversed range", afterSeq: 2, throughSeq: 1, limit: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := s.ReadEventRange(
+				context.Background(),
+				test.afterSeq,
+				test.throughSeq,
+				test.limit,
+			); err == nil {
+				t.Fatal("ReadEventRange accepted invalid arguments")
+			}
+		})
+	}
+}
+
 func TestAppendEventsRejectsStaleBoundaryWithoutWriting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "test.db")
 	s, err := Open(path)

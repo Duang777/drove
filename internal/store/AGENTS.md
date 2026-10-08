@@ -18,6 +18,8 @@
   `Replay` 通过 left join 返回仍保留的附件。
 - `RecentEvents` 在 SQLite 内按会话和事件类型过滤、倒序截取有限尾部，再按
   `seq` 升序返回；它只读 event envelope，绝不联接或加载输出附件。
+- `ReadEventRange` 按全局序号读取有上限的连续前缀，只返回 event envelope，
+  供通知等派生投影追赶已发布事件。
 - `SessionBoundary` 在一个短读事务中捕获全局 durable head、会话序号边界和
   exclusive next output offset。
 - `ReadSessionRange` 同时限制行数与 hydrated attachment 字节数；结果显式标记
