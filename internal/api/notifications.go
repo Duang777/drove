@@ -405,9 +405,13 @@ func rejectNotificationQuery(w http.ResponseWriter, r *http.Request) bool {
 }
 
 func canonicalUUID(raw string) (string, error) {
+	return canonicalUUIDField(raw, "subscription_id")
+}
+
+func canonicalUUIDField(raw string, field string) (string, error) {
 	parsed, err := uuid.Parse(raw)
 	if err != nil || parsed.String() != raw {
-		return "", errors.New("subscription_id must be a canonical UUID")
+		return "", errors.New(field + " must be a canonical UUID")
 	}
 	return raw, nil
 }

@@ -65,6 +65,8 @@ type ServerOptions struct {
 	AllowedOrigins []string
 	// Notifications contains the optional durable notification runtime.
 	Notifications NotificationOptions
+	// Actions coordinates one-time tickets with live session responses.
+	Actions ActionService
 }
 
 // Server 是 HTTP/WS 服务。
@@ -127,6 +129,11 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/agents/{id}/resume", s.handleResume)
 	mux.HandleFunc("GET /api/v1/agents/{id}/explain", s.handleExplain)
 	mux.HandleFunc("POST /api/v1/agents/{id}/input", s.handleInput)
+	mux.HandleFunc(
+		"POST /api/v1/agents/{id}/action-context",
+		s.handleActionContext,
+	)
+	mux.HandleFunc("POST /api/v1/agents/{id}/actions", s.handleAction)
 	mux.HandleFunc("GET /api/v1/agents/{id}/events", s.handleReplay)
 	mux.HandleFunc("POST /api/v1/auth/login-code", s.handleIssueLoginCode)
 	mux.HandleFunc("POST /api/v1/auth/token/rotate", s.handleRotateToken)

@@ -28,6 +28,9 @@ daemon 通信。
   - `DELETE /api/v1/push/subscriptions/{id}`：撤销浏览器订阅
   - `POST /api/v1/notifications/presence`：记录可见页面的短期 presence
   - `POST /api/v1/notifications/test`：向一个订阅发送元数据测试通知
+  - `POST /api/v1/agents/{id}/action-context`：校验实时 Blocked 上下文并签发
+    action-bound tickets
+  - `POST /api/v1/agents/{id}/actions`：消费一次性 ticket 并执行远程响应
   - `GET  /api/v1/agents/{id}/timeline`：状态区间、Blocked 索引与输出保留范围
   - `GET  /api/v1/agents/{id}/timeline/blocked/{number}`：一基 Blocked 跳转位置
   - `GET  /api/v1/agents/{id}/frame`：按 seq、at 或 offset 精确重建受限终端帧
@@ -73,6 +76,9 @@ daemon 通信。
 - 处理函数保持薄：解析→调用 Manager→序列化；业务逻辑不得进入本包。
 - 通知处理函数只依赖 `NotificationService`。公开响应不得返回 subscription
   endpoint、订阅密钥、VAPID 私钥或 ntfy 凭据。
+- 远程响应处理函数只依赖 `ActionService`。Agent、action、Blocked 序号、channel
+  和 device 由已验证 ticket claims 决定，API 不接受这些重复字段。
+- action ticket 和 reply 不得进入错误响应或日志。
 - 统一 JSON 错误格式：`{"error": "..."}`，HTTP 状态码语义化。
 - WebSocket 发送带 write deadline + ping/pong 保活，防止死连接。
 

@@ -32,6 +32,8 @@
 - 保留循环在 Store 关闭前取消并等待退出；当前时间、tick 和 prune 操作可由聚焦测试注入。
 - 启动时用 `Lstat` 校验数据目录和数据库类型；既有路径开放 group/other 权限时记录
   结构化警告，但不自动修改模式。
+- 只有启用 Web Push 时才加载 action-ticket key、创建 ticket manager 和
+  `internal/respond` 服务，并把后者注入 API。
 - 启动时清理无法跨重启存活的 session 注入目录，并解析同目录或 PATH 中的
   `drove` relay，再通过 ManagerOption 注入；厂商参数仍由 adapter 决定。
 - 信号取消与 Serve 异常共用关闭路径；任一步失败都继续清理剩余资源，并汇总返回错误。

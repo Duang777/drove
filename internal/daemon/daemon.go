@@ -215,6 +215,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		EventBuffer:    d.cfg.EventBuffer,
 		AllowedOrigins: allowedOrigins,
 		Notifications:  notificationAPIOptions(notifications, d.cfg.Notify),
+		Actions:        actionAPIService(notifications),
 	})
 
 	stopRetention, retentionDone := d.startRetentionLoop(st, log)

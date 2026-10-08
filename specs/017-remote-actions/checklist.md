@@ -8,10 +8,10 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 - [x] `internal/adapter` is the only package with Claude/Codex key mappings.
 - [x] `internal/session` owns state freshness, screen actionability, PTY writes,
       response fencing, and action/input audit.
-- [ ] `internal/notify` owns ticket signing, expiry, device binding, and replay
+- [x] `internal/notify` owns ticket signing, expiry, device binding, and replay
       state, but cannot write a PTY.
-- [ ] `internal/respond` owns ticket-consume-before-session-execute ordering.
-- [ ] The API only parses, invokes the response service, and maps errors.
+- [x] `internal/respond` owns ticket-consume-before-session-execute ordering.
+- [x] The API only parses, invokes the response service, and maps errors.
 - [x] The global Committer never performs PTY I/O.
 
 ## State and concurrency
@@ -50,26 +50,26 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 
 ## Ticket security
 
-- [ ] A distinct 256-bit HMAC key is atomically created as a regular `0600`
+- [x] A distinct 256-bit HMAC key is atomically created as a regular `0600`
       file.
-- [ ] Tickets bind JTI, Agent, Blocked sequence, action, device, issue time, and
+- [x] Tickets bind JTI, Agent, Blocked sequence, action, device, issue time, and
       expiry.
-- [ ] Ticket parsing rejects non-canonical encoding, unknown fields, bad MAC,
+- [x] Ticket parsing rejects non-canonical encoding, unknown fields, bad MAC,
       future issue times, and excessive lifetime.
-- [ ] Ticket rows contain only digest and bounded metadata.
-- [ ] One concurrent consume wins and replay remains rejected after restart.
-- [ ] Revoked devices cannot use outstanding tickets.
-- [ ] Tickets are consumed before PTY execution and are never automatically
+- [x] Ticket rows contain only digest and bounded metadata.
+- [x] One concurrent consume wins and replay remains rejected after restart.
+- [x] Revoked devices cannot use outstanding tickets.
+- [x] Tickets are consumed before PTY execution and are never automatically
       retried.
 
 ## API and PWA
 
-- [ ] Action context and action routes require existing authentication.
-- [ ] Cookie POST requests require an exact allowed Origin.
-- [ ] Request size, media type, UTF-8, unknown fields, and extra JSON values are
+- [x] Action context and action routes require existing authentication.
+- [x] Cookie POST requests require an exact allowed Origin.
+- [x] Request size, media type, UTF-8, unknown fields, and extra JSON values are
       rejected.
 - [x] Sequence values cross JavaScript boundaries as decimal strings.
-- [ ] Web Push payloads contain action tickets but no screen or reply text.
+- [x] Web Push payloads contain action tickets but no screen or reply text.
 - [ ] The service worker never approves directly.
 - [ ] Direct denial posts once; any failure opens the PWA approval page.
 - [ ] Approve, reply, empty actions, and unsupported action buttons open the

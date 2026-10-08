@@ -45,6 +45,56 @@ func TestOpenCreatesPrivateDatabaseAndMigratesOnce(t *testing.T) {
 	}
 }
 
+func TestOpenMigratesVersionOneDatabaseToActionTickets(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "notify.db")
+	store, err := Open(path)
+	if err != nil {
+		t.Fatalf("open notification database: %v", err)
+	}
+	createdAt := time.Date(2026, time.October, 8, 10, 0, 0, 0, time.UTC)
+	saveTestSubscription(t, store, "phone", createdAt)
+	if _, err := store.db.Exec(`
+		DROP TABLE action_tickets;
+		PRAGMA user_version = 1;
+	`); err != nil {
+		t.Fatalf("downgrade database fixture to version 1: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close version 1 database fixture: %v", err)
+	}
+
+	migrated, err := Open(path)
+	if err != nil {
+		t.Fatalf("migrate version 1 notification database: %v", err)
+	}
+	defer migrated.Close()
+
+	var version int
+	if err := migrated.db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read migrated schema version: %v", err)
+	}
+	if version != 2 {
+		t.Fatalf("migrated schema version = %d, want 2", version)
+	}
+	var tableName string
+	if err := migrated.db.QueryRow(
+		`SELECT name FROM sqlite_schema
+		 WHERE type = 'table' AND name = 'action_tickets'`,
+	).Scan(&tableName); err != nil {
+		t.Fatalf("find migrated action ticket table: %v", err)
+	}
+	subscription, found, err := migrated.PushSubscription(ctx, "phone")
+	if err != nil {
+		t.Fatalf("read subscription after migration: %v", err)
+	}
+	if !found ||
+		subscription.ID != "phone" ||
+		!subscription.CreatedAt.Equal(createdAt) {
+		t.Fatalf("subscription after migration = %+v, found=%t", subscription, found)
+	}
+}
+
 func TestOpenRejectsUnsafeDatabasePaths(t *testing.T) {
 	dir := t.TempDir()
 	directoryPath := filepath.Join(dir, "directory")

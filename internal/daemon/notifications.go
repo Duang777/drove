@@ -13,6 +13,7 @@ import (
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/notify"
+	"github.com/Duang777/drove/internal/respond"
 	"github.com/Duang777/drove/internal/session"
 	"github.com/Duang777/drove/internal/store"
 )
@@ -23,6 +24,7 @@ type notificationRuntime struct {
 	store   *notify.Store
 	service *notify.Service
 	webPush *notify.WebPushChannel
+	actions *respond.Service
 	ntfy    bool
 }
 
@@ -49,10 +51,23 @@ func startNotifications(
 
 	var channels []notify.Channel
 	var webPushChannel *notify.WebPushChannel
+	var actionTickets *notify.ActionTickets
 	if cfg.Notify.WebPush.Enabled {
 		credentials, err := notify.LoadOrCreateVAPID(cfg.DataDir)
 		if err != nil {
 			return fail(fmt.Errorf("daemon: Web Push credentials: %w", err))
+		}
+		actionTicketKey, err := notify.LoadOrCreateActionTicketKey(cfg.DataDir)
+		if err != nil {
+			return fail(fmt.Errorf("daemon: action ticket key: %w", err))
+		}
+		actionTickets, err = notify.NewActionTickets(
+			notificationStore,
+			actionTicketKey,
+			notify.ActionTicketOptions{},
+		)
+		if err != nil {
+			return fail(fmt.Errorf("daemon: action tickets: %w", err))
 		}
 		webPushChannel, err = notify.NewWebPushChannel(notify.WebPushOptions{
 			Subject:     cfg.Notify.WebPush.VAPIDSubject,
@@ -84,6 +99,10 @@ func startNotifications(
 		Events:   events,
 		Hub:      hub,
 		Resolver: managerNotificationResolver{manager: manager},
+		ActionResolver: managerNotificationResolver{
+			manager: manager,
+		},
+		ActionTickets: actionTickets,
 		Policy: notify.Policy{
 			Debounce:        time.Duration(cfg.Notify.DebounceSeconds) * time.Second,
 			QuietWhenActive: cfg.Notify.QuietWhenActive,
@@ -100,6 +119,20 @@ func startNotifications(
 	if err := service.Start(context.Background()); err != nil {
 		return fail(fmt.Errorf("daemon: start notification service: %w", err))
 	}
+	var actionService *respond.Service
+	if actionTickets != nil {
+		actionService, err = respond.NewService(respond.ServiceOptions{
+			Sessions: manager,
+			Tickets:  service,
+		})
+		if err != nil {
+			closeErr := service.Close(context.Background())
+			return fail(errors.Join(
+				fmt.Errorf("daemon: response service: %w", err),
+				closeErr,
+			))
+		}
+	}
 	logger.Info(
 		"notification service started",
 		"web_push", webPushChannel != nil,
@@ -109,6 +142,7 @@ func startNotifications(
 		store:   notificationStore,
 		service: service,
 		webPush: webPushChannel,
+		actions: actionService,
 		ntfy:    cfg.Notify.Ntfy.Enabled,
 	}, nil
 }
@@ -153,6 +187,13 @@ func notificationAPIOptions(
 	return options
 }
 
+func actionAPIService(runtime *notificationRuntime) api.ActionService {
+	if runtime == nil {
+		return nil
+	}
+	return runtime.actions
+}
+
 type managerNotificationResolver struct {
 	manager *session.Manager
 }
@@ -173,4 +214,24 @@ func (r managerNotificationResolver) ResolveNotificationAgent(
 		Name:   status.Name,
 		Vendor: status.Vendor,
 	}, nil
+}
+
+func (r managerNotificationResolver) ResolveNotificationActions(
+	ctx context.Context,
+	agentID string,
+	blockedSeq uint64,
+) ([]agent.ActionKind, error) {
+	actionContext, err := r.manager.ActionContext(
+		ctx,
+		agent.ID(agentID),
+		session.StateSeq(blockedSeq),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"daemon: resolve notification actions for Agent %q: %w",
+			agentID,
+			err,
+		)
+	}
+	return actionContext.Actions, nil
 }

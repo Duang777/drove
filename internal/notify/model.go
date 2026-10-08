@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/Duang777/drove/internal/agent"
 )
 
 var (
@@ -31,14 +33,22 @@ const (
 
 // Notification is the complete metadata allowed to leave Drove by default.
 type Notification struct {
-	ID         string    `json:"id"`
-	AgentID    string    `json:"agent_id"`
-	AgentName  string    `json:"agent_name"`
-	Vendor     string    `json:"vendor"`
-	State      string    `json:"state"`
-	BlockedSeq uint64    `json:"blocked_seq"`
-	OccurredAt time.Time `json:"occurred_at"`
-	DeepLink   string    `json:"deep_link"`
+	ID            string             `json:"id"`
+	AgentID       string             `json:"agent_id"`
+	AgentName     string             `json:"agent_name"`
+	Vendor        string             `json:"vendor"`
+	State         string             `json:"state"`
+	BlockedSeq    uint64             `json:"blocked_seq"`
+	OccurredAt    time.Time          `json:"occurred_at"`
+	DeepLink      string             `json:"deep_link"`
+	ActionContext *PushActionContext `json:"action_context,omitempty"`
+}
+
+// PushActionContext is the versioned action data allowed in Web Push payloads.
+type PushActionContext struct {
+	Version   int                  `json:"version"`
+	Tickets   []IssuedActionTicket `json:"tickets"`
+	ExpiresAt time.Time            `json:"expires_at"`
 }
 
 // AgentMetadata contains stable labels used in a notification.
@@ -61,6 +71,31 @@ func (f MetadataResolverFunc) ResolveNotificationAgent(
 	agentID string,
 ) (AgentMetadata, error) {
 	return f(ctx, agentID)
+}
+
+// ActionResolver returns the actions available for one live Blocked occurrence.
+type ActionResolver interface {
+	ResolveNotificationActions(
+		context.Context,
+		string,
+		uint64,
+	) ([]agent.ActionKind, error)
+}
+
+// ActionResolverFunc adapts a function to ActionResolver.
+type ActionResolverFunc func(
+	context.Context,
+	string,
+	uint64,
+) ([]agent.ActionKind, error)
+
+// ResolveNotificationActions implements ActionResolver.
+func (f ActionResolverFunc) ResolveNotificationActions(
+	ctx context.Context,
+	agentID string,
+	blockedSeq uint64,
+) ([]agent.ActionKind, error) {
+	return f(ctx, agentID, blockedSeq)
 }
 
 // Policy controls Blocked notification suppression.
