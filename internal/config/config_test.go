@@ -69,6 +69,116 @@ func TestLoadResolvedAllowsMissingDefaultConfig(t *testing.T) {
 	}
 }
 
+func TestInitializeDefaultsBacksUpExistingConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("DROVE_DATA_DIR", "")
+
+	configPath := DefaultPath()
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	original := []byte("{\"custom\":\"preserve exactly\"}\n")
+	if err := os.WriteFile(configPath, original, 0o640); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	backupPath, err := InitializeDefaults("")
+	if err != nil {
+		t.Fatalf("initialize defaults: %v", err)
+	}
+	if filepath.Dir(backupPath) != filepath.Dir(configPath) {
+		t.Fatalf("backup path = %q, want same directory as config", backupPath)
+	}
+	if !strings.HasPrefix(
+		filepath.Base(backupPath),
+		filepath.Base(configPath)+".bak-",
+	) {
+		t.Fatalf("backup path = %q, want config.json.bak-*", backupPath)
+	}
+	backup, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(backup) != string(original) {
+		t.Fatalf("backup contents = %q, want %q", backup, original)
+	}
+	backupInfo, err := os.Stat(backupPath)
+	if err != nil {
+		t.Fatalf("inspect backup: %v", err)
+	}
+	if backupInfo.Mode().Perm() != 0o600 {
+		t.Fatalf(
+			"backup mode = %04o, want 0600",
+			backupInfo.Mode().Perm(),
+		)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("load initialized config: %v", err)
+	}
+	defaults := Defaults()
+	if cfg.APIBind != defaults.APIBind ||
+		cfg.EventBuffer != defaults.EventBuffer ||
+		cfg.Storage.OutputRetentionDays !=
+			defaults.Storage.OutputRetentionDays {
+		t.Fatalf("initialized config = %+v, want defaults", cfg)
+	}
+
+	next := []byte("{\"custom\":\"preserve next version\"}\n")
+	if err := os.WriteFile(configPath, next, 0o600); err != nil {
+		t.Fatalf("write next config: %v", err)
+	}
+	nextBackupPath, err := InitializeDefaults(configPath)
+	if err != nil {
+		t.Fatalf("initialize defaults again: %v", err)
+	}
+	if nextBackupPath == backupPath {
+		t.Fatalf("second initialization reused backup path %q", backupPath)
+	}
+	nextBackup, err := os.ReadFile(nextBackupPath)
+	if err != nil {
+		t.Fatalf("read next backup: %v", err)
+	}
+	if string(nextBackup) != string(next) {
+		t.Fatalf("next backup contents = %q, want %q", nextBackup, next)
+	}
+	originalBackup, err := os.ReadFile(backupPath)
+	if err != nil {
+		t.Fatalf("read original backup again: %v", err)
+	}
+	if string(originalBackup) != string(original) {
+		t.Fatalf(
+			"original backup contents = %q, want %q",
+			originalBackup,
+			original,
+		)
+	}
+}
+
+func TestInitializeDefaultsDoesNotReplaceUnbackablePath(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.Mkdir(configPath, 0o700); err != nil {
+		t.Fatalf("create directory at config path: %v", err)
+	}
+
+	backupPath, err := InitializeDefaults(configPath)
+	if err == nil {
+		t.Fatal("initialize defaults succeeded without backing up existing path")
+	}
+	if backupPath != "" {
+		t.Fatalf("backup path = %q, want empty", backupPath)
+	}
+	info, statErr := os.Stat(configPath)
+	if statErr != nil {
+		t.Fatalf("inspect original path: %v", statErr)
+	}
+	if !info.IsDir() {
+		t.Fatalf("original path mode = %v, want directory", info.Mode())
+	}
+}
+
 func TestLoadResolvedHonorsExplicitPathAndEnvironment(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	overrideDir := filepath.Join(t.TempDir(), "override")

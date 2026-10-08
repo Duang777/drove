@@ -236,15 +236,13 @@ func newInitCmd() *cobra.Command {
 		Short: "初始化配置与数据目录",
 		Args:  usageArgs(cobra.NoArgs),
 		RunE: func(_ *cobra.Command, _ []string) error {
-			cfg := config.Defaults()
 			path := config.DefaultPath()
-			dir := filepath.Dir(path)
-			if err := os.MkdirAll(dir, 0o700); err != nil {
+			backupPath, err := config.InitializeDefaults(path)
+			if err != nil {
 				return err
 			}
-			raw, _ := json.MarshalIndent(cfg, "", "  ")
-			if err := os.WriteFile(path, raw, 0o644); err != nil {
-				return err
+			if backupPath != "" {
+				fmt.Printf("Previous config backed up: %s\n", backupPath)
 			}
 			fmt.Printf("Drove initialized: %s\n", path)
 			return nil

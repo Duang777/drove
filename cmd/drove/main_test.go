@@ -174,6 +174,39 @@ func TestInitCreatesPrivateDataDirectoryWithRetentionDefault(t *testing.T) {
 	}
 }
 
+func TestInitBacksUpExistingConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	configPath := filepath.Join(home, ".drove", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatalf("create config directory: %v", err)
+	}
+	original := []byte("{\"custom\":\"keep this version\"}\n")
+	if err := os.WriteFile(configPath, original, 0o600); err != nil {
+		t.Fatalf("write existing config: %v", err)
+	}
+
+	cmd := newInitCmd()
+	if err := cmd.RunE(cmd, nil); err != nil {
+		t.Fatalf("run init: %v", err)
+	}
+
+	backups, err := filepath.Glob(configPath + ".bak-*")
+	if err != nil {
+		t.Fatalf("find config backups: %v", err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("config backups = %v, want one", backups)
+	}
+	backup, err := os.ReadFile(backups[0])
+	if err != nil {
+		t.Fatalf("read config backup: %v", err)
+	}
+	if string(backup) != string(original) {
+		t.Fatalf("backup contents = %q, want %q", backup, original)
+	}
+}
+
 func TestUpCommandExposesRunnerAndHookFlags(t *testing.T) {
 	flags := newUpCmd().Flags()
 	oneshot := flags.Lookup("oneshot")

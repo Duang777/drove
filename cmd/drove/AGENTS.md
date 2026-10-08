@@ -12,7 +12,8 @@ log / timeline / explain / attach / tui / stop / worktree / token rotate / web /
 
 - 命令树用 `spf13/cobra`；`root` 只挂子命令，不做业务。
 - `drove init` 以 `0700` 创建缺失的数据目录，并把含 30 天输出保留期的默认配置写到
-  `~/.drove/config.json`。
+  `~/.drove/config.json`；既有配置先保存为同目录唯一的 `config.json.bak-*`，
+  备份失败时不得覆盖原文件。
 - `drove up <vendor|command>` 启动一个 agent：默认 `interactive`，`--oneshot`
   切换为单次执行，`--hooks` 选择 `off|auto|required`；未知厂商名仍视为
   generic 命令。`--worktree` 把调用方目录解析为绝对仓库路径，`--branch` 只在

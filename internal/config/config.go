@@ -87,6 +87,72 @@ func DefaultPath() string {
 	return filepath.Join(defaultDataDir(), "config.json")
 }
 
+// InitializeDefaults writes the default configuration and backs up an existing file.
+func InitializeDefaults(path string) (string, error) {
+	if path == "" {
+		path = DefaultPath()
+	}
+	raw, err := json.MarshalIndent(Defaults(), "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("config: encode defaults: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return "", fmt.Errorf("config: create directory for %q: %w", path, err)
+	}
+	backupPath, err := backupExistingFile(path)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		if backupPath != "" {
+			return backupPath, fmt.Errorf(
+				"config: write %q after backup %q: %w",
+				path,
+				backupPath,
+				err,
+			)
+		}
+		return backupPath, fmt.Errorf("config: write %q: %w", path, err)
+	}
+	return backupPath, nil
+}
+
+func backupExistingFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("config: read existing %q: %w", path, err)
+	}
+
+	backup, err := os.CreateTemp(
+		filepath.Dir(path),
+		filepath.Base(path)+".bak-*",
+	)
+	if err != nil {
+		return "", fmt.Errorf("config: create backup for %q: %w", path, err)
+	}
+	backupPath := backup.Name()
+	cleanup := func() {
+		_ = backup.Close()
+		_ = os.Remove(backupPath)
+	}
+	if _, err := backup.Write(raw); err != nil {
+		cleanup()
+		return "", fmt.Errorf("config: write backup %q: %w", backupPath, err)
+	}
+	if err := backup.Sync(); err != nil {
+		cleanup()
+		return "", fmt.Errorf("config: sync backup %q: %w", backupPath, err)
+	}
+	if err := backup.Close(); err != nil {
+		_ = os.Remove(backupPath)
+		return "", fmt.Errorf("config: close backup %q: %w", backupPath, err)
+	}
+	return backupPath, nil
+}
+
 // defaultDataDir 按平台返回默认数据目录（$HOME/.drove 或 /tmp 兜底）。
 func defaultDataDir() string {
 	home, err := os.UserHomeDir()

@@ -10,6 +10,8 @@
 - `LoadResolved(path)` 同时返回绝对配置路径，供 CLI 自动拉起 daemon 时精确透传。
 - `Defaults()` 提供安全默认值（数据目录、loopback API 地址、事件缓冲大小、本地控制台
   Origin、30 天原始输出保留期）；`storage.output_retention_days=0` 表示永久保留。
+- `InitializeDefaults(path)` 写入默认配置；既有文件先按原始字节保存为同目录
+  `config.json.bak-*`，备份使用 `0600` 权限并在覆盖前同步到磁盘。
 - `Validate()` 以 `0700` 创建缺失的数据目录，但不修改既有目录模式；负保留天数无效。
 - `Agents` 保存 vendor-keyed 启动配置；`signal_injection` 只接受 `auto|off`，
   adapter 能力默认值由 composition root 解析，config 不包含厂商分支。
@@ -25,4 +27,5 @@
 
 - 禁止在其它包硬编码路径/端口常量；一律从 Config 读取。
 - 环境变量覆盖（如 `DROVE_DATA_DIR`）只允许在本包实现。
-- 导出类型：`Config`、`AgentConfig`、`SignalInjection`。
+- 导出类型：`Config`、`AgentConfig`、`SignalInjection`；导出函数：
+  `Defaults`、`DefaultPath`、`InitializeDefaults`、`Load`、`LoadResolved`。

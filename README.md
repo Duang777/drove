@@ -96,7 +96,7 @@ drove web
 drove version
 ```
 
-`drove init` 把默认配置写到 `~/.drove/config.json`。文件已存在时会覆盖。`data_dir` 写成主目录下 `.drove` 的绝对路径，目录权限是 `0700`。
+`drove init` 把默认配置写到 `~/.drove/config.json`。文件已存在时，先把原始内容备份到同目录唯一的 `config.json.bak-*`，再写入默认配置。`data_dir` 写成主目录下 `.drove` 的绝对路径，目录权限是 `0700`。
 
 `drove up` 在 daemon 没在听的时候拉起 `droved`。日志在 `<data_dir>/drove.log`。上面的 `/bin/cat` 不需要安装 Claude 或 Codex，用来确认链路。Claude Code 和 Codex 需要它们自己的 CLI 已在 `PATH` 里：
 
@@ -111,7 +111,7 @@ drove up claude --worktree --branch feature/api
 
 | 命令 | 行为 |
 | --- | --- |
-| `drove init` | 写入默认 `config.json`。已存在则覆盖 |
+| `drove init` | 写入默认 `config.json`。已存在则先备份为 `config.json.bak-*` |
 | `drove up <vendor\|command>` | 启动一个会话。厂商名是 `claude`、`codex`；其他字符串当作可执行文件名，不能再跟参数 |
 | `drove resume <agent-id>` | 对可恢复的 Claude / Codex 会话执行厂商原生 resume，保留 Agent ID |
 | `drove ps` | 打印 AGENT ID、NAME、VENDOR、MODE、STATE、PID、RESUMABLE。没有会话时打印 `no agents running` |
