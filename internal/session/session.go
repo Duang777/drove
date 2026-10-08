@@ -34,6 +34,7 @@ type Status struct {
 	Dir                   string                      `json:"dir,omitempty"`
 	Mode                  agent.RunMode               `json:"mode"`
 	State                 agent.State                 `json:"state"`
+	StateSeq              StateSeq                    `json:"state_seq"`
 	PID                   int                         `json:"pid,omitempty"`
 	CreatedAt             time.Time                   `json:"created_at"`
 	UpdatedAt             time.Time                   `json:"updated_at"`
@@ -303,6 +304,7 @@ func Bootstrap(
 			return nil, fmt.Errorf("session: bootstrap restore agent %q: %w", snapshot.ID, err)
 		}
 		managed := newManagedAgent(restored)
+		managed.setStateSeq(plan.StateSeqs[string(snapshot.ID)])
 		managed.setVendorSessionReference(plan.VendorSessionRefs[string(snapshot.ID)])
 		managed.setWorkspaceState(workspaceRuntimeState{
 			workingDir:    plan.WorkingDirs[string(snapshot.ID)],
@@ -495,7 +497,7 @@ func (m *Manager) Start(
 	running.injectionDir = injection.dir
 	receipt, err := m.committer.CommitAgent(
 		ctx,
-		a,
+		managed,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "session_start",
@@ -789,7 +791,7 @@ func (m *Manager) resumeReserved(
 	}
 	if _, err := m.committer.CommitAgent(
 		ctx,
-		target,
+		managed,
 		agent.ResumeToStarting("session resume", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "session_resume",
@@ -1102,7 +1104,8 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 			hookStatus = sess.observer.Snapshot().HookStatus()
 		}
 	}
-	state := a.State()
+	stateView := managed.stateView()
+	state := stateView.state
 	ref := managed.vendorSessionReference()
 	entry, exactVendor := m.reg.Lookup(a.Vendor())
 	workspaceState := managed.workspaceState()
@@ -1126,13 +1129,14 @@ func (m *Manager) Status(id agent.ID) (*Status, error) {
 		Dir:            workingDir,
 		Mode:           a.RunMode(),
 		State:          state,
-		CreatedAt:      a.CreatedAt(),
-		UpdatedAt:      a.UpdatedAt(),
-		StateSince:     a.StateSince(),
-		LastError:      a.LastError(),
+		StateSeq:       stateView.stateSeq,
+		CreatedAt:      stateView.createdAt,
+		UpdatedAt:      stateView.updatedAt,
+		StateSince:     stateView.stateSince,
+		LastError:      stateView.lastError,
 		HookPolicy:     a.HookPolicy(),
 		HookStatus:     hookStatus,
-		LastTransition: a.LastTransition(),
+		LastTransition: stateView.lastTransition,
 		Resumable:      resumable,
 	}
 	st.SignalInjection = a.SignalInjection()

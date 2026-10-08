@@ -355,6 +355,7 @@ func TestHandleCreateAcceptsLowercaseOneshotMode(t *testing.T) {
 	}
 	if status.Mode != agent.RunModeOneshot ||
 		status.Dir != workingDir ||
+		status.StateSeq == 0 ||
 		status.PID <= 0 {
 		t.Fatalf("status = %+v, want live oneshot session", status)
 	}

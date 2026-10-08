@@ -103,6 +103,7 @@ export interface AgentStatus {
   dir?: string
   mode: RunMode
   state: AgentState
+  state_seq: DecimalString
   pid?: number
   created_at: string
   updated_at: string
@@ -171,6 +172,7 @@ export type EventType =
   | 'error'
   | 'session_lifecycle'
   | 'agent.input'
+  | 'agent.action'
   | 'agent.signal'
   | 'agent.resized'
   | 'agent.attachment'

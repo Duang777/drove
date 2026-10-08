@@ -2,12 +2,16 @@ package session
 
 import (
 	"sync"
+	"time"
 
 	"github.com/Duang777/drove/internal/agent"
 )
 
 type managedAgent struct {
 	agent *agent.Agent
+
+	stateMu  sync.RWMutex
+	stateSeq StateSeq
 
 	refMu            sync.RWMutex
 	vendorSessionRef string
@@ -31,8 +35,59 @@ type processGroupCleanupState struct {
 	pid     int
 }
 
+type managedStateView struct {
+	state          agent.State
+	stateSeq       StateSeq
+	createdAt      time.Time
+	updatedAt      time.Time
+	stateSince     time.Time
+	lastError      string
+	lastTransition *agent.Evidence
+}
+
 func newManagedAgent(target *agent.Agent) *managedAgent {
 	return &managedAgent{agent: target}
+}
+
+func (m *managedAgent) currentStateSeq() StateSeq {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.stateSeq
+}
+
+func (m *managedAgent) setStateSeq(sequence StateSeq) {
+	m.stateMu.Lock()
+	m.stateSeq = sequence
+	m.stateMu.Unlock()
+}
+
+func (m *managedAgent) applyCommitted(
+	prepared agent.PreparedChange,
+	sequence StateSeq,
+) error {
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	if err := m.agent.ApplyCommitted(prepared); err != nil {
+		return err
+	}
+	if sequence != 0 {
+		m.stateSeq = sequence
+	}
+	return nil
+}
+
+func (m *managedAgent) stateView() managedStateView {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return managedStateView{
+		state:          m.agent.State(),
+		stateSeq:       m.stateSeq,
+		createdAt:      m.agent.CreatedAt(),
+		updatedAt:      m.agent.UpdatedAt(),
+		stateSince:     m.agent.StateSince(),
+		lastError:      m.agent.LastError(),
+		lastTransition: m.agent.LastTransition(),
+	}
 }
 
 func (m *managedAgent) vendorSessionReference() string {

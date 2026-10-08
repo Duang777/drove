@@ -3,6 +3,7 @@ package adapter
 import (
 	"time"
 
+	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/detect"
 )
 
@@ -25,6 +26,17 @@ func codexScreenRules() []screenRuleDefinition {
 				confirmation: 750 * time.Millisecond,
 			},
 			cleared: &approvalCleared,
+			approval: &approvalDefinition{
+				bindings: map[agent.ActionKind]approvalActionBinding{
+					agent.ActionApprove: {prefix: []byte("\r")},
+					agent.ActionDeny:    {prefix: []byte{0x1b}},
+					agent.ActionReply: {
+						prefix:       []byte{0x1b},
+						suffix:       []byte("\r"),
+						includeReply: true,
+					},
+				},
+			},
 		},
 		{
 			name:       "codex.idle_prompt",

@@ -173,10 +173,11 @@ func TestTypedCommitterSealsDraftsAndAppliesAgentAfterStore(t *testing.T) {
 	defer hub.Unsubscribe(subscription)
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
+	managed := newManagedAgent(a)
 
 	receipt, err := committer.CommitAgent(
 		context.Background(),
-		a,
+		managed,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "session_start",
@@ -201,6 +202,9 @@ func TestTypedCommitterSealsDraftsAndAppliesAgentAfterStore(t *testing.T) {
 		a.LastTransition() == nil ||
 		a.LastTransition().Event != "session_start" {
 		t.Fatalf("agent projection = state %s evidence %+v", a.State(), a.LastTransition())
+	}
+	if got := managed.currentStateSeq(); got != 2 {
+		t.Fatalf("state sequence = %d, want 2", got)
 	}
 	rows := st.Rows()
 	if len(rows) != 2 ||
@@ -228,10 +232,11 @@ func TestTypedCommitterStoreFailureLeavesAgentUnchanged(t *testing.T) {
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
 	a := agent.New("agent-1")
+	managed := newManagedAgent(a)
 
 	_, err := committer.CommitAgent(
 		context.Background(),
-		a,
+		managed,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "session_start",
@@ -244,6 +249,9 @@ func TestTypedCommitterStoreFailureLeavesAgentUnchanged(t *testing.T) {
 	}
 	if snapshot := a.Snapshot(); snapshot.State != agent.StatePending || snapshot.Revision != 0 {
 		t.Fatalf("agent changed after failed append: %+v", snapshot)
+	}
+	if got := managed.currentStateSeq(); got != 0 {
+		t.Fatalf("state sequence = %d after failed append, want 0", got)
 	}
 }
 
@@ -381,6 +389,9 @@ func TestDecisionCommitAppliesBothProjectionsAfterStore(t *testing.T) {
 			managed.vendorSessionReference(),
 		)
 	}
+	if got := managed.currentStateSeq(); got != 2 {
+		t.Fatalf("state sequence = %d, want 2", got)
+	}
 	for want := uint64(1); want <= 2; want++ {
 		select {
 		case published := <-subscription.C():
@@ -477,6 +488,9 @@ func TestDecisionCommitStoreFailureLeavesBothProjectionsUnchanged(t *testing.T) 
 			managed.vendorSessionReference(),
 		)
 	}
+	if got := managed.currentStateSeq(); got != 0 {
+		t.Fatalf("state sequence = %d after failed decision, want 0", got)
+	}
 }
 
 func TestTypedCommitterPoisonsAfterPostCommitInvariantFailure(t *testing.T) {
@@ -500,10 +514,11 @@ func TestTypedCommitterPoisonsAfterPostCommitInvariantFailure(t *testing.T) {
 	hub := event.NewHub(0)
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
+	managed := newManagedAgent(a)
 
 	_, err = committer.CommitAgent(
 		context.Background(),
-		a,
+		managed,
 		agent.MoveTo(agent.StateStarting, "session start", agent.Evidence{
 			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
 		}),
@@ -712,10 +727,11 @@ func TestCommitterRejectsInvalidAgentChangeWithoutFailing(t *testing.T) {
 	committer := newCommitter(0, st, hub)
 	defer committer.Close()
 	a := agent.New("agent-1")
+	managed := newManagedAgent(a)
 
 	_, err := committer.CommitAgent(
 		context.Background(),
-		a,
+		managed,
 		agent.MoveTo(agent.StateDone, "invalid", agent.Evidence{
 			Source:     agent.EvidenceSession,
 			Event:      "invalid",

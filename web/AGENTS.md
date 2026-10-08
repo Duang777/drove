@@ -42,6 +42,8 @@
 - **原始输出摘要**：`output.chunk` 只显示 offset 和解码长度；EventLog 不渲染
   `data_b64`。
 - **本地投影仅是视图**：前端从事件流推导的状态只是展示用，权威状态永远以 daemon 为准（刷新列表纠正）。
+- **状态序号不进 number**：`AgentStatus.state_seq` 在 JSON 中是规范十进制字符串，
+  经边界解析后保留为 branded `DecimalString`。
 - **本地录制有界**：tape 达到 64 MiB 后冻结 exact frontier，但 live xterm.js
   继续更新。origin prefix 不淘汰，过期附件通过 `OutputExpiredError` 进入明确状态。
 - **工作目录兼容旧事件**：详情 header 显示 `AgentResource.dir`；旧 creation 事件

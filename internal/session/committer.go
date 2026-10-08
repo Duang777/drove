@@ -109,9 +109,9 @@ type eventsOperation struct {
 func (eventsOperation) isCommitOperation() {}
 
 type agentOperation struct {
-	agent  *agent.Agent
-	change agent.Change
-	drafts []event.Draft
+	managed *managedAgent
+	change  agent.Change
+	drafts  []event.Draft
 }
 
 func (agentOperation) isCommitOperation() {}
@@ -153,14 +153,14 @@ func newEventsOperation(drafts []event.Draft) eventsOperation {
 }
 
 func newAgentOperation(
-	target *agent.Agent,
+	target *managedAgent,
 	change agent.Change,
 	drafts []event.Draft,
 ) agentOperation {
 	return agentOperation{
-		agent:  target,
-		change: change,
-		drafts: append([]event.Draft(nil), drafts...),
+		managed: target,
+		change:  change,
+		drafts:  append([]event.Draft(nil), drafts...),
 	}
 }
 
@@ -223,12 +223,14 @@ func (c *committer) CommitEvents(
 
 func (c *committer) CommitAgent(
 	ctx context.Context,
-	target *agent.Agent,
+	target *managedAgent,
 	change agent.Change,
 	drafts []event.Draft,
 ) (commitReceipt, error) {
-	if target == nil {
-		return commitReceipt{}, errors.New("session: agent commit requires an Agent")
+	if target == nil || target.agent == nil {
+		return commitReceipt{}, errors.New(
+			"session: agent commit requires a managed Agent",
+		)
 	}
 	result, err := c.submit(ctx, newAgentOperation(target, change, drafts))
 	return result.receipt, err
@@ -515,15 +517,16 @@ func prepareCommitOperation(
 		}
 		return append([]event.Draft(nil), typed.drafts...), nil, time.Now().UTC(), nil
 	case agentOperation:
-		prepared, prepareErr := typed.agent.Prepare(typed.change)
+		target := typed.managed.agent
+		prepared, prepareErr := target.Prepare(typed.change)
 		if prepareErr != nil {
 			return nil, nil, time.Time{}, prepareErr
 		}
 		drafts = append([]event.Draft(nil), typed.drafts...)
 		if message, ok := prepared.ErrorMessage(); ok {
 			drafts = append(drafts, event.NewErrorDraft(
-				string(typed.agent.ID()),
-				string(typed.agent.ID()),
+				string(target.ID()),
+				string(target.ID()),
 				message,
 			))
 		}
@@ -536,8 +539,8 @@ func prepareCommitOperation(
 				)
 			}
 			drafts = append(drafts, event.NewStateChangedDraft(
-				string(typed.agent.ID()),
-				string(typed.agent.ID()),
+				string(target.ID()),
+				string(target.ID()),
 				string(from),
 				string(to),
 				reason,
@@ -547,8 +550,11 @@ func prepareCommitOperation(
 		if len(drafts) == 0 {
 			return nil, nil, time.Time{}, errors.New("session: empty agent operation")
 		}
-		return drafts, func([]event.Event) error {
-			return typed.agent.ApplyCommitted(prepared)
+		return drafts, func(committed []event.Event) error {
+			return typed.managed.applyCommitted(
+				prepared,
+				committedStateSeq(committed),
+			)
 		}, prepared.Timestamp(), nil
 	case decisionOperation:
 		target := typed.managed.agent
@@ -594,9 +600,12 @@ func prepareCommitOperation(
 		if len(drafts) == 0 {
 			return nil, nil, time.Time{}, errors.New("session: empty decision operation")
 		}
-		return drafts, func([]event.Event) error {
+		return drafts, func(committed []event.Event) error {
 			if hasChange {
-				if applyErr := target.ApplyCommitted(prepared); applyErr != nil {
+				if applyErr := typed.managed.applyCommitted(
+					prepared,
+					committedStateSeq(committed),
+				); applyErr != nil {
 					return applyErr
 				}
 			}
@@ -636,6 +645,15 @@ func prepareCommitOperation(
 			operation,
 		)
 	}
+}
+
+func committedStateSeq(committed []event.Event) StateSeq {
+	for _, committedEvent := range committed {
+		if committedEvent.Type == event.TypeStateChanged {
+			return StateSeq(committedEvent.Seq)
+		}
+	}
+	return 0
 }
 
 func encodeStateEvidence(evidence agent.Evidence) ([]byte, error) {

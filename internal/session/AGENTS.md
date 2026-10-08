@@ -30,6 +30,9 @@
   Committer 才应用 Agent 投影并按序发布 Hub。workspace removal 使用 typed
   operation，在 append 后清除 working directory、关闭 Resume，再发布事件；该元数据
   事件不改变 Agent 状态的 UpdatedAt，恢复投影必须保持相同语义。
+- `managedAgent` 在同一投影锁下保存 Agent 可变状态和当前 `state_changed` 序号；
+  `Status.state_seq` 以十进制字符串公开。Committer 是运行时唯一写者，恢复投影从
+  最后一条已接受的状态事件重建该序号。
 - `Start(ctx, req)`：校验并默认 `RunMode` → 按 vendor 取适配器 → 构造 agent →
   持久化 `starting` → 以统一的 40 行 × 120 列初始尺寸创建带固定回调的 PTY →
   创建 terminal actor → 持久化 `working` → 依次放行 signal 与 PTY callback →
@@ -124,6 +127,8 @@
 - 恢复投影显式识别 `agent.input`、`agent.attachment`、`agent.resumed` 和
   `output.chunk`。input 与 attachment 不改变状态；`output.chunk` 与旧 `output`
   只更新已有会话的事件事实。
+- 恢复投影只接受指向当前 Blocked 序号的 `agent.action`，并要求它后面紧邻同 Agent、
+  同事务时间戳的有效 `agent.input`；重复、旧序号和未配对动作均视为损坏。
 - 恢复投影只接受紧邻同 Agent `agent.resumed` 的 `Stopped -> Starting`；启动自动恢复
   只消费重启前非终态且已有 ref 的一次性候选，并按创建时间排序。候选等待同 Agent
   cleanup completion；自动或普通 `Resume` 消费此候选时，恢复进程及 required hook
@@ -148,7 +153,7 @@
 - 会话关闭必须幂等（多次 Close 不 panic、不泄漏 goroutine）。
 - 临时注入路径必须二次校验并拒绝 symlink；adapter 不得直接操作文件系统。
 - 导出类型：`Manager`、`ManagerOption`、`StartRequest`、`Status`、
-  `WorktreeRequest`、
+  `StateSeq`、`WorktreeRequest`、
   `ExplainOptions`、`ExplainEvent`、`ExplainScreen`、`Explanation`、
   `AttachmentID`、`AttachmentMode`、`AttachmentPurpose`、`AttachmentOptions`、
   `TerminalAttachment`、`LiveSnapshot`。

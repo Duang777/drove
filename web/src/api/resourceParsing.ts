@@ -1,6 +1,7 @@
 import {
   requireArray,
   requireBoolean,
+  requireDecimalString,
   requireKeys,
   requirePositiveInteger,
   requireRecord,
@@ -42,6 +43,7 @@ export function parseAgentStatus(
       'vendor',
       'mode',
       'state',
+      'state_seq',
       'created_at',
       'updated_at',
       'state_since',
@@ -77,6 +79,7 @@ export function parseAgentStatus(
     vendor: requireString(object.vendor, `${name}.vendor`),
     mode: parseRunMode(object.mode, `${name}.mode`),
     state: parseAgentState(object.state, `${name}.state`),
+    state_seq: requireDecimalString(object.state_seq, `${name}.state_seq`),
     created_at: requireTimestamp(object.created_at, `${name}.created_at`).iso,
     updated_at: requireTimestamp(object.updated_at, `${name}.updated_at`).iso,
     state_since: requireTimestamp(

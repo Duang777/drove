@@ -4,8 +4,8 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 
 ## Architecture
 
-- [ ] `internal/agent` owns the vendor-neutral action enum.
-- [ ] `internal/adapter` is the only package with Claude/Codex key mappings.
+- [x] `internal/agent` owns the vendor-neutral action enum.
+- [x] `internal/adapter` is the only package with Claude/Codex key mappings.
 - [ ] `internal/session` owns state freshness, screen actionability, PTY writes,
       response fencing, and action/input audit.
 - [ ] `internal/notify` owns ticket signing, expiry, device binding, and replay
@@ -16,8 +16,8 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 
 ## State and concurrency
 
-- [ ] Every Agent exposes the sequence of its current committed state.
-- [ ] Recovery restores the last accepted state event sequence.
+- [x] Every Agent exposes the sequence of its current committed state.
+- [x] Recovery restores the last accepted state event sequence.
 - [ ] The per-session control gate covers every user or terminal PTY writer,
       Detector state commit, stop, and exit ownership.
 - [ ] Remote action validation and PTY write happen while the same gate is held.
@@ -30,21 +30,21 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 
 ## Action contract
 
-- [ ] Claude approve, deny, and reply bytes are fixture-tested.
-- [ ] Codex approve, deny, and reply bytes are fixture-tested.
-- [ ] Generic and non-approval Blocked screens expose no actions.
+- [x] Claude approve, deny, and reply bytes are fixture-tested.
+- [x] Codex approve, deny, and reply bytes are fixture-tested.
+- [x] Generic and non-approval Blocked screens expose no actions.
 - [ ] Reply text is UTF-8, bounded, non-empty, and contains no control bytes.
 - [ ] Approve and deny reject reply text.
-- [ ] No automatic approval path exists.
+- [x] No automatic approval path exists.
 
 ## Audit and recovery
 
-- [ ] `agent.action` has a versioned, strict, redacted payload.
+- [x] `agent.action` has a versioned, strict, redacted payload.
 - [ ] A complete action writes adjacent `agent.action` and `agent.input` rows in
       one transaction.
-- [ ] The action event records action, channel, device ID, Blocked sequence,
+- [x] The action event records action, channel, device ID, Blocked sequence,
       prompt rule, and reply byte count only.
-- [ ] Recovery accepts valid action/input pairs and rejects malformed,
+- [x] Recovery accepts valid action/input pairs and rejects malformed,
       duplicate, unpaired, or wrong-Blocked action events.
 - [ ] Partial writes and post-write audit failures say not to retry.
 
@@ -68,7 +68,7 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 - [ ] Cookie POST requests require an exact allowed Origin.
 - [ ] Request size, media type, UTF-8, unknown fields, and extra JSON values are
       rejected.
-- [ ] Sequence values cross JavaScript boundaries as decimal strings.
+- [x] Sequence values cross JavaScript boundaries as decimal strings.
 - [ ] Web Push payloads contain action tickets but no screen or reply text.
 - [ ] The service worker never approves directly.
 - [ ] Direct denial posts once; any failure opens the PWA approval page.
@@ -80,12 +80,16 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 
 ## Verification
 
-- [ ] Focused Go unit and race tests pass.
-- [ ] `go test ./... -race -count=1` passes or any unrelated timeout is recorded.
-- [ ] `go vet ./...` passes.
-- [ ] `make build` passes.
-- [ ] `scripts/check-workspace-platforms.sh` passes.
-- [ ] Web typecheck, unit tests, and production build pass.
+- [x] Focused Go unit and race tests pass.
+- [x] `go test ./... -race -count=1` passes or any unrelated timeout is recorded.
+      On 2026-10-08 all packages except `internal/workspace` passed; that
+      package reached the existing 10-minute aggregate timeout while
+      `TestAcknowledgeRejectsBrokenWorktreeAfterPrepareSourceSwap` had run for
+      4 seconds.
+- [x] `go vet ./...` passes.
+- [x] `make build` passes.
+- [x] `scripts/check-workspace-platforms.sh` passes.
+- [x] Web typecheck, unit tests, and production build pass.
 - [ ] Playwright covers notification actions and the approval page.
 - [ ] Approval UI has no horizontal overflow at 320, 375, and 1280 px.
 - [ ] Git diff and generated Web assets contain no secret or reply fixture.

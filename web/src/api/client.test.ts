@@ -7,6 +7,7 @@ import {
   parseTimeline,
 } from './client'
 import { frameWire, timelineWire } from '../test/terminalFixtures'
+import { parseAgentStatus } from './resourceParsing'
 
 describe('terminal REST parsing', () => {
   afterEach(() => {
@@ -134,6 +135,7 @@ describe('terminal REST parsing', () => {
             dir: '/workspace/drove',
             mode: 'interactive',
             state: 'blocked',
+            state_seq: '42',
             created_at: '2026-10-04T12:00:00Z',
             updated_at: '2026-10-04T12:00:05Z',
             state_since: '2026-10-04T12:00:03Z',
@@ -165,6 +167,7 @@ describe('terminal REST parsing', () => {
       {
         agent_id: 'agent-1',
         dir: '/workspace/drove',
+        state_seq: '42',
         state_since: '2026-10-04T12:00:03Z',
         hook_policy: 'auto',
         signal_injection_reason: 'unsupported',
@@ -176,6 +179,31 @@ describe('terminal REST parsing', () => {
       },
     ])
   })
+
+  it.each(['042', 42, '18446744073709551616'])(
+    'rejects noncanonical state sequence %s',
+    (stateSeq) => {
+      expect(() =>
+        parseAgentStatus({
+          agent_id: 'agent-1',
+          name: 'worker',
+          vendor: 'generic',
+          mode: 'interactive',
+          state: 'blocked',
+          state_seq: stateSeq,
+          created_at: '2026-10-04T12:00:00Z',
+          updated_at: '2026-10-04T12:00:05Z',
+          state_since: '2026-10-04T12:00:03Z',
+          hook_policy: 'auto',
+          hook_status: 'fallback',
+          signal_injection: 'off',
+          signal_injection_status: 'off',
+          signal_injection_reason: 'unsupported',
+          resumable: false,
+        }),
+      ).toThrow(/state_seq must be a canonical uint64 decimal string/)
+    },
+  )
 
   it('rejects malformed expiry bodies instead of inventing missing ranges', async () => {
     vi.stubGlobal(

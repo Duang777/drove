@@ -787,8 +787,11 @@ func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 		agent.WithRunMode(agent.RunModeInteractive),
 		agent.WithHookPolicy(agent.HooksRequired),
 	)
-	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	managed := newManagedAgent(a)
+	manager.mu.Lock()
+	manager.agents[a.ID()] = managed
+	manager.mu.Unlock()
+	commitTestState(t, manager, a, agent.StateStarting, "test start")
 	running, _, _, err := manager.prepareManagedRuntime(
 		managed,
 		manager.reg.For("claude"),
@@ -798,7 +801,6 @@ func TestDeliverHookWaitsForProcessStartCommit(t *testing.T) {
 	}
 	running.process = &fakeProcessSession{}
 	manager.mu.Lock()
-	manager.agents[a.ID()] = managed
 	manager.sessions[a.ID()] = running
 	manager.mu.Unlock()
 	t.Cleanup(func() {

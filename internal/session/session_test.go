@@ -697,8 +697,9 @@ func TestTransitionPersistenceFailureLeavesAgentAndHubUnchanged(t *testing.T) {
 		agent.WithVendor("generic"),
 		agent.WithRunMode(agent.RunModeInteractive),
 	)
+	managed := newManagedAgent(a)
 	manager.mu.Lock()
-	manager.agents[id] = newManagedAgent(a)
+	manager.agents[id] = managed
 	manager.mu.Unlock()
 	subscription := manager.hub.Subscribe(1)
 	defer manager.hub.Unsubscribe(subscription)
@@ -708,7 +709,7 @@ func TestTransitionPersistenceFailureLeavesAgentAndHubUnchanged(t *testing.T) {
 	}
 	_, err := manager.committer.CommitAgent(
 		context.Background(),
-		a,
+		managed,
 		agent.MoveTo(agent.StateStarting, "test", agent.Evidence{
 			Source: agent.EvidenceSession, Event: "session_start", Confidence: 1,
 		}),
@@ -2482,9 +2483,13 @@ func commitTestState(
 		source = agent.EvidenceSession
 		eventName = "session_start"
 	}
+	managed, ok := manager.managed(a.ID())
+	if !ok {
+		t.Fatalf("managed agent %q is missing", a.ID())
+	}
 	if _, err := manager.committer.CommitAgent(
 		context.Background(),
-		a,
+		managed,
 		agent.MoveTo(target, reason, agent.Evidence{
 			Source: source, Event: eventName, Confidence: 1,
 		}),

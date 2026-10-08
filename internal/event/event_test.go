@@ -43,6 +43,100 @@ func TestNewAgentInputCarriesRedactedPayload(t *testing.T) {
 	}
 }
 
+func TestAgentActionPayloadValidationAndCommit(t *testing.T) {
+	payload := AgentActionPayloadV1{
+		Version:    AgentActionPayloadVersion,
+		Action:     "reply",
+		Channel:    "web_push",
+		DeviceID:   "550e8400-e29b-41d4-a716-446655440000",
+		BlockedSeq: "42",
+		ReplyBytes: 13,
+		PromptRule: "codex.approval_prompt",
+	}
+	draft, err := NewAgentActionDraft("agent-1", "agent-1", payload)
+	if err != nil {
+		t.Fatalf("NewAgentActionDraft: %v", err)
+	}
+	committed, err := Commit(
+		9,
+		time.Date(2026, time.October, 8, 10, 0, 0, 0, time.UTC),
+		draft,
+	)
+	if err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if committed.Type != TypeAgentAction || committed.Reason != "responded" {
+		t.Fatalf("committed action = %+v", committed)
+	}
+	decoded, err := DecodeAgentActionPayload(committed.Payload)
+	if err != nil {
+		t.Fatalf("DecodeAgentActionPayload: %v", err)
+	}
+	if decoded != payload {
+		t.Fatalf("decoded = %+v, want %+v", decoded, payload)
+	}
+	for _, forbidden := range []string{"use read-only", "ticket", "endpoint"} {
+		if strings.Contains(committed.Payload, forbidden) {
+			t.Fatalf("action payload contains %q: %s", forbidden, committed.Payload)
+		}
+	}
+}
+
+func TestAgentActionPayloadRejectsMalformedValues(t *testing.T) {
+	valid := AgentActionPayloadV1{
+		Version:    AgentActionPayloadVersion,
+		Action:     "approve",
+		Channel:    "web_push",
+		DeviceID:   "550e8400-e29b-41d4-a716-446655440000",
+		BlockedSeq: "42",
+		PromptRule: "claude.approval_prompt",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*AgentActionPayloadV1)
+	}{
+		{name: "version", mutate: func(p *AgentActionPayloadV1) { p.Version = 2 }},
+		{name: "action", mutate: func(p *AgentActionPayloadV1) { p.Action = "auto_approve" }},
+		{name: "channel", mutate: func(p *AgentActionPayloadV1) { p.Channel = "rule" }},
+		{name: "device", mutate: func(p *AgentActionPayloadV1) { p.DeviceID = "device" }},
+		{name: "zero sequence", mutate: func(p *AgentActionPayloadV1) { p.BlockedSeq = "0" }},
+		{name: "noncanonical sequence", mutate: func(p *AgentActionPayloadV1) { p.BlockedSeq = "042" }},
+		{name: "reply bytes on approve", mutate: func(p *AgentActionPayloadV1) { p.ReplyBytes = 1 }},
+		{name: "missing reply bytes", mutate: func(p *AgentActionPayloadV1) {
+			p.Action = "reply"
+		}},
+		{name: "large reply", mutate: func(p *AgentActionPayloadV1) {
+			p.Action = "reply"
+			p.ReplyBytes = 4097
+		}},
+		{name: "prompt rule", mutate: func(p *AgentActionPayloadV1) { p.PromptRule = "claude.idle_prompt" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			payload := valid
+			test.mutate(&payload)
+			if err := payload.Validate(); err == nil {
+				t.Fatalf("Validate accepted %+v", payload)
+			}
+		})
+	}
+
+	encoded, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	invalidJSON := []string{
+		string(encoded[:len(encoded)-1]) + `,"reply":"secret"}`,
+		string(encoded) + `{"version":1}`,
+		`{"version":1`,
+	}
+	for _, raw := range invalidJSON {
+		if _, err := DecodeAgentActionPayload(raw); err == nil {
+			t.Fatalf("DecodeAgentActionPayload accepted %q", raw)
+		}
+	}
+}
+
 func TestNewAgentSignalCarriesNormalizedPayload(t *testing.T) {
 	ev := NewAgentSignal(9, "session-1", "agent-1", "hook", `{"version":1}`)
 

@@ -8,11 +8,13 @@
 
 - `Draft` 不含序号和时间；只有 Committer 能通过 `Commit` 把它封成只读 `Event`。
 - `Type` 分类：`StateChanged` / `Output` / `OutputChunk` / `Error` /
-  `SessionLifecycle` / `AgentInput` / `AgentSignal` / `AgentResized` /
-  `AgentAttachment`。
+  `SessionLifecycle` / `AgentInput` / `AgentAction` / `AgentSignal` /
+  `AgentResized` / `AgentAttachment` / `AgentResumed`。
 - `output.chunk` 的公开 payload 使用版本化 Base64；持久化 metadata 与原始附件保存在
   `Event` 的私有字段中，访问器始终返回字节副本。
 - `AgentInput` 只记录脱敏审计元数据，不记录用户输入正文。
+- `AgentAction` 只记录版本、显式动作、渠道、设备 ID、Blocked 事件序号、回复字节数
+  和稳定 prompt rule，不记录票据、回复或终端内容。
 - `Hub` 内部用注册表 + buffered channel 扇出；订阅者需在注册时声明 buffer 大小，Hub 不阻塞发布者（慢订阅者被丢弃并计数，见 `Dropped`）。
 - `Hub.PublishBatch` 先校验整个连续批次，再向订阅者发布；全局序号由 `internal/session` 的 Committer 独占分配。
 - `agent.signal` 与新 `state_changed` payload 使用版本化、可校验的脱敏元数据；

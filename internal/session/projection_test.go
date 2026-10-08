@@ -111,6 +111,9 @@ func TestRecoveryProjectorReconcilesEveryState(t *testing.T) {
 			if plan.Report.LastSeq != lastInputSeq+uint64(test.wantRows) {
 				t.Fatalf("last seq = %d, want %d", plan.Report.LastSeq, lastInputSeq+uint64(test.wantRows))
 			}
+			if got := plan.StateSeqs["agent-1"]; got != StateSeq(plan.Report.LastSeq) {
+				t.Fatalf("state sequence = %d, want %d", got, plan.Report.LastSeq)
+			}
 		})
 	}
 }
@@ -1700,6 +1703,199 @@ func TestRecoveryProjectorAcceptsAttachmentAuditWithoutChangingState(t *testing.
 	if projector.lastSeq != 3 || projector.report.ScannedEvents != 3 {
 		t.Fatalf("projector position = (%d, %d)", projector.lastSeq, projector.report.ScannedEvents)
 	}
+}
+
+func TestRecoveryProjectorValidatesActionInputPair(t *testing.T) {
+	base := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+	projector := newRecoveryProjector()
+	rows := actionRecoveryRows(t, base)
+	for _, row := range rows {
+		if err := projector.Apply(row); err != nil {
+			t.Fatalf("apply seq %d: %v", row.Seq, err)
+		}
+	}
+
+	draft := projector.sessions["agent-1"]
+	if draft == nil || draft.respondedStateSeq != 4 {
+		t.Fatalf("recovered action state = %+v, want blocked sequence 4", draft)
+	}
+	plan, err := projector.Finish(base.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("finish projection: %v", err)
+	}
+	if got := plan.StateSeqs["agent-1"]; got != 8 {
+		t.Fatalf("reconciled state sequence = %d, want 8", got)
+	}
+}
+
+func TestRecoveryProjectorRejectsInvalidActionHistory(t *testing.T) {
+	base := time.Date(2026, time.October, 8, 12, 0, 0, 0, time.UTC)
+
+	t.Run("wrong blocked sequence", func(t *testing.T) {
+		rows := actionRecoveryRows(t, base)
+		rows[4].Payload = actionRecoveryPayload(t, "3")
+		projector := newRecoveryProjector()
+		for index, row := range rows {
+			err := projector.Apply(row)
+			if index == 4 {
+				if err == nil || !strings.Contains(err.Error(), "does not match") {
+					t.Fatalf("apply action error = %v, want sequence mismatch", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("apply seq %d: %v", row.Seq, err)
+			}
+		}
+		t.Fatal("wrong blocked sequence was accepted")
+	})
+
+	t.Run("missing paired input", func(t *testing.T) {
+		projector := newRecoveryProjector()
+		rows := actionRecoveryRows(t, base)
+		for _, row := range rows[:5] {
+			if err := projector.Apply(row); err != nil {
+				t.Fatalf("apply seq %d: %v", row.Seq, err)
+			}
+		}
+		if _, err := projector.Finish(base.Add(time.Hour)); err == nil ||
+			!strings.Contains(err.Error(), "missing its adjacent agent.input") {
+			t.Fatalf("finish error = %v, want missing input", err)
+		}
+	})
+
+	t.Run("nonadjacent input", func(t *testing.T) {
+		projector := newRecoveryProjector()
+		rows := actionRecoveryRows(t, base)
+		for _, row := range rows[:5] {
+			if err := projector.Apply(row); err != nil {
+				t.Fatalf("apply seq %d: %v", row.Seq, err)
+			}
+		}
+		err := projector.Apply(store.EventRow{
+			Seq:       6,
+			Timestamp: rows[4].Timestamp,
+			Type:      string(event.TypeOutput),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+		})
+		if err == nil || !strings.Contains(err.Error(), "adjacent same-batch") {
+			t.Fatalf("apply error = %v, want adjacent input rejection", err)
+		}
+	})
+
+	t.Run("malformed paired input", func(t *testing.T) {
+		projector := newRecoveryProjector()
+		rows := actionRecoveryRows(t, base)
+		rows[5].Payload = `{"version":1,"bytes":0}`
+		for index, row := range rows {
+			err := projector.Apply(row)
+			if index == 5 {
+				if err == nil || !strings.Contains(err.Error(), "validate paired") {
+					t.Fatalf("apply input error = %v, want payload rejection", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("apply seq %d: %v", row.Seq, err)
+			}
+		}
+		t.Fatal("malformed paired input was accepted")
+	})
+
+	t.Run("duplicate response", func(t *testing.T) {
+		projector := newRecoveryProjector()
+		rows := actionRecoveryRows(t, base)
+		for _, row := range rows {
+			if err := projector.Apply(row); err != nil {
+				t.Fatalf("apply seq %d: %v", row.Seq, err)
+			}
+		}
+		duplicate := rows[4]
+		duplicate.Seq = 7
+		duplicate.Timestamp = base.Add(3 * time.Second)
+		err := projector.Apply(duplicate)
+		if err == nil || !strings.Contains(err.Error(), "duplicate agent.action") {
+			t.Fatalf("duplicate error = %v, want duplicate rejection", err)
+		}
+	})
+}
+
+func actionRecoveryRows(t *testing.T, base time.Time) []store.EventRow {
+	t.Helper()
+	actionAt := base.Add(2 * time.Second)
+	return []store.EventRow{
+		{
+			Seq:       1,
+			Timestamp: base,
+			Type:      string(event.TypeSessionLifecycle),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "created",
+			Payload:   `{"version":1,"name":"agent","vendor":"claude"}`,
+		},
+		{
+			Seq:       2,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "pending",
+			To:        "starting",
+		},
+		{
+			Seq:       3,
+			Timestamp: base.Add(time.Second),
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "starting",
+			To:        "working",
+		},
+		{
+			Seq:       4,
+			Timestamp: actionAt,
+			Type:      string(event.TypeStateChanged),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			From:      "working",
+			To:        "blocked",
+		},
+		{
+			Seq:       5,
+			Timestamp: actionAt,
+			Type:      string(event.TypeAgentAction),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "responded",
+			Payload:   actionRecoveryPayload(t, "4"),
+		},
+		{
+			Seq:       6,
+			Timestamp: actionAt,
+			Type:      string(event.TypeAgentInput),
+			SessionID: "agent-1",
+			AgentID:   "agent-1",
+			Reason:    "accepted",
+			Payload:   `{"version":1,"bytes":2}`,
+		},
+	}
+}
+
+func actionRecoveryPayload(t *testing.T, blockedSeq string) string {
+	t.Helper()
+	payload, err := json.Marshal(event.AgentActionPayloadV1{
+		Version:    event.AgentActionPayloadVersion,
+		Action:     "approve",
+		Channel:    "web_push",
+		DeviceID:   "550e8400-e29b-41d4-a716-446655440000",
+		BlockedSeq: blockedSeq,
+		PromptRule: "claude.approval_prompt",
+	})
+	if err != nil {
+		t.Fatalf("marshal action payload: %v", err)
+	}
+	return string(payload)
 }
 
 func TestRecoveryProjectorRejectsCriticalCorruption(t *testing.T) {

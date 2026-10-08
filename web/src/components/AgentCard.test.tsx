@@ -1,6 +1,7 @@
 import { act, create } from 'react-test-renderer'
 import type { ReactTestRenderer } from 'react-test-renderer'
 import { describe, expect, it, vi } from 'vitest'
+import { formatUint64 } from '../api/parsing'
 import type { AgentStatus, TerminalSnapshot } from '../api/types'
 import type { FleetAgent } from '../fleet/fleetProjection'
 import { parseTerminalTextMessage } from '../ws/terminalStream'
@@ -134,6 +135,7 @@ function agentFixture(): AgentStatus {
     vendor: 'generic',
     mode: 'interactive',
     state: 'blocked',
+    state_seq: formatUint64(4n),
     created_at: '2026-10-04T12:00:00Z',
     updated_at: '2026-10-04T12:00:00Z',
     state_since: '2026-10-04T12:00:00Z',
