@@ -8,6 +8,17 @@ import (
 	"time"
 )
 
+var (
+	// ErrWebPushUnavailable indicates that no Web Push channel is configured.
+	ErrWebPushUnavailable = errors.New("notify: Web Push is unavailable")
+	// ErrPushSubscriptionNotFound indicates that a push target is absent.
+	ErrPushSubscriptionNotFound = errors.New("notify: push subscription not found")
+	// ErrPushSubscriptionRevoked indicates that a push provider invalidated a target.
+	ErrPushSubscriptionRevoked = errors.New("notify: push subscription revoked")
+	// ErrPushTestFailed indicates that a provider did not accept a test delivery.
+	ErrPushTestFailed = errors.New("notify: push test failed")
+)
+
 // ChannelKind identifies a notification transport.
 type ChannelKind string
 

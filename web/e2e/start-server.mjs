@@ -43,6 +43,21 @@ async function main() {
           auto_resume_on_start: false,
           termination_grace_seconds: 0,
         },
+        notify: {
+          on: ['blocked'],
+          debounce_seconds: 30,
+          quiet_when_active: true,
+          web_push: {
+            enabled: true,
+            vapid_subject: 'mailto:e2e@example.com',
+          },
+          ntfy: {
+            enabled: false,
+            base_url: '',
+            topic: '',
+            token_file: '',
+          },
+        },
       },
       null,
       2,

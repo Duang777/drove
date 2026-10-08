@@ -316,6 +316,32 @@ func (s *Store) PushSubscriptions(
 	return subscriptions, nil
 }
 
+// PushSubscription returns one durable browser target.
+func (s *Store) PushSubscription(
+	ctx context.Context,
+	id string,
+) (PushSubscription, bool, error) {
+	if id == "" {
+		return PushSubscription{}, false, errors.New(
+			"notify: subscription ID is required",
+		)
+	}
+	subscription, err := scanPushSubscription(s.db.QueryRowContext(
+		ctx,
+		`SELECT id, endpoint, p256dh, auth, device_name, created_at, revoked_at
+		 FROM push_subscriptions
+		 WHERE id = ?`,
+		id,
+	))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PushSubscription{}, false, nil
+	}
+	if err != nil {
+		return PushSubscription{}, false, err
+	}
+	return subscription, true, nil
+}
+
 // RevokePushSubscription revokes a browser target and cancels its unsent work.
 func (s *Store) RevokePushSubscription(
 	ctx context.Context,

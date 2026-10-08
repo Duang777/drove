@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/Duang777/drove/internal/event"
 	eventstore "github.com/Duang777/drove/internal/store"
 )
@@ -499,6 +501,63 @@ func (s *Service) RevokePushSubscription(
 	id string,
 ) (bool, error) {
 	return s.store.RevokePushSubscription(ctx, id, s.now().UTC())
+}
+
+// SendPushTest sends one immediate metadata-only test to a browser target.
+func (s *Service) SendPushTest(ctx context.Context, id string) error {
+	channel, available := s.channels[ChannelWebPush]
+	if !available {
+		return ErrWebPushUnavailable
+	}
+	subscription, found, err := s.store.PushSubscription(ctx, id)
+	if err != nil {
+		return fmt.Errorf("notify: load push test target: %w", err)
+	}
+	if !found {
+		return ErrPushSubscriptionNotFound
+	}
+	if subscription.RevokedAt != nil {
+		return ErrPushSubscriptionRevoked
+	}
+
+	now := s.now().UTC()
+	deliveryID := "test-" + uuid.NewString()
+	result, err := channel.Send(ctx, Delivery{
+		ID:       deliveryID,
+		AgentID:  "drove",
+		Channel:  ChannelWebPush,
+		TargetID: subscription.ID,
+		Notification: Notification{
+			ID:         deliveryID,
+			AgentID:    "drove",
+			AgentName:  "Drove",
+			Vendor:     "system",
+			State:      "test",
+			BlockedSeq: 1,
+			OccurredAt: now,
+			DeepLink:   "/",
+		},
+		Subscription: &subscription,
+	})
+	if err != nil {
+		return ErrPushTestFailed
+	}
+	if err := result.validate(); err != nil {
+		return ErrPushTestFailed
+	}
+	switch result.Outcome {
+	case SendDelivered:
+		return nil
+	case SendRevokeTarget:
+		if _, err := s.store.RevokePushSubscription(ctx, id, now); err != nil {
+			return fmt.Errorf("notify: revoke rejected push test target: %w", err)
+		}
+		return ErrPushSubscriptionRevoked
+	case SendRetry, SendPermanent:
+		return ErrPushTestFailed
+	default:
+		return ErrPushTestFailed
+	}
 }
 
 // CurrentBlockedSeq returns the current Blocked transition for an Agent.

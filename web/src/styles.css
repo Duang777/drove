@@ -122,6 +122,19 @@ code,
   margin-bottom: 24px;
 }
 
+.header-status {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.notification-trigger[aria-expanded="true"] {
+  border-color: oklch(68% 0.08 164);
+  color: var(--accent-strong);
+  background: oklch(94% 0.035 164);
+}
+
 .brand-block h1 {
   margin: 0;
   color: var(--text);
@@ -153,6 +166,130 @@ code,
   font-size: 12px;
   font-weight: 650;
   line-height: 1;
+}
+
+.notification-panel {
+  margin: -8px 0 24px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: oklch(98% 0.004 235);
+  padding: 16px 0 18px;
+}
+
+.notification-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.notification-heading h2,
+.notification-heading p {
+  margin: 0;
+}
+
+.notification-heading h2 {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 720;
+  line-height: 1.3;
+}
+
+.notification-heading p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.notification-device-count {
+  flex: none;
+  color: var(--muted);
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
+}
+
+.notification-loading {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.notification-error {
+  margin: 14px 0 0;
+}
+
+.notification-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 14px 0 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.notification-facts > div {
+  min-width: 0;
+  padding: 10px 12px;
+}
+
+.notification-facts > div + div {
+  border-left: 1px solid var(--line);
+}
+
+.notification-facts dt,
+.notification-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.notification-facts dt {
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.4;
+}
+
+.notification-facts dd {
+  margin-top: 3px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.45;
+}
+
+.notification-policy,
+.notification-note,
+.notification-message {
+  margin: 10px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.notification-policy {
+  color: var(--muted);
+}
+
+.notification-note {
+  color: oklch(43% 0.06 75);
+}
+
+.notification-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.notification-message-success {
+  color: oklch(35% 0.1 155);
+}
+
+.notification-message-error {
+  color: var(--danger);
 }
 
 .connection-open,
@@ -1119,8 +1256,17 @@ code,
     gap: 16px;
   }
 
+  .header-status {
+    align-items: flex-start;
+  }
+
   .brand-block h1 {
     font-size: 21px;
+  }
+
+  .brand-block h1 span {
+    display: block;
+    margin-top: 2px;
   }
 
   .brand-block p {
@@ -1131,6 +1277,35 @@ code,
     max-width: 132px;
     text-align: center;
     white-space: normal;
+  }
+
+  .notification-panel {
+    margin-top: -6px;
+  }
+
+  .notification-heading {
+    gap: 10px;
+  }
+
+  .notification-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .notification-facts > div + div {
+    border-left: 0;
+  }
+
+  .notification-facts > div:nth-child(even) {
+    border-left: 1px solid var(--line);
+  }
+
+  .notification-facts > div:nth-child(n + 3) {
+    border-top: 1px solid var(--line);
+  }
+
+  .notification-actions {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .section-toolbar {

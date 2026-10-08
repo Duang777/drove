@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Bell } from 'lucide-react'
 import { listAgents } from './api/client'
 import type { AgentStatus } from './api/types'
 import { useAgentEvents } from './hooks/useAgentEvents'
@@ -6,6 +7,7 @@ import { useFleetSnapshots } from './hooks/useFleetSnapshots'
 import { AgentList } from './components/AgentList'
 import { AgentDetailPage } from './components/AgentDetailPage'
 import { EventLog } from './components/EventLog'
+import { NotificationPanel } from './components/NotificationPanel'
 import { resolveFleetKeyboardAction } from './fleet/fleetKeyboard'
 import { projectFleetAgents } from './fleet/fleetProjection'
 import {
@@ -13,11 +15,16 @@ import {
   parseAppLocation,
   type AppLocation,
 } from './navigation'
+import {
+  registerDroveServiceWorker,
+  startPresenceHeartbeat,
+} from './notifications/push'
 
 export default function App() {
   const { events, connection } = useAgentEvents()
   const [agents, setAgents] = useState<AgentStatus[]>([])
   const [loadErr, setLoadErr] = useState<string | null>(null)
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
   const [location, setLocation] = useState<AppLocation>(() =>
     parseAppLocation(window.location.search),
   )
@@ -36,6 +43,11 @@ export default function App() {
     const timer = setInterval(() => void refresh(), 5000)
     return () => clearInterval(timer)
   }, [refresh])
+
+  useEffect(() => {
+    void registerDroveServiceWorker().catch(() => {})
+    return startPresenceHeartbeat()
+  }, [])
 
   useEffect(() => {
     const handlePopState = () => {
@@ -124,14 +136,33 @@ export default function App() {
             </h1>
             <p>herdr 让 Agent 活着，Drove 让它们往对的方向跑。</p>
           </div>
-          <span className={`connection-status connection-${connection}`}>
-            {connection === 'open'
-              ? '已连接'
-              : connection === 'connecting'
-                ? '连接中…'
-                : '已断开（重连中）'}
-          </span>
+          <div className="header-status">
+            <button
+              type="button"
+              className="icon-button notification-trigger"
+              aria-label={
+                notificationsOpen ? '关闭通知设置' : '打开通知设置'
+              }
+              aria-expanded={notificationsOpen}
+              aria-controls="notification-settings"
+              title="通知设置"
+              onClick={() => setNotificationsOpen((open) => !open)}
+            >
+              <Bell size={17} aria-hidden="true" />
+            </button>
+            <span className={`connection-status connection-${connection}`}>
+              {connection === 'open'
+                ? '已连接'
+                : connection === 'connecting'
+                  ? '连接中…'
+                  : '已断开（重连中）'}
+            </span>
+          </div>
         </header>
+      )}
+
+      {location.kind === 'fleet' && notificationsOpen && (
+        <NotificationPanel />
       )}
 
       {loadErr && (

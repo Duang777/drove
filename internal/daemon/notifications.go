@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/api"
 	"github.com/Duang777/drove/internal/config"
 	"github.com/Duang777/drove/internal/event"
 	"github.com/Duang777/drove/internal/notify"
@@ -131,6 +132,25 @@ func (r *notificationRuntime) closeStore() error {
 		return nil
 	}
 	return r.store.Close()
+}
+
+func notificationAPIOptions(
+	runtime *notificationRuntime,
+	cfg config.NotifyConfig,
+) api.NotificationOptions {
+	options := api.NotificationOptions{
+		Debounce:        time.Duration(cfg.DebounceSeconds) * time.Second,
+		QuietWhenActive: cfg.QuietWhenActive,
+	}
+	if runtime == nil {
+		return options
+	}
+	options.Service = runtime.service
+	options.NtfyEnabled = runtime.ntfy
+	if runtime.webPush != nil {
+		options.WebPushPublicKey = runtime.webPush.PublicKey()
+	}
+	return options
 }
 
 type managerNotificationResolver struct {

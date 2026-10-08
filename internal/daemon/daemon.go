@@ -181,6 +181,19 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		for _, host := range browserHosts {
 			allowedOrigins = append(allowedOrigins, "http://"+host)
 		}
+		browserHosts, err = appendConsoleOriginHosts(
+			browserHosts,
+			d.cfg.ConsoleOrigins,
+		)
+		if err != nil {
+			closeErr := mgr.Close()
+			hub.Close()
+			return errors.Join(
+				fmt.Errorf("daemon: browser proxy policy: %w", err),
+				closeListeners(listeners),
+				closeErr,
+			)
+		}
 	}
 
 	notifications, err := startNotifications(d.cfg, st, hub, mgr, log)
@@ -201,6 +214,7 @@ func (d *Daemon) Run(ctx context.Context) (runErr error) {
 		Web:            webui.FS(),
 		EventBuffer:    d.cfg.EventBuffer,
 		AllowedOrigins: allowedOrigins,
+		Notifications:  notificationAPIOptions(notifications, d.cfg.Notify),
 	})
 
 	stopRetention, retentionDone := d.startRetentionLoop(st, log)
@@ -366,6 +380,28 @@ func loopbackHosts(address string) ([]string, error) {
 		}
 		seen[candidate] = struct{}{}
 		hosts = append(hosts, candidate)
+	}
+	return hosts, nil
+}
+
+func appendConsoleOriginHosts(
+	hosts []string,
+	origins []string,
+) ([]string, error) {
+	seen := make(map[string]struct{}, len(hosts)+len(origins))
+	for _, host := range hosts {
+		seen[host] = struct{}{}
+	}
+	for _, origin := range origins {
+		parsed, err := url.Parse(origin)
+		if err != nil || parsed.Host == "" {
+			return nil, fmt.Errorf("parse console origin %q", origin)
+		}
+		if _, exists := seen[parsed.Host]; exists {
+			continue
+		}
+		seen[parsed.Host] = struct{}{}
+		hosts = append(hosts, parsed.Host)
 	}
 	return hosts, nil
 }

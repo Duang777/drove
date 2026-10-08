@@ -7,6 +7,9 @@ const approvalFixture = resolve(
   here,
   '../../internal/adapter/testdata/codex/approval.bin',
 )
+const pushPublicKey =
+  'BGbO2S2tz3pivutjJWd-uU9CDTjHxbKlumyLfljDKhIJxM1g0SPtrGYzk-JcQ7vcrPUTpVKEYoTm1FUWGcbxBq0'
+const pushAuth = '-XrP1hCEVz_XgHLJenwHwg'
 
 test('operator can triage and answer a blocked agent from the fleet', async ({
   page,
@@ -18,8 +21,23 @@ test('operator can triage and answer a blocked agent from the fleet', async ({
       testInfo.repeatEachIndex === 0 && testInfo.retry === 0
         ? ''
         : `-${testInfo.repeatEachIndex}-${testInfo.retry}`
+    const presenceResponsePromise = page.waitForResponse(
+      (response) =>
+        response.request().method() === 'POST' &&
+        new URL(response.url()).pathname ===
+          '/api/v1/notifications/presence',
+    )
     await page.goto('/')
+    expect((await presenceResponsePromise).status()).toBe(204)
     await expect(page.getByText('已连接', { exact: true })).toBeVisible()
+    await expect
+      .poll(() =>
+        page.evaluate(async () => {
+          const registration = await navigator.serviceWorker.ready
+          return registration.active?.scriptURL.endsWith('/service-worker.js')
+        }),
+      )
+      .toBe(true)
 
     await page.getByLabel('Agent vendor').selectOption('generic')
     await page.getByLabel('Generic command').fill('/bin/cat')
@@ -145,6 +163,148 @@ test('operator can triage and answer a blocked agent from the fleet', async ({
   } finally {
     await stopAgents(request, createdAgentIDs)
   }
+})
+
+test('operator can enable, test, and revoke Web Push', async ({
+  page,
+}, testInfo) => {
+  await page.addInitScript(
+    ({ auth, publicKey }) => {
+      let notificationPermission: NotificationPermission = 'default'
+      let currentSubscription: {
+        endpoint: string
+        getKey: (name: string) => ArrayBuffer | null
+        unsubscribe: () => Promise<boolean>
+      } | null = null
+      const decode = (value: string): ArrayBuffer => {
+        const padded = value
+          .replace(/-/g, '+')
+          .replace(/_/g, '/')
+          .padEnd(Math.ceil(value.length / 4) * 4, '=')
+        const binary = window.atob(padded)
+        const buffer = new ArrayBuffer(binary.length)
+        const bytes = new Uint8Array(buffer)
+        for (let index = 0; index < binary.length; index++) {
+          bytes[index] = binary.charCodeAt(index)
+        }
+        return buffer
+      }
+      const registration = {
+        pushManager: {
+          getSubscription: async () => currentSubscription,
+          subscribe: async () => {
+            currentSubscription = {
+              endpoint: 'https://push.example.test/e2e-device',
+              getKey: (name: string) => {
+                if (name === 'p256dh') return decode(publicKey)
+                if (name === 'auth') return decode(auth)
+                return null
+              },
+              unsubscribe: async () => {
+                currentSubscription = null
+                return true
+              },
+            }
+            return currentSubscription
+          },
+        },
+      }
+      Object.defineProperty(navigator, 'serviceWorker', {
+        configurable: true,
+        value: {
+          register: async () => registration,
+          ready: Promise.resolve(registration),
+        },
+      })
+      Object.defineProperty(window, 'PushManager', {
+        configurable: true,
+        value: function PushManager() {},
+      })
+      Object.defineProperty(window.Notification, 'permission', {
+        configurable: true,
+        get: () => notificationPermission,
+      })
+      Object.defineProperty(window.Notification, 'requestPermission', {
+        configurable: true,
+        value: async () => {
+          notificationPermission = 'granted'
+          return notificationPermission
+        },
+      })
+    },
+    { auth: pushAuth, publicKey: pushPublicKey },
+  )
+  await page.route('**/api/v1/notifications/test', async (route) => {
+    expect(route.request().method()).toBe('POST')
+    await route.fulfill({ status: 204 })
+  })
+
+  await page.goto('/')
+  await page.getByRole('button', { name: '打开通知设置' }).click()
+  await expect(
+    page.getByRole('heading', { name: '通知', exact: true }),
+  ).toBeVisible()
+  await expect(page.getByText('未请求', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '启用此设备' }).click()
+  await expect(page.getByText('此设备已启用通知')).toBeVisible()
+  await expect(page.getByText('macOS Chrome', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: '发送测试' }).click()
+  await expect(page.getByText('测试通知已发送')).toBeVisible()
+  await page.screenshot({
+    path: testInfo.outputPath('notifications-desktop.png'),
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 375, height: 812 })
+  await expectNoHorizontalOverflow(page.locator('html'))
+  await page.screenshot({
+    path: testInfo.outputPath('notifications-mobile-375.png'),
+    fullPage: true,
+  })
+
+  await page.setViewportSize({ width: 320, height: 720 })
+  await expectNoHorizontalOverflow(page.locator('html'))
+  await page.screenshot({
+    path: testInfo.outputPath('notifications-mobile-320.png'),
+    fullPage: true,
+  })
+
+  await page.getByRole('button', { name: '停用此设备' }).click()
+  await expect(page.getByText('此设备已停用通知')).toBeVisible()
+  await expect(
+    page.getByRole('button', { name: '启用此设备' }),
+  ).toBeVisible()
+})
+
+test('notification click opens the Agent deep link in the existing window', async ({
+  context,
+  page,
+}) => {
+  await page.goto('/')
+  const [worker] = context.serviceWorkers()
+  if (worker === undefined) {
+    throw new Error('Drove service worker is missing')
+  }
+  await worker.evaluate(async () => {
+    let completion: Promise<unknown> | undefined
+    const event = new Event('notificationclick')
+    Object.defineProperty(event, 'notification', {
+      value: {
+        close() {},
+        data: { deepLink: '/?agent=push-agent-1' },
+      },
+    })
+    Object.defineProperty(event, 'waitUntil', {
+      value: (promise: Promise<unknown>) => {
+        completion = promise
+      },
+    })
+    self.dispatchEvent(event)
+    await completion
+  })
+  await expect(page).toHaveURL(/[?&]agent=push-agent-1(?:&|$)/)
 })
 
 interface CreatedAgent {

@@ -327,6 +327,71 @@ func TestServicePresenceExpiresBeforeLaterBlockedTransition(t *testing.T) {
 	}
 }
 
+func TestServiceSendsPushTestAndRevokesRejectedTarget(t *testing.T) {
+	ctx := context.Background()
+	base := time.Date(2026, time.October, 8, 21, 0, 0, 0, time.UTC)
+	notifications := openInitializedStore(t, 0)
+	saved, err := notifications.SavePushSubscription(ctx, PushSubscription{
+		ID:         "subscription-1",
+		Endpoint:   "https://push.example.test/device",
+		P256DH:     "public-key",
+		Auth:       "auth-secret",
+		DeviceName: "Test phone",
+		CreatedAt:  base,
+	})
+	if err != nil {
+		t.Fatalf("save push subscription: %v", err)
+	}
+	channel := &recordingChannel{
+		kind:       ChannelWebPush,
+		deliveries: make(chan Delivery, 2),
+		result:     SendResult{Outcome: SendDelivered},
+	}
+	service := &Service{
+		store:    notifications,
+		channels: map[ChannelKind]Channel{ChannelWebPush: channel},
+		now:      func() time.Time { return base.Add(time.Minute) },
+	}
+
+	if err := service.SendPushTest(ctx, saved.ID); err != nil {
+		t.Fatalf("send push test: %v", err)
+	}
+	delivery := <-channel.deliveries
+	if delivery.TargetID != saved.ID ||
+		delivery.Notification.State != "test" ||
+		delivery.Notification.AgentName != "Drove" ||
+		delivery.Notification.DeepLink != "/" {
+		t.Fatalf("test delivery = %+v", delivery)
+	}
+
+	channel.result = SendResult{Outcome: SendRevokeTarget, Code: "gone"}
+	if err := service.SendPushTest(ctx, saved.ID); !errors.Is(
+		err,
+		ErrPushSubscriptionRevoked,
+	) {
+		t.Fatalf("rejected push test error = %v, want revoked", err)
+	}
+	subscription, found, err := notifications.PushSubscription(ctx, saved.ID)
+	if err != nil {
+		t.Fatalf("load rejected subscription: %v", err)
+	}
+	if !found || subscription.RevokedAt == nil {
+		t.Fatalf("rejected subscription = %+v, found=%t", subscription, found)
+	}
+	if err := service.SendPushTest(ctx, saved.ID); !errors.Is(
+		err,
+		ErrPushSubscriptionRevoked,
+	) {
+		t.Fatalf("revoked push test error = %v, want revoked", err)
+	}
+	if err := service.SendPushTest(ctx, "missing"); !errors.Is(
+		err,
+		ErrPushSubscriptionNotFound,
+	) {
+		t.Fatalf("missing push test error = %v, want not found", err)
+	}
+}
+
 func TestServiceCloseReleasesInterruptedLease(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

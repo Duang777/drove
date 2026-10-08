@@ -384,7 +384,12 @@ func validateConsoleOrigin(origin string) error {
 		return fmt.Errorf("config: console origin %q must be an HTTP origin", origin)
 	}
 	if !isLoopbackHost(parsed.Hostname()) {
-		return fmt.Errorf("config: console origin host %q must be loopback", parsed.Hostname())
+		if parsed.Scheme == "http" {
+			return fmt.Errorf(
+				"config: HTTP console origin host %q must be loopback",
+				parsed.Hostname(),
+			)
+		}
 	}
 	return nil
 }
