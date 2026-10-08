@@ -1,0 +1,91 @@
+# Audited remote actions checklist
+
+Related issue: [#28](https://github.com/Duang777/drove/issues/28)
+
+## Architecture
+
+- [ ] `internal/agent` owns the vendor-neutral action enum.
+- [ ] `internal/adapter` is the only package with Claude/Codex key mappings.
+- [ ] `internal/session` owns state freshness, screen actionability, PTY writes,
+      response fencing, and action/input audit.
+- [ ] `internal/notify` owns ticket signing, expiry, device binding, and replay
+      state, but cannot write a PTY.
+- [ ] `internal/respond` owns ticket-consume-before-session-execute ordering.
+- [ ] The API only parses, invokes the response service, and maps errors.
+- [ ] The global Committer never performs PTY I/O.
+
+## State and concurrency
+
+- [ ] Every Agent exposes the sequence of its current committed state.
+- [ ] Recovery restores the last accepted state event sequence.
+- [ ] The per-session control gate covers every user or terminal PTY writer,
+      Detector state commit, stop, and exit ownership.
+- [ ] Remote action validation and PTY write happen while the same gate is held.
+- [ ] The terminal actor checks the current approval screen immediately before
+      entering the action callback.
+- [ ] Earlier admitted PTY output cannot be overtaken by an action.
+- [ ] A local response or another remote response fences the same Blocked
+      occurrence after the first positive byte.
+- [ ] Different Agents can write independently.
+
+## Action contract
+
+- [ ] Claude approve, deny, and reply bytes are fixture-tested.
+- [ ] Codex approve, deny, and reply bytes are fixture-tested.
+- [ ] Generic and non-approval Blocked screens expose no actions.
+- [ ] Reply text is UTF-8, bounded, non-empty, and contains no control bytes.
+- [ ] Approve and deny reject reply text.
+- [ ] No automatic approval path exists.
+
+## Audit and recovery
+
+- [ ] `agent.action` has a versioned, strict, redacted payload.
+- [ ] A complete action writes adjacent `agent.action` and `agent.input` rows in
+      one transaction.
+- [ ] The action event records action, channel, device ID, Blocked sequence,
+      prompt rule, and reply byte count only.
+- [ ] Recovery accepts valid action/input pairs and rejects malformed,
+      duplicate, unpaired, or wrong-Blocked action events.
+- [ ] Partial writes and post-write audit failures say not to retry.
+
+## Ticket security
+
+- [ ] A distinct 256-bit HMAC key is atomically created as a regular `0600`
+      file.
+- [ ] Tickets bind JTI, Agent, Blocked sequence, action, device, issue time, and
+      expiry.
+- [ ] Ticket parsing rejects non-canonical encoding, unknown fields, bad MAC,
+      future issue times, and excessive lifetime.
+- [ ] Ticket rows contain only digest and bounded metadata.
+- [ ] One concurrent consume wins and replay remains rejected after restart.
+- [ ] Revoked devices cannot use outstanding tickets.
+- [ ] Tickets are consumed before PTY execution and are never automatically
+      retried.
+
+## API and PWA
+
+- [ ] Action context and action routes require existing authentication.
+- [ ] Cookie POST requests require an exact allowed Origin.
+- [ ] Request size, media type, UTF-8, unknown fields, and extra JSON values are
+      rejected.
+- [ ] Sequence values cross JavaScript boundaries as decimal strings.
+- [ ] Web Push payloads contain action tickets but no screen or reply text.
+- [ ] The service worker never approves directly.
+- [ ] Direct denial posts once; any failure opens the PWA approval page.
+- [ ] Approve, reply, empty actions, and unsupported action buttons open the
+      approval page without putting tickets in the URL.
+- [ ] The page shows the bounded live approval view, confirms approval, accepts
+      a bounded reply, and waits for authoritative state changes.
+- [ ] `agent.action` is visible in replay without changing frontend state.
+
+## Verification
+
+- [ ] Focused Go unit and race tests pass.
+- [ ] `go test ./... -race -count=1` passes or any unrelated timeout is recorded.
+- [ ] `go vet ./...` passes.
+- [ ] `make build` passes.
+- [ ] `scripts/check-workspace-platforms.sh` passes.
+- [ ] Web typecheck, unit tests, and production build pass.
+- [ ] Playwright covers notification actions and the approval page.
+- [ ] Approval UI has no horizontal overflow at 320, 375, and 1280 px.
+- [ ] Git diff and generated Web assets contain no secret or reply fixture.
