@@ -248,7 +248,11 @@ test('operator can enable, test, and revoke Web Push', async ({
 
   await page.getByRole('button', { name: '启用此设备' }).click()
   await expect(page.getByText('此设备已启用通知')).toBeVisible()
-  await expect(page.getByText('macOS Chrome', { exact: true })).toBeVisible()
+  const currentDevice = page
+    .locator('.notification-facts > div')
+    .filter({ hasText: '当前设备' })
+    .locator('dd')
+  await expect(currentDevice).toHaveText(/ Chrome$/)
 
   await page.getByRole('button', { name: '发送测试' }).click()
   await expect(page.getByText('测试通知已发送')).toBeVisible()
@@ -282,11 +286,9 @@ test('notification click opens the Agent deep link in the existing window', asyn
   context,
   page,
 }) => {
+  const workerPromise = context.waitForEvent('serviceworker')
   await page.goto('/')
-  const [worker] = context.serviceWorkers()
-  if (worker === undefined) {
-    throw new Error('Drove service worker is missing')
-  }
+  const worker = await workerPromise
   await worker.evaluate(async () => {
     let completion: Promise<unknown> | undefined
     const event = new Event('notificationclick')
