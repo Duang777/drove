@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -70,7 +71,11 @@ func TestWebSocketV2AcceptanceRacingSubscribeReconnectsWithoutLoss(t *testing.T)
 	go func() {
 		defer workers.Done()
 		<-start
-		_, err := manager.SendInput(agent.ID(status.AgentID), []byte("race\n"))
+		_, err := sendInputWithControlRetry(
+			manager,
+			agent.ID(status.AgentID),
+			[]byte("race\n"),
+		)
 		results <- err
 	}()
 	close(start)
@@ -107,7 +112,11 @@ func TestWebSocketV2AcceptanceRacingSubscribeReconnectsWithoutLoss(t *testing.T)
 		len(beforeRace)+len("race\n"),
 	)
 
-	if _, err := manager.SendInput(agent.ID(status.AgentID), []byte("live\n")); err != nil {
+	if _, err := sendInputWithControlRetry(
+		manager,
+		agent.ID(status.AgentID),
+		[]byte("live\n"),
+	); err != nil {
 		t.Fatalf("send live input: %v", err)
 	}
 	wantLength := len(beforeRace) + len("race\n") + len("live\n")
@@ -196,7 +205,11 @@ func TestWebSocketV2AcceptanceSlowConnectionIsIsolated(t *testing.T) {
 	fastHistory := readRawTranscriptToCaughtUp(t, fast, time.Now().Add(3*time.Second))
 
 	large := []byte(strings.Repeat("x", 512) + "\n")
-	if _, err := manager.SendInput(agent.ID(status.AgentID), large); err != nil {
+	if _, err := sendInputWithControlRetry(
+		manager,
+		agent.ID(status.AgentID),
+		large,
+	); err != nil {
 		t.Fatalf("send overflow input: %v", err)
 	}
 	slowError := readWebSocketV2TextType(
@@ -224,7 +237,8 @@ func TestWebSocketV2AcceptanceSlowConnectionIsIsolated(t *testing.T) {
 	}
 
 	startedAt := time.Now()
-	if _, err := manager.SendInput(
+	if _, err := sendInputWithControlRetry(
+		manager,
 		agent.ID(status.AgentID),
 		[]byte("after\n"),
 	); err != nil {
@@ -462,10 +476,30 @@ func sendExactEchoInput(
 	previousLength int,
 ) {
 	t.Helper()
-	if _, err := manager.SendInput(agent.ID(agentID), data); err != nil {
+	if _, err := sendInputWithControlRetry(manager, agent.ID(agentID), data); err != nil {
 		t.Fatalf("send exact echo input: %v", err)
 	}
 	waitForRecordedOutputLength(t, manager, agentID, previousLength+len(data))
+}
+
+func sendInputWithControlRetry(
+	manager *session.Manager,
+	id agent.ID,
+	data []byte,
+) (session.InputResult, error) {
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		result, err := manager.SendInput(id, data)
+		if err == nil ||
+			result.BytesWritten > 0 ||
+			!errors.Is(err, session.ErrInputBackpressure) {
+			return result, err
+		}
+		if time.Now().After(deadline) {
+			return result, fmt.Errorf("retry input after control backpressure: %w", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func subscribeWritableRaw(

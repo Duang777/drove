@@ -6,47 +6,47 @@ Related issue: [#28](https://github.com/Duang777/drove/issues/28)
 
 - [x] `internal/agent` owns the vendor-neutral action enum.
 - [x] `internal/adapter` is the only package with Claude/Codex key mappings.
-- [ ] `internal/session` owns state freshness, screen actionability, PTY writes,
+- [x] `internal/session` owns state freshness, screen actionability, PTY writes,
       response fencing, and action/input audit.
 - [ ] `internal/notify` owns ticket signing, expiry, device binding, and replay
       state, but cannot write a PTY.
 - [ ] `internal/respond` owns ticket-consume-before-session-execute ordering.
 - [ ] The API only parses, invokes the response service, and maps errors.
-- [ ] The global Committer never performs PTY I/O.
+- [x] The global Committer never performs PTY I/O.
 
 ## State and concurrency
 
 - [x] Every Agent exposes the sequence of its current committed state.
 - [x] Recovery restores the last accepted state event sequence.
-- [ ] The per-session control gate covers every user or terminal PTY writer,
+- [x] The per-session control gate covers every user or terminal PTY writer,
       Detector state commit, stop, and exit ownership.
-- [ ] Remote action validation and PTY write happen while the same gate is held.
-- [ ] The terminal actor checks the current approval screen immediately before
+- [x] Remote action validation and PTY write happen while the same gate is held.
+- [x] The terminal actor checks the current approval screen immediately before
       entering the action callback.
-- [ ] Earlier admitted PTY output cannot be overtaken by an action.
-- [ ] A local response or another remote response fences the same Blocked
+- [x] Earlier admitted PTY output cannot be overtaken by an action.
+- [x] A local response or another remote response fences the same Blocked
       occurrence after the first positive byte.
-- [ ] Different Agents can write independently.
+- [x] Different Agents can write independently.
 
 ## Action contract
 
 - [x] Claude approve, deny, and reply bytes are fixture-tested.
 - [x] Codex approve, deny, and reply bytes are fixture-tested.
 - [x] Generic and non-approval Blocked screens expose no actions.
-- [ ] Reply text is UTF-8, bounded, non-empty, and contains no control bytes.
-- [ ] Approve and deny reject reply text.
+- [x] Reply text is UTF-8, bounded, non-empty, and contains no control bytes.
+- [x] Approve and deny reject reply text.
 - [x] No automatic approval path exists.
 
 ## Audit and recovery
 
 - [x] `agent.action` has a versioned, strict, redacted payload.
-- [ ] A complete action writes adjacent `agent.action` and `agent.input` rows in
+- [x] A complete action writes adjacent `agent.action` and `agent.input` rows in
       one transaction.
 - [x] The action event records action, channel, device ID, Blocked sequence,
       prompt rule, and reply byte count only.
 - [x] Recovery accepts valid action/input pairs and rejects malformed,
       duplicate, unpaired, or wrong-Blocked action events.
-- [ ] Partial writes and post-write audit failures say not to retry.
+- [x] Partial writes and post-write audit failures say not to retry.
 
 ## Ticket security
 

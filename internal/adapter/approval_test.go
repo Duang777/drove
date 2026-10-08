@@ -3,9 +3,11 @@ package adapter
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Duang777/drove/internal/agent"
+	"github.com/Duang777/drove/internal/term"
 )
 
 func TestApprovalPlansUseVendorScreenRules(t *testing.T) {
@@ -138,4 +140,72 @@ func TestGenericClassifierHasNoApprovalPlan(t *testing.T) {
 	); !errors.Is(err, ErrApprovalPromptUnavailable) {
 		t.Fatalf("generic approval error = %v, want unavailable", err)
 	}
+}
+
+func TestApprovalPlanValidatesReplyText(t *testing.T) {
+	classifier, err := NewRegistry().For("claude").NewScreenClassifier()
+	if err != nil {
+		t.Fatalf("NewScreenClassifier: %v", err)
+	}
+	snapshot := approvalTestSnapshot(t, "claude")
+
+	tests := []struct {
+		name  string
+		kind  agent.ActionKind
+		reply string
+	}{
+		{name: "approve with reply", kind: agent.ActionApprove, reply: "unexpected"},
+		{name: "deny with reply", kind: agent.ActionDeny, reply: "unexpected"},
+		{name: "empty reply", kind: agent.ActionReply},
+		{name: "whitespace reply", kind: agent.ActionReply, reply: " \t "},
+		{name: "invalid UTF-8", kind: agent.ActionReply, reply: string([]byte{0xff})},
+		{name: "C0 control", kind: agent.ActionReply, reply: "first\nsecond"},
+		{name: "C1 control", kind: agent.ActionReply, reply: "first\u0085second"},
+		{name: "too large", kind: agent.ActionReply, reply: strings.Repeat("x", 4097)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := classifier.PlanApprovalAction(snapshot, test.kind, test.reply)
+			if !errors.Is(err, ErrApprovalReplyInvalid) {
+				t.Fatalf("PlanApprovalAction error = %v, want ErrApprovalReplyInvalid", err)
+			}
+			if test.reply != "" && strings.Contains(err.Error(), test.reply) {
+				t.Fatal("validation error contains reply text")
+			}
+		})
+	}
+
+	plan, err := classifier.PlanApprovalAction(
+		snapshot,
+		agent.ActionReply,
+		"  use read-only  ",
+	)
+	if err != nil {
+		t.Fatalf("PlanApprovalAction trimmed reply: %v", err)
+	}
+	if got, want := plan.Bytes(), []byte("2\ruse read-only\r"); !bytes.Equal(got, want) {
+		t.Fatalf("plan bytes = %q, want %q", got, want)
+	}
+	if plan.ReplyBytes() != len("use read-only") {
+		t.Fatalf("reply bytes = %d, want %d", plan.ReplyBytes(), len("use read-only"))
+	}
+}
+
+func approvalTestSnapshot(t *testing.T, vendor string) term.Snapshot {
+	t.Helper()
+	controller := newScreenTestController(t)
+	t.Cleanup(func() {
+		closeScreenTestController(t, controller)
+	})
+	writeScreenFixture(
+		t,
+		controller,
+		loadScreenFixture(t, vendor, "approval"),
+		screenFeedMode{name: "complete", sizes: []int{4096}},
+	)
+	snapshot, err := controller.Snapshot()
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	return snapshot
 }

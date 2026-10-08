@@ -70,6 +70,7 @@ type observationActor struct {
 	state     *detect.State
 	committer *committer
 	clock     observationClock
+	controlMu *sync.Mutex
 
 	requests chan observationRequest
 	stop     chan struct{}
@@ -92,8 +93,29 @@ func newManagedObservationActor(
 	config detect.Config,
 	clock observationClock,
 ) (*observationActor, error) {
+	return newManagedObservationActorWithControl(
+		managed,
+		committer,
+		policy,
+		config,
+		clock,
+		&sync.Mutex{},
+	)
+}
+
+func newManagedObservationActorWithControl(
+	managed *managedAgent,
+	committer *committer,
+	policy agent.HookPolicy,
+	config detect.Config,
+	clock observationClock,
+	controlMu *sync.Mutex,
+) (*observationActor, error) {
 	if managed == nil || managed.agent == nil || committer == nil {
 		return nil, errors.New("session: observation actor requires Agent and committer")
+	}
+	if controlMu == nil {
+		return nil, errors.New("session: observation actor requires control gate")
 	}
 	detector, err := detect.New(config)
 	if err != nil {
@@ -110,6 +132,7 @@ func newManagedObservationActor(
 		state:          &state,
 		committer:      committer,
 		clock:          clock,
+		controlMu:      controlMu,
 		requests:       make(chan observationRequest, observationInboxSize),
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -251,6 +274,9 @@ func (a *observationActor) handle(
 	timerC *<-chan time.Time,
 	timerRef *detect.TimerRef,
 ) error {
+	a.controlMu.Lock()
+	defer a.controlMu.Unlock()
+
 	decision, err := a.detector.Decide(
 		a.state.Snapshot(),
 		a.target.Snapshot(),

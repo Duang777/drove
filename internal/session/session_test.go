@@ -1987,9 +1987,9 @@ func TestSendInputRejectsConcurrentAdmission(t *testing.T) {
 	manager.sessions[id] = running
 	manager.mu.Unlock()
 
-	running.inputMu.Lock()
+	running.controlMu.Lock()
 	result, err := manager.SendInput(id, []byte("input"))
-	running.inputMu.Unlock()
+	running.controlMu.Unlock()
 	if !errors.Is(err, ErrInputBackpressure) {
 		t.Fatalf("send input error = %v, want ErrInputBackpressure", err)
 	}

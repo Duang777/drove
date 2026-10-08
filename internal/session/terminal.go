@@ -20,8 +20,11 @@ const (
 )
 
 var (
-	errTerminalActorClosed = errors.New("session: terminal actor closed")
-	errTerminalStreamEnded = errors.New("session: terminal output stream ended")
+	errTerminalActorClosed         = errors.New("session: terminal actor closed")
+	errTerminalStreamEnded         = errors.New("session: terminal output stream ended")
+	errTerminalSnapshotUnavailable = errors.New(
+		"session: current terminal snapshot is unavailable",
+	)
 )
 
 type terminalResizeError struct {
@@ -51,11 +54,16 @@ type terminalObserver interface {
 	Deliver(context.Context, detect.Observation) error
 }
 
+type terminalReplyWriter func([]byte) (int, error)
+
+type terminalSnapshotCallback func(term.Snapshot, time.Time) error
+
 type terminalOperation uint8
 
 const (
 	terminalFeed terminalOperation = iota + 1
 	terminalSnapshot
+	terminalCurrentSnapshot
 	terminalProcessExited
 	terminalEndOutput
 	terminalResize
@@ -66,6 +74,7 @@ type terminalRequest struct {
 	chunk       term.CommittedChunk
 	finalOffset uint64
 	size        term.Size
+	callback    terminalSnapshotCallback
 	result      chan terminalResult
 }
 
@@ -84,6 +93,7 @@ type terminalActor struct {
 	normalizer adapter.TerminalNotificationNormalizer
 	osc9       *term.OSC9Scanner
 	process    terminalProcess
+	writeReply terminalReplyWriter
 	observer   terminalObserver
 	vendor     string
 	clock      observationClock
@@ -152,10 +162,39 @@ func newTerminalActorAtOffset(
 	fail func(error),
 	initialOutputOffset uint64,
 ) (*terminalActor, error) {
+	return newTerminalActorAtOffsetWithReplyWriter(
+		size,
+		process,
+		classifier,
+		normalizer,
+		observer,
+		vendor,
+		clock,
+		fail,
+		initialOutputOffset,
+		process.Write,
+	)
+}
+
+func newTerminalActorAtOffsetWithReplyWriter(
+	size term.Size,
+	process terminalProcess,
+	classifier *adapter.ScreenClassifier,
+	normalizer adapter.TerminalNotificationNormalizer,
+	observer terminalObserver,
+	vendor string,
+	clock observationClock,
+	fail func(error),
+	initialOutputOffset uint64,
+	writeReply terminalReplyWriter,
+) (*terminalActor, error) {
 	if process == nil || classifier == nil {
 		return nil, errors.New(
 			"session: terminal actor requires process and classifier",
 		)
+	}
+	if writeReply == nil {
+		return nil, errors.New("session: terminal actor requires reply writer")
 	}
 	if vendor == "" {
 		return nil, errors.New("session: terminal actor vendor is required")
@@ -172,6 +211,7 @@ func newTerminalActorAtOffset(
 		classifier:          classifier,
 		normalizer:          normalizer,
 		process:             process,
+		writeReply:          writeReply,
 		observer:            observer,
 		vendor:              vendor,
 		clock:               clock,
@@ -201,7 +241,7 @@ func (a *terminalActor) forwardReplies() {
 			continue
 		}
 		data := frame.Bytes()
-		written, err := a.process.Write(data)
+		written, err := a.writeReply(data)
 		if err == nil && written == len(data) {
 			continue
 		}
@@ -262,6 +302,23 @@ func (a *terminalActor) snapshotState() (
 		return term.Snapshot{}, time.Time{}, 0, false
 	}
 	return result.snapshot, result.capturedAt, result.outputOffset, result.available
+}
+
+func (a *terminalActor) WithCurrentSnapshot(
+	ctx context.Context,
+	callback terminalSnapshotCallback,
+) error {
+	if callback == nil {
+		return errors.New("session: terminal snapshot callback is required")
+	}
+	result, err := a.submit(ctx, terminalRequest{
+		operation: terminalCurrentSnapshot,
+		callback:  callback,
+	})
+	if err != nil {
+		return err
+	}
+	return result.err
 }
 
 func (a *terminalActor) MarkProcessExited() {
@@ -473,6 +530,32 @@ func (a *terminalActor) handle(
 			capturedAt:   state.snapshotCapturedAt,
 			outputOffset: state.snapshotOutputOffset,
 			available:    state.snapshotAvailable && !state.processExited,
+		}
+
+	case terminalCurrentSnapshot:
+		if state.processExited || state.ended || state.controllerClosed {
+			return terminalResult{err: errTerminalSnapshotUnavailable}
+		}
+		snapshot, err := a.controller.Snapshot()
+		if err != nil {
+			return terminalResult{err: fmt.Errorf(
+				"session: snapshot current terminal: %w",
+				err,
+			)}
+		}
+		capturedAt := a.clock.Now().UTC()
+		state.snapshot = snapshot
+		state.snapshotCapturedAt = capturedAt
+		state.snapshotOutputOffset = state.nextOutputOffset
+		state.snapshotAvailable = true
+		if err := request.callback(snapshot, capturedAt); err != nil {
+			return terminalResult{err: err}
+		}
+		return terminalResult{
+			snapshot:     snapshot,
+			capturedAt:   capturedAt,
+			outputOffset: state.nextOutputOffset,
+			available:    true,
 		}
 
 	case terminalProcessExited:

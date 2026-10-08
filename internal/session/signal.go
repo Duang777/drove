@@ -235,18 +235,7 @@ func (m *Manager) prepareManagedRuntimeAtOffsetWithTerminalNotifications(
 		terminalNotice = entry.TerminalNotificationNormalizer
 	}
 
-	observer, err := newManagedObservationActor(
-		managed,
-		m.committer,
-		policy,
-		m.detectConfig,
-		m.clock,
-	)
-	if err != nil {
-		return nil, nil, "", err
-	}
 	running := &runningSession{
-		observer:       observer,
 		classifier:     classifier,
 		terminalNotice: terminalNotice,
 		callbacksReady: make(chan struct{}),
@@ -254,6 +243,18 @@ func (m *Manager) prepareManagedRuntimeAtOffsetWithTerminalNotifications(
 		processExited:  make(chan struct{}),
 		vendor:         a.Vendor(),
 	}
+	observer, err := newManagedObservationActorWithControl(
+		managed,
+		m.committer,
+		policy,
+		m.detectConfig,
+		m.clock,
+		&running.controlMu,
+	)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	running.observer = observer
 	if policy == agent.HooksOff || !entry.SupportsHooks() {
 		running.output = newOutputProcessorAtOffsetWithSanitizer(
 			m,

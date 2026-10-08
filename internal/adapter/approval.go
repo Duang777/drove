@@ -3,6 +3,8 @@ package adapter
 import (
 	"errors"
 	"fmt"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/Duang777/drove/internal/agent"
 	"github.com/Duang777/drove/internal/term"
@@ -13,6 +15,8 @@ var (
 	ErrApprovalPromptUnavailable = errors.New("adapter: approval prompt is unavailable")
 	// ErrApprovalActionUnsupported means the matched prompt cannot perform the action.
 	ErrApprovalActionUnsupported = errors.New("adapter: approval action is unsupported")
+	// ErrApprovalReplyInvalid means the reply violates the bounded text contract.
+	ErrApprovalReplyInvalid = errors.New("adapter: approval reply is invalid")
 )
 
 type approvalActionBinding struct {
@@ -27,9 +31,10 @@ type approvalDefinition struct {
 
 // ApprovalActionPlan is an immutable vendor-specific input plan.
 type ApprovalActionPlan struct {
-	kind  agent.ActionKind
-	rule  string
-	input []byte
+	kind       agent.ActionKind
+	rule       string
+	input      []byte
+	replyBytes int
 }
 
 // Kind returns the normalized action represented by this plan.
@@ -45,6 +50,11 @@ func (p ApprovalActionPlan) Rule() string {
 // Bytes returns a copy of the PTY input bytes.
 func (p ApprovalActionPlan) Bytes() []byte {
 	return append([]byte(nil), p.input...)
+}
+
+// ReplyBytes returns the normalized reply size recorded in the action audit.
+func (p ApprovalActionPlan) ReplyBytes() int {
+	return p.replyBytes
 }
 
 // AvailableApprovalActions reports actions for the approval prompt visible now.
@@ -75,6 +85,10 @@ func (c *ScreenClassifier) PlanApprovalAction(
 	kind agent.ActionKind,
 	reply string,
 ) (ApprovalActionPlan, error) {
+	normalizedReply, replyBytes, err := validateApprovalReply(kind, reply)
+	if err != nil {
+		return ApprovalActionPlan{}, err
+	}
 	rule := c.matchingApprovalRule(snapshot)
 	if rule == nil {
 		return ApprovalActionPlan{}, ErrApprovalPromptUnavailable
@@ -89,19 +103,45 @@ func (c *ScreenClassifier) PlanApprovalAction(
 	}
 	size := len(binding.prefix) + len(binding.suffix)
 	if binding.includeReply {
-		size += len(reply)
+		size += len(normalizedReply)
 	}
 	input := make([]byte, 0, size)
 	input = append(input, binding.prefix...)
 	if binding.includeReply {
-		input = append(input, reply...)
+		input = append(input, normalizedReply...)
 	}
 	input = append(input, binding.suffix...)
 	return ApprovalActionPlan{
-		kind:  kind,
-		rule:  rule.definition.name,
-		input: input,
+		kind:       kind,
+		rule:       rule.definition.name,
+		input:      input,
+		replyBytes: replyBytes,
 	}, nil
+}
+
+func validateApprovalReply(
+	kind agent.ActionKind,
+	reply string,
+) (string, int, error) {
+	if kind != agent.ActionReply {
+		if reply != "" {
+			return "", 0, ErrApprovalReplyInvalid
+		}
+		return "", 0, nil
+	}
+	if !utf8.ValidString(reply) {
+		return "", 0, ErrApprovalReplyInvalid
+	}
+	normalized := strings.TrimSpace(reply)
+	if len(normalized) == 0 || len(normalized) > 4096 {
+		return "", 0, ErrApprovalReplyInvalid
+	}
+	for _, value := range normalized {
+		if value <= 0x1f || value >= 0x7f && value <= 0x9f {
+			return "", 0, ErrApprovalReplyInvalid
+		}
+	}
+	return normalized, len(normalized), nil
 }
 
 func (c *ScreenClassifier) matchingApprovalRule(

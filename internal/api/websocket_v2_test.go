@@ -70,7 +70,11 @@ func TestWebSocketV2NegotiatesAndStreamsRawHistoryFromOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("start agent: %v", err)
 	}
-	if _, err := manager.SendInput(agent.ID(status.AgentID), []byte("hello\n")); err != nil {
+	if _, err := sendInputWithControlRetry(
+		manager,
+		agent.ID(status.AgentID),
+		[]byte("hello\n"),
+	); err != nil {
 		t.Fatalf("seed terminal output: %v", err)
 	}
 	if recorded := waitForRecordedOutput(t, manager, status.AgentID); len(recorded) < 2 {

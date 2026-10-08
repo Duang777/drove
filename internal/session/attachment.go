@@ -450,17 +450,26 @@ func (p *outputProcessor) sendAttachedInput(
 		return InputResult{}, ErrAttachmentClosed
 	}
 
-	if err := p.attachedInputAvailable(); err != nil {
-		return InputResult{}, err
-	}
 	if !sameTerminalSize(attachment.proposed, state.effectiveSize) {
 		if err := p.applyResize(state, attachment.proposed); err != nil {
 			return InputResult{}, err
 		}
 	}
 
+	if !p.running.controlMu.TryLock() {
+		return InputResult{}, ErrInputBackpressure
+	}
+	defer p.running.controlMu.Unlock()
+	managed, err := p.attachedInputAvailable()
+	if err != nil {
+		return InputResult{}, err
+	}
+
 	written, err := p.running.process.Write(data)
 	result := InputResult{BytesWritten: written}
+	if written > 0 {
+		p.running.responseFence = managed.currentStateSeq()
+	}
 	if writeErr := classifyInputWrite(
 		p.id,
 		written,
@@ -493,18 +502,22 @@ func (p *outputProcessor) sendAttachedInput(
 	return result, nil
 }
 
-func (p *outputProcessor) attachedInputAvailable() error {
+func (p *outputProcessor) attachedInputAvailable() (*managedAgent, error) {
 	p.manager.mu.RLock()
 	defer p.manager.mu.RUnlock()
 	if p.manager.closed {
-		return ErrManagerClosed
+		return nil, ErrManagerClosed
 	}
+	managed, known := p.manager.agents[p.id]
 	current, attached := p.manager.sessions[p.id]
 	if !attached || current != p.running || p.running.exitClaimed ||
-		p.running.process == nil {
-		return fmt.Errorf("%w: %q", ErrNotAttached, p.id)
+		p.running.stopCause != stopCauseNone || p.running.process == nil {
+		return nil, fmt.Errorf("%w: %q", ErrNotAttached, p.id)
 	}
-	return nil
+	if !known {
+		return nil, fmt.Errorf("%w: %q", ErrUnknownAgent, p.id)
+	}
+	return managed, nil
 }
 
 func (p *outputProcessor) nextTicket(state *outputProcessorState) uint64 {

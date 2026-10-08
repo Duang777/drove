@@ -33,6 +33,7 @@ const (
 	outputDetachAll
 	outputAttachedInput
 	outputWatchSnapshots
+	outputBarrier
 	outputClose
 )
 
@@ -213,11 +214,6 @@ func (p *outputProcessor) SendAttachedInput(
 	data []byte,
 	payload string,
 ) (InputResult, error) {
-	if !p.running.inputMu.TryLock() {
-		return InputResult{}, ErrInputBackpressure
-	}
-	defer p.running.inputMu.Unlock()
-
 	result, err := p.submit(ctx, outputRequest{
 		operation:    outputAttachedInput,
 		attachmentID: id,
@@ -228,6 +224,14 @@ func (p *outputProcessor) SendAttachedInput(
 		return InputResult{}, err
 	}
 	return result.input, result.err
+}
+
+func (p *outputProcessor) Barrier(ctx context.Context) error {
+	result, err := p.submit(ctx, outputRequest{operation: outputBarrier})
+	if err != nil {
+		return err
+	}
+	return result.err
 }
 
 func (p *outputProcessor) WatchSnapshots(
@@ -382,6 +386,8 @@ func (p *outputProcessor) handle(
 	case outputWatchSnapshots:
 		snapshots, err := p.watchSnapshots(state, request.attachmentID)
 		return outputResult{snapshots: snapshots, err: err}
+	case outputBarrier:
+		return outputResult{}
 	default:
 		return outputResult{err: fmt.Errorf(
 			"session: unknown recording operation %d",

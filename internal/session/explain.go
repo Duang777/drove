@@ -115,16 +115,26 @@ func (m *Manager) Explain(
 
 	m.mu.RLock()
 	running, attached := m.sessions[id]
-	if attached && !running.exitClaimed && running.terminal != nil {
+	if attached && running.exitClaimed {
+		attached = false
+	}
+	var terminal *terminalActor
+	var observer *observationActor
+	if attached {
+		terminal = running.terminal
+		observer = running.observer
+	}
+	m.mu.RUnlock()
+
+	if attached && terminal != nil {
 		explanation.Attached = true
-		if running.observer != nil {
-			explanation.HookStatus = running.observer.Snapshot().HookStatus()
+		if observer != nil {
+			explanation.HookStatus = observer.Snapshot().HookStatus()
 		}
-		snapshot, capturedAt, available := running.terminal.snapshotWithCapturedAt()
+		snapshot, capturedAt, available := terminal.snapshotWithCapturedAt()
 		if available {
 			screen, screenErr := explainScreen(snapshot, capturedAt)
 			if screenErr != nil {
-				m.mu.RUnlock()
 				return Explanation{}, fmt.Errorf(
 					"session: render explain screen for agent %q: %w",
 					id,
@@ -134,7 +144,6 @@ func (m *Manager) Explain(
 			explanation.Screen = &screen
 		}
 	}
-	m.mu.RUnlock()
 	return explanation, nil
 }
 

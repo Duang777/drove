@@ -185,9 +185,9 @@ func TestAttachmentInputRejectsConcurrentAdmission(t *testing.T) {
 	}
 	defer attachment.Close()
 
-	running.inputMu.Lock()
+	running.controlMu.Lock()
 	result, err := attachment.SendInput(context.Background(), []byte("input"))
-	running.inputMu.Unlock()
+	running.controlMu.Unlock()
 	if !errors.Is(err, ErrInputBackpressure) {
 		t.Fatalf("send input error = %v, want ErrInputBackpressure", err)
 	}
